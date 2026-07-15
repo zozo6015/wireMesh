@@ -96,6 +96,45 @@ impl Lab {
     }
 }
 
+/// Which NAT mapping behavior a router cell exhibits, per the classic
+/// STUN/RFC 4787 taxonomy. `PortRestricted` (endpoint-independent mapping,
+/// port-restricted filtering) is what plain `masquerade` gives you; a real
+/// symmetric NAT (endpoint-dependent mapping) requires per-destination port
+/// randomization, which nftables approximates with `masquerade fully-random`.
+#[derive(Clone, Copy)]
+pub enum NatKind {
+    PortRestricted,
+    Symmetric,
+}
+
+impl Lab {
+    /// Creates a router `Ns` with IPv4 forwarding enabled and an nftables
+    /// masquerade rule installed on egress. Convention: callers wire the
+    /// router's outside (public-facing) interface as `out0` and its inside
+    /// (private-facing) interface as `in0` via `Lab::veth`.
+    pub fn nat_router(&mut self, name: &str, kind: NatKind) -> Result<Ns> {
+        let ns = self.ns(name)?;
+        ns.exec(&["sysctl", "-w", "net.ipv4.ip_forward=1"])?;
+        let flags = match kind {
+            NatKind::PortRestricted => "",
+            NatKind::Symmetric => " fully-random",
+        };
+        // nft's block syntax needs a newline (or semicolon) between the
+        // `type nat hook ...` chain header and the rule that follows it, and
+        // will not accept a bare `;}}` — closing braces must be preceded by
+        // a statement terminator on their own line. A fully inline one-liner
+        // (`{ ... ; } }`) fails with "syntax error, unexpected '}'".
+        let ruleset = format!(
+            "table ip nat {{\n  chain post {{\n    type nat hook postrouting priority 100;\n    oifname \"out0\" masquerade{flags};\n  }}\n}}\n"
+        );
+        let ruleset_path = format!("/tmp/{}.nft", ns.name);
+        std::fs::write(&ruleset_path, &ruleset)
+            .with_context(|| format!("write nft ruleset {ruleset_path}"))?;
+        ns.exec(&["nft", "-f", &ruleset_path])?;
+        Ok(ns)
+    }
+}
+
 impl Drop for Lab {
     fn drop(&mut self) {
         for ns in &self.namespaces {

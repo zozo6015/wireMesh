@@ -327,3 +327,50 @@ echo return-path keying still needs a dedicated fix task.
 ## Bet 3: QUIC relay
 ## Bet 4: NAT observation + hole punch
 ## Bet 5: NAT matrix harness
+
+### Task 10: NAT cells — port-restricted + symmetric, behavior-proven (2026-07-15)
+
+**Result: validated.** `natlab` (spike/natlab) gained
+`pub enum NatKind { PortRestricted, Symmetric }` and
+`Lab::nat_router(name, kind) -> Result<Ns>`: a router namespace with
+`net.ipv4.ip_forward=1` and an nftables `ip nat` postrouting masquerade on
+`out0` (convention: outside iface `out0`, inside `in0`; callers wire veths).
+`PortRestricted` = plain `masquerade`; `Symmetric` = `masquerade fully-random`.
+
+Behavior proven by observed external source ports, not just rule
+installation (`spike/natlab/tests/nat_behavior.rs`: one client UDP socket
+bound to :6000 sends to two server addresses through the router; per-address
+`udpsink` example binaries report the peer port they saw):
+
+| Cell | Observed ports (dst1 / dst2) | Verdict |
+|---|---|---|
+| PortRestricted (`masquerade`) | 6000 / 6000 (equal, port-preserved) | endpoint-independent mapping ✓ |
+| Symmetric (`fully-random`) run 1 | 29207 / 55524 (differ) | per-destination mapping ✓ |
+| Symmetric (`fully-random`) run 2 | 62412 / 13809 (differ) | per-destination mapping ✓ |
+| Symmetric (`fully-random`) run 3 | 45104 / 28754 (differ) | per-destination mapping ✓ |
+
+**Risk that did NOT materialize:** the brief flagged that kernel SNAT
+port-preservation might defeat `fully-random` (making the "symmetric" cell
+endpoint-independent). On this kernel (`6.12.76-linuxkit`, aarch64,
+nftables in the dev container) `masquerade fully-random` genuinely maps
+per-destination — no fallback (`masquerade random` or explicit
+per-destination `snat to :range` rules) was needed.
+
+**CGNAT:** no dedicated `NatKind` — CGNAT is composed as two chained
+`Symmetric` routers; the composition will be demonstrated in the later
+hole-punch tests (Bet 4 matrix), not by a separate cell type.
+
+**nft syntax finding:** the brief's one-line ruleset
+(`table ip nat { chain post { ...; } }`) does not parse — nft requires a
+newline (or standalone semicolon line) before closing braces; a bare `; } }`
+fails with `syntax error, unexpected '}'`. The constructor emits the ruleset
+with real newlines.
+
+Canonical command (all 3 natlab tests green):
+```
+./dev.sh run "cd spike/natlab && cargo build --examples && cargo test -- --test-threads=1 --nocapture"
+# test port_restricted_nat_is_endpoint_independent ... ok
+# test symmetric_nat_maps_per_destination ... ok
+# test veth_pair_pings ... ok
+# test result: ok. 2 passed (nat_behavior) + 1 passed (veth_ping); 0 failed
+```
