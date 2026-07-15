@@ -118,6 +118,69 @@ iperf Done.
 tunnel processes' startup messages racing on stderr — cosmetic only.)
 
 ## Bet 2: tc-BPF enforcer
+
+### Task 6: aya tc classifier scaffold — attach-on-tun + default-deny (2026-07-15)
+
+**Result: validated.** tc-BPF (aya) attaches to a real WireGuard tun device
+(boringtun via `spike-tunnel`), L3 parsing works with no ethernet header
+(byte 0 is the IP header), and default-deny + pinned counters behave as
+designed. Integration test `default_deny_drops_overlay_ping_and_counts`
+(spike/enforcer/enforcer/tests/enforce.rs) is green, twice consecutively:
+pre-enforcement overlay ping succeeds through the two-node WG lab; after
+attaching `aeth_ingress`/`aeth_egress` on ns b's `wg0` with an empty rule
+table, the overlay ping is dropped and the pinned `deny` counter reads >= 2.
+
+Canonical command:
+```
+./dev.sh run "cd spike/enforcer && SPIKE_TUNNEL_BIN=/work/spike/tunnel/target/release/spike-tunnel cargo test -- --test-threads=1 --nocapture"
+# test default_deny_drops_overlay_ping_and_counts ... ok
+# test result: ok. 1 passed; 0 failed  (finished in ~5.1s)
+```
+
+**Environment:** Docker Desktop for Mac (aarch64), container Debian 12,
+kernel `6.12.76-linuxkit`. Because the kernel is >= 6.6, aya 0.14 attaches
+`SchedClassifier` via the **TCX link API**, not legacy netlink tc filters —
+so `tc filter show dev ... ingress` shows nothing; use `bpftool prog show` /
+`bpftool link show` to observe the attachment (link type shows as raw
+`type 11` = BPF_LINK_TYPE_TCX with the container's bpftool).
+
+**Docker Desktop / container BPF quirks found (both fixed in the enforcer,
+not in dev tooling — a real gateway needs the same guarantees):**
+
+1. `/sys/fs/bpf` is a plain sysfs directory, **not a mounted bpffs** — no
+   `sys-fs-bpf.mount` equivalent in the container. `create_dir_all` /
+   `BPF_OBJ_PIN` under it fail ENOENT. Fix: `enforcer run` now checks
+   `statfs(/sys/fs/bpf).f_type == BPF_FS_MAGIC (0xcafe4a11)` and mounts
+   bpffs itself before creating the pin dir.
+2. **bpffs mounts don't cross `ip netns exec` invocations.** `ip netns exec`
+   does its own `unshare(CLONE_NEWNS)` + `/sys` remount per invocation, and
+   every bpffs mount is an independent, empty superblock — so maps pinned by
+   the running enforcer are invisible to a later `enforcer stats` invocation
+   in the "same" namespace. BPF object IDs are system-global, though: `stats`
+   falls back to `aya::maps::loaded_maps()` and opens the map named
+   `COUNTERS` by id (`MapData::from_id`) when the pin path is absent.
+   Spike-grade: assumes one enforcer per kernel; revisit if that changes.
+3. The aya template's `.cargo/config.toml` sets `runner = "sudo -E"`, which
+   breaks all `cargo test`/`cargo run` in the root-only, sudo-less dev
+   container ("No such file or directory" before any test executes). Runner
+   removed — we're already root.
+
+**aya API friction (vs. the Task 6 brief, which assumed aya 0.13):** the
+template pins **aya 0.14.0 / aya-ebpf 0.2.1**; the brief's code nonetheless
+matched the real API almost verbatim. Notable 0.14-era facts: aya raises
+`RLIMIT_MEMLOCK` internally during `Ebpf::load` (the template's manual
+`libc::setrlimit` dance is dead code); `#[classifier]` emits every tc program
+into one shared `"classifier"` ELF section, discovered by symbol name (both
+`aeth_ingress` and `aeth_egress` live there — expected, not a collision);
+`cargo generate` for the template needs `$USER` set plus explicit
+`-d default_iface=... -d direction=...` args to run non-interactively.
+Full detail: `.superpowers/sdd/task-6-report.md`.
+
+Also caught by the test author (recorded here so Task 7/8 tests don't trip
+on it): `natlab::Ns::exec` bails with `Err` on any non-zero exit, so
+"expect this command to fail" assertions must use `.is_err()`, never
+`!output.status.success()`.
+
 ## Bet 3: QUIC relay
 ## Bet 4: NAT observation + hole punch
 ## Bet 5: NAT matrix harness
