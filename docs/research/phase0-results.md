@@ -249,6 +249,22 @@ repeated real reloads under live traffic. No residual read-once/visibility
 anomaly was found — the A/B flip design behaved exactly as specced across
 all 3 runs.
 
+### Task 8: stateful reply path with enforcers on both gateways (2026-07-15)
+
+**Result: validated.** New test `reply_traffic_passes_via_flow_table_with_enforcers_on_both_sides`
+(spike/enforcer/enforcer/tests/enforce.rs) runs enforcers on **both** sides of
+the tunnel at once (ns b: allow inbound tcp:5201; ns a: allow nothing
+inbound) and proves the SYN-ACK reply, which arrives at A's tun ingress with
+no rule permitting it, is let through solely by A's egress-recorded flow
+table — confirmed for the right reason via A-side stats after the iperf3
+run: `allow:0, deny:0, flow_hit:938` (A's static table never matched
+anything and default-deny never fired; every reply packet was resolved by
+the flow table first). Full suite green 4/4 twice consecutively
+(`./dev.sh run "cd spike/enforcer && SPIKE_TUNNEL_BIN=/work/spike/tunnel/target/release/spike-tunnel cargo test -- --test-threads=1 --nocapture"`,
+~30.7-30.8s per run). No implementation changes were needed — the two
+likely-failure-cause hypotheses in the task brief (pin-dir collision, fixed
+in commit be8f904; FlowKey byte-order asymmetry) did not materialize.
+
 ## Bet 3: QUIC relay
 ## Bet 4: NAT observation + hole punch
 ## Bet 5: NAT matrix harness

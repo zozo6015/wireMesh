@@ -15,6 +15,20 @@ fn stats(ns: &natlab::Ns, bin: &str) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).unwrap()
 }
 
+// Task 8 (test author): variant of `stats` for the multi-enforcer-per-kernel
+// case. `stats` (above) always queries the default `--pin-dir
+// /sys/fs/bpf/aeth`, which is fine when only one enforcer instance exists at
+// a time (Tasks 6-7). This test runs TWO concurrent enforcers (one per
+// netns, one per side of the tunnel) with distinct `--pin-dir` flags (see
+// Task 6's phase0-results.md note: `stats --pin-dir X` resolves via the pin
+// or the pin-dir-keyed `/tmp/enforcer-<sanitized X>.mapids.json` file written
+// by `run --pin-dir X`, so each side's counters are queried unambiguously by
+// passing the matching pin dir here).
+fn stats_pin(ns: &natlab::Ns, bin: &str, pin_dir: &str) -> serde_json::Value {
+    let out = ns.exec(&[bin, "stats", "--pin-dir", pin_dir]).unwrap();
+    serde_json::from_slice(&out.stdout).unwrap()
+}
+
 #[test]
 fn default_deny_drops_overlay_ping_and_counts() {
     let enf = env!("CARGO_BIN_EXE_enforcer");
@@ -134,6 +148,54 @@ fn rule_flip_under_traffic_never_transiently_denies() {
         deny_before,
         "transient denies during flip"
     );
+    for c in &mut children { let _ = c.kill(); }
+    drop(lab);
+}
+
+// Task 8, Step 1 (test author): proves spec §5.3 stateful reply semantics
+// with enforcers running on BOTH gateways at once (Tasks 6-7 only ever ran
+// one enforcer, in ns b). B allows inbound tcp:5201; A allows NOTHING
+// inbound. The SYN passes B's allow rule normally, but the SYN-ACK arrives
+// at A's tun ingress where NO rule permits it -- if A's enforcer only
+// consulted the static rule table, the reply would be dropped and the
+// iperf3 client would time out. It must instead be let through by A's own
+// egress-recorded flow-table entry (A's egress path, when the SYN went out,
+// records the flow; A's ingress path finds the reverse-key hit for the
+// SYN-ACK and passes it before ever reaching the default-deny fallback).
+//
+// Adapted from the brief's literal listing per this file's established idiom
+// (see the NOTE above `default_deny_drops_overlay_ping_and_counts`):
+// `natlab::Ns::exec()` bails with `Err` on non-zero exit, so
+// `a.exec(&["iperf3", ...])` is asserted with `.is_ok()`, not
+// `.unwrap().status.success()`. Also uses the new `stats_pin` helper (see
+// above) since this test needs the A-side enforcer's counters specifically,
+// and two concurrent enforcers means the plain `stats` (default pin dir)
+// helper cannot disambiguate between them.
+#[test]
+fn reply_traffic_passes_via_flow_table_with_enforcers_on_both_sides() {
+    let enf = env!("CARGO_BIN_EXE_enforcer");
+    let (lab, a, b, mut children) = wg_lab();
+    // B allows inbound tcp:5201; A allows NOTHING inbound.
+    std::fs::write("/tmp/rb.json",
+        r#"[{"src":"10.10.0.0/24","dst":"10.10.0.2/32","proto":"tcp","ports":[5201,5201],"action":"allow"}]"#).unwrap();
+    std::fs::write("/tmp/ra.json", "[]").unwrap();
+    children.push(b.spawn(&[enf, "run", "--iface", "wg0", "--rules", "/tmp/rb.json",
+                            "--pin-dir", "/sys/fs/bpf/aeth-b"]).unwrap());
+    children.push(a.spawn(&[enf, "run", "--iface", "wg0", "--rules", "/tmp/ra.json",
+                            "--pin-dir", "/sys/fs/bpf/aeth-a"]).unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    children.push(b.spawn(&["iperf3", "-s", "-p", "5201"]).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // A->B iperf: SYN passes B's allow rule; SYN-ACK arrives at A's tun
+    // ingress, where NO rule allows it -- it must pass via A's
+    // egress-recorded flow entry.
+    assert!(
+        a.exec(&["iperf3", "-c", "10.10.0.2", "-p", "5201", "-t", "2"]).is_ok(),
+        "reply path through initiator-side flow table failed"
+    );
+    let sa = stats_pin(&a, enf, "/sys/fs/bpf/aeth-a");
+    assert!(sa["flow_hit"].as_u64().unwrap() > 0, "A-side flow table never hit: {sa}");
     for c in &mut children { let _ = c.kill(); }
     drop(lab);
 }
