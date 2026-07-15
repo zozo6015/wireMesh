@@ -271,6 +271,59 @@ the flow table first). Full suite green 4/4 twice consecutively
 likely-failure-cause hypotheses in the task brief (pin-dir collision, fixed
 in commit be8f904; FlowKey byte-order asymmetry) did not materialize.
 
+### Task 9: ICMP embedded-error pass/deny via egress-recorded flows (2026-07-15)
+
+**Result: validated — Bet 2 COMPLETE.** New kernel branch in `try_ingress`
+(`spike/enforcer/enforcer-ebpf/src/main.rs`), inserted between the flow-table
+lookups and the rules scan: for inbound ICMP (proto 1) with type 3/11/12
+(dest-unreachable / time-exceeded / parameter-problem), parse the EMBEDDED
+original IPv4 header at `ihl + 8`, extract its src/dst/proto and first 8 L4
+bytes (ports), and pass (`TC_ACT_PIPE`, bumping `icmp_err_pass`) iff that
+embedded 4-tuple+proto matches a flow this segment recorded at egress — the
+spec §5.3 / Cilium approach. Non-matching ICMP errors fall through to the
+rules scan and default-deny.
+
+New crafted-packet injector `spike/enforcer/enforcer/src/bin/pktgen.rs`
+(raw ICMPv4 socket via socket2): sends one type-3/code-4 frag-needed packet
+embedding a caller-specified fake original IPv4+TCP header.
+
+Test `icmp_error_for_recorded_flow_passes_unrelated_icmp_error_dropped`
+(tests/enforce.rs): A enforces with an empty ruleset; a python3
+source-port-44444 connect attempt from A records the outbound flow (the
+container image ships no `nc`/`ncat`/`socat` — test-only substitution, no
+implementation change); B injects (1) a frag-needed embedding the exact
+recorded flow — asserted to bump `icmp_err_pass` by **exactly** 1 — and (2)
+one embedding an unrecorded 4-tuple — asserted to bump `deny`. Green for the
+right reason on strict assertions.
+
+Canonical command, full suite 5/5 twice consecutively (~33.4s), plus the new
+test re-run in isolation for a flakiness check:
+```
+./dev.sh run "cd spike/enforcer && SPIKE_TUNNEL_BIN=/work/spike/tunnel/target/release/spike-tunnel cargo test -- --test-threads=1 --nocapture"
+# test result: ok. 5 passed; 0 failed
+```
+
+**Verifier fights:** none — the branch compiled and loaded clean on the first
+attempt (bounded explicit offsets, `.map_err(|_| ())?` on required loads,
+`.unwrap_or(0)` on the embedded L4 port loads). The only friction was
+userspace: socket2 0.5's `Type::RAW` is gated behind its `all` feature, so
+the dep is `socket2 = { version = "0.5", features = ["all"] }`.
+
+**Bet 2 summary — COMPLETE.** Kernel `6.12.76-linuxkit` (Docker Desktop,
+aarch64, aya 0.14 via TCX). All five enforcer behaviors proven by the 5-test
+suite: (1) attach-on-tun with L3-only parsing (no ethernet header, Task 6);
+(2) default-deny + pinned counters (Task 6); (3) first-match scan + atomic
+A/B table flip under live traffic, 0% loss across 50 SIGHUP reloads (Task 7);
+(4) stateful reply path via egress-recorded flow table with enforcers on both
+gateways (Task 8); (5) ICMP embedded-error pass/deny (Task 9).
+
+**Carried design finding (deferred, tracked for MVP):** ICMP-ECHO
+reverse-flow keying is asymmetric (egress records echo as `{sport: id,
+dport: 0}`; ingress reverse lookup swaps to `{sport: 0, dport: id}`), so
+inside-initiated echo *replies* don't match the flow table — ICMP *errors*
+work (proven here, disjoint type set, independent of the echo encoding);
+echo return-path keying still needs a dedicated fix task.
+
 ## Bet 3: QUIC relay
 ## Bet 4: NAT observation + hole punch
 ## Bet 5: NAT matrix harness

@@ -199,3 +199,82 @@ fn reply_traffic_passes_via_flow_table_with_enforcers_on_both_sides() {
     for c in &mut children { let _ = c.kill(); }
     drop(lab);
 }
+
+// Task 9, Step 3 (test author): proves spec §5.3's ICMP-error rule (kernel
+// branch inserted by the implementer, phase 1, in `try_ingress`): an inbound
+// ICMP error (type 3/11/12) whose EMBEDDED original header matches a flow
+// this segment itself originated (recorded at egress) must be let through
+// (`icmp_err_pass` counter), while one with no matching embedded flow must
+// fall through to default-deny.
+//
+// A allows NOTHING inbound (same shape as
+// `reply_traffic_passes_via_flow_table_with_enforcers_on_both_sides` above,
+// minus B's enforcer -- this test only needs A's ingress path and B as a
+// dumb ICMP-error source, so only A runs the enforcer). We manufacture a
+// real outbound flow record on A for tcp 10.10.0.1:44444 -> 10.10.0.2:5201,
+// then have B (via `pktgen`, the raw-socket ICMP-error injector added in
+// phase 1) send two crafted "fragmentation needed" packets to A: one whose
+// embedded header matches that recorded flow (must PASS -- `icmp_err_pass`
+// +1) and one whose embedded header matches no flow (must be DENIED).
+//
+// Deviation from the brief's literal Step 3 listing: the brief uses `nc -p
+// 44444 10.10.0.2 5201` to open the outbound flow. The container image has
+// no `nc`/`ncat`/`socat`/`nmap` (`which nc` inside `./dev.sh run` resolves to
+// nothing on all four). `python3` IS present, so a short inline script binds
+// the exact source port and attempts the connect instead -- like the brief's
+// `nc` call, the connect is expected to fail (nothing listens on :5201 in
+// this lab) and that's fine: only the SYN leaving A's tun egress matters,
+// which is what records the flow (same mechanism the brief's own `nc`
+// comment relies on -- "connect fails, that's fine, egress recording happens
+// on the SYN"). All other pieces (pktgen's positional argv, the two
+// counters, the `stats_pin` helper) match the brief's Step 3 and the actual
+// `pktgen.rs` (confirmed by reading it: `pktgen <dst> <esrc> <edst> <esport>
+// <edport>`) exactly -- no other adaptation needed.
+#[test]
+fn icmp_error_for_recorded_flow_passes_unrelated_icmp_error_dropped() {
+    let enf = env!("CARGO_BIN_EXE_enforcer");
+    let pktgen = env!("CARGO_BIN_EXE_pktgen");
+    let (lab, a, b, mut children) = wg_lab();
+    std::fs::write("/tmp/ra.json", "[]").unwrap(); // A allows nothing inbound
+    children.push(a.spawn(&[enf, "run", "--iface", "wg0", "--rules", "/tmp/ra.json",
+                            "--pin-dir", "/sys/fs/bpf/aeth-a"]).unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    // Create an outbound flow record on A: tcp 10.10.0.1:44444 -> 10.10.0.2:5201.
+    // (No `nc` in this image -- see the deviation note above -- so a tiny
+    // inline python3 script binds the source port and attempts the connect;
+    // it is expected to fail/time out since nothing listens on B:5201, same
+    // as the brief's `nc` call. `let _ =` discards the (expected) error.)
+    let _ = a.exec(&["python3", "-c", r#"
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(1)
+try:
+    s.bind(("10.10.0.1", 44444))
+    s.connect(("10.10.0.2", 5201))
+except Exception:
+    pass
+"#]);
+    // Small settle so the egress flow record is written before pktgen fires
+    // (avoids a race between the SYN's egress hook and the ICMP probes).
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let stats_a = || -> serde_json::Value {
+        let out = a.exec(&[enf, "stats", "--pin-dir", "/sys/fs/bpf/aeth-a"]).unwrap();
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+    let (icmp0, deny0) = { let s = stats_a();
+        (s["icmp_err_pass"].as_u64().unwrap(), s["deny"].as_u64().unwrap()) };
+
+    // matching frag-needed from B, embedding the flow just recorded on A — must PASS.
+    b.exec(&[pktgen, "10.10.0.1", "10.10.0.1", "10.10.0.2", "44444", "5201"]).unwrap();
+    // non-matching frag-needed (no such flow was ever recorded) — must be DENIED.
+    b.exec(&[pktgen, "10.10.0.1", "10.10.0.1", "10.10.0.2", "12345", "9999"]).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    let s = stats_a();
+    assert_eq!(s["icmp_err_pass"].as_u64().unwrap(), icmp0 + 1, "matching ICMP error not passed: {s}");
+    assert!(s["deny"].as_u64().unwrap() > deny0, "unrelated ICMP error not denied: {s}");
+    for c in &mut children { let _ = c.kill(); }
+    drop(lab);
+}

@@ -86,7 +86,35 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
         bump(CTR_FLOW_HIT);
         return Ok(TC_ACT_PIPE);
     }
-    // 3) rules (default deny) — Task 7 fills scan_rules; scaffold denies all
+    // 3) ICMP errors: pass iff the EMBEDDED original packet matches a recorded flow.
+    // (spec §5.3, Cilium approach) — the ICMP error itself is a fresh inbound
+    // packet with no flow of its own; instead we look at the original packet
+    // it is reporting on, which (being sent from inside this segment) was
+    // recorded as-is at egress.
+    if proto == 1 {
+        let itype: u8 = ctx.load(ihl).map_err(|_| ())?;
+        if itype == 3 || itype == 11 || itype == 12 {
+            // embedded original IP header starts at ihl + 8 (icmp hdr)
+            let eoff = ihl + 8;
+            let evihl: u8 = ctx.load(eoff).map_err(|_| ())?;
+            if evihl >> 4 == 4 {
+                let eihl = ((evihl & 0x0f) as usize) * 4;
+                let eproto: u8 = ctx.load(eoff + 9).map_err(|_| ())?;
+                let esrc: u32 = ctx.load(eoff + 12).map_err(|_| ())?;
+                let edst: u32 = ctx.load(eoff + 16).map_err(|_| ())?;
+                let esport: u16 = ctx.load(eoff + eihl).unwrap_or(0);
+                let edport: u16 = ctx.load(eoff + eihl + 2).unwrap_or(0);
+                // original packet was OUTBOUND from this segment => recorded at egress as-is
+                let ekey = FlowKey { src: esrc, dst: edst, sport: esport, dport: edport,
+                                     proto: eproto, _pad: [0; 3] };
+                if unsafe { FLOWS.get(&ekey) }.is_some() {
+                    bump(CTR_ICMP_ERR);
+                    return Ok(TC_ACT_PIPE);
+                }
+            }
+        }
+    }
+    // 4) rules (default deny) — Task 7 fills scan_rules; scaffold denies all
     if scan_rules(src, dst, proto, dport) == ACT_ALLOW {
         let _ = FLOWS.insert(&fwd, &1u64, 0);
         bump(CTR_ALLOW);
