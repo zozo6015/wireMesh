@@ -4,7 +4,7 @@ use std::process::{Child, Command, Output, Stdio};
 pub struct Lab { prefix: String, namespaces: Vec<String> }
 
 #[derive(Clone)]
-pub struct Ns { pub name: String }
+pub struct Ns { pub name: String, mountns: String }
 
 fn run(cmd: &[&str]) -> Result<Output> {
     let out = Command::new(cmd[0]).args(&cmd[1..]).output()
@@ -15,6 +15,22 @@ fn run(cmd: &[&str]) -> Result<Output> {
     Ok(out)
 }
 
+/// Directory holding one persistent mount-namespace reference file per `Ns`
+/// (created via `unshare --mount=<file>`). `ip netns exec` only isolates the
+/// *network* namespace — it does not give each namespace a private `/run`.
+/// Filesystem-scoped daemons that key state off a fixed path under `/run`
+/// (e.g. boringtun's WireGuard UAPI socket at `/var/run/wireguard/<ifname>.sock`,
+/// see spike/tunnel's API-friction notes) would otherwise collide across
+/// namespaces that use the same name. Giving each `Ns` its own persistent
+/// mount namespace with a private `tmpfs` at `/var/run/wireguard` avoids that,
+/// and mirrors how real gateway deployments are isolated (separate host/pod
+/// per gateway, not just a separate network namespace).
+const MOUNTNS_DIR: &str = "/run/natlab-mountns";
+
+fn mountns_path(full_name: &str) -> String {
+    format!("{MOUNTNS_DIR}/{full_name}")
+}
+
 impl Lab {
     pub fn new(prefix: &str) -> Result<Self> {
         Ok(Self { prefix: prefix.into(), namespaces: vec![] })
@@ -23,10 +39,23 @@ impl Lab {
     pub fn ns(&mut self, name: &str) -> Result<Ns> {
         let full = format!("{}-{}", self.prefix, name);
         run(&["ip", "netns", "add", &full])?;
-        // Track immediately so Drop cleans up even if lo-up fails below.
+        // Track immediately so Drop cleans up even if later steps fail.
         self.namespaces.push(full.clone());
         run(&["ip", "netns", "exec", &full, "ip", "link", "set", "lo", "up"])?;
-        Ok(Ns { name: full })
+
+        std::fs::create_dir_all(MOUNTNS_DIR).context("create natlab mountns dir")?;
+        let mountns = mountns_path(&full);
+        std::fs::File::create(&mountns).context("create mountns pin file")?;
+        run(&[
+            "unshare",
+            &format!("--mount={mountns}"),
+            "--",
+            "bash",
+            "-c",
+            "mkdir -p /var/run/wireguard && mount -t tmpfs tmpfs /var/run/wireguard",
+        ])?;
+
+        Ok(Ns { name: full, mountns })
     }
 
     pub fn veth(&mut self, a: (&Ns, &str, &str), b: (&Ns, &str, &str)) -> Result<()> {
@@ -66,19 +95,29 @@ impl Drop for Lab {
     fn drop(&mut self) {
         for ns in &self.namespaces {
             let _ = Command::new("ip").args(["netns", "del", ns]).status();
+            let mountns = mountns_path(ns);
+            let _ = Command::new("umount").arg(&mountns).status();
+            let _ = std::fs::remove_file(&mountns);
         }
     }
 }
 
 impl Ns {
+    /// `nsenter --mount=<pin>` enters this Ns's private, persistent mount
+    /// namespace *before* handing off to `ip netns exec`, so the private
+    /// `/var/run/wireguard` tmpfs (set up in `Lab::ns`) is part of the mount
+    /// table `ip netns exec`'s own internal unshare(CLONE_NEWNS) copies —
+    /// see the MOUNTNS_DIR doc comment above.
     pub fn exec(&self, cmd: &[&str]) -> Result<Output> {
-        let mut full = vec!["ip", "netns", "exec", &self.name];
+        let mount_arg = format!("--mount={}", self.mountns);
+        let mut full = vec!["nsenter", &mount_arg, "--", "ip", "netns", "exec", &self.name];
         full.extend_from_slice(cmd);
         run(&full)
     }
     pub fn spawn(&self, cmd: &[&str]) -> Result<Child> {
-        Command::new("ip")
-            .args(["netns", "exec", &self.name])
+        Command::new("nsenter")
+            .arg(format!("--mount={}", self.mountns))
+            .args(["--", "ip", "netns", "exec", &self.name])
             .args(cmd)
             .stdout(Stdio::piped()).stderr(Stdio::piped())
             .spawn().context("spawn in netns")
