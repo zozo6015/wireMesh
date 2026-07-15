@@ -16,7 +16,12 @@
 # already per-namespace.
 set -euo pipefail
 BIN=${1:?usage: bench.sh <path-to-spike-tunnel-binary>}
-cleanup() { ip netns del bwa 2>/dev/null || true; ip netns del bwb 2>/dev/null || true; }
+cleanup() {
+  pkill -f spike-tunnel 2>/dev/null || true
+  pkill iperf3 2>/dev/null || true
+  ip netns del bwa 2>/dev/null || true
+  ip netns del bwb 2>/dev/null || true
+}
 trap cleanup EXIT; cleanup
 
 ip netns add bwa; ip netns add bwb
