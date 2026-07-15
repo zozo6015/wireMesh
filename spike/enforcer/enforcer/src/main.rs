@@ -1,6 +1,6 @@
 use anyhow::{bail, Context, Result};
 use aya::{
-    maps::{loaded_maps, Array, MapData},
+    maps::{Array, MapData},
     programs::{tc, SchedClassifier, TcAttachType},
     Ebpf,
 };
@@ -76,6 +76,50 @@ fn ensure_bpffs(pin_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+const PINNED_MAPS: [&str; 6] = ["COUNTERS", "ACTIVE", "RULES_A", "RULES_B", "RULE_LEN", "FLOWS"];
+
+/// Mount-ns-shared rendezvous file mapping this enforcer instance's map names
+/// to their (system-global) BPF map ids, keyed by the pin dir.
+///
+/// Why it exists: `ip netns exec` does its own unshare(CLONE_NEWNS) + /sys
+/// remount on every invocation, and each bpffs mount is an independent, empty
+/// superblock — so a later `enforcer stats` invocation can never see the pins
+/// the running enforcer created in its own mount ns. BPF object ids, however,
+/// are global to the kernel, and /tmp (unlike /sys) survives those unshares
+/// as the same shared mount. Keying the filename by the full pin-dir path is
+/// what keeps concurrent enforcer instances (e.g. Task 8's two gateways with
+/// --pin-dir /sys/fs/bpf/aeth-a and .../aeth-b) deterministically separable:
+/// `stats --pin-dir X` reads exactly the ids written by `run --pin-dir X`.
+/// The file is overwritten on every `run` start with the same pin dir; a
+/// stale file from a dead enforcer is detected in `stats` by re-checking the
+/// map's name via MapInfo before trusting the id.
+fn map_ids_path(pin_dir: &std::path::Path) -> std::path::PathBuf {
+    let key = pin_dir
+        .to_string_lossy()
+        .trim_matches('/')
+        .replace('/', "_");
+    std::path::PathBuf::from(format!("/tmp/enforcer-{key}.mapids.json"))
+}
+
+fn write_map_ids(pin_dir: &std::path::Path) -> Result<()> {
+    let mut ids = serde_json::Map::new();
+    for m in PINNED_MAPS {
+        let id = MapData::from_pin(pin_dir.join(m))
+            .with_context(|| format!("reopening pinned map {m}"))?
+            .info()
+            .with_context(|| format!("querying map info for {m}"))?
+            .id();
+        ids.insert(m.to_string(), id.into());
+    }
+    let path = map_ids_path(pin_dir);
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::Value::Object(ids).to_string())
+        .with_context(|| format!("writing map-id file {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("moving map-id file into place at {}", path.display()))?;
+    Ok(())
+}
+
 fn run(iface: &str, rules_path: &std::path::Path, pin_dir: &std::path::Path) -> Result<()> {
     let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
@@ -93,9 +137,10 @@ fn run(iface: &str, rules_path: &std::path::Path, pin_dir: &std::path::Path) -> 
     ensure_bpffs(pin_dir)?;
     std::fs::create_dir_all(pin_dir)
         .with_context(|| format!("creating pin dir {}", pin_dir.display()))?;
-    for m in ["COUNTERS", "ACTIVE", "RULES_A", "RULES_B", "RULE_LEN", "FLOWS"] {
+    for m in PINNED_MAPS {
         ebpf.map_mut(m).context(m)?.pin(pin_dir.join(m))?;
     }
+    write_map_ids(pin_dir)?;
 
     // Install the SIGHUP handler *before* the first apply_rules so the
     // process is never briefly running with the default disposition (which
@@ -205,28 +250,51 @@ fn apply_rules(ebpf: &mut Ebpf, rules_path: &std::path::Path) -> Result<()> {
 }
 
 fn stats(pin_dir: &std::path::Path) -> Result<()> {
-    // Preferred path: the pinned COUNTERS map. This only works when we share
-    // a mount namespace (and thus the same bpffs instance) with the enforcer
-    // that pinned it. Under `ip netns exec`, every invocation gets a fresh
-    // unshare(CLONE_NEWNS) + /sys remount, so the bpffs the running enforcer
-    // mounted and pinned into is invisible here and each new bpffs mount is an
-    // independent, empty instance. BPF object ids, however, are system-global:
-    // fall back to locating the loaded map named COUNTERS by id. (Spike-grade:
-    // assumes a single enforcer instance; Task 7+ can disambiguate via ifindex
-    // or pin-path metadata if multiple gateways ever share a kernel.)
+    // Resolution order (see map_ids_path for the mount-ns background):
+    //  1. The pinned COUNTERS map — works when we share a mount namespace
+    //     (and thus the same bpffs instance) with the enforcer that pinned it.
+    //  2. The pin-dir-keyed map-id file written by `run --pin-dir <same X>`,
+    //     opened via the system-global BPF map id and verified to still be a
+    //     map named COUNTERS (guards against id reuse after enforcer death).
+    // Never falls back to enumerating loaded maps by name: with multiple
+    // enforcer instances in one kernel that returns whichever loaded first —
+    // silently reading the WRONG instance's counters. Loud failure beats that.
     let m = match MapData::from_pin(pin_dir.join("COUNTERS")) {
         Ok(m) => m,
         Err(pin_err) => {
-            let info = loaded_maps()
-                .filter_map(|i| i.ok())
-                .find(|i| i.name_as_str() == Some("COUNTERS"))
-                .with_context(|| {
+            let ids_path = map_ids_path(pin_dir);
+            let ids: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&ids_path).with_context(|| {
                     format!(
-                        "COUNTERS not found: no pin at {} ({pin_err}) and no loaded map named COUNTERS (is the enforcer running?)",
-                        pin_dir.join("COUNTERS").display()
+                        "COUNTERS not found: no pin at {} ({pin_err}) and no map-id file at {} — \
+                         is an enforcer running with --pin-dir {}?",
+                        pin_dir.join("COUNTERS").display(),
+                        ids_path.display(),
+                        pin_dir.display()
                     )
-                })?;
-            MapData::from_id(info.id()).context("open COUNTERS map by id")?
+                })?,
+            )
+            .with_context(|| format!("parsing map-id file {}", ids_path.display()))?;
+            let id = ids["COUNTERS"]
+                .as_u64()
+                .with_context(|| format!("no COUNTERS id in {}", ids_path.display()))?
+                as u32;
+            let m = MapData::from_id(id).with_context(|| {
+                format!(
+                    "opening map id {id} from {} — stale id file from a dead enforcer?",
+                    ids_path.display()
+                )
+            })?;
+            let name = m.info().ok().and_then(|i| i.name_as_str().map(String::from));
+            if name.as_deref() != Some("COUNTERS") {
+                bail!(
+                    "map id {id} from {} is now {:?}, not COUNTERS — stale id file from a dead \
+                     enforcer (the id was reused); restart the enforcer",
+                    ids_path.display(),
+                    name
+                );
+            }
+            m
         }
     };
     let counters: Array<MapData, u64> = Array::try_from(aya::maps::Map::Array(m))?;

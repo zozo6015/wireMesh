@@ -156,10 +156,21 @@ not in dev tooling — a real gateway needs the same guarantees):**
    does its own `unshare(CLONE_NEWNS)` + `/sys` remount per invocation, and
    every bpffs mount is an independent, empty superblock — so maps pinned by
    the running enforcer are invisible to a later `enforcer stats` invocation
-   in the "same" namespace. BPF object IDs are system-global, though: `stats`
-   falls back to `aya::maps::loaded_maps()` and opens the map named
-   `COUNTERS` by id (`MapData::from_id`) when the pin path is absent.
-   Spike-grade: assumes one enforcer per kernel; revisit if that changes.
+   in the "same" namespace. BPF object IDs are system-global, though: at
+   startup (after pinning) `enforcer run` writes a pin-dir-keyed map-id file
+   to `/tmp/enforcer-<sanitized pin dir>.mapids.json` (`/tmp`, unlike `/sys`,
+   survives the unshares as one shared mount), and `stats --pin-dir X` tries
+   the pin first, then that instance's id file (`MapData::from_id`, with the
+   map's name re-verified via `MapInfo` to catch stale ids from dead
+   enforcers). It never enumerates loaded maps by name — with multiple
+   enforcers per kernel (Task 8 runs two) that silently returns whichever
+   instance loaded first. Verified manually: two concurrent enforcers with
+   `--pin-dir /sys/fs/bpf/aeth-a`/`aeth-b`, traffic denied on side A only →
+   `stats` reads `deny:3` vs `deny:0` deterministically via both resolution
+   paths, and a bogus id in the file errors out loudly instead of guessing.
+   (Off-tun aside from that check: on a veth, most frames hit the
+   "unparseable => SHOT, no counter" path because byte 0 is an ethernet MAC,
+   not an IPv4 header — the enforcer is tun-only by design, spec §1.)
 3. The aya template's `.cargo/config.toml` sets `runner = "sudo -E"`, which
    breaks all `cargo test`/`cargo run` in the root-only, sudo-less dev
    container ("No such file or directory" before any test executes). Runner
