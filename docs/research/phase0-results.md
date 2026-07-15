@@ -326,6 +326,170 @@ echo return-path keying still needs a dedicated fix task.
 
 ## Bet 3: QUIC relay
 ## Bet 4: NAT observation + hole punch
+
+### Task 11: UDP-native NAT observation endpoint (2026-07-15)
+
+**Result: validated.** `spike/punch`'s `observe`/`whoami`/`punch::observe` prove
+a UDP-native observation endpoint reports the client's post-NAT public
+mapping, never the private address (`spike/punch/tests/observe.rs`,
+`observation_reports_nat_mapping_not_local_addr`). Full detail:
+`.superpowers/sdd/task-11-report.md`.
+
+### Task 12: brokered UDP hole punch — validated, with two real findings (2026-07-15)
+
+**Result: validated.** `spike/punch/tests/punch.rs` builds the full
+two-NAT topology (`pa--ra--inet--rb--pb`; `observe` + `broker` on the
+`inet` ns; fresh Lab per cell) and proves the Bet 4 punch matrix, green and
+deterministic across 3 consecutive full-suite runs:
+
+| Cell | A result | B result | Verdict |
+|---|---|---|---|
+| PortRestricted x PortRestricted | `PUNCHED 198.51.100.130:6100` (exit 0) | `PUNCHED 198.51.100.2:6100` (exit 0) | brokered simultaneous punch works ✓ (3/3 runs, identical output) |
+| Symmetric x Symmetric | `punch failed (timeout)` (exit 1) | `punch failed (timeout)` (exit 1) | pair does NOT punch ✓ (3/3 runs) |
+
+**Right-reason check (asserted in the test, not just eyeballed):** each
+side's `PUNCHED` address is the *peer router's public out0 address*
+(`198.51.100.130` seen by A, `198.51.100.2` seen by B) — never loopback,
+never a private address. In the symmetric cell each side's observed
+candidate had a different random external port per run (e.g. A observed
+`:53805`, `:2626`, `:16215` across the 3 runs) — per-destination mapping
+means the registered candidate is the wrong port for the peer, exactly why
+punching fails and **exactly the case the QUIC relay (Tasks 13–14) exists
+for**.
+
+**Time-to-punch:** with the lab's modeled 40ms one-way inter-NAT latency
+(see finding 2), the positive cell resolves in well under a second — a
+manual end-to-end run measured ~160ms from puncher spawn to both PUNCHED
+(includes observation + broker registration + go + first PING/PONG
+round trip); the whole punch.rs suite (positive cell + symmetric cell's
+full 5s timeout burn) runs in ~6.9s. Canonical command:
+
+```
+./dev.sh run "cd spike/punch && cargo test -- --test-threads=1 --nocapture"
+# test observation_reports_nat_mapping_not_local_addr ... ok
+# test port_restricted_pair_punches ... ok
+# test symmetric_pair_fails_to_punch ... ok
+```
+
+**Finding 1 (implementation bug, found by these tests, fixed in
+`puncher.rs`):** the initial puncher advertised a `0.0.0.0:{port}`
+"local guess" candidate. Linux silently rewrites `sendto()` to destination
+`0.0.0.0` into `127.0.0.1`, so every puncher PINGed *itself* over loopback
+and instantly self-"punched" (`PUNCHED 127.0.0.1:6100` for both peers, in
+both NAT cells, 3/3 runs — deterministic, masking the real punch outcome
+entirely and making even the symmetric cell spuriously "succeed"). Fixed by
+registering only the observed post-NAT candidate plus a defensive skip of
+unspecified/loopback candidates in the PING loop. The positive test now
+asserts the punched address is the peer's real public address, so this
+class of bug cannot regress silently.
+
+**Finding 2 (lab-fidelity requirement — the important one for Sync's
+design):** with zero-latency veth links, brokered simultaneous punch
+through Linux-masquerade NATs fails **deterministically** (0% punch, both
+cells). Cause, confirmed via `/proc/net/nf_conntrack` mid-punch: the peer's
+first PING arrives at the local router *before* the local side's own first
+outbound has crossed it; the unsolicited inbound creates a local-stack
+conntrack entry occupying the `:6100` reply tuple, so the local side's
+masquerade is forced onto a mutated source port (observed: A's mapping
+pushed to `sport=51642` beneath an `[UNREPLIED] .130:6100 -> .2:6100`
+entry) — after which neither direction can match, for conntrack's 30s UDP
+unreplied timeout (far beyond the 5s punch window). Simultaneous punch
+relies on each side's first outbound beating the peer's inbound through its
+own NAT; on the real internet, one-way path latency (tens of ms) >> broker
+go-skew (µs–ms), guaranteeing it. The lab restores that invariant with
+`tc netem delay 20ms` on each internet-side link (40ms one-way). With
+delay: 3/3 success; without: 0% — this is a modeled-physics fix, not a
+flakiness mask. **Design implication for Sync (spec §6.1):** go-skew
+between the two peers must stay below the inter-peer one-way latency, or a
+Linux-NAT'd peer's mapping gets poisoned for ~30s; a production broker
+should send "go" as simultaneously as possible (and/or peers should
+tolerate/retry after a mapping-poisoning window). Recorded for the MVP
+design, not fixed in the spike.
+
+**Topology note (deviation from the task brief):** the brief's sketch gave
+ra's public link a /24 (`198.51.100.2/24`), which makes ra consider rb's
+public address (`198.51.100.130`) on-link and ARP for it into the void —
+no punch traffic can flow in either direction (verified: `ip neigh` shows
+`INCOMPLETE`, 100% loss both ways). The test uses a /25 split instead
+(`198.51.100.0/25` on ra's side, `198.51.100.128/25` on rb's), which routes
+cleanly via `inet`.
+
+Full diagnosis narrative: `.superpowers/sdd/task-12-report.md`.
+
+<details>
+<summary>Superseded interim entry (test author's BLOCKED_ON_IMPL report for finding 1, kept for the record)</summary>
+
+### Task 12 (interim): brokered UDP hole punch — BLOCKED_ON_IMPL, real bug found (2026-07-15)
+
+**Status: blocked, not committed.** The test author (`spike/punch/tests/punch.rs`,
+`port_restricted_pair_punches` / `symmetric_pair_fails_to_punch`) built the
+brief's exact `pa--ra--inet--rb--pb` topology and ran the brokered punch for
+both `NatKind::PortRestricted` and `NatKind::Symmetric`. **Every single run
+(3/3, fully deterministic, no flakiness) printed `PUNCHED 127.0.0.1:6100`
+for both peers, in both NAT cells** — never the peer's real masqueraded
+address (e.g. `198.51.100.130:6100`). That address is impossible for a
+genuine cross-NAT punch (pa/pb/ra/rb/inet are separate netns; a real reply
+would show up as the peer's public `198.51.100.x` address, never loopback),
+so the `PUNCHED` result is not evidence the brokered design works — it's a
+different bug entirely.
+
+**Root cause (confirmed by direct reproduction, independent of natlab):**
+`puncher.rs` registers two candidates per side — `observed` and a
+`local_guess` of `"0.0.0.0:{port}"` — and blasts `PING` at both. On this
+kernel, `sendto()` to destination `0.0.0.0:<port>` is silently rewritten to
+`127.0.0.1:<port>` (classic Linux/BSD INADDR_ANY-as-destination behavior).
+Verified directly:
+
+```
+$ python3 -c "
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.bind(('0.0.0.0', 9999))
+s.settimeout(2); s.sendto(b'hello', ('0.0.0.0', 9999))
+print(s.recvfrom(64))"
+received from ('127.0.0.1', 9999)
+```
+
+Since every puncher binds and blasts from the *same* port it's pinging, this
+means **every puncher instance PINGs itself over loopback and replies to
+itself** — a self-punch that resolves near-instantly (same-process
+loopback, no network hop), always winning the race against any real
+cross-NAT round trip. Total suite time (~1.6s for both cells, both with 5s
+internal timeouts available) corroborates: nothing waited on a real
+network round trip.
+
+**Why this blocks both test cells:** the implementer's phase-1 report
+(`.superpowers/sdd/task-12-report.md`) explicitly assessed this candidate as
+"dead weight ... simply unreachable in practice," verified only via a
+same-host root-netns smoke test with no NAT/netns isolation in the path —
+that assessment does not hold once real network namespaces are involved.
+With the bug live, the positive cell (`port_restricted_pair_punches`)
+currently passes, but for an unverifiable reason — the real
+`observed`-candidate exchange may or may not be working; the self-loop masks
+it either way. The negative cell (`symmetric_pair_fails_to_punch`) fails
+outright because the same self-loop makes the symmetric case spuriously
+"succeed" too, which is exactly the CLAUDE.md-flagged "failing behavior test
+may be a real finding" case — investigated, and the finding is an
+implementation bug, not a surprising real symmetric-punch success.
+
+**Recommended fix (for the implementer, not applied here — out of scope for
+test authorship):** `puncher.rs` should filter out any candidate whose
+address is unspecified/loopback (`0.0.0.0`, `127.0.0.0/8`) before sending,
+or simply drop the `local_guess` candidate — per the implementer's own doc
+comment it never represents a dialable on-link peer in this lab.
+
+**Not committed:** `spike/punch/tests/punch.rs` is written (matches the
+brief, both cells) and correctly surfaces this bug, but per the task's
+BLOCKED_ON_IMPL protocol, it is left uncommitted pending a `puncher.rs` fix
+by the implementer and a re-run to confirm the tests then measure the real
+positive/negative punch behavior described in the brief.
+
+*(Interim entry ends here — superseded by the validated Task 12 entry
+above: the implementer fixed the candidate bug, after which a second real
+issue — the zero-latency conntrack poisoning, finding 2 — was diagnosed and
+addressed via lab-fidelity netem delay, and both cells went green 3/3.)*
+
+</details>
+
 ## Bet 5: NAT matrix harness
 
 ### Task 10: NAT cells — port-restricted + symmetric, behavior-proven (2026-07-15)
