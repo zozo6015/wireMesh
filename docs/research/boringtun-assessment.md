@@ -23,10 +23,16 @@ Appendix):
   GitHub's API defines as issues **plus** PRs combined. Split via the search
   API: **74 open issues**, **32 open pull requests** — a healthy PR pipeline
   (PRs are actively being proposed, not just issues piling up unanswered).
-  Newest open PRs are dated 2026-07-05 (`#489`–`#491`, e.g. "Don't roam peer
-  endpoint on cookie replies", "Use ip+port for calculating cookie") and
-  2026-06-29 (`#488`, a dependency bump), i.e. active review/merge traffic in
-  the two weeks before this assessment, not just drive-by issue filing.
+  The newest open items are dated 2026-07-05 (`#489`–`#491`, e.g. "Don't roam
+  peer endpoint on cookie replies", "Use ip+port for calculating cookie") and
+  2026-06-29 (`#488`, a dependency bump) — i.e. active upstream traffic in the
+  two weeks before this assessment, not just drive-by issue filing. Caveat:
+  these four items came from the `/issues` endpoint, which returns issues and
+  PRs mixed, so their issue-vs-PR classification is inferred from the titles
+  (code-change/dependency-bump phrasing), not strictly proven by the endpoint
+  itself. `#492` ("docs: include modules behind feature flags", 2026-07-12) is
+  the newest item of all but is omitted from this activity narrative because
+  it reads as a documentation request, not code-change traffic.
 - **Formal GitHub "Releases" page is stale, but tags are not:** the
   `/releases` endpoint's newest 3 entries are all from **2022**
   (`boringtun-cli-0.5.2` / `boringtun-0.5.2`, 2022-07-20; `boringtun-cli-0.5.1`,
@@ -128,10 +134,11 @@ do not fork, and do not escalate to a kernel-only spec change yet.**
 Reasoning tied to the facts above:
 
 1. **Maintenance health supports "as-is."** The repo is not archived, has a
-   commit as recent as three days before this repo was last pushed to
-   (2026-06-15 commit vs. 2026-06-29 push), an active 32-PR review pipeline,
-   and version tags (0.7.1) six minor versions ahead of what a stale-looking
-   Releases page would suggest. This clears the bar for "safe to depend on
+   default-branch commit from 2026-06-15 and a repo push as recent as
+   2026-06-29 (both within a month of this 2026-07-15 assessment), an active
+   32-PR review pipeline, and version tags (0.7.1) two minor versions ahead
+   of the 0.5.2 a stale-looking Releases page would suggest is latest. This
+   clears the bar for "safe to depend on
    without vendoring" — vendoring is a burden-shifting move that should be
    reserved for a project that's actually abandoned or for a bug upstream
    won't fix, neither of which is established here.
