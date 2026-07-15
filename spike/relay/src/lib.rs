@@ -1,8 +1,9 @@
 // relay client lib + TLS plumbing shared with the `relay` server binary.
 //
 // Wire format:
-//   - Registration: each client's first (and only) unidirectional stream
-//     carries its 8-byte, NUL-padded id.
+//   - Registration: each client's first (and only) bidirectional stream
+//     carries its 8-byte, NUL-padded id; the relay replies with a 1-byte
+//     ack once the id is in its registry.
 //   - Datagrams sent to the relay: `[8B dest_id][payload]`.
 //   - Datagrams the relay forwards to the destination: `[8B src_id][payload]`.
 use anyhow::{bail, Context, Result};
@@ -138,7 +139,8 @@ pub struct Client {
 impl Client {
     /// Connect to the relay with mutual TLS: root = ca.pem, client cert =
     /// `gw-<my_id>.pem/key`. Registers `my_id` with the relay over the
-    /// connection's first uni stream before returning.
+    /// connection's first bidirectional stream (and waits for the relay's
+    /// registration ack) before returning.
     pub async fn connect(relay_addr: SocketAddr, certdir: &Path, my_id: &str) -> Result<Client> {
         let endpoint = client_endpoint(certdir, Some(my_id))?;
         Self::finish_connect(endpoint, relay_addr, my_id).await
