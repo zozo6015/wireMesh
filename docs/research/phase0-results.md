@@ -325,6 +325,60 @@ work (proven here, disjoint type set, independent of the echo encoding);
 echo return-path keying still needs a dedicated fix task.
 
 ## Bet 3: QUIC relay
+
+### Task 13: QUIC datagram relay with mandatory mutual TLS (2026-07-15)
+
+**Result: validated.** `spike/relay`'s `mkcerts`/`relay`/`Client` (quinn 0.11
++ rustls 0.23 + rcgen 0.13) prove all three of Bet 3's claims in one
+integration test, `spike/relay/tests/bridge.rs::bridges_datagrams_and_rejects_certless_clients`,
+run entirely in the root netns on loopback (no NAT needed to prove bridging
++ auth). Green twice consecutively:
+
+```
+./dev.sh run "cd spike/relay && cargo test -- --test-threads=1 --nocapture"
+# test bridges_datagrams_and_rejects_certless_clients ... ok
+# test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.94-0.96s
+```
+
+1. **Bridging:** `gw-A.send_to("gw-B", b"hello")` arrives at `gw-B.recv()`
+   as `(src="gw-A", data=b"hello")` — the relay's `[8B dest_id][payload]` →
+   `[8B src_id][payload]` rewrite is correct end-to-end.
+2. **Datagram size (spec §6.1 floor: WG tunnel MTU 1280 + WireGuard overhead
+   32 + this relay's 8-byte id header = 1320 bytes required):**
+   `max_datagram_size()` measured **`Some(1414)`**, both immediately after
+   `Client::connect` and again after a 500ms settle (identical both times —
+   on loopback, DPLPMTUD's initial probe already lands at its ceiling, so
+   there is nothing further to discover). **1414 >= 1320, ~94 bytes of
+   headroom.** Loopback is not representative of the WG(1280)-constrained
+   path the spec is actually worried about; re-measure once Task 14 (NAT
+   punch integration) or a netns path with a real Ethernet-ish MTU is in
+   play.
+3. **Mandatory mutual TLS:** `Client::connect_no_cert` (no client
+   certificate) cannot complete the connect+register+bridge flow — it
+   returns `Err`. The rejection is **asynchronous**, not a clean handshake
+   error: the client-side `endpoint.connect(...).await` and the subsequent
+   `open_bi()`/id-write both succeed before the server's rejection lands;
+   the failure actually surfaces one step later, awaiting the relay's
+   registration ack (`recv.read_to_end(1)`), with message:
+   `await registration ack: read error: connection lost: connection lost:
+   aborted by peer: the cryptographic handshake failed: error 116: peer
+   sent no certificates`. A naive assertion on the raw
+   `endpoint.connect(...).await` future (bypassing the registration round
+   trip) would be unreliable — the test asserts on `Client::connect_no_cert`'s
+   aggregate `Result` instead, which is guaranteed to be `Err` regardless of
+   which internal step actually surfaces the rejection, since it wraps
+   connect + open_bi + write + ack-read into one `Result`-returning async
+   fn. Mutual TLS is enforced for real, not merely by convention.
+
+**API friction vs. the brief** (rustls-pemfile needed for on-disk PEM→DER,
+explicit process-default `CryptoProvider` install, quinn's rustls→QuicConfig
+conversion step, `IdleTimeout` not being a bare `Duration`, datagrams needing
+enabling on both endpoints not just the server, and — the one substantive
+design fix, not just an API-version gap — registration switched from a
+uni-stream to an acked bi-stream to close a real race where `send_to` could
+fire before the relay's registry insert had happened) is recorded in full in
+`.superpowers/sdd/task-13-report.md`.
+
 ## Bet 4: NAT observation + hole punch
 
 ### Task 11: UDP-native NAT observation endpoint (2026-07-15)
