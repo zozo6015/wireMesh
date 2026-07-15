@@ -1,6 +1,10 @@
 # Phase 0 Spike — Measured Results
 
-Environment: (fill in `uname -a`, CPU, container details at first measurement)
+Environment (all measurements): dev container on Docker Desktop for Mac (linuxkit
+VM, `--privileged`, aarch64), kernel `6.12.76-linuxkit`, `nproc=8`, host CPU Apple
+M2. Per-bet environment specifics are repeated in each section. **These container
+numbers are indicative only — never the G-2 gate** (see Bet 1). Final synthesis and
+go/no-go per bet: [`phase0-report.md`](phase0-report.md).
 
 ## Bet 1: boringtun throughput
 
