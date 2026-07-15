@@ -56,8 +56,8 @@ receive-pipeline bottleneck (decrypt→TUN write, or an internal queue dropping)
 **inconsistent with pure shared-vCPU scheduling noise**. But the cause has **not been
 isolated**: it may be a Docker-Desktop/linuxkit-on-Apple-Silicon artifact, or a genuine
 boringtun receive-path property. This is a hypothesis, not a finding. Also carried: the
-UAPI control socket is **mount-namespace-scoped, not network-namespace-scoped** — bit
-the two-peer test lab (fixed in `natlab` via private mount ns), harmless to the
+UAPI control socket is **mount-namespace-scoped, not network-namespace-scoped** — it
+hit the two-peer test lab (fixed in `natlab` via private mount ns), harmless to the
 production one-gateway-per-mount-namespace model.
 
 **Go/no-go.** **go-with-caveats.** Embedding is unconditionally proven. The throughput
