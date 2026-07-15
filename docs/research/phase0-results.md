@@ -379,6 +379,82 @@ uni-stream to an acked bi-stream to close a real race where `send_to` could
 fire before the relay's registry insert had happened) is recorded in full in
 `.superpowers/sdd/task-13-report.md`.
 
+### Task 14: WireGuard over the QUIC relay, end to end, at tun MTU 1280 (2026-07-15)
+
+**Result: validated — the single most load-bearing spike result.** Real
+WireGuard traffic (boringtun via `spike-tunnel`) handshakes and flows
+through Task 13's authenticated QUIC relay via a new `udpshim` bridge
+(`spike/relay/src/bin/udpshim.rs`), across a 3-netns lab where the two
+gateways (`a`, `b`) have **no direct underlay link at all** — `r` (running
+`relay`) is the only path between them. `udpshim <bind> <relay_addr>
+<certdir> <my_id> <peer_id>` bridges a local UDP socket (where WireGuard's
+peer "endpoint" is pointed) to the relay: local recv → `Client::send_to`
+to a fixed peer id; relay `recv()` → forwarded to whichever local address
+last sent something.
+
+Topology (`spike/relay/tests/wg_over_relay.rs::wireguard_handshakes_and_pings_at_mtu_1280_over_relay`):
+```
+a::u0 (10.9.3.1/24) --veth-- r::ur0 (10.9.3.2/24)   [relay binds here: 10.9.3.2:4443]
+b::u1 (10.9.4.1/24) --veth-- r::ur1 (10.9.4.2/24)   [b routes 10.9.3.0/24 via 10.9.4.2]
+wg0 in a and b: overlay 10.10.0.1 <-> 10.10.0.2, tun MTU 1280,
+  peer "endpoint" = 127.0.0.1:51999 in BOTH — each side's own local udpshim,
+  never the other side's underlay address (none exists).
+```
+Confirmed there is no other path before trusting a ping success as proof:
+`a`'s ping to `b`'s underlay address (10.9.4.1) fails outright (no route) —
+any overlay traffic that gets through therefore *must* have traversed the
+relay. Also confirmed directly in the relay's own log:
+`relay: registered "gw-A" from 10.9.3.1:...` and `registered "gw-B" from
+10.9.4.1:...` both present every run.
+
+**Shim peer-learning chicken/egg (a real design property, not a bug):**
+`udpshim`'s downlink can only deliver a relayed datagram to whichever local
+address last sent it something — there is no local peer on record until the
+local WireGuard instance has sent at least once through its own shim. If
+only one side pinged, that side's handshake-initiation would reach the
+peer's shim and be silently dropped (peer's shim has no local address on
+record yet). The test runs a background ping from **both** `a` and `b`
+concurrently before checking for a handshake, so each side's own wg0
+independently queues outbound traffic and primes its own shim, regardless of
+whether the peer's messages arrive first.
+
+All three required properties, green twice consecutively (`cargo test --
+--test-threads=1 --nocapture`, full suite including Task 13's `bridge.rs`):
+
+1. **WG handshake completes over the relay:** `wg show wg0 latest-handshakes`
+   goes non-zero on both sides within ~1.1s of the background pings
+   starting (`elapsed=1.09s` both runs). *Friction/curiosity, not a
+   blocker:* the reported epoch value itself was `1` on both sides both
+   runs, not a plausible Unix wall-clock timestamp (~1.7×10⁹) — suggests
+   boringtun's UAPI `latest-handshakes` in this build may not be reporting
+   true wall-clock time. Not investigated further: the brief's own bar is
+   "non-zero," which this unambiguously clears, and the handshake's actual
+   effect (overlay ping/iperf3 below) is independently proven to work.
+2. **MTU boundary is real, both directions:** `ping -c 3 -M do -s 1232` (1260
+   bytes on the wire, under the 1280 tun MTU) succeeds; `ping -c 1 -M do -s
+   1400` (1428 bytes, over 1280) fails outright. Both held on both runs —
+   the relay carries traffic exactly up to the design MTU and not beyond.
+3. **iperf3 through the relay:**
+   - Run 1: sender 2.41 MBytes / 3.00s = **6.74 Mbits/sec**; receiver 2.19
+     MBytes / 3.10s = 5.93 Mbits/sec.
+   - Run 2: sender 2.90 MBytes / 3.00s = **8.11 Mbits/sec**; receiver 2.72
+     MBytes / 3.09s = 7.38 Mbits/sec.
+   - Single-hop QUIC-relayed throughput on loopback-class veth links in the
+     dev container; not a production bandwidth estimate (no real WAN RTT/
+     loss in this lab), but confirms the relay path carries sustained TCP
+     traffic at the 1280 MTU without stalling or erroring.
+
+Canonical command (both runs green):
+```
+./dev.sh run "cd spike/tunnel && cargo build --release && cd ../relay && \
+  SPIKE_TUNNEL_BIN=/work/spike/tunnel/target/release/spike-tunnel \
+  cargo test -- --test-threads=1 --nocapture"
+# tests/bridge.rs::bridges_datagrams_and_rejects_certless_clients ... ok
+# tests/wg_over_relay.rs::wireguard_handshakes_and_pings_at_mtu_1280_over_relay ... ok
+# test result: ok. 1 passed; 0 failed (bridge.rs, ~0.95s)
+# test result: ok. 1 passed; 0 failed (wg_over_relay.rs, ~10.2-10.3s)
+```
+
 ## Bet 4: NAT observation + hole punch
 
 ### Task 11: UDP-native NAT observation endpoint (2026-07-15)
