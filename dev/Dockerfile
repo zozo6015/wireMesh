@@ -10,4 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN rustup toolchain install nightly --component rust-src \
     && cargo install bpf-linker cargo-generate
 
+# bash -lc sources /etc/profile which resets PATH; keep cargo/rustup visible in login shells
+RUN echo 'export PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH' > /etc/profile.d/cargo.sh
+
 WORKDIR /work
