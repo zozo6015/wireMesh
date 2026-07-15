@@ -8,7 +8,7 @@ chk "kernel >= 5.10"        '[ "$(uname -r | cut -d. -f1)" -ge 6 ] || { [ "$(una
 chk "netns create/delete"   'ip netns add __doc && ip netns del __doc'
 chk "tun device"            'ip tuntap add __doc0 mode tun && ip link del __doc0'
 chk "clsact qdisc"          'ip link add __docv0 type veth peer name __docv1 && tc qdisc add dev __docv0 clsact && ip link del __docv0'
-chk "bpf syscall"           'bpftool prog list 2>/dev/null || [ -e /proc/sys/kernel/unprivileged_bpf_disabled ]'
+chk "bpf prog load (sched_cls)" 'bpftool feature probe kernel | grep -q "program_type sched_cls is available"'
 chk "nftables"              'nft add table inet __doc && nft delete table inet __doc'
 chk "wireguard-tools (wg)"  'wg --version'
 chk "iperf3"                'iperf3 --version'
