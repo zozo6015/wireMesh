@@ -1,0 +1,11 @@
+[package]
+name = "spike-tunnel"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+boringtun = { version = "0.6", features = ["device"] }
+anyhow = "1"
+
+[dev-dependencies]
+natlab = { path = "../natlab" }
