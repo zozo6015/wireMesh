@@ -171,6 +171,12 @@ not in dev tooling — a real gateway needs the same guarantees):**
    (Off-tun aside from that check: on a veth, most frames hit the
    "unparseable => SHOT, no counter" path because byte 0 is an ethernet MAC,
    not an IPv4 header — the enforcer is tun-only by design, spec §1.)
+   The id-file name embeds an FNV-1a hash of the full pin-dir path (plain
+   sanitization is not injective: `aeth_a` vs `aeth/a`). Known limitation:
+   the stale-id guard re-verifies only the map NAME, and every enforcer
+   instance names its map COUNTERS — name-based re-verification cannot
+   detect id reuse by a same-named map from another instance; the window
+   requires a stale id file AND kernel id reuse.
 3. The aya template's `.cargo/config.toml` sets `runner = "sudo -E"`, which
    breaks all `cargo test`/`cargo run` in the root-only, sudo-less dev
    container ("No such file or directory" before any test executes). Runner

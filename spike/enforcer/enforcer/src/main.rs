@@ -94,11 +94,17 @@ const PINNED_MAPS: [&str; 6] = ["COUNTERS", "ACTIVE", "RULES_A", "RULES_B", "RUL
 /// stale file from a dead enforcer is detected in `stats` by re-checking the
 /// map's name via MapInfo before trusting the id.
 fn map_ids_path(pin_dir: &std::path::Path) -> std::path::PathBuf {
-    let key = pin_dir
-        .to_string_lossy()
-        .trim_matches('/')
-        .replace('/', "_");
-    std::path::PathBuf::from(format!("/tmp/enforcer-{key}.mapids.json"))
+    let raw = pin_dir.to_string_lossy();
+    // Sanitization alone is not injective (`aeth_a` vs `aeth/a` both become
+    // `aeth_a`), so a hash of the ORIGINAL path is appended to make the name
+    // collision-free. FNV-1a, inlined: dependency-free and — unlike std's
+    // DefaultHasher — guaranteed stable across Rust/std versions, so `run`
+    // and `stats` binaries from different builds still agree on the path.
+    let hash = raw.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+        (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+    });
+    let key = raw.trim_matches('/').replace('/', "_");
+    std::path::PathBuf::from(format!("/tmp/enforcer-{key}-{hash:016x}.mapids.json"))
 }
 
 fn write_map_ids(pin_dir: &std::path::Path) -> Result<()> {
@@ -285,6 +291,10 @@ fn stats(pin_dir: &std::path::Path) -> Result<()> {
                     ids_path.display()
                 )
             })?;
+            // Known limitation: every enforcer names this map COUNTERS, so a
+            // name check cannot detect the id being reused by ANOTHER enforcer
+            // instance's same-named map (window requires a stale id file AND
+            // kernel id reuse); it only catches reuse by unrelated maps.
             let name = m.info().ok().and_then(|i| i.name_as_str().map(String::from));
             if name.as_deref() != Some("COUNTERS") {
                 bail!(
