@@ -5,6 +5,8 @@ use aya::{
     Ebpf,
 };
 use clap::{Parser, Subcommand};
+use enforcer_common::Rule;
+use signal_hook::{consts::SIGHUP, iterator::Signals};
 
 const BPFFS_ROOT: &str = "/sys/fs/bpf";
 const BPF_FS_MAGIC: u64 = 0xcafe_4a11;
@@ -94,19 +96,111 @@ fn run(iface: &str, rules_path: &std::path::Path, pin_dir: &std::path::Path) -> 
     for m in ["COUNTERS", "ACTIVE", "RULES_A", "RULES_B", "RULE_LEN", "FLOWS"] {
         ebpf.map_mut(m).context(m)?.pin(pin_dir.join(m))?;
     }
-    apply_rules(&mut ebpf, rules_path)?; // Task 7 — scaffold: writes zero-length table
+
+    // Install the SIGHUP handler *before* the first apply_rules so the
+    // process is never briefly running with the default disposition (which
+    // is termination). This is what lets the enforcer survive `kill -HUP`
+    // and treat it as "reload rules" instead of "die" — a plain
+    // `std::thread::park()` loop with no signal handler would be killed by
+    // the first SIGHUP, silently tearing down TCX enforcement with it.
+    let mut signals = Signals::new([SIGHUP]).context("installing SIGHUP handler")?;
+
+    apply_rules(&mut ebpf, rules_path)?;
     eprintln!("enforcer: attached on {iface}; SIGHUP reloads rules");
-    // SIGHUP loop added in Task 7; scaffold just parks:
-    loop {
-        std::thread::park();
+
+    for sig in signals.forever() {
+        if sig == SIGHUP {
+            match apply_rules(&mut ebpf, rules_path) {
+                Ok(()) => {}
+                Err(e) => eprintln!("enforcer: rule reload failed, keeping previous rules: {e:#}"),
+            }
+        }
     }
+    Ok(())
 }
 
-fn apply_rules(ebpf: &mut Ebpf, _rules_path: &std::path::Path) -> Result<()> {
-    let mut len: Array<&mut MapData, u32> = Array::try_from(ebpf.map_mut("RULE_LEN").unwrap())?;
-    len.set(0, 0, 0)?;
-    let mut active: Array<&mut MapData, u32> = Array::try_from(ebpf.map_mut("ACTIVE").unwrap())?;
-    active.set(0, 0, 0)?;
+#[derive(serde::Deserialize)]
+struct RuleSpec {
+    src: String,
+    dst: String,
+    proto: String,
+    ports: Option<[u16; 2]>,
+    action: String,
+}
+
+fn parse_cidr(s: &str) -> Result<(u32, u32)> {
+    let (ip, plen) = s.split_once('/').context("cidr must be ip/prefixlen")?;
+    Ok((
+        u32::from(ip.parse::<std::net::Ipv4Addr>()?).to_be(),
+        plen.parse()?,
+    ))
+}
+
+/// Parses the rules JSON file, writes it into whichever of RULES_A/RULES_B
+/// is currently the *inactive* table, sets that table's RULE_LEN entry, then
+/// flips ACTIVE to point at it. The flip (`active.set(0, target, 0)`) is a
+/// single map update — the kernel side (`scan_rules`) reads ACTIVE exactly
+/// once per packet, so every in-flight packet observes either wholly the old
+/// generation or wholly the new one, never a half-written table.
+fn apply_rules(ebpf: &mut Ebpf, rules_path: &std::path::Path) -> Result<()> {
+    let specs: Vec<RuleSpec> = serde_json::from_slice(
+        &std::fs::read(rules_path)
+            .with_context(|| format!("reading rules file {}", rules_path.display()))?,
+    )
+    .context("parsing rules JSON")?;
+
+    let rules: Vec<Rule> = specs
+        .iter()
+        .map(|s| -> Result<Rule> {
+            let (src, src_plen) = parse_cidr(&s.src)?;
+            let (dst, dst_plen) = parse_cidr(&s.dst)?;
+            Ok(Rule {
+                src,
+                src_plen,
+                dst,
+                dst_plen,
+                proto: match s.proto.as_str() {
+                    "tcp" => 6,
+                    "udp" => 17,
+                    "icmp" => 1,
+                    _ => 0, // "any" (or unrecognized -> treated as any, spike-grade)
+                },
+                port_lo: s.ports.map(|p| p[0]).unwrap_or(0),
+                port_hi: s.ports.map(|p| p[1]).unwrap_or(0),
+                action: if s.action == "allow" {
+                    enforcer_common::ACT_ALLOW
+                } else {
+                    enforcer_common::ACT_DENY
+                },
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    if rules.len() > 64 {
+        bail!("{} rules exceeds the 64-entry table capacity", rules.len());
+    }
+
+    let active_now: u32 = {
+        let a: Array<&MapData, u32> = Array::try_from(ebpf.map("ACTIVE").context("ACTIVE")?)?;
+        a.get(&0, 0)?
+    };
+    let target = 1 - active_now; // write the INACTIVE table, then flip onto it
+    let table_name = if target == 0 { "RULES_A" } else { "RULES_B" };
+
+    let mut tbl: Array<&mut MapData, Rule> =
+        Array::try_from(ebpf.map_mut(table_name).context(table_name)?)?;
+    for (i, r) in rules.iter().enumerate() {
+        tbl.set(i as u32, *r, 0)?;
+    }
+    let mut len: Array<&mut MapData, u32> =
+        Array::try_from(ebpf.map_mut("RULE_LEN").context("RULE_LEN")?)?;
+    len.set(target, rules.len() as u32, 0)?;
+
+    let mut active: Array<&mut MapData, u32> =
+        Array::try_from(ebpf.map_mut("ACTIVE").context("ACTIVE")?)?;
+    active.set(0, target, 0)?; // ATOMIC FLIP
+
+    eprintln!("enforcer: {} rules active on table {target}", rules.len());
     Ok(())
 }
 

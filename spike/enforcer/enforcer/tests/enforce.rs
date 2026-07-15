@@ -45,3 +45,95 @@ fn default_deny_drops_overlay_ping_and_counts() {
     for c in &mut children { let _ = c.kill(); }
     drop(lab);
 }
+
+// Task 7, Step 3 (test author): two new failing tests pinning down the
+// interface all later tasks reuse — the rules JSON format
+// (`[{"src","dst","proto","ports","action"}]`, proto in tcp|udp|icmp|any,
+// ports absent = any port) and SIGHUP-triggered atomic A/B rule-table flip.
+//
+// Both tests are adapted from the brief's literal listing to this file's
+// established idiom from Task 6 (see the NOTE above
+// `default_deny_drops_overlay_ping_and_counts`): `natlab::Ns::exec()` bails
+// with `Err` on ANY non-zero exit, so "must succeed"/"must fail" assertions
+// use `.is_ok()`/`.is_err()`, never `.unwrap().status.success()` — the
+// latter would either panic (masking a real failure as a harness crash) or
+// be vacuously true (since `exec()` only ever returns `Ok` for a successful
+// exit, so `.status.success()` after an `unwrap()` that didn't panic is
+// always true and asserts nothing).
+
+#[test]
+fn allow_rule_permits_tcp_and_denies_others() {
+    let enf = env!("CARGO_BIN_EXE_enforcer");
+    let (lab, a, b, mut children) = wg_lab();
+    std::fs::write("/tmp/r1.json",
+        r#"[{"src":"10.10.0.0/24","dst":"10.10.0.2/32","proto":"tcp","ports":[5201,5201],"action":"allow"}]"#).unwrap();
+    children.push(b.spawn(&[enf, "run", "--iface", "wg0", "--rules", "/tmp/r1.json"]).unwrap());
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    children.push(b.spawn(&["iperf3", "-s", "-p", "5201"]).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // allowed: iperf3 client (a) -> server (b) on tcp/5201, the sole allow
+    // rule in r1.json. This isolates B-side ingress allow + B->A reply
+    // traffic (A runs no enforcer, so only B's tun ingress can deny).
+    assert!(
+        a.exec(&["iperf3", "-c", "10.10.0.2", "-p", "5201", "-t", "2"]).is_ok(),
+        "iperf3 client should succeed: tcp/5201 to 10.10.0.2 is allowed by r1.json"
+    );
+    // denied: ping (icmp has no allow rule in r1.json -> falls through to
+    // default-deny, same mechanism proven in Task 6).
+    assert!(
+        a.exec(&["ping", "-c", "1", "-W", "2", "10.10.0.2"]).is_err(),
+        "ping should be denied (no icmp allow rule in r1.json), but it succeeded"
+    );
+    for c in &mut children { let _ = c.kill(); }
+    drop(lab);
+}
+
+#[test]
+fn rule_flip_under_traffic_never_transiently_denies() {
+    let enf = env!("CARGO_BIN_EXE_enforcer");
+    let (lab, a, b, mut children) = wg_lab();
+    std::fs::write("/tmp/r2.json",
+        r#"[{"src":"10.10.0.0/24","dst":"10.10.0.2/32","proto":"icmp","action":"allow"}]"#).unwrap();
+    let enf_child = b.spawn(&[enf, "run", "--iface", "wg0", "--rules", "/tmp/r2.json"]).unwrap();
+    // b.spawn() execs the enforcer in-place via nsenter -- ip netns exec
+    // (no intermediate fork that would leave enf_child.id() pointing at a
+    // wrapper), and `ip netns exec` only isolates the *network* namespace,
+    // not the PID namespace -- so the enforcer's real pid is both known
+    // here and signalable from `b.exec(&["kill", "-HUP", ...])` below, which
+    // runs in the same (root) pid namespace.
+    let enf_pid = enf_child.id().to_string();
+    children.push(enf_child);
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
+    let deny_before = stats(&b, enf)["deny"].as_u64().unwrap();
+    // Continuous ping (0.2s interval, 60 total => ~12s) from a, overlapped
+    // with 50 SIGHUP-triggered reloads of the *same* icmp-allow ruleset at
+    // 100ms intervals (~5s of flipping). Reloading identical rules must
+    // never transiently deny traffic: the atomic ACTIVE flip (write the
+    // inactive A/B table, then flip the index) means every packet's single
+    // read of ACTIVE during scan_rules should see either the old or the new
+    // table, both of which allow this traffic -- never a window with an
+    // empty/inactive table.
+    let mut pinger = a.spawn(&["ping", "-i", "0.2", "-c", "60", "10.10.0.2"]).unwrap();
+    for _ in 0..50 {
+        b.exec(&["kill", "-HUP", &enf_pid]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    let out = pinger.wait_with_output().unwrap();
+    let txt = String::from_utf8_lossy(&out.stdout);
+    // Assertion strength kept exactly at the brief's level on purpose: 0%
+    // packet loss and an unchanged deny counter across 50 flips are the
+    // entire point of this test. Per CLAUDE.md, if this fails it is a
+    // candidate spike finding about the read-once-ACTIVE-per-packet design
+    // (record it in docs/research/ and investigate) -- not a reason to
+    // loosen the assertion or delete the case to get green.
+    assert!(txt.contains(" 0% packet loss"), "loss during flips: {txt}");
+    assert_eq!(
+        stats(&b, enf)["deny"].as_u64().unwrap(),
+        deny_before,
+        "transient denies during flip"
+    );
+    for c in &mut children { let _ = c.kill(); }
+    drop(lab);
+}

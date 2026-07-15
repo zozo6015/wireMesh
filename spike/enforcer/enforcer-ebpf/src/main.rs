@@ -104,8 +104,48 @@ fn try_egress(ctx: &TcContext) -> Result<(), ()> {
     Ok(())
 }
 
-fn scan_rules(_src: u32, _dst: u32, _proto: u8, _dport: u16) -> u32 {
-    ACT_DENY // scaffold: Task 7 implements first-match scan over active table
+// First-match linear scan over whichever table ACTIVE currently points at.
+// ACTIVE is read exactly ONCE per packet (`table` below) — the spec's
+// one-generation-read-per-packet rule that the A/B atomic flip depends on:
+// every packet must see either wholly the old ruleset or wholly the new one,
+// never a mix from re-reading ACTIVE mid-scan.
+fn scan_rules(src: u32, dst: u32, proto: u8, dport: u16) -> u32 {
+    let table = ACTIVE.get(0).copied().unwrap_or(0);
+    let len = RULE_LEN.get(table).copied().unwrap_or(0).min(64);
+    // Bounded `for 0..64` (not `while i < len`) so the verifier can see a
+    // fixed iteration count at compile time; the `i >= len` break enforces
+    // the real (runtime) length.
+    for i in 0..64u32 {
+        if i >= len {
+            break;
+        }
+        let r = match if table == 0 { RULES_A.get(i) } else { RULES_B.get(i) } {
+            Some(r) => r,
+            None => break,
+        };
+        if rule_matches(r, src, dst, proto, dport) {
+            return r.action;
+        }
+    }
+    ACT_DENY
+}
+
+fn prefix_match(addr: u32, net: u32, plen: u32) -> bool {
+    if plen == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - plen);
+    (u32::from_be(addr) & mask) == (u32::from_be(net) & mask)
+}
+
+fn rule_matches(r: &Rule, src: u32, dst: u32, proto: u8, dport: u16) -> bool {
+    prefix_match(src, r.src, r.src_plen)
+        && prefix_match(dst, r.dst, r.dst_plen)
+        && (r.proto == 0 || r.proto == proto as u32)
+        && (r.port_hi == 0 || {
+            let p = u16::from_be(dport);
+            p >= r.port_lo && p <= r.port_hi
+        })
 }
 
 #[cfg(not(test))]

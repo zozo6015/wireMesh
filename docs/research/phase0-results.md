@@ -181,6 +181,63 @@ on it): `natlab::Ns::exec` bails with `Err` on any non-zero exit, so
 "expect this command to fail" assertions must use `.is_err()`, never
 `!output.status.success()`.
 
+### Task 7: first-match rule scan + atomic A/B table flip + SIGHUP reload (2026-07-15)
+
+**Result: validated.** First-match linear rule scan (`scan_rules` in
+`spike/enforcer/enforcer-ebpf/src/main.rs`) reads `ACTIVE` exactly once per
+packet, then walks the selected table (`RULES_A`/`RULES_B`, prefix + proto +
+port match, first match wins, default-deny on no match). Userspace
+`apply_rules` (`spike/enforcer/enforcer/src/main.rs`) parses the rules JSON,
+writes the **inactive** table, sets that table's `RULE_LEN` entry, then does
+a single `ACTIVE.set(0, target, 0)` as the atomic flip. `enforcer run` now
+installs a `signal-hook` SIGHUP handler *before* the first `apply_rules`
+call and loops on `signals.forever()`, re-running `apply_rules` on every
+`SIGHUP` instead of parking.
+
+Canonical command, run 3 times consecutively (no flakiness observed):
+```
+./dev.sh run "cd spike/enforcer && SPIKE_TUNNEL_BIN=/work/spike/tunnel/target/release/spike-tunnel cargo test -- --test-threads=1 --nocapture"
+# test allow_rule_permits_tcp_and_denies_others ... ok
+# test default_deny_drops_overlay_ping_and_counts ... ok
+# test rule_flip_under_traffic_never_transiently_denies ... ok
+# test result: ok. 3 passed; 0 failed  (each run ~25.8s for the enforce.rs harness)
+```
+
+**Flip-under-traffic test (`rule_flip_under_traffic_never_transiently_denies`):**
+continuous `ping -i 0.2 -c 60` (~12s) from ns `a` overlapped with 50
+`kill -HUP` reloads of the *same* icmp-allow ruleset at 100ms intervals
+(~5s of flipping) against the enforcer in ns `b`. On **all 3 runs**: 0%
+packet loss and the pinned `deny` counter unchanged across the flip storm —
+the read-once-`ACTIVE` design gives every in-flight packet a consistent
+view of either the pre-flip or post-flip table, never a transiently-empty
+one. No transient denies or drops were observed on the first attempt or on
+either repeat run.
+
+**Verifier note:** the brief's kernel-side sketch used
+`while i < len { ... i += 1; }` over the (runtime-bounded, `.min(64)`)
+table length. Implemented instead as `for i in 0..64u32 { if i >= len {
+break; } ... }` — a compile-time-bounded loop with a runtime early-exit —
+per the plan's guidance, to keep the iteration count visibly finite to the
+verifier rather than relying on it proving termination from a
+data-dependent `while`. This compiled clean on the first attempt; no
+verifier rejection was actually hit, but the bounded form was used
+preemptively rather than risking one.
+
+**Prerequisite bug found and fixed (this task's real "finding"):** the
+Task-6 scaffold's `run()` had no signal handler at all — a bare
+`std::thread::park()` loop. The test author's RED report identified that
+`SIGHUP`'s default disposition is process termination, so the *first* of
+the flip test's 50 `kill -HUP` calls killed the enforcer outright (not
+"reloaded" it), silently detaching TCX enforcement from `wg0` and leaving
+the rest of the ping run passing through unenforced — a false-positive-
+looking near-0%-loss result for the wrong reason. Fixed by installing the
+`signal-hook` `Signals::new([SIGHUP])` handler *before* the first
+`apply_rules` call in `run()`, so the process's disposition for `SIGHUP` is
+never the default. Once fixed, the test measures what it's meant to:
+repeated real reloads under live traffic. No residual read-once/visibility
+anomaly was found — the A/B flip design behaved exactly as specced across
+all 3 runs.
+
 ## Bet 3: QUIC relay
 ## Bet 4: NAT observation + hole punch
 ## Bet 5: NAT matrix harness
