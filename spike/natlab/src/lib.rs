@@ -52,7 +52,12 @@ impl Lab {
             "--",
             "bash",
             "-c",
-            "mkdir -p /var/run/wireguard && mount -t tmpfs tmpfs /var/run/wireguard",
+            // --make-rprivate first: isolation must hold by construction, not
+            // depend on the container's ambient mount-propagation default for
+            // /run (if that were ever `shared`, the tmpfs would propagate to
+            // sibling namespaces and silently reintroduce the wg0.sock
+            // collision disguised as isolation).
+            "mount --make-rprivate / && mkdir -p /var/run/wireguard && mount -t tmpfs tmpfs /var/run/wireguard",
         ])?;
 
         Ok(Ns { name: full, mountns })
