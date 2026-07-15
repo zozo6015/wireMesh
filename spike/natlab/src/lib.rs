@@ -23,8 +23,9 @@ impl Lab {
     pub fn ns(&mut self, name: &str) -> Result<Ns> {
         let full = format!("{}-{}", self.prefix, name);
         run(&["ip", "netns", "add", &full])?;
-        run(&["ip", "netns", "exec", &full, "ip", "link", "set", "lo", "up"])?;
+        // Track immediately so Drop cleans up even if lo-up fails below.
         self.namespaces.push(full.clone());
+        run(&["ip", "netns", "exec", &full, "ip", "link", "set", "lo", "up"])?;
         Ok(Ns { name: full })
     }
 
@@ -35,12 +36,28 @@ impl Lab {
         let ta = format!("{}0", &self.prefix);
         let tb = format!("{}1", &self.prefix);
         run(&["ip", "link", "add", &ta, "type", "veth", "peer", "name", &tb])?;
-        run(&["ip", "link", "set", &ta, "netns", &na.name, "name", ia])?;
-        run(&["ip", "link", "set", &tb, "netns", &nb.name, "name", ib])?;
-        na.exec(&["ip", "addr", "add", addra, "dev", ia])?;
-        nb.exec(&["ip", "addr", "add", addrb, "dev", ib])?;
-        na.exec(&["ip", "link", "set", ia, "up"])?;
-        nb.exec(&["ip", "link", "set", ib, "up"])?;
+        let setup = (|| -> Result<()> {
+            run(&["ip", "link", "set", &ta, "netns", &na.name, "name", ia])?;
+            run(&["ip", "link", "set", &tb, "netns", &nb.name, "name", ib])?;
+            na.exec(&["ip", "addr", "add", addra, "dev", ia])?;
+            nb.exec(&["ip", "addr", "add", addrb, "dev", ib])?;
+            na.exec(&["ip", "link", "set", ia, "up"])?;
+            nb.exec(&["ip", "link", "set", ib, "up"])?;
+            Ok(())
+        })();
+        if let Err(e) = setup {
+            // Best-effort reap of any end left in the root ns; deleting either
+            // remaining end of a veth pair removes both. Exit status ignored.
+            let deleted_ta = Command::new("ip")
+                .args(["link", "del", &ta])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if !deleted_ta {
+                let _ = Command::new("ip").args(["link", "del", &tb]).status();
+            }
+            return Err(e);
+        }
         Ok(())
     }
 }
