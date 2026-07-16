@@ -6,7 +6,7 @@
 | **Author** | Peter |
 | **Working name** | *TBD* (referred to as "the fabric" throughout; CLI examples use `fabricctl`) |
 | **Last updated** | 2026-07-07 |
-| **Target audience** | Platform/DevOps engineers, infrastructure teams, homelab operators, Aether tenants |
+| **Target audience** | Platform/DevOps engineers, infrastructure teams, homelab operators, managed-platform operators |
 
 ---
 
@@ -24,7 +24,7 @@ A standalone, cloud-agnostic, zero-trust L3/L4 network fabric written in Rust. I
 
 ### Architecture (3 components, Twingate-style)
 
-1. **Controller** — control plane. Manages topology, CIDR registry, gateway peers; distributes routing tables and ACL policy; handles key exchange and rotation. Communicates with gateways over mTLS gRPC. Deployable anywhere: VPS, Kubernetes, Aether, or future SaaS.
+1. **Controller** — control plane. Manages topology, CIDR registry, gateway peers; distributes routing tables and ACL policy; handles key exchange and rotation. Communicates with gateways over mTLS gRPC. Deployable anywhere: VPS, Kubernetes, or a managed platform.
 2. **Gateway** — data plane. Single Rust binary on any Linux VM/LXC. One per network segment. Owns a CIDR block, advertises it to the controller, builds WireGuard tunnels (boringtun) to peer gateways, and enforces L4 ACLs locally via nftables (eBPF/XDP later). Transparent to workloads behind it.
 3. **Relay** — stateless QUIC forwarder for NAT traversal fallback when direct UDP between gateways is blocked. Runs on any VM with a public IP. Zero payload visibility (end-to-end encrypted).
 
@@ -51,7 +51,7 @@ A standalone, cloud-agnostic, zero-trust L3/L4 network fabric written in Rust. I
 |---|---|---|
 | **Platform engineer (multi-cloud org)** | Runs EKS + on-prem + a second cloud; today stitches VPNs by hand or pays for interconnect | Reliable segment routing with auditable policy, GitOps-friendly config |
 | **Homelab / prosumer operator** | Proxmox at home, VPS in a cloud, wants lab ↔ cloud connectivity without exposing services | Simple setup, one binary, cheap relay, no SaaS dependency |
-| **Aether platform tenant** | Consumes managed clusters; wants their cluster networks joined to their own infra | First-class, near-zero-config fabric attachment from the Aether portal |
+| **Managed-platform tenant** | Consumes managed clusters; wants their cluster networks joined to their own infra | First-class, near-zero-config fabric attachment from the platform portal |
 | **Security/compliance engineer** | Must demonstrate segmentation and least-privilege between environments | Default-deny posture, policy-as-code, audit log of policy changes and denied flows |
 
 ## 6. User Stories
@@ -65,7 +65,7 @@ Ordered by priority.
 5. As a **platform engineer**, I want the controller to reject overlapping CIDRs at onboarding with a clear error, so that routing ambiguity is impossible by construction.
 6. As an **operator**, I want existing tunnels and policy to keep working when the controller is down, so that a control-plane outage is not a network outage.
 7. As a **security engineer**, I want an audit trail of who changed which policy and when, plus counters/logs of denied flows, so that I can investigate incidents.
-8. As an **Aether tenant**, I want to attach my cluster's network to my fabric from the portal in one action, so that managed clusters feel like part of my own infrastructure.
+8. As a **managed-platform tenant**, I want to attach my cluster's network to my fabric from the portal in one action, so that managed clusters feel like part of my own infrastructure.
 9. As an **operator**, I want Prometheus metrics from every component (tunnel state, handshake age, policy version, relay throughput, denied-packet counters), so that I can alert on fabric health with my existing stack.
 10. As an **operator**, I want to drain and remove a gateway cleanly, so that decommissioning a segment doesn't strand routes or keys.
 
@@ -119,7 +119,7 @@ Ordered by priority.
 
 ### 7.2 Nice-to-Have (P1)
 
-- **Aether first-class integration** — attach an Aether-managed cluster's network to a tenant fabric from the portal/API; gateway lifecycle managed by Aether. Positioned as a *reference downstream integration* — the fabric is an independent OSS project first, and Aether is one consumer of it.
+- **Managed-platform first-class integration** — attach a managed cluster's network to a tenant fabric from the platform portal/API; gateway lifecycle managed by the platform. Positioned as a *reference downstream integration* — the fabric is an independent OSS project first, and any managed platform is merely one consumer of it.
 - **Helm chart + deb/rpm packages** — richer packaging on top of the P0 binary/OCI/install-script distribution.
 - **Web UI (read-mostly)** — topology graph, tunnel health, policy viewer. CLI/API remain the write path initially.
 - **Policy dry-run / plan** — `fabricctl policy plan` shows which existing flows a proposed change would break (based on recent flow counters).
@@ -169,7 +169,7 @@ policy:
 
 **Lagging (2 quarters):**
 - **≥ 25 distinct production-ish deployments** self-reported (telemetry is opt-in only; count via discussions/issues/adopters file).
-- **≥ 3 Aether tenants** using the fabric integration once P1 ships.
+- **≥ 3 managed-platform tenants** using the fabric integration once P1 ships.
 - Soak stability: a 3-segment reference fabric runs **30 days** with zero unplanned data-plane interruptions.
 - Zero critical CVEs in the enforcement or key-handling paths post external review.
 
@@ -203,10 +203,10 @@ No hard external deadlines. Suggested phases, each independently shippable:
 - **Phase 0 — Spike (2–3 weeks):** boringtun tunnel between two gateways with static config; nftables rule application; QUIC relay prototype. De-risks the three riskiest technical bets before any controller work.
 - **Phase 1 — MVP (P0 core):** controller with enrollment, CIDR registry, route/policy distribution; 2–3 segment mesh; relay fallback; CLI; AWS + Proxmox + generic Linux quickstarts. *Exit criterion: the 30-minute tutorial passes with an external tester.*
 - **Phase 2 — Hardening:** key rotation, drain/decommission, full observability, audit log, GCP/Azure docs, threat model publication, soak testing.
-- **Phase 3 — P1 wave:** Aether integration, policy plan/dry-run, web UI (read-only), Terraform provider, controller HA.
+- **Phase 3 — P1 wave:** managed-platform integration, policy plan/dry-run, web UI (read-only), Terraform provider, controller HA.
 - **Phase 4 — P2 exploration:** eBPF enforcement path, user-access layer, SaaS controller.
 
-**Dependency callouts:** Aether integration (Phase 3) depends on Aether's tenant/network APIs being stable; eBPF path depends on the policy IR decision (Open Question #1) being made *now* even though implementation is deferred.
+**Dependency callouts:** managed-platform integration (Phase 3) depends on the target platform's tenant/network APIs being stable; eBPF path depends on the policy IR decision (Open Question #1) being made *now* even though implementation is deferred.
 
 ## 13. Risks
 

@@ -1,4 +1,4 @@
-# AetherLink
+# WireMesh
 
 Open-source (Apache-2.0), fully self-hosted, cloud-agnostic zero-trust L3/L4 network
 fabric in Rust. Connects network *segments* (VPCs, VLANs, subnets) via one gateway per
@@ -7,7 +7,7 @@ The project ships binaries and docs, never hosted infrastructure.
 
 ## Document map (authority order)
 
-1. `docs/superpowers/specs/2026-07-15-aetherlink-engineering-design.md` — **approved
+1. `docs/superpowers/specs/2026-07-15-wiremesh-engineering-design.md` — **approved
    engineering design**; its §1 decision record and §11 amendments supersede the PRD
    where they conflict (eBPF-first enforcement, per-gateway key epochs, single-tenant
    controller, no SaaS).

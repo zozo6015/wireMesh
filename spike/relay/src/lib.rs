@@ -93,7 +93,7 @@ pub fn server_config(certdir: &Path) -> Result<QuinnServerConfig> {
     let mut tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(relay_certs, relay_key)?;
-    tls.alpn_protocols = vec![b"aetherlink-relay/0".to_vec()];
+    tls.alpn_protocols = vec![b"wiremesh-relay/0".to_vec()];
 
     let quic_crypto = QuicServerConfig::try_from(tls)?;
     let mut server_config = QuinnServerConfig::with_crypto(Arc::new(quic_crypto));
@@ -118,7 +118,7 @@ fn client_endpoint(certdir: &Path, my_id: Option<&str>) -> Result<Endpoint> {
         }
         None => builder.with_no_client_auth(),
     };
-    tls.alpn_protocols = vec![b"aetherlink-relay/0".to_vec()];
+    tls.alpn_protocols = vec![b"wiremesh-relay/0".to_vec()];
 
     let quic_crypto = QuicClientConfig::try_from(tls)?;
     let mut client_config = QuinnClientConfig::new(Arc::new(quic_crypto));

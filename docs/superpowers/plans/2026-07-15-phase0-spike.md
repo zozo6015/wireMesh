@@ -1,4 +1,4 @@
-# AetherLink Phase 0 Spike Implementation Plan
+# WireMesh Phase 0 Spike Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **Spec:** `docs/superpowers/specs/2026-07-15-aetherlink-engineering-design.md` — spike items per §12(1); success criteria referenced per task.
+- **Spec:** `docs/superpowers/specs/2026-07-15-wiremesh-engineering-design.md` — spike items per §12(1); success criteria referenced per task.
 - **All code, tests, and commands run inside the dev container** (Task 1). Shell commands below are written for that container's shell as root unless prefixed with `HOST:`.
 - Kernel floor for the eBPF path: **≥ 5.10** (spec D1). The container `doctor.sh` verifies this.
 - v1 fabric is **IPv4-only** (spec §1); no IPv6 anywhere in the spike.
@@ -72,14 +72,14 @@ WORKDIR /work
 #!/usr/bin/env bash
 # dev.sh — run from repo root on the macOS host
 set -euo pipefail
-IMAGE=aetherlink-dev
+IMAGE=wiremesh-dev
 case "${1:-}" in
   build) docker build -t "$IMAGE" dev/ ;;
   shell) docker run --rm -it --privileged \
-           -v "$PWD":/work -v aetherlink-cargo:/usr/local/cargo/registry \
+           -v "$PWD":/work -v wiremesh-cargo:/usr/local/cargo/registry \
            "$IMAGE" bash ;;
   run)   shift; docker run --rm --privileged \
-           -v "$PWD":/work -v aetherlink-cargo:/usr/local/cargo/registry \
+           -v "$PWD":/work -v wiremesh-cargo:/usr/local/cargo/registry \
            "$IMAGE" bash -lc "$*" ;;
   *) echo "usage: ./dev.sh {build|shell|run <cmd>}"; exit 1 ;;
 esac

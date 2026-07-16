@@ -1,4 +1,4 @@
-# AetherLink — Engineering Design: Controller, Policy Pipeline & Trust Model
+# WireMesh — Engineering Design: Controller, Policy Pipeline & Trust Model
 
 | | |
 |---|---|
@@ -22,7 +22,7 @@ This design resolves every open question from PRD §11 plus decisions made durin
 | OQ4 | Route injection | **Manual documented routes + published Terraform modules per cloud.** No cloud credentials on gateways, ever |
 | OQ5 | CIDRs per gateway | **Multiple** — a segment declares whatever CIDRs its platform brings |
 | OQ6 | Stateful semantics | **Stateful with implicit return traffic** (flow table; security-group-style) |
-| OQ7 | Name + license | **AetherLink**, **Apache-2.0**, no CLA |
+| OQ7 | Name + license | **WireMesh**, **Apache-2.0**, no CLA |
 | OQ8 | Relay abuse prevention | **Mutual TLS on QUIC with existing fabric certs**, offline verification + revoked-serial denylist. No relay tokens |
 | OQ9 | Kubernetes gateway mode | **Node-network only in v1** — cluster is an opaque subnet; no CNI interaction |
 | D1 | Enforcement backend — **amends PRD** (was nftables P0 / eBPF P2) | **eBPF-first in v1** (tc-BPF on the tunnel interface + BPF LRU flow table); **nftables as fallback** where eBPF is unavailable. Policy IR targets both |
@@ -100,7 +100,7 @@ Enforcement placement: **every packet entering a segment from the fabric is chec
 
 ## 3. Trust & Identity
 
-Everything roots in one **fabric CA**. In the default *embedded* mode the controller generates it at first startup and its private key lives in a **separate file on disk** (`/var/lib/aetherlink/ca.key`, `0600`) — never inside SQLite, so database backups do not contain the CA key. Certificates and serials are recorded in SQLite. The documented backup unit is therefore *the SQLite file plus the key directory*. Both the CA and secret storage are pluggable provider seams (§3.4) — an external PKI (Vault/OpenBao, AWS Private CA, GCP CA Service, …) can own signing, and an external secrets manager can own the material at rest and its rotation.
+Everything roots in one **fabric CA**. In the default *embedded* mode the controller generates it at first startup and its private key lives in a **separate file on disk** (`/var/lib/wiremesh/ca.key`, `0600`) — never inside SQLite, so database backups do not contain the CA key. Certificates and serials are recorded in SQLite. The documented backup unit is therefore *the SQLite file plus the key directory*. Both the CA and secret storage are pluggable provider seams (§3.4) — an external PKI (Vault/OpenBao, AWS Private CA, GCP CA Service, …) can own signing, and an external secrets manager can own the material at rest and its rotation.
 
 | Relationship | Mechanism |
 |---|---|
@@ -116,7 +116,7 @@ Everything roots in one **fabric CA**. In the default *embedded* mode the contro
 The enrollment token is a single self-contained blob:
 
 ```
-aether://controller.example.com:8443/#tok_9f2kQ...@sha256:ab34cd...
+wiremesh://controller.example.com:8443/#tok_9f2kQ...@sha256:ab34cd...
         └────────── address ─────────┘ └─ secret ─┘ └─ CA cert fingerprint ─┘
 ```
 
@@ -128,7 +128,7 @@ sequenceDiagram
 
     Op->>C: fabricctl token create --kind gateway --cidrs 192.168.0.0/16
     C-->>Op: enrollment token (single-use, TTL 24h, CIDR-bound)
-    Op->>G: fabricd enroll --token aether://...
+    Op->>G: fabricd enroll --token wiremesh://...
     G->>C: TLS connect — verify server cert against pinned CA fingerprint
     G->>C: Enroll(token secret, CSR, declared CIDRs)
     Note over C: validate: token unused & unexpired,<br/>CIDRs ⊆ token binding,<br/>no overlap with registry (atomic)
@@ -156,7 +156,7 @@ Failure specifics (PRD C-1, C-2): a reused or expired token returns a distinct e
 
 ### 3.3 Human/CI authentication
 
-- **Bootstrap:** on the controller host, `fabricctl` over the Unix socket (`/run/aetherlink/controller.sock`, `0700`) is implicitly `admin`. This is also the break-glass path.
+- **Bootstrap:** on the controller host, `fabricctl` over the Unix socket (`/run/wiremesh/controller.sock`, `0700`) is implicitly `admin`. This is also the break-glass path.
 - **Remote:** `fabricctl token create --name peter --role admin` mints a named bearer token (hash stored, plaintext shown once). Config lives kubeconfig-style at `~/.config/fabricctl/config` with named controller contexts. Server verification uses the same pinned-CA logic as gateways.
 - Roles are exactly two in v1: `admin` (mutate), `read-only` (topology, status, audit). Token names become the `actor` field in the audit log (C-8).
 
@@ -207,7 +207,7 @@ trait CertificateIssuer {
 
 ## 4. Controller
 
-Single Rust binary (`aetherlink-controller`), embedded SQLite, no external dependencies. Deployable as systemd unit, `docker run`, or Kubernetes Deployment — the project ships artifacts, never infrastructure. **Deployment requirement:** the controller's UDP observation endpoint (§6.1) must be reachable without source-address rewriting — behind a Kubernetes Service/LB this means a UDP LoadBalancer with externalTrafficPolicy preserving source addresses, or direct host exposure; the docs call this out per platform.
+Single Rust binary (`wiremesh-controller`), embedded SQLite, no external dependencies. Deployable as systemd unit, `docker run`, or Kubernetes Deployment — the project ships artifacts, never infrastructure. **Deployment requirement:** the controller's UDP observation endpoint (§6.1) must be reachable without source-address rewriting — behind a Kubernetes Service/LB this means a UDP LoadBalancer with externalTrafficPolicy preserving source addresses, or direct host exposure; the docs call this out per platform.
 
 ### 4.1 Data model
 
@@ -368,14 +368,14 @@ The gateway reports its active backend to the controller (`fabricctl gateway lis
 
 ## 6. Gateway
 
-Single static Rust binary (`aetherlink-gateway`), x86-64 + arm64 (G-1). In-process components:
+Single static Rust binary (`wiremesh-gateway`), x86-64 + arm64 (G-1). In-process components:
 
 | Component | Responsibility |
 |---|---|
 | Sync client | mTLS stream to controller; applies snapshots/deltas; acks versions; persists state bundle |
 | Tunnel manager | embedded boringtun; per-epoch static keys; endpoint management; NAT traversal; relay failover |
 | Enforcer | backend probe; IR → eBPF or nftables; counters |
-| State store | last-applied desired state at `/var/lib/aetherlink/state.json` (0600) + WG private keys — powers fail-static |
+| State store | last-applied desired state at `/var/lib/wiremesh/state.json` (0600) + WG private keys — powers fail-static |
 | Metrics/logs | Prometheus endpoint; structured JSON logs |
 
 ### 6.1 NAT traversal, MTU & relay failover (G-3, R-3)
@@ -425,7 +425,7 @@ Mechanical but P0: static musl builds (x86-64, arm64) as release artifacts, OCI 
 
 ## 7. Relay
 
-Single static Rust binary (`aetherlink-relay`). **Stateless means no session or flow state** (R-1, qualified): restart loses only in-flight sessions, which gateways re-establish automatically. The relay *does* persist its identity material — client cert + key, fabric CA trust bundle, and the last-pushed revocation denylist (`/var/lib/aetherlink/`, 0600) — otherwise a relay restart during a controller outage would leave it unable to authenticate anyone, violating the spirit of fail-static.
+Single static Rust binary (`wiremesh-relay`). **Stateless means no session or flow state** (R-1, qualified): restart loses only in-flight sessions, which gateways re-establish automatically. The relay *does* persist its identity material — client cert + key, fabric CA trust bundle, and the last-pushed revocation denylist (`/var/lib/wiremesh/`, 0600) — otherwise a relay restart during a controller outage would leave it unable to authenticate anyone, violating the spirit of fail-static.
 
 - **Enrollment:** identical token flow (§3.1) with `--kind relay`; registers its public endpoint; controller advertises it to all gateways (R-2 — usable by all pairs without gateway restarts).
 - **Session model:** gateways hold one authenticated QUIC connection per relay they may use. WireGuard packets ride **QUIC unreliable datagrams (RFC 9221)** — no retransmission or head-of-line blocking under the tunnel; DPLPMTUD per §6.1. Each datagram carries a destination gateway ID header; the relay bridges datagrams between the two connections of a pair. The only runtime state is the in-memory map {gateway ID → connection}.
@@ -480,7 +480,7 @@ For traceability, this design amends the PRD as follows (to be folded into PRD v
 3. **§10 / §7.1 C-5**: per-pair WireGuard keys replaced by **per-gateway per-epoch keys** (D5); the threat-model property is provided by Noise ephemeral DH. C-5's rotation trigger becomes per-gateway.
 4. **§7.1 R-1**: "stateless" qualified to *no session/flow state*; relays persist identity material and the revocation denylist to honor fail-static.
 5. **§11**: all nine open questions resolved per §1 above.
-6. **§2/§7.2**: project positioning sharpened — fully self-hosted, Apache-2.0, no project-hosted components, no monetization; Aether integration is a downstream consumer provisioning per-tenant controllers.
+6. **§2/§7.2**: project positioning sharpened — fully self-hosted, Apache-2.0, no project-hosted components, no monetization; any managed-platform integration is a downstream consumer provisioning per-tenant controllers, not part of this project.
 7. **§7.1/§7.2 (new, D6)**: pluggable `SecretStore`/`CertificateIssuer` provider seams with manager-driven rotation and a normative manager-outage contract — traits + embedded defaults + Vault/OpenBao reference provider are **P0**; **P1** drivers: AWS (Secrets Manager + Private CA; KMS as an encrypting decorator), GCP (Secret Manager + CA Service), Azure (Key Vault, `SecretStore` only — it is not a CA).
 
 ## 12. Next Artifacts

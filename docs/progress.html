@@ -1,4 +1,4 @@
-<title>AetherLink · Build Progress</title>
+<title>WireMesh · Build Progress</title>
 <style>
   :root {
     --paper: #E7EDF3;
@@ -234,7 +234,7 @@
 <div class="wrap">
 
   <header>
-    <p class="eyebrow">AetherLink · Build Progress</p>
+    <p class="eyebrow">WireMesh · Build Progress</p>
     <h1>Zero-trust network fabric — cycle-by-cycle build tracker</h1>
     <p class="lede">Open-source (Apache-2.0), self-hosted, cloud-agnostic L3/L4 network fabric in Rust: WireGuard data plane, default-deny eBPF policy, one gateway per segment, no agents on workloads. The engineering design ships as four plan cycles; this page tracks what's done, in flight, and next.</p>
     <p class="stamp">Last updated <b>2026-07-16</b> · main @ <b>09a9b54</b> · spec v0.2 (approved)</p>
@@ -411,6 +411,7 @@ flowchart LR
           <li><b>Scoped Cycle 2 to controller core only</b>, per spec §12 — policy pipeline and gateway/relay deferred to their own cycles.</li>
           <li>Entered the brainstorming flow to turn the controller-core spec sections into a design, then an implementation plan.</li>
           <li><b>Created this progress tracker</b> — to be updated at the end of each session with what shipped, what's in flight, and what's next.</li>
+          <li><b>Renamed the project AetherLink &rarr; WireMesh</b> across docs, spec, plan, dev tooling, and the relay ALPN; severed the external "Aether" product references in the PRD/spec (genericized to managed-platform). Relay handshake re-verified green under the new ALPN.</li>
         </ul>
       </div>
       <div class="entry">
@@ -434,7 +435,7 @@ flowchart LR
   </section>
 
   <footer>
-    AetherLink · updated at the end of each working session · source: docs/progress.html · authority order: spec &gt; PRD &gt; plans
+    WireMesh · updated at the end of each working session · source: docs/progress.html · authority order: spec &gt; PRD &gt; plans
   </footer>
 
 </div>
