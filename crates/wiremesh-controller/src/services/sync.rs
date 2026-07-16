@@ -17,7 +17,6 @@
 //! (deliberately) an empty message.
 
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 use tokio_stream::Stream;
@@ -34,20 +33,11 @@ pub type WatchStream = Pin<Box<dyn Stream<Item = Result<SyncMessage, Status>> + 
 
 pub struct SyncSvc {
     db: DbHandle,
-    /// Cycle-2's `revision` is a simple in-process monotonic counter (see
-    /// `projection`'s doc comment) — incremented once per snapshot pushed,
-    /// starting at 1. Not persisted: a controller restart resetting it to 1
-    /// is fine, since nothing yet compares revisions across a restart
-    /// boundary (that's Task 8's delta-stream scope).
-    revision_counter: AtomicU64,
 }
 
 impl SyncSvc {
     pub fn new(db: DbHandle) -> Self {
-        Self {
-            db,
-            revision_counter: AtomicU64::new(0),
-        }
+        Self { db }
     }
 }
 
@@ -72,11 +62,7 @@ impl Sync for SyncSvc {
                 )
             })?;
 
-        // Monotonic and >= 1 on the very first snapshot ever produced by
-        // this process — see the field's doc comment.
-        let revision = self.revision_counter.fetch_add(1, Ordering::SeqCst) + 1;
-
-        let snapshot = projection::build_snapshot(&self.db, gw.id, self_cert_pem, revision)
+        let snapshot = projection::build_snapshot(&self.db, gw.id, self_cert_pem)
             .await
             .map_err(|e| Status::internal(format!("building Sync snapshot: {e}")))?;
 

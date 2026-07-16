@@ -6,9 +6,11 @@
 //! Cycle-2 scope, per the engineering design's amendments: `policy_ir` is
 //! always an empty v0 IR (`policy_version = 0`) — the policy pipeline is a
 //! later task — and `relays` is always empty (relay support is later too).
-//! `revision` is a simple monotonic counter (see `services::sync::SyncSvc`),
-//! not derived from any versioned DB state; a single connect only needs
-//! *some* value `>= 1`, not a globally meaningful revision number.
+//! `revision` is the persisted `state_revision` counter
+//! ([`crate::db::Db::current_revision`]) — a value that survives a
+//! controller restart, so a reconnecting gateway never sees the revision go
+//! backwards (which would break T8 delta comparison / T9 fail-static
+//! resync).
 
 use wiremesh_proto::v1::{Peer, PeerKey, StateSnapshot};
 
@@ -27,8 +29,9 @@ pub async fn build_snapshot(
     db: &DbHandle,
     gateway_id: i64,
     self_cert_pem: String,
-    revision: u64,
 ) -> anyhow::Result<StateSnapshot> {
+    // Persisted, restart-surviving revision (see this module's doc comment).
+    let revision = db.current_revision().await?;
     let peer_routes = routes::peers_of(db, gateway_id).await?;
     let peers = peer_routes
         .into_iter()

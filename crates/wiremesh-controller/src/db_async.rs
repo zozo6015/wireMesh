@@ -132,6 +132,12 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.revoked_serials()).await?
     }
 
+    /// See [`Db::current_revision`].
+    pub async fn current_revision(&self) -> Result<u64> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.current_revision()).await?
+    }
+
     /// See [`Db::find_gateway_by_name`].
     pub async fn find_gateway_by_name(&self, name: String) -> Result<Option<GatewayIdentity>> {
         let db = self.inner.clone();

@@ -13,7 +13,26 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use ipnet::Ipv4Net;
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
+
+/// Increments the persisted `state_revision` counter and returns the NEW
+/// value, using `tx` so the bump commits atomically with whatever mutation
+/// `tx` is carrying — a rolled-back mutation therefore never advances the
+/// revision. Every projection-affecting mutation ([`Db::insert_segment`],
+/// [`Db::enroll_gateway`], and — as later tasks land them — key rotate /
+/// drain / revoke / policy apply) must call this inside its own transaction.
+fn bump_revision_tx(tx: &Transaction<'_>) -> rusqlite::Result<u64> {
+    tx.execute(
+        "UPDATE state_revision SET revision = revision + 1 WHERE id = 0",
+        [],
+    )?;
+    let rev: i64 = tx.query_row(
+        "SELECT revision FROM state_revision WHERE id = 0",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(rev as u64)
+}
 
 /// Full schema for master-spec §4.1. Applied once, in a single transaction,
 /// by [`Db::run_migrations`] when `PRAGMA user_version` is `0`. Datetimes are
@@ -129,6 +148,19 @@ CREATE TABLE audit_log (
     entity    TEXT NOT NULL,
     diff_json TEXT NOT NULL
 );
+
+-- Single-row monotonic counter backing the Sync snapshot's `revision`
+-- (master-spec: the projection revision must survive a controller restart,
+-- else a reconnecting gateway comparing against a stale baseline would
+-- mis-diff — see T8 delta stream / T9 fail-static resync). `id = 0` pins it
+-- to exactly one row; `revision` starts at 0 and is bumped IN THE SAME
+-- TRANSACTION as every projection-affecting mutation, so a rolled-back
+-- mutation never advances it.
+CREATE TABLE state_revision (
+    id       INTEGER PRIMARY KEY CHECK (id = 0),
+    revision INTEGER NOT NULL
+);
+INSERT INTO state_revision (id, revision) VALUES (0, 0);
 "#;
 
 /// Returned (wrapped in [`anyhow::Error`]) when [`Db::insert_segment`]'s CIDR
@@ -365,8 +397,30 @@ impl Db {
             accepted.push(*cidr);
         }
 
+        // Projection-affecting mutation: a new segment (and its CIDRs) can
+        // change any gateway's peer allowed_ips, so bump the persisted
+        // revision in this same transaction — a rollback above returns early
+        // and never reaches here.
+        bump_revision_tx(&tx)?;
+
         tx.commit()?;
         Ok(segment_id)
+    }
+
+    /// Reads the persisted Sync-projection revision (the single
+    /// `state_revision` row). Starts at 0 on a fresh DB and only ever
+    /// increases — every projection-affecting mutation bumps it in its own
+    /// transaction (see [`bump_revision_tx`]). Sourcing the snapshot's
+    /// `revision` from here (rather than an in-process counter) is what makes
+    /// it survive a controller restart.
+    pub fn current_revision(&self) -> Result<u64> {
+        let conn = self.conn.lock().unwrap();
+        let rev: i64 = conn.query_row(
+            "SELECT revision FROM state_revision WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(rev as u64)
     }
 
     /// Appends one row to `audit_log` (master-spec §4.5, C-8).
@@ -573,6 +627,13 @@ impl Db {
                 format!(r#"{{"segment_id":{segment_id},"gateway_id":{gateway_id}}}"#),
             ],
         )?;
+
+        // Projection-affecting mutation: a newly enrolled gateway becomes a
+        // peer in every other gateway's full-mesh snapshot, so bump the
+        // persisted revision in this same transaction. Any early return above
+        // rolls back without reaching here, so a rejected enroll doesn't
+        // advance the revision.
+        bump_revision_tx(&tx)?;
 
         tx.commit()?;
         Ok(EnrollOutcome { segment_id, gateway_id })

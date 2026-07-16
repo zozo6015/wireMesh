@@ -46,3 +46,44 @@ fn audit_row_is_appended() {
     db.audit("token:ci", "create", "segment/aws", r#"{"name":"aws"}"#).unwrap();
     assert_eq!(db.count_audit().unwrap(), 1);
 }
+
+/// The Sync snapshot's `revision` must be a PERSISTED, monotonically
+/// non-decreasing counter — not an in-process `AtomicU64` that resets to 1
+/// on restart. A reset would be a landmine for T8 (delta comparison against
+/// a stale baseline) and T9 (fail-static resync: a gateway that last saw
+/// revision N, reconnecting to a restarted controller now advertising
+/// revision 1, could conclude nothing changed and skip a needed resync).
+/// So `current_revision()` must (a) bump on every projection-affecting
+/// mutation and (b) survive a `Db::open` of the same on-disk file — hence a
+/// real file path here, not `open_memory()`, so the state actually persists
+/// across the reopen.
+#[test]
+fn revision_is_persistent_and_monotonic_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("controller.db");
+
+    let db = Db::open(&db_path).unwrap();
+    let r0 = db.current_revision().unwrap();
+
+    // A projection-affecting mutation must advance the revision.
+    db.insert_segment("aws", &[Ipv4Net::from_str("10.0.0.0/16").unwrap()]).unwrap();
+    let r1 = db.current_revision().unwrap();
+    assert!(r1 > r0, "insert_segment must bump the revision: r1={r1} r0={r0}");
+
+    // Reopen the SAME file: the revision must have persisted (non-decreasing).
+    drop(db);
+    let db2 = Db::open(&db_path).unwrap();
+    assert!(
+        db2.current_revision().unwrap() >= r1,
+        "revision must persist across reopen (>= {r1}), got {}",
+        db2.current_revision().unwrap()
+    );
+
+    // And it must keep incrementing after the reopen, not restart from a base.
+    db2.insert_segment("gcp", &[Ipv4Net::from_str("10.1.0.0/16").unwrap()]).unwrap();
+    assert!(
+        db2.current_revision().unwrap() > r1,
+        "mutation after reopen must bump the revision above {r1}, got {}",
+        db2.current_revision().unwrap()
+    );
+}

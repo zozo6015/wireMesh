@@ -38,3 +38,5 @@ wiremesh-proto = { path = "../wiremesh-proto" }
 wiremesh-testkit = { path = "../wiremesh-testkit" }
 # StreamExt::next() to consume StubGateway::open_sync()'s Sync.Watch stream.
 tokio-stream = "0.1"
+# Real on-disk DB file path for the persisted-revision reopen test.
+tempfile = "3"

@@ -1633,6 +1633,7 @@ dependencies = [
  "rand",
  "rusqlite",
  "sha2",
+ "tempfile",
  "time",
  "tokio",
  "tokio-stream",
