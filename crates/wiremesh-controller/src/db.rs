@@ -209,8 +209,21 @@ pub enum EnrollError {
     /// the token is authorized only for its own segment's cidrs, so it can't
     /// be redeemed into a different segment by declaring that segment's
     /// cidrs. Kept distinct from `InvalidToken` so the gRPC layer can pick
-    /// the mapping (this task maps it to `PermissionDenied`).
+    /// the mapping (this task maps it to `PermissionDenied`). Also used for
+    /// a `rebind` token (Task 10) whose `rebind_segment_id` doesn't match
+    /// the segment the declared cidrs actually resolve to — same
+    /// "authorized for one segment, tried to redeem into another" shape.
     BoundCidrMismatch,
+    /// (Task 10) A `gateway`-kind token declared cidrs that resolve to a
+    /// segment which already has an active gateway. This is the
+    /// one-gateway-per-segment invariant's enforcement point (a self-overlap
+    /// on the *segment*, not the raw CIDR ranges — see `insert_segment`'s
+    /// `OverlapError` for the CIDR-range flavor of the same idea): only an
+    /// explicit `rebind` token — minted bound to that exact `segment_id` —
+    /// is allowed to replace the incumbent gateway. Mapped by the gRPC layer
+    /// to `AlreadyExists`, mirroring `CreateSegment`'s `OverlapError`
+    /// mapping.
+    SegmentAlreadyBound,
     /// Anything else — a genuine DB/storage error.
     Other(anyhow::Error),
 }
@@ -227,6 +240,10 @@ impl std::fmt::Display for EnrollError {
             EnrollError::BoundCidrMismatch => write!(
                 f,
                 "declared cidrs are outside the token's minted bound_cidrs scope"
+            ),
+            EnrollError::SegmentAlreadyBound => write!(
+                f,
+                "segment already has an active gateway; use a rebind token to replace it"
             ),
             EnrollError::Other(e) => write!(f, "{e}"),
         }
@@ -245,6 +262,14 @@ impl From<rusqlite::Error> for EnrollError {
 pub struct EnrollOutcome {
     pub segment_id: i64,
     pub gateway_id: i64,
+    /// (Task 10) The `issuer_handle`(s) of any gateway cert(s) this call
+    /// revoked in the DB as part of a `rebind` — empty for an ordinary
+    /// `gateway`-kind enrollment. The caller (`EnrollmentSvc`) uses these to
+    /// also call `CertificateIssuer::revoke` for each, best-effort — see
+    /// that call site's comment for why the DB's `revoked_at` (already
+    /// committed by the time this is returned), not that call, is
+    /// authoritative.
+    pub revoked_issuer_handles: Vec<String>,
 }
 
 /// One row of [`Db::list_other_gateways`] — an enrolled gateway's identity
@@ -476,11 +501,37 @@ impl Db {
 
     /// Redeems a single-use `enrollment_token` for a signed gateway
     /// certificate, ALL in one transaction: validates the token (right
-    /// kind, unexpired, unused), enforces that the declared `cidrs` match the
-    /// set the token was minted bound to (`bound_cidrs`), resolves the
-    /// segment that owns every declared `cidrs` entry, inserts the `gateway`
-    /// row, records the `certificate`, marks the token `used_at`, and appends
-    /// an audit entry.
+    /// kind, unexpired, unused), enforces authorization scope appropriate to
+    /// the token's own `kind` (see below), resolves the segment that owns
+    /// every declared `cidrs` entry, inserts the `gateway` row, records the
+    /// `certificate`, marks the token `used_at`, and appends an audit entry.
+    ///
+    /// The token's `kind` (`gateway` or `rebind`; `relay` is out of this
+    /// method's scope — Task 5's slice) is read from the matched row itself
+    /// rather than supplied by the caller, so this one method handles both
+    /// shapes uniformly:
+    ///
+    /// - **`gateway`**: the declared `cidrs` must exactly match the token's
+    ///   minted `bound_cidrs` set (a `gateway` token minted with an EMPTY
+    ///   bound set is unscoped and rejected outright — it would otherwise be
+    ///   a bearer credential for every segment). The resolved segment must
+    ///   NOT already have an active gateway — this is the
+    ///   one-gateway-per-segment invariant (`EnrollError::SegmentAlreadyBound`,
+    ///   the "self-overlap" a `rebind` token exists to get past).
+    /// - **`rebind`** (Task 10): `bound_cidrs` is ignored (expected empty —
+    ///   MintToken never populates it for this kind); authorization instead
+    ///   requires the resolved segment's id to equal the token's minted
+    ///   `rebind_segment_id` exactly (`EnrollError::BoundCidrMismatch`
+    ///   otherwise) — so a rebind token minted for segment A can never be
+    ///   redeemed against segment B by declaring B's cidrs, even though
+    ///   nothing else about the request looks different from a legitimate
+    ///   rebind of A. Exempted from the `SegmentAlreadyBound` check (that's
+    ///   the whole point), and every currently-active gateway row for that
+    ///   segment is: (1) has its still-unrevoked `certificate` row(s) marked
+    ///   `revoked_at = now` (pushing the serial onto the `revoked_serials`
+    ///   denylist the Sync projection reads), and (2) is itself marked
+    ///   `status = 'replaced'` so it stops counting as "active" for both a
+    ///   future `SegmentAlreadyBound` check and the Sync full-mesh peer list.
     ///
     /// Holding the connection mutex for the whole operation (same pattern as
     /// [`Db::insert_segment`]) is what makes the token's single-use
@@ -498,7 +549,6 @@ impl Db {
     pub fn enroll_gateway(
         &self,
         secret_hash: &str,
-        kind: &str,
         cidrs: &[Ipv4Net],
         gateway_name: &str,
         cert_serial: &str,
@@ -513,65 +563,73 @@ impl Db {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        let token_row: Option<(String, String)> = {
+        let token_row: Option<(String, String, String, Option<i64>)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, bound_cidrs FROM enrollment_token \
-                 WHERE secret_hash = ?1 AND kind = ?2 AND used_at IS NULL AND expires_at > ?3",
+                "SELECT id, kind, bound_cidrs, rebind_segment_id FROM enrollment_token \
+                 WHERE secret_hash = ?1 AND used_at IS NULL AND expires_at > ?2 \
+                 AND kind IN ('gateway', 'rebind')",
             )?;
-            let mut rows = stmt.query(params![secret_hash, kind, now])?;
+            let mut rows = stmt.query(params![secret_hash, now])?;
             match rows.next()? {
                 // bound_cidrs is NULL-able in the schema; treat NULL as "" so
                 // the T4 decode contract (""→[]) applies uniformly.
-                Some(row) => Some((row.get(0)?, row.get::<_, Option<String>>(1)?.unwrap_or_default())),
+                Some(row) => Some((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                    row.get(3)?,
+                )),
                 None => None,
             }
         };
 
-        let Some((token_id, bound_cidrs_raw)) = token_row else {
+        let Some((token_id, kind, bound_cidrs_raw, rebind_segment_id)) = token_row else {
             tx.rollback()?;
             return Err(EnrollError::InvalidToken);
         };
+        let is_rebind = kind == "rebind";
 
-        // Authorization scope: the declared `cidrs` must match the CIDR set
-        // this token was minted bound to (MintToken stored them, comma-joined,
-        // in `bound_cidrs`). Decoded through the canonical T4 decoder
-        // (`decode_bound_cidrs`: ""→[]). A `gateway` token with an EMPTY
-        // bound set is unscoped and rejected outright — it would otherwise be
-        // a bearer credential for every segment. (`rebind` tokens legitimately
-        // carry empty bound_cidrs and steer by `rebind_segment_id` instead,
-        // but only `gateway`-kind tokens reach this method today; rebind is
-        // Task 10.) Comparison is set-based over parsed `Ipv4Net` values so
-        // it's order- and formatting-insensitive but still exact (no
-        // subnet-of slack). Checked BEFORE marking the token used, and a
+        // Authorization scope: a `gateway` token's declared `cidrs` must
+        // match the CIDR set it was minted bound to (MintToken stored them,
+        // comma-joined, in `bound_cidrs`, decoded via the canonical T4
+        // decoder: ""→[]). Comparison is set-based over parsed `Ipv4Net`
+        // values so it's order- and formatting-insensitive but still exact
+        // (no subnet-of slack). Checked BEFORE marking the token used, and a
         // mismatch rolls the transaction back, so a rejected enroll does NOT
-        // consume the single-use token — same discipline as NoMatchingSegment.
-        let bound: std::collections::BTreeSet<Ipv4Net> = {
-            let decoded = crate::services::admin::decode_bound_cidrs(&bound_cidrs_raw);
-            let mut set = std::collections::BTreeSet::new();
-            for c in decoded {
-                let net: Ipv4Net = c.parse().map_err(|e| {
-                    EnrollError::Other(anyhow::anyhow!(
-                        "stored bound_cidr {c:?} is not valid IPv4: {e}"
-                    ))
-                })?;
-                set.insert(net);
+        // consume the single-use token — same discipline as
+        // `NoMatchingSegment`.
+        //
+        // A `rebind` token carries no bound_cidrs at all (its scope is the
+        // segment id, checked further down once `segment_id` is resolved) —
+        // this block is entirely skipped for it.
+        if !is_rebind {
+            let bound: std::collections::BTreeSet<Ipv4Net> = {
+                let decoded = crate::services::admin::decode_bound_cidrs(&bound_cidrs_raw);
+                let mut set = std::collections::BTreeSet::new();
+                for c in decoded {
+                    let net: Ipv4Net = c.parse().map_err(|e| {
+                        EnrollError::Other(anyhow::anyhow!(
+                            "stored bound_cidr {c:?} is not valid IPv4: {e}"
+                        ))
+                    })?;
+                    set.insert(net);
+                }
+                set
+            };
+            if bound.is_empty() {
+                tx.rollback()?;
+                return Err(EnrollError::BoundCidrMismatch);
             }
-            set
-        };
-        if bound.is_empty() {
-            tx.rollback()?;
-            return Err(EnrollError::BoundCidrMismatch);
-        }
-        let declared: std::collections::BTreeSet<Ipv4Net> = cidrs.iter().copied().collect();
-        if declared != bound {
-            tx.rollback()?;
-            return Err(EnrollError::BoundCidrMismatch);
+            let declared: std::collections::BTreeSet<Ipv4Net> = cidrs.iter().copied().collect();
+            if declared != bound {
+                tx.rollback()?;
+                return Err(EnrollError::BoundCidrMismatch);
+            }
         }
 
         // Resolve the segment that owns EVERY declared cidr — all of them
         // must belong to the same, already-registered segment (cycle-2
-        // scope: the segment pre-exists; a `rebind` token's segment
-        // exemption is Task 10).
+        // scope: the segment pre-exists).
         let mut segment_id: Option<i64> = None;
         for cidr in cidrs {
             let found: Option<i64> = tx
@@ -596,6 +654,73 @@ impl Db {
         }
         let segment_id =
             segment_id.expect("cidrs is non-empty: loop above always sets segment_id or returns early");
+
+        // Per-kind scope/occupancy check, now that the target segment is
+        // known:
+        let mut revoked_issuer_handles: Vec<String> = Vec::new();
+        if is_rebind {
+            // A rebind token is only authorized for the ONE segment it was
+            // minted bound to — declaring a DIFFERENT (even if real,
+            // registered) segment's cidrs must not let it claim that
+            // segment instead. This is what stops a rebind token for
+            // segment A from being redeemed against segment B.
+            if rebind_segment_id != Some(segment_id) {
+                tx.rollback()?;
+                return Err(EnrollError::BoundCidrMismatch);
+            }
+
+            // Replace every currently-active gateway on this segment:
+            // revoke its still-unrevoked cert(s) and mark it no longer
+            // active. Ordinarily there is exactly one (the
+            // one-gateway-per-segment invariant an ordinary `gateway` token
+            // enforces below) — this loops defensively rather than
+            // assuming exactly one row.
+            let old_gateway_ids: Vec<i64> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id FROM gateway WHERE segment_id = ?1 AND status = 'active'",
+                )?;
+                let rows = stmt.query_map(params![segment_id], |row| row.get::<_, i64>(0))?;
+                rows.collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for old_gateway_id in old_gateway_ids {
+                let certs_to_revoke: Vec<(String, String)> = {
+                    let mut stmt = tx.prepare(
+                        "SELECT serial, issuer_handle FROM certificate \
+                         WHERE subject_kind = 'gateway' AND subject_id = ?1 AND revoked_at IS NULL",
+                    )?;
+                    let rows = stmt.query_map(params![old_gateway_id], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                    rows
+                };
+                for (serial, handle) in certs_to_revoke {
+                    tx.execute(
+                        "UPDATE certificate SET revoked_at = ?1 WHERE serial = ?2",
+                        params![now, serial],
+                    )?;
+                    revoked_issuer_handles.push(handle);
+                }
+                tx.execute(
+                    "UPDATE gateway SET status = 'replaced' WHERE id = ?1",
+                    params![old_gateway_id],
+                )?;
+            }
+        } else {
+            // Ordinary `gateway` token: the resolved segment must not
+            // already have an active gateway (one-gateway-per-segment) — an
+            // explicit `rebind` token is the only sanctioned way to replace
+            // one.
+            let occupied: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM gateway WHERE segment_id = ?1 AND status = 'active')",
+                params![segment_id],
+                |row| row.get(0),
+            )?;
+            if occupied {
+                tx.rollback()?;
+                return Err(EnrollError::SegmentAlreadyBound);
+            }
+        }
 
         tx.execute(
             "INSERT INTO gateway (segment_id, name, status, backend, last_seen) \
@@ -629,33 +754,44 @@ impl Db {
             params![
                 now,
                 "enrollment-token",
-                "enroll",
+                if is_rebind { "rebind" } else { "enroll" },
                 format!("gateway/{gateway_name}"),
                 format!(r#"{{"segment_id":{segment_id},"gateway_id":{gateway_id}}}"#),
             ],
         )?;
 
         // Projection-affecting mutation: a newly enrolled gateway becomes a
-        // peer in every other gateway's full-mesh snapshot, so bump the
+        // peer in every other gateway's full-mesh snapshot (and a rebind
+        // additionally changes the revoked-serials denylist), so bump the
         // persisted revision in this same transaction. Any early return above
         // rolls back without reaching here, so a rejected enroll doesn't
         // advance the revision.
         bump_revision_tx(&tx)?;
 
         tx.commit()?;
-        Ok(EnrollOutcome { segment_id, gateway_id })
+        Ok(EnrollOutcome {
+            segment_id,
+            gateway_id,
+            revoked_issuer_handles,
+        })
     }
 
-    /// The other N-1 enrolled gateways (every `gateway` row except
-    /// `exclude_gateway_id`), each with the segment it belongs to. Used by
-    /// `routes::peers_of` to build the full-mesh peer set for a Sync
-    /// snapshot. Ordered by id for deterministic output.
+    /// The other N-1 *active* enrolled gateways (every `status = 'active'`
+    /// `gateway` row except `exclude_gateway_id`), each with the segment it
+    /// belongs to. Used by `routes::peers_of` to build the full-mesh peer
+    /// set for a Sync snapshot. Ordered by id for deterministic output.
+    ///
+    /// Excludes `status = 'replaced'` rows (Task 10's rebind: the gateway a
+    /// rebind superseded) so a superseded gateway — whose cert is already on
+    /// the `revoked_serials` denylist — stops appearing as a mesh peer too,
+    /// rather than lingering as a dead entry every other gateway keeps
+    /// trying to route to.
     pub fn list_other_gateways(&self, exclude_gateway_id: i64) -> Result<Vec<GatewayRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT g.id, g.segment_id, s.name \
              FROM gateway g JOIN segment s ON s.id = g.segment_id \
-             WHERE g.id != ?1 \
+             WHERE g.id != ?1 AND g.status = 'active' \
              ORDER BY g.id",
         )?;
         let rows = stmt

@@ -29,13 +29,12 @@ use crate::db_async::{DbHandle, EnrollError};
 use crate::projection::ChangeEvent;
 
 /// Cycle-2 leaf certs (gateway enrollment) are valid for 90 days from
-/// issuance — no renewal path yet (a later task can make this configurable
-/// / add rebind-driven renewal).
+/// issuance — no renewal path yet (a later task can make this configurable).
+/// A `rebind` token (Task 10) issues a fresh 90-day cert too, exactly like an
+/// ordinary `gateway` token — only its authorization scope and the
+/// replaced-gateway revocation differ, both handled inside
+/// `Db::enroll_gateway`.
 const GATEWAY_CERT_TTL: StdDuration = StdDuration::from_secs(90 * 24 * 3600);
-
-/// This task's slice only handles `kind = "gateway"` tokens. `relay` tokens
-/// and the `rebind` segment-exemption path are out of scope (Task 10).
-const TOKEN_KIND_GATEWAY: &str = "gateway";
 
 pub struct EnrollmentSvc {
     db: DbHandle,
@@ -135,7 +134,6 @@ impl Enrollment for EnrollmentSvc {
             .db
             .enroll_gateway(
                 secret_hash_hex,
-                TOKEN_KIND_GATEWAY.to_string(),
                 cidrs,
                 gateway_name.clone(),
                 issued.serial.clone(),
@@ -145,19 +143,38 @@ impl Enrollment for EnrollmentSvc {
             )
             .await;
 
-        if let Err(err) = outcome {
-            return Err(match err {
-                EnrollError::InvalidToken => Status::permission_denied(
-                    "enrollment token is invalid, expired, wrong kind, or already used",
-                ),
-                EnrollError::NoMatchingSegment => Status::failed_precondition(
-                    "no segment is registered for the declared cidrs",
-                ),
-                EnrollError::BoundCidrMismatch => Status::permission_denied(
-                    "declared cidrs are outside this token's authorized scope",
-                ),
-                EnrollError::Other(e) => Status::internal(format!("enrollment failed: {e}")),
-            });
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                return Err(match err {
+                    EnrollError::InvalidToken => Status::permission_denied(
+                        "enrollment token is invalid, expired, wrong kind, or already used",
+                    ),
+                    EnrollError::NoMatchingSegment => Status::failed_precondition(
+                        "no segment is registered for the declared cidrs",
+                    ),
+                    EnrollError::BoundCidrMismatch => Status::permission_denied(
+                        "declared cidrs are outside this token's authorized scope",
+                    ),
+                    EnrollError::SegmentAlreadyBound => Status::already_exists(
+                        "segment already has an active gateway; use a rebind token to replace it",
+                    ),
+                    EnrollError::Other(e) => Status::internal(format!("enrollment failed: {e}")),
+                });
+            }
+        };
+
+        // (Task 10) If this was a `rebind`, `Db::enroll_gateway` already
+        // committed the replaced gateway's cert(s) as `revoked_at` in the DB
+        // — that's the AUTHORITATIVE denylist the Sync projection's
+        // `revoked_serials` reads from, and it's already durable by this
+        // point regardless of what happens below. This best-effort call to
+        // `CertificateIssuer::revoke` is purely so the issuer's own
+        // bookkeeping (e.g. `EmbeddedTrust`'s in-memory `revoked` set) stays
+        // consistent with the DB; a failure here does NOT undo or fail the
+        // enrollment that already succeeded.
+        for handle in &outcome.revoked_issuer_handles {
+            let _ = self.trust.revoke(handle).await;
         }
 
         // Projection-affecting mutation succeeded (and its transaction

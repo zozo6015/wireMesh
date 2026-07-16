@@ -73,12 +73,14 @@ impl DbHandle {
     /// See [`Db::enroll_gateway`]. Returns [`EnrollError`] (not
     /// `anyhow::Error`) so the gRPC handler can distinguish "bad token" from
     /// "no matching segment" from "internal error" and map each to the
-    /// right `tonic::Status` code.
+    /// right `tonic::Status` code. The token's `kind` (`gateway` vs.
+    /// `rebind`) is no longer a caller-supplied parameter (Task 10) — `Db`
+    /// reads it off the matched `enrollment_token` row itself, so one call
+    /// handles both.
     #[allow(clippy::too_many_arguments)]
     pub async fn enroll_gateway(
         &self,
         secret_hash: String,
-        kind: String,
         cidrs: Vec<Ipv4Net>,
         gateway_name: String,
         cert_serial: String,
@@ -90,7 +92,6 @@ impl DbHandle {
         match tokio::task::spawn_blocking(move || {
             db.enroll_gateway(
                 &secret_hash,
-                &kind,
                 &cidrs,
                 &gateway_name,
                 &cert_serial,

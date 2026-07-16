@@ -229,6 +229,16 @@ pub struct StubGateway {
     // directly — mirrors `TestController::_data_dir`.
     _state_dir: TempDir,
     state_dir_path: PathBuf,
+    // (Task 10) The segment id this gateway enrolled into, if the caller
+    // told us — `EnrollResponse` doesn't carry a segment id (and the T10
+    // brief deliberately doesn't grow the proto just for this test helper),
+    // so `enroll()` itself never knows it. `enroll_one` DOES know it (it
+    // just read it back from `CreateSegment`'s response) and threads it in
+    // via `set_segment_id` right after `enroll()` returns. `None` for a
+    // `StubGateway` built directly via `enroll()` (e.g. rebind's
+    // replacement gateway in `tests/rebind.rs`, which never calls
+    // `segment_id()`).
+    segment_id: Option<i64>,
 }
 
 impl StubGateway {
@@ -285,6 +295,7 @@ impl StubGateway {
             sync_addr: controller.sync_tcp_addr(),
             _state_dir: state_dir,
             state_dir_path,
+            segment_id: None,
         })
     }
 
@@ -410,6 +421,25 @@ impl StubGateway {
         &self.state_dir_path
     }
 
+    /// (Task 10 test-setup plumbing) Records the segment id this gateway
+    /// enrolled into, so a later [`StubGateway::segment_id`] call can return
+    /// it. `pub(crate)` — only [`enroll_one`] (which already knows the id
+    /// from `CreateSegment`'s response) calls this; `enroll()` itself has no
+    /// way to learn it (see the `segment_id` field's doc comment).
+    pub(crate) fn set_segment_id(&mut self, segment_id: i64) {
+        self.segment_id = Some(segment_id);
+    }
+
+    /// The segment id this gateway enrolled into. Only set for a
+    /// `StubGateway` returned by [`enroll_one`] — panics otherwise, since
+    /// nothing else records it (see the `segment_id` field's doc comment).
+    pub fn segment_id(&self) -> u64 {
+        self.segment_id.expect(
+            "StubGateway::segment_id() called on a gateway whose segment id was never \
+             recorded — only enroll_one() sets it (enroll() has no way to learn it)",
+        ) as u64
+    }
+
     /// This gateway's leaf certificate's serial number, as a lowercase hex
     /// string (e.g. `"01a2b3"`), parsed back out of `cert_pem`. Used by
     /// later tasks to correlate "the cert this stub is holding" with "the
@@ -463,13 +493,14 @@ impl StubGateway {
 pub async fn enroll_one(h: &TestController, segment_name: &str, cidr: &str) -> StubGateway {
     let mut admin = h.admin_client().await;
 
-    admin
+    let segment = admin
         .create_segment(CreateSegmentRequest {
             name: segment_name.to_string(),
             cidrs: vec![cidr.to_string()],
         })
         .await
-        .expect("creating segment for enroll_one");
+        .expect("creating segment for enroll_one")
+        .into_inner();
 
     let token = admin
         .mint_token(MintTokenRequest {
@@ -482,9 +513,15 @@ pub async fn enroll_one(h: &TestController, segment_name: &str, cidr: &str) -> S
         .into_inner()
         .token;
 
-    StubGateway::enroll(h, &token, &[cidr])
+    let mut gw = StubGateway::enroll(h, &token, &[cidr])
         .await
-        .expect("enrolling stub gateway in enroll_one")
+        .expect("enrolling stub gateway in enroll_one");
+    // (Task 10) Thread the segment id `CreateSegment` handed back into the
+    // stub, so a caller can later call `gw.segment_id()` (e.g. to mint a
+    // `rebind` token bound to this exact segment) without needing a
+    // dedicated lookup RPC.
+    gw.set_segment_id(segment.id as i64);
+    gw
 }
 
 /// Generates a fresh keypair and a PEM-encoded CSR with common name `cn` —
