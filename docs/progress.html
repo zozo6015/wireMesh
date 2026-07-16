@@ -253,7 +253,7 @@
     <p class="eyebrow">WireMesh &middot; Build Progress</p>
     <h1>Zero-trust network fabric &mdash; cycle-by-cycle build tracker</h1>
     <p class="lede">Open-source (Apache-2.0), self-hosted, cloud-agnostic L3/L4 network fabric in Rust: WireGuard data plane, default-deny eBPF policy, one gateway per segment, no agents on workloads. The engineering design ships as four plan cycles; this page tracks what's done, in flight, and next.</p>
-    <p class="stamp">Last updated <b>2026-07-16</b> &middot; Phase 0 + Cycle 2 complete &middot; Cycle 2 on GitHub (PR open, ruleset-gated)</p>
+    <p class="stamp">Last updated <b>2026-07-17</b> &middot; Phase 0 + Cycle 2 complete &amp; merged to <code>main</code> &middot; Cycle 3 up next</p>
   </header>
 
   <div class="metrics">
@@ -265,7 +265,7 @@
     <div class="metric">
       <p class="k">Cycle 2 tasks</p>
       <div class="v">18<small> / 18 done</small></div>
-      <p class="sub">suite 34/34 green</p>
+      <p class="sub">suite 42/42 green</p>
     </div>
     <div class="metric">
       <p class="k">Phase 0 bets</p>
@@ -274,8 +274,8 @@
     </div>
     <div class="metric">
       <p class="k">Current focus</p>
-      <div class="v" style="font-size:19px;">On GitHub</div>
-      <p class="sub">PR open &middot; ruleset-gated</p>
+      <div class="v" style="font-size:19px;">Cycle 3</div>
+      <p class="sub">Cycle 2 merged &middot; PR #3</p>
     </div>
   </div>
 
@@ -321,8 +321,8 @@
           <h3>Controller core</h3>
           <span class="pill done"><span>Complete &middot; 2026-07-16</span></span>
         </div>
-        <p>The single-tenant control plane, built subagent-driven across 18 tasks (suite 34/34 green): 5-crate cargo workspace &mdash; proto wire contract, embedded trust (CA + secret store + conformance suite), SQLite data model + persistent revision, single-use enrollment (bound-CIDR scoping, rebind, one-gateway-per-segment), mTLS Sync projection (snapshot + broadcast deltas + Report), key-epoch rotation bookkeeping, drain, full Admin CRUD + <code>fabricctl</code> + fail-closed bearer/UDS auth, declarative <code>apply -f</code> (idempotent, policy stubbed), authenticated UDP observation, revocation denylist + audit query/export.</p>
-        <p class="dep"><b>Done bar proven:</b> enroll &rarr; Sync snapshot/delta &rarr; ack &rarr; fail-static/restore against a stub gateway. <b>Deferred by design:</b> policy compiler (cycle 3), OpenBao (cycle 2b), data plane (cycle 4). <b>On GitHub:</b> PR open, gated on the repo's Code-Scanning ruleset.</p>
+        <p>The single-tenant control plane, built subagent-driven across 18 tasks (suite 42/42 green after the CodeRabbit fix pass): 5-crate cargo workspace &mdash; proto wire contract, embedded trust (CA + secret store + conformance suite), SQLite data model + persistent revision, single-use enrollment (bound-CIDR scoping, rebind, one-gateway-per-segment), mTLS Sync projection (snapshot + broadcast deltas + Report), key-epoch rotation bookkeeping, drain, full Admin CRUD + <code>fabricctl</code> + fail-closed bearer/UDS auth, declarative <code>apply -f</code> (idempotent, policy stubbed), authenticated UDP observation, revocation denylist + audit query/export.</p>
+        <p class="dep"><b>Done bar proven:</b> enroll &rarr; Sync snapshot/delta &rarr; ack &rarr; fail-static/restore against a stub gateway. <b>Deferred by design:</b> policy compiler (cycle 3), OpenBao (cycle 2b), data plane (cycle 4). <b>Merged to <code>main</code>:</b> PR #3 at <code>4ac4411</code>, all checks green.</p>
       </article>
 
       <article class="cycle" data-status="pending">
@@ -413,6 +413,16 @@
   <section>
     <h2>Session log</h2>
     <div class="log">
+      <div class="entry">
+        <div class="date">2026-07-17</div>
+        <h4>Cycle 2 merged to <code>main</code> &mdash; review fixes, CI green, local cleanup</h4>
+        <ul>
+          <li><b>Addressed the CodeRabbit review on PR #3</b> (27 of 33 findings fixed, rest deferred with reasons). Headline fix: a <b>fail-closed CA bug</b> &mdash; a partial CA state (only <code>ca.key</code> or only <code>ca.pem</code>) used to silently regenerate the CA and rotate the trust anchor; it now hard-errors. Suite grew <b>34 &rarr; 42 green</b>.</li>
+          <li><b>Added a CLAUDE.md workflow rule:</b> tests are executed by a dedicated agent &mdash; neither the code author nor the test author.</li>
+          <li><b>Fixed the failing CodeQL check:</b> the PR branch predated <code>codeql.yml</code> on <code>main</code>, so the <code>actions</code> analyzer found no workflow files and errored; carried the workflow file onto the branch. (A separate "AI findings" run fails on a transient GitHub-side <code>model_not_supported</code> error &mdash; not a required check, zero alerts.)</li>
+          <li><b>PR #3 merged to <code>main</code> at <code>4ac4411</code></b>; local <code>main</code> synced and the merged worktree/branch torn down. <b>Next: Cycle 3 (policy pipeline)</b>, starting fresh tomorrow.</li>
+        </ul>
+      </div>
       <div class="entry">
         <div class="date">2026-07-16 &middot; later</div>
         <h4>Cycle 2 (controller core) &mdash; built, reviewed, on GitHub</h4>
