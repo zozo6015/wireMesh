@@ -1122,6 +1122,202 @@ impl Db {
         Ok(())
     }
 
+    /// (Task 13) Every registered segment with its CIDRs, ordered by id —
+    /// backs `Admin.ListSegments` / `fabricctl segment list`.
+    pub fn list_segments(&self) -> Result<Vec<(i64, String, Vec<String>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id, name FROM segment ORDER BY id")?;
+        let segments: Vec<(i64, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+
+        let mut out = Vec::with_capacity(segments.len());
+        for (id, name) in segments {
+            let mut cstmt = conn.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
+            let cidrs = cstmt
+                .query_map(params![id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            out.push((id, name, cidrs));
+        }
+        Ok(out)
+    }
+
+    /// (Task 13) Deletes a segment and its `cidr` rows in one transaction.
+    /// Refuses (returns `Err`, message contains `"has associated gateway"`
+    /// so `AdminSvc::delete_segment` can map it to `FailedPrecondition`) if
+    /// any `gateway` row (any status — a foreign key would otherwise block
+    /// this at the DB level anyway) still references `segment_id`: an
+    /// operator must drain/replace those first. Also errors (message
+    /// contains `"no segment row"`, mapped to `NotFound`) if the id doesn't
+    /// exist.
+    pub fn delete_segment(&self, segment_id: i64) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM segment WHERE id = ?1)",
+            params![segment_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.rollback()?;
+            anyhow::bail!("DeleteSegment: no segment row with id {segment_id}");
+        }
+
+        let has_gateway: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway WHERE segment_id = ?1)",
+            params![segment_id],
+            |row| row.get(0),
+        )?;
+        if has_gateway {
+            tx.rollback()?;
+            anyhow::bail!(
+                "DeleteSegment: segment {segment_id} has associated gateway row(s); \
+                 drain them before deleting the segment"
+            );
+        }
+
+        tx.execute("DELETE FROM cidr WHERE segment_id = ?1", params![segment_id])?;
+        tx.execute("DELETE FROM segment WHERE id = ?1", params![segment_id])?;
+
+        bump_revision_tx(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// (Task 13) Inserts a new `relay` row (`status = 'active'`, unseen
+    /// yet). Returns the new relay's id. A duplicate `name` surfaces as a
+    /// `rusqlite::Error` (UNIQUE constraint) — `AdminSvc::register_relay`
+    /// maps that to `AlreadyExists`, mirroring `insert_segment`'s pattern.
+    pub fn insert_relay(&self, name: &str, endpoint: &str) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO relay (name, endpoint, status, last_seen) VALUES (?1, ?2, 'active', NULL)",
+            params![name, endpoint],
+        )?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    /// (Task 13) Every registered relay, ordered by id.
+    pub fn list_relays(&self) -> Result<Vec<(i64, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id, name, endpoint, status FROM relay ORDER BY id")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// (Task 13) Inserts a new `api_token` row. `secret_hash` is the sha256
+    /// (hex) of the token's random secret — same never-store-the-raw-secret
+    /// discipline as [`Db::insert_enrollment_token`]. `role` is stored
+    /// verbatim (`"admin"` or `"read-only"`; validated by the gRPC layer
+    /// before this call). `expires_at` is `None` for cycle-2's API
+    /// tokens — no TTL/renewal path yet (mirrors how `RevokeApiToken` is the
+    /// only way to invalidate one early).
+    pub fn insert_api_token(
+        &self,
+        id: &str,
+        name: &str,
+        role: &str,
+        secret_hash: &str,
+        expires_at: Option<&str>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO api_token (id, name, role, secret_hash, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![id, name, role, secret_hash, expires_at],
+        )?;
+        Ok(())
+    }
+
+    /// (Task 13) Marks the `api_token` row named `name` revoked (`revoked_at
+    /// = now`). Returns `false` (rather than erroring) if no such row
+    /// exists — `AdminSvc::revoke_api_token` maps that to `NotFound`.
+    /// Idempotent: revoking an already-revoked token just re-stamps
+    /// `revoked_at` and still returns `true`.
+    pub fn revoke_api_token(&self, name: &str, now: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE api_token SET revoked_at = ?1 WHERE name = ?2",
+            params![now, name],
+        )?;
+        Ok(updated > 0)
+    }
+
+    /// (Task 13) The `role` of the unrevoked, unexpired `api_token` row
+    /// whose `secret_hash` matches, if any — the sole lookup the bearer-auth
+    /// middleware (`crate::auth`) performs per TCP Admin request. `None`
+    /// covers "no such token", "revoked", and "expired" uniformly (same
+    /// non-disclosure posture as `EnrollError::InvalidToken`: a caller can't
+    /// distinguish which).
+    pub fn find_active_api_token_role(&self, secret_hash: &str, now: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT role FROM api_token \
+             WHERE secret_hash = ?1 AND revoked_at IS NULL \
+             AND (expires_at IS NULL OR expires_at > ?2)",
+            params![secret_hash, now],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// (Task 13) Most-recent-first `audit_log` rows, up to `limit` (clamped
+    /// to at least 1) — backs `Admin.AuditQuery` / `fabricctl audit query`.
+    pub fn audit_query(&self, limit: i64) -> Result<Vec<(i64, String, String, String, String, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let limit = limit.max(1);
+        let mut stmt = conn.prepare(
+            "SELECT id, ts, actor, action, entity, diff_json FROM audit_log \
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt
+            .query_map(params![limit], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// (Task 13) Every `gateway` row (any status) with the segment name it
+    /// belongs to and its last-acked `applied_version` — backs
+    /// `Admin.ListGateways`, making T8's `Sync.Report` bookkeeping
+    /// (`Db::set_applied_version`) observable from the Admin surface for the
+    /// first time. Ordered by id.
+    pub fn list_gateways(&self) -> Result<Vec<(i64, String, String, String, Option<i64>)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT g.id, g.name, s.name, g.status, g.applied_version \
+             FROM gateway g JOIN segment s ON s.id = g.segment_id \
+             ORDER BY g.id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// Resolves an enrolled gateway by its `gateway.name` — the same value
     /// `EnrollmentSvc` derives deterministically from the enrollment token
     /// (`gw-<secret_hash_hex>`) and stamps as the issued leaf cert's subject

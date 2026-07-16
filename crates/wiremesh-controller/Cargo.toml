@@ -30,6 +30,14 @@ base64 = "0.22"
 # version `wiremesh-testkit`/`wiremesh-trust` already use for the analogous
 # job on the client side.
 x509-parser = "0.16"
+# (Task 13) `crate::auth`'s bearer-auth middleware wraps the Admin TCP
+# listener's `tonic::service::Routes` as a `tower::Layer`/`Service` operating
+# on raw `http::Request<BoxBody>`/`http::Response<BoxBody>` — see that
+# module's doc comment for why a `tower::Layer` (not a
+# `tonic::service::Interceptor`) is what it takes to classify a request by
+# gRPC method name.
+http = "1"
+tower = { version = "0.4", features = ["util"] }
 
 [dev-dependencies]
 ipnet = { workspace = true }

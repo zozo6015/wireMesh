@@ -1,7 +1,10 @@
-//! `Admin` service (minimal, cycle-2 Task 4 slice): `CreateSegment` and
-//! `MintToken`. `ListGateways` is part of the wire contract already (grown
-//! further in Task 13) but out of this task's scope — it returns
-//! `Unimplemented` rather than silently faking data.
+//! `Admin` service: segment CRUD (`CreateSegment`/`ListSegments`/
+//! `DeleteSegment`), gateway bookkeeping (`ListGateways`/`RotateKey`/
+//! `DebugKeyStates`/`Drain`), enrollment-token minting (`MintToken`), relay
+//! bookkeeping (`RegisterRelay`/`ListRelays`), API-bearer-token minting/
+//! revocation (`MintApiToken`/`RevokeApiToken` — the credential
+//! `crate::auth`'s TCP bearer-auth middleware checks; distinct from
+//! `MintToken`'s gateway/relay enrollment tokens), and `AuditQuery`.
 
 use std::str::FromStr;
 
@@ -14,9 +17,13 @@ use tonic::{Request, Response, Status};
 
 use wiremesh_proto::v1::admin_server::Admin;
 use wiremesh_proto::v1::{
-    CreateSegmentRequest, DebugKeyStatesRequest, DebugKeyStatesResponse, DrainRequest,
-    DrainResponse, GatewayKeyState, ListGatewaysRequest, ListGatewaysResponse, MintTokenRequest,
-    MintTokenResponse, RotateKeyRequest, RotateKeyResponse, Segment,
+    AuditEntry, AuditQueryRequest, AuditQueryResponse, CreateSegmentRequest,
+    DebugKeyStatesRequest, DebugKeyStatesResponse, DeleteSegmentRequest, DeleteSegmentResponse,
+    DrainRequest, DrainResponse, GatewayInfo, GatewayKeyState, ListGatewaysRequest,
+    ListGatewaysResponse, ListRelaysRequest, ListRelaysResponse, ListSegmentsRequest,
+    ListSegmentsResponse, MintApiTokenRequest, MintApiTokenResponse, MintTokenRequest,
+    MintTokenResponse, RegisterRelayRequest, Relay, RevokeApiTokenRequest,
+    RevokeApiTokenResponse, RotateKeyRequest, RotateKeyResponse, Segment,
 };
 
 use crate::db_async::DbHandle;
@@ -31,6 +38,15 @@ const TOKEN_TTL: TimeDuration = TimeDuration::hours(24);
 /// Minimum accepted secret length, per the task brief ("≥32 bytes").
 const SECRET_LEN: usize = 32;
 
+/// Valid `MintApiTokenRequest.role` values — see `crate::auth`'s bearer-auth
+/// middleware, which is the actual enforcement point for what each role can
+/// do on the Admin TCP listener.
+const VALID_API_TOKEN_ROLES: &[&str] = &["admin", "read-only"];
+
+/// Default `AuditQuery` page size when the caller passes `limit <= 0`.
+const DEFAULT_AUDIT_LIMIT: i64 = 50;
+
+#[derive(Clone)]
 pub struct AdminSvc {
     db: DbHandle,
     /// hex-encoded sha256 of the embedded CA's root certificate DER —
@@ -180,16 +196,274 @@ impl Admin for AdminSvc {
         Ok(Response::new(MintTokenResponse { token }))
     }
 
+    /// (Task 13) Every `gateway` row (any status), with the segment name it
+    /// belongs to and its last-`Sync.Report`-acked `applied_version` —
+    /// [`crate::db::Db::list_gateways`] does the actual query. This is what
+    /// makes T8's applied-version bookkeeping observable from the Admin
+    /// surface for the first time.
     async fn list_gateways(
         &self,
         _request: Request<ListGatewaysRequest>,
     ) -> Result<Response<ListGatewaysResponse>, Status> {
-        // Out of Task 4's scope (Task 13 grows Admin CRUD). Explicit
-        // Unimplemented rather than a silently-empty list, so a caller can't
-        // mistake "not built yet" for "no gateways registered".
-        Err(Status::unimplemented(
-            "ListGateways is not implemented yet",
-        ))
+        let rows = self
+            .db
+            .list_gateways()
+            .await
+            .map_err(|e| Status::internal(format!("listing gateways: {e}")))?;
+        Ok(Response::new(ListGatewaysResponse {
+            gateways: rows
+                .into_iter()
+                .map(|(id, name, segment, status, applied_version)| GatewayInfo {
+                    id: id as u64,
+                    name,
+                    segment,
+                    status,
+                    applied_version: applied_version.unwrap_or(0) as u64,
+                })
+                .collect(),
+        }))
+    }
+
+    /// (Task 13) Every registered segment with its CIDRs — backs
+    /// `fabricctl segment list`.
+    async fn list_segments(
+        &self,
+        _request: Request<ListSegmentsRequest>,
+    ) -> Result<Response<ListSegmentsResponse>, Status> {
+        let rows = self
+            .db
+            .list_segments()
+            .await
+            .map_err(|e| Status::internal(format!("listing segments: {e}")))?;
+        Ok(Response::new(ListSegmentsResponse {
+            segments: rows
+                .into_iter()
+                .map(|(id, name, cidrs)| Segment {
+                    id: id as u64,
+                    name,
+                    cidrs,
+                })
+                .collect(),
+        }))
+    }
+
+    /// (Task 13) Deletes a segment — see [`crate::db::Db::delete_segment`]
+    /// for the "no associated gateways" precondition this maps to
+    /// `FailedPrecondition`.
+    async fn delete_segment(
+        &self,
+        request: Request<DeleteSegmentRequest>,
+    ) -> Result<Response<DeleteSegmentResponse>, Status> {
+        let req = request.into_inner();
+        let segment_id = req.segment_id as i64;
+
+        self.db.delete_segment(segment_id).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("no segment row") {
+                Status::not_found(msg)
+            } else if msg.contains("has associated gateway") {
+                Status::failed_precondition(msg)
+            } else {
+                Status::internal(format!("deleting segment: {e}"))
+            }
+        })?;
+
+        self.db
+            .audit(
+                "unix-socket".into(),
+                "delete".into(),
+                format!("segment/{segment_id}"),
+                "{}".into(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
+
+        Ok(Response::new(DeleteSegmentResponse {}))
+    }
+
+    /// (Task 13) Registers a relay — cycle-2 bookkeeping only (no real relay
+    /// data-plane wiring yet, mirroring `RotateKey`'s placeholder-pubkey
+    /// posture).
+    async fn register_relay(
+        &self,
+        request: Request<RegisterRelayRequest>,
+    ) -> Result<Response<Relay>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("relay name must not be empty"));
+        }
+        if req.endpoint.is_empty() {
+            return Err(Status::invalid_argument("relay endpoint must not be empty"));
+        }
+
+        let relay_id = self
+            .db
+            .insert_relay(req.name.clone(), req.endpoint.clone())
+            .await
+            .map_err(|e| Status::already_exists(e.to_string()))?;
+
+        self.db
+            .audit(
+                "unix-socket".into(),
+                "create".into(),
+                format!("relay/{}", req.name),
+                format!(r#"{{"name":"{}","endpoint":"{}"}}"#, req.name, req.endpoint),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
+
+        Ok(Response::new(Relay {
+            id: relay_id as u64,
+            name: req.name,
+            endpoint: req.endpoint,
+            status: "active".to_string(),
+        }))
+    }
+
+    /// (Task 13) Every registered relay — backs `fabricctl relay list`.
+    async fn list_relays(
+        &self,
+        _request: Request<ListRelaysRequest>,
+    ) -> Result<Response<ListRelaysResponse>, Status> {
+        let rows = self
+            .db
+            .list_relays()
+            .await
+            .map_err(|e| Status::internal(format!("listing relays: {e}")))?;
+        Ok(Response::new(ListRelaysResponse {
+            relays: rows
+                .into_iter()
+                .map(|(id, name, endpoint, status)| Relay {
+                    id: id as u64,
+                    name,
+                    endpoint,
+                    status,
+                })
+                .collect(),
+        }))
+    }
+
+    /// (Task 13) Mints a bearer API token: an `admin` or `read-only` role
+    /// credential for the Admin TCP listener's bearer-auth middleware
+    /// (`crate::auth`) — distinct from [`Self::mint_token`]'s enrollment
+    /// tokens, which authorize a GATEWAY/RELAY to enroll, not an
+    /// operator/CLI to call Admin. Only the sha256 of the random secret is
+    /// ever persisted (same discipline as enrollment tokens) — the plaintext
+    /// bearer string returned here is the only time the raw secret exists
+    /// outside the caller's own hands.
+    async fn mint_api_token(
+        &self,
+        request: Request<MintApiTokenRequest>,
+    ) -> Result<Response<MintApiTokenResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("token name must not be empty"));
+        }
+        if !VALID_API_TOKEN_ROLES.contains(&req.role.as_str()) {
+            return Err(Status::invalid_argument(format!(
+                "role must be one of {VALID_API_TOKEN_ROLES:?}, got {:?}",
+                req.role
+            )));
+        }
+
+        let mut secret = [0u8; SECRET_LEN];
+        rand::thread_rng().fill_bytes(&mut secret);
+        let secret_hex = hex_encode(&secret);
+        let secret_hash_hex = hex_encode(&Sha256::digest(secret));
+
+        let mut id_bytes = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut id_bytes);
+        let token_id = hex_encode(&id_bytes);
+
+        self.db
+            .insert_api_token(token_id, req.name.clone(), req.role.clone(), secret_hash_hex, None)
+            .await
+            .map_err(|e| Status::already_exists(e.to_string()))?;
+
+        self.db
+            .audit(
+                "unix-socket".into(),
+                "mint".into(),
+                format!("api_token/{}", req.name),
+                format!(r#"{{"role":"{}"}}"#, req.role),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
+
+        Ok(Response::new(MintApiTokenResponse { token: secret_hex }))
+    }
+
+    /// (Task 13) Revokes an API token by name — after this, `crate::auth`'s
+    /// lookup no longer finds it (its `secret_hash` still matches a row, but
+    /// `revoked_at` is now set), so any bearer credential built from it is
+    /// rejected `Unauthenticated` on its very next TCP Admin call.
+    async fn revoke_api_token(
+        &self,
+        request: Request<RevokeApiTokenRequest>,
+    ) -> Result<Response<RevokeApiTokenResponse>, Status> {
+        let req = request.into_inner();
+
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        let found = self
+            .db
+            .revoke_api_token(req.name.clone(), now)
+            .await
+            .map_err(|e| Status::internal(format!("revoking API token: {e}")))?;
+        if !found {
+            return Err(Status::not_found(format!(
+                "no api_token row named {:?}",
+                req.name
+            )));
+        }
+
+        self.db
+            .audit(
+                "unix-socket".into(),
+                "revoke".into(),
+                format!("api_token/{}", req.name),
+                "{}".into(),
+            )
+            .await
+            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
+
+        Ok(Response::new(RevokeApiTokenResponse {}))
+    }
+
+    /// (Task 13) Most-recent-first audit log entries — backs
+    /// `fabricctl audit query`.
+    async fn audit_query(
+        &self,
+        request: Request<AuditQueryRequest>,
+    ) -> Result<Response<AuditQueryResponse>, Status> {
+        let req = request.into_inner();
+        let limit = if req.limit > 0 {
+            req.limit as i64
+        } else {
+            DEFAULT_AUDIT_LIMIT
+        };
+
+        let rows = self
+            .db
+            .audit_query(limit)
+            .await
+            .map_err(|e| Status::internal(format!("querying audit log: {e}")))?;
+
+        Ok(Response::new(AuditQueryResponse {
+            entries: rows
+                .into_iter()
+                .map(|(id, ts, actor, action, entity, diff_json)| AuditEntry {
+                    id: id as u64,
+                    ts,
+                    actor,
+                    action,
+                    entity,
+                    diff_json,
+                })
+                .collect(),
+        }))
     }
 
     /// (Task 11) Starts a make-before-break key-epoch rotation: see

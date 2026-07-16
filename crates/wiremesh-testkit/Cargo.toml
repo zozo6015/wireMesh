@@ -10,6 +10,10 @@ tonic = { workspace = true }
 wiremesh-proto = { path = "../wiremesh-proto" }
 wiremesh-controller = { path = "../wiremesh-controller" }
 tempfile = "3"
+# (Task 13) `mint_api_token`'s random name suffix (so repeated calls in one
+# test never collide on `api_token.name`'s UNIQUE constraint) — same crate
+# version `wiremesh-controller` already uses for the analogous job.
+rand = "0.8"
 # Connect a tonic `Channel` to the controller's Unix socket: `tower::service_fn`
 # supplies the custom connector, `hyper-util`'s `TokioIo` adapts a
 # `tokio::net::UnixStream` to the `hyper::rt::{Read,Write}` traits tonic's

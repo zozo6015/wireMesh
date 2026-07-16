@@ -8,6 +8,7 @@
 //! `wiremesh-testkit::TestController` boots it in-process for integration
 //! tests.
 
+pub mod auth;
 pub mod db;
 pub mod db_async;
 pub mod projection;
@@ -25,6 +26,7 @@ use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
+use auth::BearerAuthLayer;
 use db::Db;
 use db_async::DbHandle;
 use services::admin::AdminSvc;
@@ -82,6 +84,15 @@ pub struct Config {
     /// Unix-domain-socket path the Admin service is served on. Its parent
     /// directory is created (if absent) and forced to mode `0700`.
     pub socket_path: PathBuf,
+    /// (Task 13) TCP port for a SECOND Admin listener, behind
+    /// [`auth::BearerAuthLayer`] — plaintext gRPC (no TLS; the bearer token
+    /// is this listener's security boundary, matching cycle-2 scope: a real
+    /// deployment would put this behind a TLS-terminating reverse proxy or
+    /// grow its own `ServerTlsConfig` later). The UDS listener above stays
+    /// implicit-admin and unauthenticated-by-token; this is what
+    /// `fabricctl --token`/`TestController::admin_client_with_bearer` dial.
+    /// `0` = OS-assigned.
+    pub admin_tcp_port: u16,
 }
 
 /// A live, in-process controller instance. Dropping it stops both servers
@@ -90,6 +101,7 @@ pub struct Config {
 pub struct RunningController {
     tcp_addr: std::net::SocketAddr,
     sync_tcp_addr: std::net::SocketAddr,
+    admin_tcp_addr: std::net::SocketAddr,
     socket_path: PathBuf,
     data_dir: PathBuf,
     /// PEM trust bundle of the embedded CA — exposed so a TLS client (e.g.
@@ -100,6 +112,8 @@ pub struct RunningController {
     ca_bundle_pem: String,
     admin_shutdown_tx: Option<oneshot::Sender<()>>,
     admin_join: Option<JoinHandle<()>>,
+    admin_tcp_shutdown_tx: Option<oneshot::Sender<()>>,
+    admin_tcp_join: Option<JoinHandle<()>>,
     enroll_shutdown_tx: Option<oneshot::Sender<()>>,
     enroll_join: Option<JoinHandle<()>>,
     sync_shutdown_tx: Option<oneshot::Sender<()>>,
@@ -123,6 +137,14 @@ impl RunningController {
     /// The Unix-domain-socket path the Admin service listens on.
     pub fn socket_path(&self) -> &Path {
         &self.socket_path
+    }
+
+    /// (Task 13) The bound TCP address the Admin service's SECOND,
+    /// bearer-auth-gated listener listens on — see [`Config::admin_tcp_port`]
+    /// and `crate::auth`. A distinct address from `tcp_addr()`/
+    /// `sync_tcp_addr()` (Enrollment/Sync's listeners).
+    pub fn admin_tcp_addr(&self) -> std::net::SocketAddr {
+        self.admin_tcp_addr
     }
 
     /// The data directory this instance was opened against (DB + CA +
@@ -163,6 +185,9 @@ impl RunningController {
         if let Some(tx) = self.admin_shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(tx) = self.admin_tcp_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
         if let Some(tx) = self.enroll_shutdown_tx.take() {
             let _ = tx.send(());
         }
@@ -170,6 +195,7 @@ impl RunningController {
             let _ = tx.send(());
         }
         join_bounded(self.admin_join.take()).await;
+        join_bounded(self.admin_tcp_join.take()).await;
         join_bounded(self.enroll_join.take()).await;
         join_bounded(self.sync_join.take()).await;
     }
@@ -203,6 +229,9 @@ impl Drop for RunningController {
         // we don't try — they're spawned tokio tasks and quit promptly once
         // their shutdown signal fires.
         if let Some(tx) = self.admin_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = self.admin_tcp_shutdown_tx.take() {
             let _ = tx.send(());
         }
         if let Some(tx) = self.enroll_shutdown_tx.take() {
@@ -307,7 +336,7 @@ pub async fn serve(config: Config) -> Result<RunningController> {
 
     let (admin_shutdown_tx, admin_shutdown_rx) = oneshot::channel::<()>();
     let admin_server = Server::builder()
-        .add_service(AdminServer::new(admin_svc))
+        .add_service(AdminServer::new(admin_svc.clone()))
         .serve_with_incoming_shutdown(uds_stream, async {
             let _ = admin_shutdown_rx.await;
         });
@@ -315,6 +344,35 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     let admin_join = tokio::spawn(async move {
         if let Err(e) = admin_server.await {
             eprintln!("wiremesh-controller: admin server error: {e}");
+        }
+    });
+
+    // (Task 13) A SECOND Admin listener, on TCP, behind `BearerAuthLayer` —
+    // see `Config::admin_tcp_port`'s doc comment for the UDS-vs-TCP auth
+    // posture split. `.layer(..)` (applied before `.add_service(..)`) wraps
+    // the WHOLE `Routes` service the auth module's doc comment explains is
+    // necessary for method-path-based classification. Plaintext gRPC (no
+    // TLS) — the bearer token is this listener's security boundary in
+    // cycle-2.
+    let admin_tcp_listener = TcpListener::bind(("127.0.0.1", config.admin_tcp_port))
+        .await
+        .context("binding Admin TCP listener")?;
+    let admin_tcp_addr = admin_tcp_listener
+        .local_addr()
+        .context("reading bound Admin TCP addr")?;
+    let admin_tcp_stream = TcpListenerStream::new(admin_tcp_listener);
+
+    let (admin_tcp_shutdown_tx, admin_tcp_shutdown_rx) = oneshot::channel::<()>();
+    let admin_tcp_server = Server::builder()
+        .layer(BearerAuthLayer::new(db_handle.clone()))
+        .add_service(AdminServer::new(admin_svc.clone()))
+        .serve_with_incoming_shutdown(admin_tcp_stream, async {
+            let _ = admin_tcp_shutdown_rx.await;
+        });
+
+    let admin_tcp_join = tokio::spawn(async move {
+        if let Err(e) = admin_tcp_server.await {
+            eprintln!("wiremesh-controller: admin TCP server error: {e}");
         }
     });
 
@@ -364,11 +422,14 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     Ok(RunningController {
         tcp_addr,
         sync_tcp_addr,
+        admin_tcp_addr,
         socket_path: config.socket_path,
         data_dir: config.data_dir,
         ca_bundle_pem,
         admin_shutdown_tx: Some(admin_shutdown_tx),
         admin_join: Some(admin_join),
+        admin_tcp_shutdown_tx: Some(admin_tcp_shutdown_tx),
+        admin_tcp_join: Some(admin_tcp_join),
         enroll_shutdown_tx: Some(enroll_shutdown_tx),
         enroll_join: Some(enroll_join),
         sync_shutdown_tx: Some(sync_shutdown_tx),

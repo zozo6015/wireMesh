@@ -2,8 +2,28 @@ syntax = "proto3";
 package wiremesh.v1;
 service Admin {
   rpc CreateSegment(CreateSegmentRequest) returns (Segment);
+  // (Task 13) Every registered segment, its id, name, and CIDRs.
+  rpc ListSegments(ListSegmentsRequest) returns (ListSegmentsResponse);
+  // (Task 13) Deletes a segment. Fails (FailedPrecondition) if any gateway
+  // row (any status) still references it — drain/replace those first.
+  rpc DeleteSegment(DeleteSegmentRequest) returns (DeleteSegmentResponse);
   rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
   rpc ListGateways(ListGatewaysRequest) returns (ListGatewaysResponse);
+  // (Task 13) Registers a relay (name + reachable endpoint).
+  rpc RegisterRelay(RegisterRelayRequest) returns (Relay);
+  // (Task 13) Every registered relay.
+  rpc ListRelays(ListRelaysRequest) returns (ListRelaysResponse);
+  // (Task 13) Mints a bearer API token (distinct from an enrollment
+  // token: this authenticates an admin/operator caller of the Admin
+  // service over its TCP listener, not a gateway/relay enrolling).
+  // `role` must be "admin" or "read-only" — see admin_auth.rs.
+  rpc MintApiToken(MintApiTokenRequest) returns (MintApiTokenResponse);
+  // (Task 13) Revokes a previously minted API token by name.
+  rpc RevokeApiToken(RevokeApiTokenRequest) returns (RevokeApiTokenResponse);
+  // (Task 13) Most-recent-first audit log entries, up to `limit` (a
+  // non-positive/zero limit falls back to a small default — see
+  // AdminSvc::audit_query).
+  rpc AuditQuery(AuditQueryRequest) returns (AuditQueryResponse);
   // (Task 11) Starts a make-before-break key-epoch rotation for a gateway:
   // inserts a new `pending` GATEWAY_KEY(epoch = n+1) row and pushes a Delta
   // to already-connected peers carrying it.
@@ -31,3 +51,33 @@ message GatewayKeyState { uint32 epoch = 1; string state = 2; } // pending|activ
 message DebugKeyStatesResponse { repeated GatewayKeyState keys = 1; }
 message DrainRequest { uint64 gateway_id = 1; }
 message DrainResponse {}
+
+message ListSegmentsRequest {}
+message ListSegmentsResponse { repeated Segment segments = 1; }
+message DeleteSegmentRequest { uint64 segment_id = 1; }
+message DeleteSegmentResponse {}
+
+message RegisterRelayRequest { string name = 1; string endpoint = 2; }
+message Relay { uint64 id = 1; string name = 2; string endpoint = 3; string status = 4; }
+message ListRelaysRequest {}
+message ListRelaysResponse { repeated Relay relays = 1; }
+
+// role: "admin" (full access) or "read-only" (non-mutating RPCs only) — see
+// the bearer-auth interceptor on the Admin TCP listener in
+// wiremesh_controller::auth.
+message MintApiTokenRequest { string name = 1; string role = 2; }
+message MintApiTokenResponse { string token = 1; }
+message RevokeApiTokenRequest { string name = 1; }
+message RevokeApiTokenResponse {}
+
+// limit <= 0 falls back to a small server-side default.
+message AuditQueryRequest { int32 limit = 1; }
+message AuditEntry {
+  uint64 id = 1;
+  string ts = 2;
+  string actor = 3;
+  string action = 4;
+  string entity = 5;
+  string diff_json = 6;
+}
+message AuditQueryResponse { repeated AuditEntry entries = 1; }

@@ -13,8 +13,11 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use hyper_util::rt::TokioIo;
+use rand::RngCore;
 use tempfile::TempDir;
 use tokio::net::UnixStream;
+use tonic::service::interceptor::InterceptedService;
+use tonic::service::Interceptor;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::service_fn;
 
@@ -22,18 +25,38 @@ use wiremesh_controller::{serve, Config, RunningController};
 use wiremesh_proto::v1::admin_client::AdminClient;
 use wiremesh_proto::v1::enrollment_client::EnrollmentClient;
 use wiremesh_proto::v1::sync_client::SyncClient;
-use wiremesh_proto::v1::{CreateSegmentRequest, MintTokenRequest, SyncMessage, WatchRequest};
+use wiremesh_proto::v1::{
+    CreateSegmentRequest, MintApiTokenRequest, MintTokenRequest, SyncMessage, WatchRequest,
+};
+
+/// (Task 13) Client-side counterpart to `crate::auth`'s bearer-auth
+/// middleware: attaches `authorization: Bearer <token>` metadata to every
+/// outgoing request on a `tonic::service::Interceptor`-wrapped channel — see
+/// [`TestController::admin_client_with_bearer`].
+#[derive(Clone)]
+pub struct BearerCredential(String);
+
+impl Interceptor for BearerCredential {
+    fn call(
+        &mut self,
+        mut request: tonic::Request<()>,
+    ) -> Result<tonic::Request<()>, tonic::Status> {
+        let value = format!("Bearer {}", self.0)
+            .parse()
+            .map_err(|_| tonic::Status::internal("bearer token is not a valid header value"))?;
+        request.metadata_mut().insert("authorization", value);
+        Ok(request)
+    }
+}
 
 /// A real controller, booted in-process against a temporary data directory,
 /// for integration tests to drive.
 pub struct TestController {
-    // FIELD ORDER IS LOad-BEARING. Rust drops struct fields in declaration
-    // order, so `running` MUST be declared before `_data_dir`: dropping
-    // `running` first fires `RunningController`'s shutdown signal, and only
-    // then does `_data_dir`'s Drop remove the DB/CA/secrets and unlink the
-    // socket. The reverse order would delete the on-disk state (and the UDS)
-    // out from under a still-running server task — which later streaming
-    // tasks (5/7/8) build on this harness and would stress.
+    // FIELD ORDER matters, but as of Task 13 the ordering between `running`
+    // and `_data_dir` is enforced EXPLICITLY in `impl Drop` below (not just
+    // by declaration order — see that impl's comment for why a plain
+    // `#[derive]`-style reliance on drop order stopped being enough once
+    // `server_runtime` entered the picture).
     //
     // `Option` (rather than a bare `RunningController`) so `restart()` can
     // `.take()` the old instance out, `.await` its `shutdown()` (releasing
@@ -43,6 +66,26 @@ pub struct TestController {
     // down first. It's `None` only for the brief instant inside `restart()`;
     // every accessor treats a `None` here as a bug (`running()` panics).
     running: Option<RunningController>,
+    // (Task 13) The dedicated background Tokio runtime `start()`/`restart()`
+    // actually run the controller's `serve()` (and everything it internally
+    // `tokio::spawn`s) on — see `start()`'s doc comment for why this exists:
+    // `fabricctl`'s CLI test (`crates/fabricctl/tests/cli.rs`) drives the
+    // BUILT binary via a genuinely blocking `std::process::Command::output()`
+    // call from inside a plain (current-thread-flavored) `#[tokio::test]`.
+    // That call fully monopolizes the test's one worker thread until the
+    // child process exits — if the controller's own accept-loop tasks
+    // shared that SAME thread (as they would if `serve()` were simply
+    // `.await`ed on the test's own ambient runtime, the way every
+    // pre-Task-13 test does), the child could never get a response: a real
+    // deadlock (the test thread blocked on the child; the child blocked on
+    // a server only that SAME blocked thread could service). A dedicated
+    // multi-thread `Runtime` has its own OS worker threads that keep
+    // polling regardless of what the CALLING test's thread is doing.
+    // `Option` so `impl Drop` can `.take()` it and call
+    // `shutdown_background()` (the non-blocking teardown — see that impl's
+    // comment for why the plain, blocking `Runtime::drop` would itself
+    // panic here).
+    server_runtime: Option<tokio::runtime::Runtime>,
     socket_path: PathBuf,
     // Held only so the directory (and everything the controller wrote under
     // it — DB, CA, secrets, the socket) is cleaned up on drop; never read
@@ -50,11 +93,45 @@ pub struct TestController {
     _data_dir: TempDir,
 }
 
+impl Drop for TestController {
+    /// Explicit teardown order (Task 13): `running` MUST be dropped (firing
+    /// `RunningController`'s best-effort shutdown-signal Drop impl) WHILE
+    /// `server_runtime`'s worker threads are still alive to receive it —
+    /// hence `.take()`ing and dropping `running` FIRST, in this body, rather
+    /// than trusting field-declaration order (which only governs drop order
+    /// for fields this impl does NOT already handle, like `_data_dir`).
+    ///
+    /// `server_runtime.shutdown_background()` (NOT plain `drop(server_runtime)`,
+    /// which reduces to the same thing once this impl ends anyway) is used
+    /// because `Runtime`'s ordinary `Drop` blocks the CURRENT thread joining
+    /// every worker thread — and Tokio explicitly PANICS if that runs from
+    /// within any async context on this thread (which this always is: a
+    /// `TestController` local variable going out of scope at the end of an
+    /// `async fn` test IS such a context). `shutdown_background()` is the
+    /// Tokio-documented non-blocking alternative for exactly this situation:
+    /// it signals shutdown and returns immediately, letting the worker
+    /// threads wind down in the background.
+    fn drop(&mut self) {
+        self.running.take();
+        if let Some(rt) = self.server_runtime.take() {
+            rt.shutdown_background();
+        }
+    }
+}
+
 impl TestController {
     /// Boots a controller against a fresh temp data-dir: a Unix socket
     /// (`<data-dir>/controller.sock`) and a TCP listener on an OS-assigned
     /// port (unused by any service yet — reserved for Enrollment/Sync in
     /// later tasks).
+    ///
+    /// (Task 13) `serve()` itself is not `.await`ed directly on whichever
+    /// runtime calls `start()` — it's handed to a fresh, dedicated
+    /// multi-thread [`tokio::runtime::Runtime`] via [`tokio::runtime::Runtime::spawn`]
+    /// (which works from ANY calling context, per its own docs) and only
+    /// the resulting `JoinHandle` is awaited here. See the `server_runtime`
+    /// field's doc comment for why this decoupling is load-bearing, not
+    /// cosmetic.
     pub async fn start() -> TestController {
         let data_dir = tempfile::tempdir().expect("creating temp data dir for TestController");
         let socket_path = data_dir.path().join("controller.sock");
@@ -64,16 +141,26 @@ impl TestController {
             tcp_port: 0,
             sync_tcp_port: 0,
             socket_path: socket_path.clone(),
+            admin_tcp_port: 0,
         };
 
-        let running = serve(config)
+        let server_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("building TestController's background server runtime");
+
+        let running = server_runtime
+            .spawn(serve(config))
             .await
+            .expect("TestController's background serve() task panicked")
             .expect("controller failed to start in TestController::start");
 
         TestController {
             _data_dir: data_dir,
             socket_path,
             running: Some(running),
+            server_runtime: Some(server_runtime),
         }
     }
 
@@ -111,10 +198,21 @@ impl TestController {
             tcp_port: 0,
             sync_tcp_port: 0,
             socket_path: self.socket_path.clone(),
+            admin_tcp_port: 0,
         };
 
-        let running = serve(config)
+        // (Task 13) Reuse the SAME `server_runtime` across a restart (rather
+        // than building a fresh one) — see `start()`/the `server_runtime`
+        // field's doc comments for why `serve()` must run via
+        // `Runtime::spawn` rather than a direct `.await` here at all.
+        let server_runtime = self
+            .server_runtime
+            .as_ref()
+            .expect("TestController::restart called with no background server runtime installed");
+        let running = server_runtime
+            .spawn(serve(config))
             .await
+            .expect("TestController's background serve() task panicked on restart")
             .expect("controller failed to restart in TestController::restart");
         self.running = Some(running);
     }
@@ -147,6 +245,15 @@ impl TestController {
         self.running().sync_tcp_addr()
     }
 
+    /// (Task 13) The controller's bound TCP address the Admin service's
+    /// SECOND, bearer-auth-gated listener listens on — see
+    /// `wiremesh_controller::Config::admin_tcp_port` and `crate::auth`
+    /// (controller-side) for the UDS-vs-TCP auth posture split this
+    /// exercises for the first time.
+    pub fn admin_tcp_addr(&self) -> SocketAddr {
+        self.running().admin_tcp_addr()
+    }
+
     /// The temp directory backing this instance's DB/CA/secrets.
     pub fn data_dir(&self) -> &Path {
         self.running().data_dir()
@@ -173,6 +280,52 @@ impl TestController {
             .await
             .expect("connecting AdminClient over the controller's unix socket");
         AdminClient::new(channel)
+    }
+
+    /// (Task 13) Mints a fresh bearer API token with the given `role`
+    /// (`"admin"` or `"read-only"`) via the implicit-admin UDS Admin
+    /// client — the SAME trust boundary `admin_client()` already uses, so
+    /// minting the credential doesn't itself require one. Returns the raw
+    /// bearer secret (`Admin.MintApiToken`'s response), the same string a
+    /// caller would hand to [`Self::admin_client_with_bearer`] or
+    /// `fabricctl --token`. Each call mints a token under a fresh random
+    /// name so a test can call this more than once without an
+    /// already-exists collision.
+    pub async fn mint_api_token(&self, role: &str) -> String {
+        let mut id_bytes = [0u8; 8];
+        rand::thread_rng().fill_bytes(&mut id_bytes);
+        let suffix: String = id_bytes.iter().map(|b| format!("{b:02x}")).collect();
+
+        self.admin_client()
+            .await
+            .mint_api_token(MintApiTokenRequest {
+                name: format!("test-{role}-{suffix}"),
+                role: role.to_string(),
+            })
+            .await
+            .expect("Admin.MintApiToken")
+            .into_inner()
+            .token
+    }
+
+    /// (Task 13) Connects an `AdminClient` to the controller's SECOND,
+    /// bearer-auth-gated TCP Admin listener (`admin_tcp_addr()`), attaching
+    /// `token` as an `authorization: Bearer <token>` header via
+    /// [`BearerCredential`] on every outgoing call — the client-side
+    /// counterpart to `wiremesh_controller::auth`'s server-side middleware.
+    /// Plaintext gRPC (no TLS), matching that listener's cycle-2 posture
+    /// (see `wiremesh_controller::Config::admin_tcp_port`'s doc comment).
+    pub async fn admin_client_with_bearer(
+        &self,
+        token: &str,
+    ) -> AdminClient<InterceptedService<Channel, BearerCredential>> {
+        let uri = format!("http://{}", self.admin_tcp_addr());
+        let channel = Channel::from_shared(uri)
+            .expect("controller Admin TCP addr must form a valid URI")
+            .connect()
+            .await
+            .expect("connecting AdminClient over the controller's Admin TCP port");
+        AdminClient::with_interceptor(channel, BearerCredential(token.to_string()))
     }
 
     /// (Task 11) Debug/test accessor: every `GATEWAY_KEY` row (any state —

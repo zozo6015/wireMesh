@@ -184,4 +184,76 @@ impl DbHandle {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.gateway_is_active(gateway_id)).await?
     }
+
+    /// See [`Db::list_segments`].
+    pub async fn list_segments(&self) -> Result<Vec<(i64, String, Vec<String>)>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.list_segments()).await?
+    }
+
+    /// See [`Db::delete_segment`].
+    pub async fn delete_segment(&self, segment_id: i64) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.delete_segment(segment_id)).await?
+    }
+
+    /// See [`Db::insert_relay`].
+    pub async fn insert_relay(&self, name: String, endpoint: String) -> Result<i64> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.insert_relay(&name, &endpoint)).await?
+    }
+
+    /// See [`Db::list_relays`].
+    pub async fn list_relays(&self) -> Result<Vec<(i64, String, String, String)>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.list_relays()).await?
+    }
+
+    /// See [`Db::insert_api_token`].
+    pub async fn insert_api_token(
+        &self,
+        id: String,
+        name: String,
+        role: String,
+        secret_hash: String,
+        expires_at: Option<String>,
+    ) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            db.insert_api_token(&id, &name, &role, &secret_hash, expires_at.as_deref())
+        })
+        .await?
+    }
+
+    /// See [`Db::revoke_api_token`].
+    pub async fn revoke_api_token(&self, name: String, now: String) -> Result<bool> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.revoke_api_token(&name, &now)).await?
+    }
+
+    /// See [`Db::find_active_api_token_role`]. Used by
+    /// [`crate::auth`]'s bearer-auth middleware on every TCP Admin request.
+    pub async fn find_active_api_token_role(
+        &self,
+        secret_hash: String,
+        now: String,
+    ) -> Result<Option<String>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.find_active_api_token_role(&secret_hash, &now)).await?
+    }
+
+    /// See [`Db::audit_query`].
+    pub async fn audit_query(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<(i64, String, String, String, String, String)>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.audit_query(limit)).await?
+    }
+
+    /// See [`Db::list_gateways`].
+    pub async fn list_gateways(&self) -> Result<Vec<(i64, String, String, String, Option<i64>)>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.list_gateways()).await?
+    }
 }

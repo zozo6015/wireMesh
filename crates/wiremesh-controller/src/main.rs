@@ -27,20 +27,26 @@ async fn main() -> Result<()> {
     let socket_path = std::env::var("WIREMESH_SOCKET_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/run/wiremesh/controller.sock"));
+    let admin_tcp_port: u16 = std::env::var("WIREMESH_ADMIN_TCP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let config = Config {
         data_dir,
         tcp_port,
         sync_tcp_port,
         socket_path,
+        admin_tcp_port,
     };
 
     let running = serve(config).await?;
     eprintln!(
-        "wiremesh-controller listening: tcp={} sync_tcp={} uds={}",
+        "wiremesh-controller listening: tcp={} sync_tcp={} uds={} admin_tcp={}",
         running.tcp_addr(),
         running.sync_tcp_addr(),
-        running.socket_path().display()
+        running.socket_path().display(),
+        running.admin_tcp_addr()
     );
 
     tokio::signal::ctrl_c().await?;
