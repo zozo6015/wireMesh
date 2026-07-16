@@ -34,8 +34,18 @@
 //! — `<package>.<Service>/<Method>`), so `req.uri().path().rsplit('/').next()`
 //! reliably recovers the exact RPC name Rust-server-side dispatch itself
 //! uses to route the call, with no risk of drifting from what the client
-//! actually invoked. [`MUTATING_METHODS`] is the single table this
-//! classification reads.
+//! actually invoked. [`READONLY_METHODS`] is the single table this
+//! classification reads, and it is an ALLOWLIST that fails CLOSED: a request
+//! is treated as requiring `admin` (i.e. denied for a `read-only` token)
+//! UNLESS its method name is explicitly listed as read-only. Any method NOT
+//! in the list — including a future Admin RPC whose author forgets to
+//! classify it — defaults to mutating and is denied for `read-only` tokens.
+//! This is deliberately the security-safe default for an auth boundary: a
+//! misclassification can only ever be too RESTRICTIVE (a genuinely
+//! read-only RPC that was forgotten gets rejected, a loud, obvious bug),
+//! never too permissive (silently granting a `read-only` token write
+//! access). The inverse — a mutating allowlist — would fail OPEN, silently
+//! exposing any forgotten-to-be-listed mutation to `read-only` tokens.
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -51,21 +61,20 @@ use tower::{Layer, Service};
 use crate::db_async::DbHandle;
 
 /// RPC method names (the segment after the last `/` in
-/// `/wiremesh.v1.Admin/<Method>`) that mutate controller state. Every other
-/// Admin RPC — `List*`, `AuditQuery`, `DebugKeyStates` — is read-only and
-/// allowed for both `admin` and `read-only` tokens. Kept as one explicit
-/// allowlist (rather than trying to infer "mutating" from the method name)
-/// so this file, not a naming convention, is the single source of truth a
-/// future Admin RPC's author must update.
-const MUTATING_METHODS: &[&str] = &[
-    "CreateSegment",
-    "DeleteSegment",
-    "RegisterRelay",
-    "MintApiToken",
-    "RevokeApiToken",
-    "MintToken",
-    "RotateKey",
-    "Drain",
+/// `/wiremesh.v1.Admin/<Method>`) that are READ-ONLY — the ONLY Admin RPCs a
+/// `read-only`-role token may call. This is the single source of truth for
+/// classification and it fails CLOSED: any method NOT listed here is treated
+/// as requiring `admin` (denied for `read-only` tokens) — see the module doc
+/// comment for why deny-unknown is the security-safe default. A future Admin
+/// RPC's author must ADD it here only if it is genuinely non-mutating;
+/// forgetting to do so denies `read-only` access (a safe, loud failure),
+/// never silently grants it.
+const READONLY_METHODS: &[&str] = &[
+    "ListSegments",
+    "ListGateways",
+    "ListRelays",
+    "AuditQuery",
+    "DebugKeyStates",
 ];
 
 /// A `tower::Layer` that wraps the Admin `Routes` service with bearer-token
@@ -162,9 +171,14 @@ async fn authorize(db: &DbHandle, headers: &HeaderMap, method: &str) -> Result<(
         .map_err(|e| Status::internal(format!("looking up API token: {e}")))?
         .ok_or_else(|| Status::unauthenticated("invalid, expired, or revoked API token"))?;
 
-    if MUTATING_METHODS.contains(&method) && role != "admin" {
+    // Fail closed: an `admin` token may call anything; a `read-only` token
+    // may call ONLY methods explicitly listed as read-only. Any method not
+    // in the allowlist (including a future, unclassified RPC) is treated as
+    // requiring `admin` — see [`READONLY_METHODS`] and the module doc
+    // comment.
+    if role != "admin" && !READONLY_METHODS.contains(&method) {
         return Err(Status::permission_denied(
-            "a read-only API token cannot call a mutating Admin RPC",
+            "a read-only API token cannot call this Admin RPC",
         ));
     }
     Ok(())

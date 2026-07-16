@@ -27,7 +27,7 @@
 //! the bearer-auth `tonic::service::Interceptor` on the TCP Admin listener,
 //! and the `fabricctl`-facing `Admin.MintApiToken`/role-check wiring in
 //! `src/services/admin.rs`) to turn this green.
-use wiremesh_proto::v1::CreateSegmentRequest;
+use wiremesh_proto::v1::{CreateSegmentRequest, ListSegmentsRequest};
 
 #[tokio::test]
 async fn read_only_token_cannot_mutate() {
@@ -68,4 +68,50 @@ async fn admin_token_can_mutate() {
         .into_inner();
 
     assert_eq!(seg.name, "y");
+}
+
+/// A `read-only`-role token must still be allowed to READ — the interceptor
+/// gates mutations by role, it doesn't blanket-deny read-only tokens. Proves
+/// the fail-closed classifier the implementer is adding doesn't over-block
+/// (a bug where "not admin" → deny everything would fail here even though
+/// `read_only_token_cannot_mutate` still passed).
+#[tokio::test]
+async fn read_only_token_can_list() {
+    let h = wiremesh_testkit::TestController::start().await;
+
+    let ro = h.mint_api_token("read-only").await;
+    let mut admin = h.admin_client_with_bearer(&ro).await;
+
+    // A non-mutating RPC over the same TCP+bearer path must succeed.
+    admin
+        .list_segments(ListSegmentsRequest {})
+        .await
+        .expect("a read-only-role bearer token must be allowed to ListSegments (a read)");
+}
+
+/// A caller presenting NO valid credential on the TCP Admin port must be
+/// rejected `Unauthenticated` (distinct from `PermissionDenied`, which is
+/// "valid credential, insufficient role"). The harness only exposes
+/// `admin_client_with_bearer`, so there's no token-less TCP client helper —
+/// we drive the same rejection path with an obviously-invalid bearer token,
+/// which the interceptor can't resolve to any `api_token` row and so must
+/// treat as unauthenticated, exactly as it would a missing one.
+#[tokio::test]
+async fn no_token_is_unauthenticated() {
+    let h = wiremesh_testkit::TestController::start().await;
+
+    let mut admin = h
+        .admin_client_with_bearer("this-is-not-a-real-api-token")
+        .await;
+
+    let err = admin
+        .list_segments(ListSegmentsRequest {})
+        .await
+        .expect_err("an invalid/absent bearer token must be rejected, not served");
+
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unauthenticated,
+        "expected Unauthenticated for a request with no valid bearer token, got: {err:?}"
+    );
 }
