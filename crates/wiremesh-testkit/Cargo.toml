@@ -23,3 +23,9 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 # enough — building/serializing a CSR doesn't need the `x509-parser` feature
 # (that's only for *parsing* one back, done in wiremesh-trust).
 rcgen = { workspace = true }
+# `StubGateway::cert_serial` parses the serial number back out of its issued
+# leaf cert's PEM. Already present transitively (rcgen's own `x509-parser`
+# feature, used by wiremesh-trust, pulls in this exact version per
+# Cargo.lock) — declaring it directly here just makes the dependency
+# explicit rather than relying on an incidental transitive edge.
+x509-parser = "0.16"

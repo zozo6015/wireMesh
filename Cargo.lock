@@ -1664,6 +1664,7 @@ dependencies = [
  "tower 0.4.13",
  "wiremesh-controller",
  "wiremesh-proto",
+ "x509-parser",
 ]
 
 [[package]]

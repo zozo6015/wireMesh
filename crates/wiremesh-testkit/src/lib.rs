@@ -133,6 +133,130 @@ impl TestController {
     }
 }
 
+/// A non-enforcing test counterpart to a real gateway: it runs the same
+/// bootstrap a gateway would (generate a keypair, build a CSR, redeem an
+/// enrollment token over `Enrollment.Enroll`) and then just *holds* the
+/// resulting identity — no tunnel, no eBPF, no nftables — so controller-side
+/// tests (Task 7's Sync stream, Task 9's fail-static reload) have something
+/// to drive without a real Linux data plane.
+///
+/// The identity (leaf cert, private key, CA bundle) is persisted to a
+/// per-instance temp directory (`state_dir()`) in addition to being held in
+/// memory, so a later test can simulate a gateway restart by reloading from
+/// disk instead of from this struct — that's what Task 9's fail-static test
+/// exercises. The directory (and everything under it) is removed when the
+/// `StubGateway` is dropped.
+pub struct StubGateway {
+    cert_pem: String,
+    key_pem: String,
+    ca_bundle_pem: String,
+    // Held only for its `Drop` (removes `state_dir` on disk); never read
+    // directly — mirrors `TestController::_data_dir`.
+    _state_dir: TempDir,
+    state_dir_path: PathBuf,
+}
+
+impl StubGateway {
+    /// Enrolls a fresh gateway identity against `controller`: generates a
+    /// keypair + CSR (real gateway's CN doesn't matter here — the controller
+    /// assigns the identity's real name/serial from the token, not from
+    /// whatever CN the CSR asks for), redeems `token` for it over
+    /// `Enrollment.Enroll` declaring `cidrs`, and persists the returned cert
+    /// + CA bundle alongside the private key to a fresh temp state dir.
+    pub async fn enroll(
+        controller: &TestController,
+        token: &str,
+        cidrs: &[&str],
+    ) -> anyhow::Result<StubGateway> {
+        let (csr_pem, key_pair) = gen_csr("stub-gw");
+        let key_pem = key_pair.serialize_pem();
+
+        let mut enr = controller.enrollment_client().await;
+        let resp = enr
+            .enroll(wiremesh_proto::v1::EnrollRequest {
+                token: token.to_string(),
+                csr_pem,
+                cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("Enrollment.Enroll failed: {status}"))?
+            .into_inner();
+
+        let state_dir = tempfile::tempdir()
+            .map_err(|e| anyhow::anyhow!("creating StubGateway state dir: {e}"))?;
+        let state_dir_path = state_dir.path().to_path_buf();
+
+        std::fs::write(state_dir_path.join("cert.pem"), &resp.cert_pem)
+            .map_err(|e| anyhow::anyhow!("writing cert.pem to state dir: {e}"))?;
+        std::fs::write(state_dir_path.join("ca_bundle.pem"), &resp.ca_bundle_pem)
+            .map_err(|e| anyhow::anyhow!("writing ca_bundle.pem to state dir: {e}"))?;
+
+        let key_path = state_dir_path.join("key.pem");
+        std::fs::write(&key_path, &key_pem)
+            .map_err(|e| anyhow::anyhow!("writing key.pem to state dir: {e}"))?;
+        // Private key must never be group/other-readable on disk, same
+        // posture `wiremesh-trust` holds its own CA key to.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| anyhow::anyhow!("setting key.pem permissions: {e}"))?;
+        }
+
+        Ok(StubGateway {
+            cert_pem: resp.cert_pem,
+            key_pem,
+            ca_bundle_pem: resp.ca_bundle_pem,
+            _state_dir: state_dir,
+            state_dir_path,
+        })
+    }
+
+    /// This gateway's signed leaf certificate, PEM-encoded.
+    pub fn cert_pem(&self) -> &str {
+        &self.cert_pem
+    }
+
+    /// This gateway's private key, PEM-encoded. Held only in-process and on
+    /// disk under `state_dir()` (0600) — never sent back to the controller.
+    pub fn key_pem(&self) -> &str {
+        &self.key_pem
+    }
+
+    /// The CA bundle the controller returned alongside the leaf cert —
+    /// what this gateway would pin as its trust root for verifying peers.
+    pub fn ca_bundle_pem(&self) -> &str {
+        &self.ca_bundle_pem
+    }
+
+    /// The temp directory this gateway's identity (cert/key/CA bundle) is
+    /// persisted under, as `cert.pem` / `key.pem` / `ca_bundle.pem` — a
+    /// later fail-static reload test (Task 9) reloads from here rather than
+    /// from this struct's in-memory fields, to prove the on-disk state is
+    /// what actually survives a restart.
+    pub fn state_dir(&self) -> &Path {
+        &self.state_dir_path
+    }
+
+    /// This gateway's leaf certificate's serial number, as a lowercase hex
+    /// string (e.g. `"01a2b3"`), parsed back out of `cert_pem`. Used by
+    /// later tasks to correlate "the cert this stub is holding" with "the
+    /// serial the controller's admin/audit surface reports" without
+    /// re-deriving it from raw DER offsets by hand.
+    pub fn cert_serial(&self) -> anyhow::Result<String> {
+        let (_, pem) = x509_parser::pem::parse_x509_pem(self.cert_pem.as_bytes())
+            .map_err(|e| anyhow::anyhow!("parsing cert_pem as PEM: {e}"))?;
+        let cert = pem
+            .parse_x509()
+            .map_err(|e| anyhow::anyhow!("parsing cert_pem's DER as X.509: {e}"))?;
+        Ok(cert
+            .raw_serial()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect())
+    }
+}
+
 /// Generates a fresh keypair and a PEM-encoded CSR with common name `cn` —
 /// mirrors what a real gateway does before calling `Enrollment.Enroll`
 /// (same pattern as Phase 0's `spike/relay/src/bin/mkcerts.rs` and
