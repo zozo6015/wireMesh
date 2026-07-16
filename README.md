@@ -71,7 +71,7 @@ WireMesh is built in four plan cycles. Progress is tracked in [`docs/progress.ht
 
 **Phase 0** validated the hard parts with throwaway-but-test-proven crates (`spike/`): embedded boringtun, a stateful tc-BPF ACL on a WireGuard tun device, a mutual-TLS QUIC relay carrying WireGuard end-to-end at MTU 1280, UDP-native NAT observation + brokered hole-punching, and a netns NAT-matrix harness. Verdicts and measurements are in [`docs/research/phase0-report.md`](docs/research/phase0-report.md).
 
-**Cycle 2** built the controller control plane as a 5-crate cargo workspace (`crates/`), proven end-to-end against a stub gateway: enroll → receive desired-state snapshot/deltas → ack → survive a controller restart with the same cert (fail-static). See [`docs/research/cycle2-controller-notes.md`](docs/research/cycle2-controller-notes.md).
+**Cycle 2** built the controller control plane as a 5-crate cargo workspace (`crates/`), proven end-to-end against a stub gateway: enroll → receive desired-state snapshot/deltas → ack → survive a controller restart with the same cert (fail-static). The wrap-up notes (`docs/research/cycle2-controller-notes.md`) land with the controller PR.
 
 ## Repository layout
 
