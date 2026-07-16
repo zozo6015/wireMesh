@@ -193,6 +193,29 @@ impl TestController {
         resp.keys.into_iter().map(|k| (k.epoch, k.state)).collect()
     }
 
+    /// (Task 12) `true` iff `gateway_id` is currently an existing, active
+    /// gateway — `false` once `Admin.Drain` has removed it. Queries the
+    /// controller's on-disk DB directly (`wiremesh_controller::db::Db::open`
+    /// against `<data-dir>/controller.db`, the same file `wiremesh_controller::serve`
+    /// opens) rather than adding a dedicated debug RPC: `TestController`
+    /// already depends on `wiremesh-controller` as a library, and this is
+    /// purely a test-harness accessor, not something a real deployment's
+    /// wire contract needs. `Db::open` re-enables `foreign_keys` and sets a
+    /// 5s `busy_timeout` on every open, so a read here racing the live
+    /// controller's own connection (a distinct in-process `Connection` to the
+    /// same file) retries instead of failing outright on a transient lock.
+    pub async fn gateway_exists(&self, gateway_id: u64) -> bool {
+        let db_path = self.data_dir().join("controller.db");
+        tokio::task::spawn_blocking(move || {
+            let db = wiremesh_controller::db::Db::open(&db_path)
+                .expect("opening controller DB for TestController::gateway_exists");
+            db.gateway_is_active(gateway_id as i64)
+                .expect("querying gateway_is_active in TestController::gateway_exists")
+        })
+        .await
+        .expect("gateway_exists blocking task panicked")
+    }
+
     /// Connects a tonic `EnrollmentClient` over the controller's TCP port.
     ///
     /// Enrollment is server-TLS only (the caller has no client cert yet —

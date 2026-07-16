@@ -59,6 +59,20 @@ pub enum ChangeEvent {
         keys: Vec<(i64, String, String)>,
         revision: u64,
     },
+    /// (Task 12, G-7) `Admin.Drain` removed `gateway_id` and revoked its
+    /// cert(s) — every OTHER already-connected gateway must withdraw it as a
+    /// peer (`Delta::removed_peer_ids`) and learn its revoked cert serial(s),
+    /// the same way a fresh snapshot would no longer list it as a peer and
+    /// would carry its serial(s) in `revoked_serials`.
+    GatewayDrained {
+        gateway_id: i64,
+        /// Serial(s) [`crate::db::Db::drain_gateway`] just revoked — folded
+        /// into this delta's `revoked_serials` so an already-open
+        /// `Sync.Watch` stream doesn't have to wait for a reconnect/fresh
+        /// snapshot to see them denylisted.
+        revoked_serials: Vec<String>,
+        revision: u64,
+    },
 }
 
 impl ChangeEvent {
@@ -71,6 +85,7 @@ impl ChangeEvent {
         match self {
             ChangeEvent::GatewayEnrolled { new_gateway_id, .. } => *new_gateway_id,
             ChangeEvent::KeyRotated { gateway_id, .. } => *gateway_id,
+            ChangeEvent::GatewayDrained { gateway_id, .. } => *gateway_id,
         }
     }
 }
@@ -134,6 +149,21 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
+        },
+        ChangeEvent::GatewayDrained {
+            gateway_id,
+            revoked_serials,
+            revision,
+        } => Delta {
+            revision,
+            // No peer identity is upserted — the drained gateway is being
+            // withdrawn, not updated.
+            upserted_peers: Vec::new(),
+            removed_peer_ids: vec![gateway_id as u64],
+            relays: Vec::new(),
+            policy_ir: Vec::new(),
+            policy_version: 0,
+            revoked_serials,
         },
     }
 }

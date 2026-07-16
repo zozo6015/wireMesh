@@ -11,7 +11,8 @@ use ipnet::Ipv4Net;
 
 use crate::db::Db;
 pub use crate::db::{
-    EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow, GatewayRow, RotateKeyOutcome,
+    DrainOutcome, EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow, GatewayRow,
+    RotateKeyOutcome,
 };
 
 /// Cheaply cloneable async handle to a [`Db`]. `Db` already serializes access
@@ -170,5 +171,17 @@ impl DbHandle {
     pub async fn find_gateway_by_name(&self, name: String) -> Result<Option<GatewayIdentity>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.find_gateway_by_name(&name)).await?
+    }
+
+    /// See [`Db::drain_gateway`].
+    pub async fn drain_gateway(&self, gateway_id: i64, now: String) -> Result<DrainOutcome> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.drain_gateway(gateway_id, &now)).await?
+    }
+
+    /// See [`Db::gateway_is_active`].
+    pub async fn gateway_is_active(&self, gateway_id: i64) -> Result<bool> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.gateway_is_active(gateway_id)).await?
     }
 }

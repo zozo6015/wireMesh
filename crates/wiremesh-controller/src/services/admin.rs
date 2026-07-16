@@ -14,9 +14,9 @@ use tonic::{Request, Response, Status};
 
 use wiremesh_proto::v1::admin_server::Admin;
 use wiremesh_proto::v1::{
-    CreateSegmentRequest, DebugKeyStatesRequest, DebugKeyStatesResponse, GatewayKeyState,
-    ListGatewaysRequest, ListGatewaysResponse, MintTokenRequest, MintTokenResponse, RotateKeyRequest,
-    RotateKeyResponse, Segment,
+    CreateSegmentRequest, DebugKeyStatesRequest, DebugKeyStatesResponse, DrainRequest,
+    DrainResponse, GatewayKeyState, ListGatewaysRequest, ListGatewaysResponse, MintTokenRequest,
+    MintTokenResponse, RotateKeyRequest, RotateKeyResponse, Segment,
 };
 
 use crate::db_async::DbHandle;
@@ -295,6 +295,58 @@ impl Admin for AdminSvc {
                 })
                 .collect(),
         }))
+    }
+
+    /// (Task 12, G-7) Drains `gateway_id`: [`crate::db_async::DbHandle::drain_gateway`]
+    /// atomically revokes its still-unrevoked cert(s), marks its `gateway`
+    /// row `status = 'removed'`, appends an audit entry, and bumps the
+    /// persisted revision — all BEFORE this handler publishes anything, same
+    /// "mutate durably first, then notify" order `RotateKey`/`enroll` use.
+    ///
+    /// Ack-wait: cycle-2 has no real per-peer ack channel to wait on (the
+    /// master-spec's "waits for acks (or 5s)" describes a later cycle's
+    /// fully-tracked withdrawal). Rather than block this RPC for a fixed
+    /// window that serves no one (the mutation has already committed by the
+    /// time any peer could ack it, and no code path reads such an ack), this
+    /// returns as soon as the withdrawal `Delta` is published — an immediate,
+    /// zero-wait bound that trivially satisfies "at most 5s" without making
+    /// every `Drain` call pay a latency tax it can't act on.
+    async fn drain(
+        &self,
+        request: Request<DrainRequest>,
+    ) -> Result<Response<DrainResponse>, Status> {
+        let req = request.into_inner();
+        let gateway_id = req.gateway_id as i64;
+
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        let outcome = self.db.drain_gateway(gateway_id, now).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("no gateway row") {
+                Status::not_found(msg)
+            } else {
+                Status::internal(format!("draining gateway: {e}"))
+            }
+        })?;
+
+        let revision = self
+            .db
+            .current_revision()
+            .await
+            .map_err(|e| Status::internal(format!("reading revision after drain: {e}")))?;
+
+        // `send` errors only when there are currently no `Sync.Watch`
+        // subscribers — nobody to notify, which is not a failure (mirrors
+        // `EnrollmentSvc::enroll`/`AdminSvc::rotate_key`'s identical `let _ =`).
+        let _ = self.change_tx.send(ChangeEvent::GatewayDrained {
+            gateway_id,
+            revoked_serials: outcome.revoked_serials,
+            revision,
+        });
+
+        Ok(Response::new(DrainResponse {}))
     }
 }
 

@@ -301,6 +301,16 @@ pub struct RotateKeyOutcome {
     pub pubkey: String,
 }
 
+/// Result of a successful [`Db::drain_gateway`] call: the serial(s) of every
+/// `certificate` row this drain revoked (ordinarily exactly one — a gateway's
+/// current leaf cert — but this tolerates more than one still-unrevoked row).
+/// Fed into the `GatewayDrained` `ChangeEvent`'s `revoked_serials`, mirroring
+/// how already-connected peers learn a rebind's revocation via
+/// `revoked_serials` in the projection.
+pub struct DrainOutcome {
+    pub revoked_serials: Vec<String>,
+}
+
 /// The controller's embedded SQLite store.
 ///
 /// The connection is held behind a `Mutex` purely for interior mutability
@@ -320,6 +330,14 @@ impl Db {
         // must be re-enabled on every open (it is not persisted in the file).
         // Without this, all REFERENCES clauses in the schema are decorative.
         conn.pragma_update(None, "foreign_keys", true)?;
+        // A second, independent connection to this same file (e.g.
+        // `wiremesh-testkit::TestController::gateway_exists` opening its own
+        // read-only-in-spirit `Db::open` against the live controller's DB
+        // file) would otherwise get an immediate `SQLITE_BUSY` if it ever
+        // raced a writer's in-flight transaction — SQLite's default
+        // busy-timeout is 0. 5s comfortably covers any of this controller's
+        // (short, single-statement-batch) transactions.
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let db = Db {
             conn: Mutex::new(conn),
         };
@@ -945,6 +963,105 @@ impl Db {
 
         tx.commit()?;
         Ok(RotateKeyOutcome { epoch: new_epoch, pubkey })
+    }
+
+    /// (Task 12, G-7) Drains `gateway_id`: revokes every still-unrevoked
+    /// `certificate` row of its (`revoked_at = now`), marks its `gateway` row
+    /// `status = 'removed'` (dropping it out of
+    /// [`Db::list_other_gateways`]'s `status = 'active'` filter — the same
+    /// mechanism `enroll_gateway`'s rebind path uses for a `'replaced'`
+    /// gateway — rather than deleting the row outright, which would require
+    /// also cascading the delete through `gateway_key`/`certificate`/
+    /// `policy_status` under `foreign_keys = ON`), appends an audit entry,
+    /// and bumps the persisted revision — ALL in one transaction, so a
+    /// caller observing success can rely on every side effect having landed
+    /// together.
+    ///
+    /// Cycle-2 doesn't track real per-peer withdrawal acks (see the Task 12
+    /// brief/report for what's deferred): this method does the atomic
+    /// "mark removed + revoke" mutation the caller (`AdminSvc::drain`)
+    /// publishes a `GatewayDrained` `ChangeEvent` from immediately after —
+    /// the "ack-wait (or 5s)" the master-spec describes is a bounded, best-
+    /// effort window in the RPC handler, not gating this DB mutation.
+    ///
+    /// Errors (rather than silently no-op'ing) if no `gateway` row with this
+    /// id exists at all, so `AdminSvc::drain` can map that to `NotFound`.
+    /// Draining an already-`removed` gateway is NOT an error — it's treated
+    /// as idempotent (only still-unrevoked certs get touched, so a second
+    /// call revokes nothing further and returns an empty `revoked_serials`)
+    /// rather than surfacing a confusing "no such gateway" for a gateway
+    /// that unambiguously did exist a moment ago.
+    pub fn drain_gateway(&self, gateway_id: i64, now: &str) -> Result<DrainOutcome> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway WHERE id = ?1)",
+            params![gateway_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.rollback()?;
+            anyhow::bail!("Drain: no gateway row with id {gateway_id} to drain");
+        }
+
+        let certs_to_revoke: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT serial FROM certificate \
+                 WHERE subject_kind = 'gateway' AND subject_id = ?1 AND revoked_at IS NULL",
+            )?;
+            let rows = stmt.query_map(params![gateway_id], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for serial in &certs_to_revoke {
+            tx.execute(
+                "UPDATE certificate SET revoked_at = ?1 WHERE serial = ?2",
+                params![now, serial],
+            )?;
+        }
+
+        tx.execute(
+            "UPDATE gateway SET status = 'removed' WHERE id = ?1",
+            params![gateway_id],
+        )?;
+
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                "unix-socket",
+                "drain",
+                format!("gateway/{gateway_id}"),
+                format!(r#"{{"gateway_id":{gateway_id},"revoked_serials":{certs_to_revoke:?}}}"#),
+            ],
+        )?;
+
+        // Projection-affecting mutation: the drained gateway must vanish
+        // from every peer's full-mesh view and its cert(s) must join the
+        // revoked-serials denylist, so bump the persisted revision in this
+        // same transaction (see `bump_revision_tx`'s doc comment). The early
+        // `tx.rollback()` above never reaches here.
+        bump_revision_tx(&tx)?;
+
+        tx.commit()?;
+        Ok(DrainOutcome {
+            revoked_serials: certs_to_revoke,
+        })
+    }
+
+    /// (Task 12 testkit accessor) `true` iff a `gateway` row with this id
+    /// exists AND is currently `status = 'active'` — `false` both for an id
+    /// that never existed and for one that's `'removed'` (drained) or
+    /// `'replaced'` (superseded by a rebind). Backs
+    /// `wiremesh-testkit::TestController::gateway_exists`.
+    pub fn gateway_is_active(&self, gateway_id: i64) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let active: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway WHERE id = ?1 AND status = 'active')",
+            params![gateway_id],
+            |row| row.get(0),
+        )?;
+        Ok(active)
     }
 
     /// Resolves an enrolled gateway by its DB `id` (the same shape

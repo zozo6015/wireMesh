@@ -12,6 +12,10 @@ service Admin {
   // gateway, straight off the DB — not part of the gateway-facing
   // projection.
   rpc DebugKeyStates(DebugKeyStatesRequest) returns (DebugKeyStatesResponse);
+  // (Task 12, G-7) Drains a gateway: withdraws it from every OTHER
+  // already-connected gateway's peer set (a Delta with removed_peer_ids),
+  // then removes its gateway row and revokes its cert(s).
+  rpc Drain(DrainRequest) returns (DrainResponse);
 }
 message CreateSegmentRequest { string name = 1; repeated string cidrs = 2; }
 message Segment { uint64 id = 1; string name = 2; repeated string cidrs = 3; }
@@ -25,3 +29,5 @@ message RotateKeyResponse { uint32 epoch = 1; string pubkey = 2; string state = 
 message DebugKeyStatesRequest { uint64 gateway_id = 1; }
 message GatewayKeyState { uint32 epoch = 1; string state = 2; } // pending|active|retiring
 message DebugKeyStatesResponse { repeated GatewayKeyState keys = 1; }
+message DrainRequest { uint64 gateway_id = 1; }
+message DrainResponse {}
