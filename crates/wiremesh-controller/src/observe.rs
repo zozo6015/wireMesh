@@ -46,11 +46,33 @@
 //! `Db::gateway_observe_key`) and recomputes the same MAC. Any mismatch, or
 //! any gateway_id that doesn't resolve to an active gateway, or any
 //! datagram that isn't exactly [`PROBE_LEN`] bytes with the right magic, is
-//! DROPPED silently: no echo, no candidate recorded. This is what stops an
-//! anonymous scanner from populating any gateway's candidate endpoint —
-//! only a caller that already holds a specific gateway's `observe_key`
-//! (learned once, at that gateway's own enrollment) can produce an
-//! accepted probe for it.
+//! DROPPED silently: no echo, no candidate recorded. This stops an
+//! anonymous scanner from FORGING a probe for a gateway whose `observe_key`
+//! it doesn't hold.
+//!
+//! # What this stand-in does NOT protect against: replay
+//!
+//! The MAC is over a FIXED input (`observe_key || MAGIC || gateway_id`) with
+//! no nonce, no timestamp, and — critically — no binding to the observed
+//! source address. So the 44-byte probe for a given gateway is a CONSTANT:
+//! anyone who can CAPTURE one valid probe on the wire can REPLAY those exact
+//! bytes later, from their own address, WITHOUT ever holding `observe_key`,
+//! and the controller will accept it and overwrite that gateway's candidate
+//! endpoint with the replayer's observed source. In other words this
+//! stand-in authenticates that SOME key-holder once sent a probe for this
+//! gateway; it does NOT prove the CURRENT sender holds the key, and it does
+//! not freshness- or origin-bind the observation. Anti-replay
+//! (nonce/timestamp binding, binding the MAC to the observed source, and
+//! binding the whole exchange to the gateway's actual WG socket) arrives
+//! with cycle 4's real WG-socket probe, which replaces this endpoint
+//! entirely — this is deliberately not fixed here (a challenge/response
+//! bolted onto a soon-to-be-deleted stand-in buys nothing).
+//!
+//! This replayability has no exploit surface in cycle 2: nothing yet
+//! CONSUMES `candidate_endpoints` (no data plane, no hole-punch — those are
+//! cycle 4), so a redirected candidate changes only a projected field no
+//! component acts on. The honest framing matters anyway so cycle 4 doesn't
+//! inherit this as an assumed-solved property.
 //!
 //! On a valid probe, the controller: (1) echoes the observed UDP source
 //! `ip:port` (as text, e.g. `"127.0.0.1:54321"`) back to the sender, and
