@@ -235,10 +235,24 @@ area for the whole-branch final review to triage:
   delta 1) — the controller's Sync signal for it is designed, not yet proven
   live; the observation probe needs real **anti-replay** (nonce/timestamp +
   WG-socket binding — the cycle-2 44-byte keyed-MAC stand-in is replayable by
-  design, documented as such in Task 15); and the revoked/replaced gateway's
-  own cert is still TLS-valid at the Sync handshake today (no CRL check at
-  that point) — cycle 4 (or an earlier hardening pass) must decide and
-  implement the enforcement point.
+  design, documented as such in Task 15).
+- **CYCLE-4 BLOCKER (hard gate before any data plane ships) — reject
+  revoked/drained/replaced gateways at the Sync handshake.** Identified by the
+  whole-branch review as the one security-composition seam: `find_gateway_by_name`
+  (the sole Sync/Report identity resolver) has no `status` filter and there is no
+  revocation check at the handshake, so a gateway that was drained
+  (`status='removed'`), rebind-replaced (`status='replaced'`), or had its cert
+  revoked via `RevokeCert` (cert `revoked_at` set but still TLS-valid for its
+  90-day life) can still open `Sync.Watch` and pull a full desired-state snapshot
+  (topology/routing confidentiality leak). It is **carryable out of cycle 2 only
+  because there is no data plane** — a revoked party pulling desired-state cannot
+  forward/receive traffic and peers have already dropped it from their
+  projections. Two-part fix: (a) cheap partial mitigation available now — add
+  `AND status = 'active'` to `find_gateway_by_name`, which rejects drained and
+  rebind-replaced gateways immediately (suite-safe: no test reconnects a
+  non-active gateway); (b) the full fix — consult the revocation denylist at the
+  Sync handshake so a `RevokeCert` on a still-`active` row is also rejected. This
+  MUST close before the cycle-4 data plane is built on top of the spine.
 
 ## Spec deltas discovered
 
