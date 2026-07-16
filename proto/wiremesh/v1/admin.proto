@@ -1,0 +1,14 @@
+syntax = "proto3";
+package wiremesh.v1;
+service Admin {
+  rpc CreateSegment(CreateSegmentRequest) returns (Segment);
+  rpc MintToken(MintTokenRequest) returns (MintTokenResponse);
+  rpc ListGateways(ListGatewaysRequest) returns (ListGatewaysResponse);
+}
+message CreateSegmentRequest { string name = 1; repeated string cidrs = 2; }
+message Segment { uint64 id = 1; string name = 2; repeated string cidrs = 3; }
+message MintTokenRequest { string kind = 1; repeated string bound_cidrs = 2; uint64 rebind_segment_id = 3; }
+message MintTokenResponse { string token = 1; }   // wiremesh://host/#tok...@sha256:...
+message ListGatewaysRequest {}
+message ListGatewaysResponse { repeated GatewayInfo gateways = 1; }
+message GatewayInfo { uint64 id = 1; string name = 2; string segment = 3; string status = 4; uint64 applied_version = 5; }

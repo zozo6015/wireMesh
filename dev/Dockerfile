@@ -4,6 +4,7 @@ FROM rust:1-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 nftables iperf3 wireguard-tools tcpdump jq \
     pkg-config libssl-dev ca-certificates kmod procps bpftool iputils-ping \
+    protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # eBPF toolchain: nightly rustc (BPF codegen) + bpf-linker + cargo-generate

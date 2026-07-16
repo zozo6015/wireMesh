@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = ["crates/wiremesh-proto", "crates/wiremesh-trust", "crates/wiremesh-controller", "crates/fabricctl", "crates/wiremesh-testkit"]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+tonic = { version = "0.12", features = ["tls"] }
+prost = "0.13"
+rustls = "0.23"
+rcgen = "0.13"
+rusqlite = { version = "0.32", features = ["bundled"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ipnet = "2"

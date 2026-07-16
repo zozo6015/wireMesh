@@ -1,0 +1,5 @@
+syntax = "proto3";
+package wiremesh.v1;
+service Enrollment { rpc Enroll(EnrollRequest) returns (EnrollResponse); }
+message EnrollRequest { string token = 1; string csr_pem = 2; repeated string cidrs = 3; }
+message EnrollResponse { string cert_pem = 1; string ca_bundle_pem = 2; }
