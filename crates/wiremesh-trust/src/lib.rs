@@ -158,6 +158,49 @@ impl EmbeddedTrust {
         }
         Ok(self.data_dir.join("secrets").join(key))
     }
+
+    /// Issues a leaf certificate for the controller's OWN TLS-server
+    /// identity (used to serve the Enrollment/Sync TCP port), keeping the
+    /// caller-supplied subject alternative names.
+    ///
+    /// This is deliberately a separate, non-trait method from
+    /// [`CertificateIssuer::sign`]: `sign()` exists to answer a CSR an
+    /// *external* gateway/relay generated, and hardens itself by discarding
+    /// every SAN/extension the CSR asked for — the CA alone decides a
+    /// gateway's identity. Here there is no external CSR to distrust: the
+    /// controller process is asking its own embedded CA to vouch for its own
+    /// listening address, so the SANs it requests (e.g. `127.0.0.1`) are
+    /// exactly what the resulting server cert must present for TLS
+    /// hostname/IP verification to succeed. Returns `(cert_pem, key_pem)`;
+    /// the private key is generated fresh here and handed back directly
+    /// (not persisted to disk by this method) since the caller needs it
+    /// in-hand to configure its TLS listener.
+    pub fn issue_server_identity(
+        &self,
+        common_name: &str,
+        subject_alt_names: Vec<String>,
+        ttl: StdDuration,
+    ) -> Result<(String, String)> {
+        let key = KeyPair::generate().context("generating server key pair")?;
+        let mut params = CertificateParams::new(subject_alt_names)
+            .context("building server cert SAN params")?;
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, common_name);
+        params.distinguished_name = dn;
+        params.is_ca = IsCa::NoCa;
+
+        let not_before = OffsetDateTime::now_utc();
+        let ttl = TimeDuration::try_from(ttl).context("ttl out of range")?;
+        params.not_before = not_before;
+        params.not_after = not_before + ttl;
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(&random_serial()));
+
+        let cert = params
+            .signed_by(&key, &self.ca_cert, &self.ca_key)
+            .context("signing server identity cert")?;
+
+        Ok((cert.pem(), key.serialize_pem()))
+    }
 }
 
 #[async_trait]

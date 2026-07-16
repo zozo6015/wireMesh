@@ -2,3 +2,4 @@
 //! defined in `wiremesh-proto`.
 
 pub mod admin;
+pub mod enrollment;

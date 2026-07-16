@@ -1,0 +1,75 @@
+//! Boots a real controller (via `wiremesh-testkit`), mints a single-use
+//! `gateway` enrollment token over the Admin UDS, then exercises the
+//! Enrollment RPC over the controller's TCP port (server-TLS, no client
+//! cert): a CSR presented with that token must come back with a signed leaf
+//! cert + CA bundle, and a *second* enroll attempt with the same (now spent)
+//! token must be rejected as `PermissionDenied` — the token is single-use.
+use wiremesh_proto::v1::{
+    admin_client::AdminClient, enrollment_client::EnrollmentClient, CreateSegmentRequest,
+    EnrollRequest, MintTokenRequest,
+};
+
+#[tokio::test]
+async fn enroll_issues_cert_then_token_is_single_use() {
+    let h = wiremesh_testkit::TestController::start().await;
+    let mut admin = h.admin_client().await;
+
+    admin
+        .create_segment(CreateSegmentRequest {
+            name: "aws".into(),
+            cidrs: vec!["10.0.0.0/16".into()],
+        })
+        .await
+        .unwrap();
+
+    let tok = admin
+        .mint_token(MintTokenRequest {
+            kind: "gateway".into(),
+            bound_cidrs: vec!["10.0.0.0/16".into()],
+            rebind_segment_id: 0,
+        })
+        .await
+        .unwrap()
+        .into_inner()
+        .token;
+
+    let (csr, _kp) = wiremesh_testkit::gen_csr("gw-aws");
+    let mut enr = h.enrollment_client().await;
+
+    let resp = enr
+        .enroll(EnrollRequest {
+            token: tok.clone(),
+            csr_pem: csr.clone(),
+            cidrs: vec!["10.0.0.0/16".into()],
+        })
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(
+        resp.cert_pem.contains("BEGIN CERTIFICATE"),
+        "cert_pem must be a PEM certificate, got: {}",
+        resp.cert_pem
+    );
+    assert!(
+        resp.ca_bundle_pem.contains("BEGIN CERTIFICATE"),
+        "ca_bundle_pem must be a PEM certificate, got: {}",
+        resp.ca_bundle_pem
+    );
+
+    // Token is now spent — a second enroll with the same token must be
+    // rejected, exactly as PermissionDenied (single-use enforcement).
+    let err = enr
+        .enroll(EnrollRequest {
+            token: tok,
+            csr_pem: csr,
+            cidrs: vec!["10.0.0.0/16".into()],
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "reusing a spent enrollment token must fail with PermissionDenied, got: {:?}",
+        err
+    );
+}

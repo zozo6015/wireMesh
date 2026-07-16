@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use ipnet::Ipv4Net;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 
 /// Full schema for master-spec §4.1. Applied once, in a single transaction,
 /// by [`Db::run_migrations`] when `PRAGMA user_version` is `0`. Datetimes are
@@ -151,6 +151,51 @@ impl std::fmt::Display for OverlapError {
 }
 
 impl std::error::Error for OverlapError {}
+
+/// Distinguishes *why* [`Db::enroll_gateway`] failed, so the gRPC layer
+/// (Task 5's `EnrollmentSvc`) can map each case to the right `tonic::Status`
+/// code without string-sniffing an `anyhow::Error`.
+#[derive(Debug)]
+pub enum EnrollError {
+    /// No `enrollment_token` row matches: wrong secret, wrong kind, expired,
+    /// or already used. Deliberately a single variant that doesn't say
+    /// which — telling a caller which of those applies would help an
+    /// attacker fish for valid-but-not-quite-right tokens.
+    InvalidToken,
+    /// The declared cidrs don't all resolve to exactly one already
+    /// registered segment.
+    NoMatchingSegment,
+    /// Anything else — a genuine DB/storage error.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for EnrollError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            EnrollError::InvalidToken => {
+                write!(f, "invalid, expired, wrong-kind, or already-used enrollment token")
+            }
+            EnrollError::NoMatchingSegment => {
+                write!(f, "no segment is registered for the declared cidrs")
+            }
+            EnrollError::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for EnrollError {}
+
+impl From<rusqlite::Error> for EnrollError {
+    fn from(e: rusqlite::Error) -> Self {
+        EnrollError::Other(e.into())
+    }
+}
+
+/// Result of a successful [`Db::enroll_gateway`] call.
+pub struct EnrollOutcome {
+    pub segment_id: i64,
+    pub gateway_id: i64,
+}
 
 /// The controller's embedded SQLite store.
 ///
@@ -331,5 +376,130 @@ impl Db {
             params![id, secret_hash, kind, bound_cidrs, rebind_segment_id, expires_at],
         )?;
         Ok(())
+    }
+
+    /// Redeems a single-use `enrollment_token` for a signed gateway
+    /// certificate, ALL in one transaction: validates the token (right
+    /// kind, unexpired, unused), resolves the segment that owns every
+    /// declared `cidrs` entry, inserts the `gateway` row, records the
+    /// `certificate`, marks the token `used_at`, and appends an audit entry.
+    ///
+    /// Holding the connection mutex for the whole operation (same pattern as
+    /// [`Db::insert_segment`]) is what makes the token's single-use
+    /// guarantee atomic: there is no window where two concurrent calls with
+    /// the same secret can both observe the row as unused — the second one
+    /// either blocks on the mutex until the first commits (and then sees
+    /// `used_at` already set), or its own `UPDATE ... WHERE used_at IS NULL`
+    /// affects zero rows, which is treated as `InvalidToken` too.
+    ///
+    /// Callers pass the already-signed certificate's `cert_serial` /
+    /// `issuer_handle` / `cert_not_after` — signing itself is pure crypto
+    /// with no DB dependency, so it happens outside this transaction (in the
+    /// gRPC handler), before this call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn enroll_gateway(
+        &self,
+        secret_hash: &str,
+        kind: &str,
+        cidrs: &[Ipv4Net],
+        gateway_name: &str,
+        cert_serial: &str,
+        issuer_handle: &str,
+        cert_not_after: &str,
+        now: &str,
+    ) -> Result<EnrollOutcome, EnrollError> {
+        if cidrs.is_empty() {
+            return Err(EnrollError::NoMatchingSegment);
+        }
+
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let token_id: Option<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT id FROM enrollment_token \
+                 WHERE secret_hash = ?1 AND kind = ?2 AND used_at IS NULL AND expires_at > ?3",
+            )?;
+            let mut rows = stmt.query(params![secret_hash, kind, now])?;
+            match rows.next()? {
+                Some(row) => Some(row.get(0)?),
+                None => None,
+            }
+        };
+
+        let Some(token_id) = token_id else {
+            tx.rollback()?;
+            return Err(EnrollError::InvalidToken);
+        };
+
+        // Resolve the segment that owns EVERY declared cidr — all of them
+        // must belong to the same, already-registered segment (cycle-2
+        // scope: the segment pre-exists; a `rebind` token's segment
+        // exemption is Task 10).
+        let mut segment_id: Option<i64> = None;
+        for cidr in cidrs {
+            let found: Option<i64> = tx
+                .query_row(
+                    "SELECT segment_id FROM cidr WHERE cidr = ?1",
+                    params![cidr.to_string()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            match (found, segment_id) {
+                (None, _) => {
+                    tx.rollback()?;
+                    return Err(EnrollError::NoMatchingSegment);
+                }
+                (Some(sid), None) => segment_id = Some(sid),
+                (Some(sid), Some(existing)) if sid != existing => {
+                    tx.rollback()?;
+                    return Err(EnrollError::NoMatchingSegment);
+                }
+                _ => {}
+            }
+        }
+        let segment_id =
+            segment_id.expect("cidrs is non-empty: loop above always sets segment_id or returns early");
+
+        tx.execute(
+            "INSERT INTO gateway (segment_id, name, status, backend, last_seen) \
+             VALUES (?1, ?2, 'active', 'wireguard', NULL)",
+            params![segment_id, gateway_name],
+        )?;
+        let gateway_id = tx.last_insert_rowid();
+
+        tx.execute(
+            "INSERT INTO certificate (serial, subject_kind, subject_id, issuer_handle, not_after) \
+             VALUES (?1, 'gateway', ?2, ?3, ?4)",
+            params![cert_serial, gateway_id, issuer_handle, cert_not_after],
+        )?;
+
+        // `AND used_at IS NULL` is redundant given the SELECT above already
+        // filtered on it under the same held lock, but it costs nothing and
+        // means a future refactor that weakens the lock discipline fails
+        // loudly (via the `updated != 1` check) instead of silently
+        // double-spending a token.
+        let updated = tx.execute(
+            "UPDATE enrollment_token SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
+            params![now, token_id],
+        )?;
+        if updated != 1 {
+            tx.rollback()?;
+            return Err(EnrollError::InvalidToken);
+        }
+
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                "enrollment-token",
+                "enroll",
+                format!("gateway/{gateway_name}"),
+                format!(r#"{{"segment_id":{segment_id},"gateway_id":{gateway_id}}}"#),
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(EnrollOutcome { segment_id, gateway_id })
     }
 }

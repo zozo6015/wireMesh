@@ -15,11 +15,12 @@ use std::path::{Path, PathBuf};
 use hyper_util::rt::TokioIo;
 use tempfile::TempDir;
 use tokio::net::UnixStream;
-use tonic::transport::{Channel, Endpoint, Uri};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Uri};
 use tower::service_fn;
 
 use wiremesh_controller::{serve, Config, RunningController};
 use wiremesh_proto::v1::admin_client::AdminClient;
+use wiremesh_proto::v1::enrollment_client::EnrollmentClient;
 
 /// A real controller, booted in-process against a temporary data directory,
 /// for integration tests to drive.
@@ -104,4 +105,52 @@ impl TestController {
             .expect("connecting AdminClient over the controller's unix socket");
         AdminClient::new(channel)
     }
+
+    /// Connects a tonic `EnrollmentClient` over the controller's TCP port.
+    ///
+    /// Enrollment is server-TLS only (the caller has no client cert yet —
+    /// mTLS begins at Sync, Task 7), so this just needs to TRUST the
+    /// controller's server identity, not present one of its own. It pins
+    /// the controller's own embedded CA (`RunningController::ca_bundle_pem`)
+    /// as the sole trust root — deliberately not the system root store, the
+    /// same way a real gateway pins the CA fingerprint carried inside its
+    /// enrollment token rather than trusting ambient CAs — and verifies the
+    /// server cert's `127.0.0.1` SAN, which is the identity
+    /// `wiremesh_controller::serve` issues its TLS listener at startup.
+    pub async fn enrollment_client(&self) -> EnrollmentClient<Channel> {
+        let uri = format!("https://{}", self.tcp_addr());
+        let tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(self.running.ca_bundle_pem()))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .expect("controller TCP addr must form a valid URI")
+            .tls_config(tls)
+            .expect("configuring EnrollmentClient TLS trust of the controller's embedded CA")
+            .connect()
+            .await
+            .expect("connecting EnrollmentClient over the controller's TCP port");
+        EnrollmentClient::new(channel)
+    }
+}
+
+/// Generates a fresh keypair and a PEM-encoded CSR with common name `cn` —
+/// mirrors what a real gateway does before calling `Enrollment.Enroll`
+/// (same pattern as Phase 0's `spike/relay/src/bin/mkcerts.rs` and
+/// `wiremesh-trust`'s own embedded test). The trust provider never sees the
+/// returned `KeyPair`'s private key beyond what's embedded in the CSR's
+/// public key — callers keep it only to mirror a gateway holding its own
+/// key material (unused by the Task 5 test beyond being generated).
+pub fn gen_csr(cn: &str) -> (String, rcgen::KeyPair) {
+    let key_pair = rcgen::KeyPair::generate().expect("generating gateway key pair");
+    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
+        .expect("building CSR params");
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
+    let csr_pem = params
+        .serialize_request(&key_pair)
+        .expect("building CSR")
+        .pem()
+        .expect("PEM-encoding CSR");
+    (csr_pem, key_pair)
 }

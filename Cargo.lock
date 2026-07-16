@@ -1657,6 +1657,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hyper-util",
+ "rcgen",
  "tempfile",
  "tokio",
  "tonic",

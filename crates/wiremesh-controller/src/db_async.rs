@@ -10,6 +10,7 @@ use anyhow::Result;
 use ipnet::Ipv4Net;
 
 use crate::db::Db;
+pub use crate::db::{EnrollError, EnrollOutcome};
 
 /// Cheaply cloneable async handle to a [`Db`]. `Db` already serializes access
 /// internally (a `Mutex<Connection>`), so `Arc<Db>` — rather than a pool — is
@@ -67,5 +68,43 @@ impl DbHandle {
             )
         })
         .await?
+    }
+
+    /// See [`Db::enroll_gateway`]. Returns [`EnrollError`] (not
+    /// `anyhow::Error`) so the gRPC handler can distinguish "bad token" from
+    /// "no matching segment" from "internal error" and map each to the
+    /// right `tonic::Status` code.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enroll_gateway(
+        &self,
+        secret_hash: String,
+        kind: String,
+        cidrs: Vec<Ipv4Net>,
+        gateway_name: String,
+        cert_serial: String,
+        issuer_handle: String,
+        cert_not_after: String,
+        now: String,
+    ) -> Result<EnrollOutcome, EnrollError> {
+        let db = self.inner.clone();
+        match tokio::task::spawn_blocking(move || {
+            db.enroll_gateway(
+                &secret_hash,
+                &kind,
+                &cidrs,
+                &gateway_name,
+                &cert_serial,
+                &issuer_handle,
+                &cert_not_after,
+                &now,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_err) => Err(EnrollError::Other(anyhow::anyhow!(
+                "enroll_gateway blocking task panicked: {join_err}"
+            ))),
+        }
     }
 }

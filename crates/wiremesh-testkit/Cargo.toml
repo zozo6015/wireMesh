@@ -17,3 +17,9 @@ tempfile = "3"
 # implements the connector's required traits directly, unlike older tonic).
 tower = { version = "0.4", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# `gen_csr` (implementer's helper for Enrollment tests): builds a gateway-side
+# CSR the same way a real gateway would, mirroring Phase 0's
+# spike/relay/src/bin/mkcerts.rs. Default features (crypto+pem+ring) are
+# enough — building/serializing a CSR doesn't need the `x509-parser` feature
+# (that's only for *parsing* one back, done in wiremesh-trust).
+rcgen = { workspace = true }
