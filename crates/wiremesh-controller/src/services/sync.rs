@@ -71,6 +71,22 @@ impl Sync for SyncSvc {
                 )
             })?;
 
+        // Subscribe BEFORE building the snapshot. `build_snapshot` has
+        // internal `await` points (each `DbHandle` call hops onto
+        // `spawn_blocking`), so a `ChangeEvent` published in the window
+        // between the snapshot's DB read and here would otherwise be LOST:
+        // committed too late to appear in the snapshot, yet published before
+        // a receiver existed to buffer it — the gateway would silently miss
+        // that peer until its next reconnect. Subscribing first closes the
+        // window: any event arriving during snapshot-building is buffered in
+        // `rx` and delivered as a Delta right after the snapshot. At worst
+        // that's a redundant upsert for a peer already in the snapshot
+        // (whose Delta `revision` may even equal the snapshot's in the rare
+        // overlap) — harmless, since `upserted_peers` is idempotent on the
+        // client.
+        let self_gateway_id = gw.id;
+        let rx = self.change_tx.subscribe();
+
         let snapshot = projection::build_snapshot(&self.db, gw.id, self_cert_pem)
             .await
             .map_err(|e| Status::internal(format!("building Sync snapshot: {e}")))?;
@@ -84,8 +100,6 @@ impl Sync for SyncSvc {
         // published on `change_tx` (currently only gateway enrollment —
         // see `crate::services::enrollment`) is forwarded as a `Delta`,
         // for as long as this gRPC call is alive.
-        let self_gateway_id = gw.id;
-        let rx = self.change_tx.subscribe();
         let delta_stream = BroadcastStream::new(rx).filter_map(move |item| match item {
             Ok(event) => {
                 // A gateway must never receive a delta "adding" itself as
