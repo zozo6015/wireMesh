@@ -34,7 +34,15 @@ pub struct TestController {
     // socket. The reverse order would delete the on-disk state (and the UDS)
     // out from under a still-running server task — which later streaming
     // tasks (5/7/8) build on this harness and would stress.
-    running: RunningController,
+    //
+    // `Option` (rather than a bare `RunningController`) so `restart()` can
+    // `.take()` the old instance out, `.await` its `shutdown()` (releasing
+    // the TCP/UDS listeners and joining every server task) to completion,
+    // and only THEN boot a new one against the same `_data_dir` — see
+    // `restart()`'s doc comment for why the old instance must be fully torn
+    // down first. It's `None` only for the brief instant inside `restart()`;
+    // every accessor treats a `None` here as a bug (`running()` panics).
+    running: Option<RunningController>,
     socket_path: PathBuf,
     // Held only so the directory (and everything the controller wrote under
     // it — DB, CA, secrets, the socket) is cleaned up on drop; never read
@@ -65,8 +73,60 @@ impl TestController {
         TestController {
             _data_dir: data_dir,
             socket_path,
-            running,
+            running: Some(running),
         }
+    }
+
+    /// Restarts the controller in place: awaits a full, graceful shutdown of
+    /// the CURRENT `RunningController` (both TCP listeners closed, every
+    /// server task joined — NOT just `Drop`'s best-effort signal-and-abandon,
+    /// which doesn't wait for the OS to actually release the ports), then
+    /// boots a brand-new one via `serve` against the SAME `_data_dir` — same
+    /// SQLite DB file, same embedded CA key, same Unix socket path. This is
+    /// what proves C-7 (`fail_static.rs`): the new controller reopens
+    /// already-issued gateway certs' trust root and already-recorded
+    /// projection state from disk, rather than starting from scratch.
+    ///
+    /// The old shutdown MUST complete before the new `serve()` call binds —
+    /// otherwise the new listeners could collide with sockets the old
+    /// process hasn't released yet, or a caller's `reconnect` could race and
+    /// hit the dying old controller instead of the new one. Awaiting
+    /// `RunningController::shutdown()` (rather than just dropping the old
+    /// value) is what guarantees that ordering.
+    ///
+    /// The new controller's TCP/Sync ports are OS-assigned again (`0`) and
+    /// may differ from the old ones, so callers must re-read
+    /// `tcp_addr()`/`sync_tcp_addr()` (or, for a `StubGateway`, call
+    /// `reconnect(&self)`) after this returns rather than reusing an address
+    /// captured before the restart.
+    pub async fn restart(&mut self) {
+        let old = self
+            .running
+            .take()
+            .expect("TestController::restart called on an already-shut-down controller");
+        old.shutdown().await;
+
+        let config = Config {
+            data_dir: self._data_dir.path().to_path_buf(),
+            tcp_port: 0,
+            sync_tcp_port: 0,
+            socket_path: self.socket_path.clone(),
+        };
+
+        let running = serve(config)
+            .await
+            .expect("controller failed to restart in TestController::restart");
+        self.running = Some(running);
+    }
+
+    /// The current `RunningController`. Panics if called between `restart()`
+    /// taking the old instance and installing the new one — `restart()` is
+    /// the only place that window exists, and it never yields to another
+    /// caller of `TestController` while `running` is `None`.
+    fn running(&self) -> &RunningController {
+        self.running
+            .as_ref()
+            .expect("TestController::running() called with no controller installed")
     }
 
     /// The Unix-domain-socket path the Admin service is listening on.
@@ -77,19 +137,19 @@ impl TestController {
     /// The controller's bound TCP address the Enrollment service (server-TLS
     /// only) listens on.
     pub fn tcp_addr(&self) -> SocketAddr {
-        self.running.tcp_addr()
+        self.running().tcp_addr()
     }
 
     /// The controller's bound TCP address the Sync service (mTLS: client
     /// cert required) listens on — a separate listener/port from
     /// `tcp_addr()` (see `wiremesh_controller::serve`'s doc comment for why).
     pub fn sync_tcp_addr(&self) -> SocketAddr {
-        self.running.sync_tcp_addr()
+        self.running().sync_tcp_addr()
     }
 
     /// The temp directory backing this instance's DB/CA/secrets.
     pub fn data_dir(&self) -> &Path {
-        self.running.data_dir()
+        self.running().data_dir()
     }
 
     /// Connects a tonic `AdminClient` over the controller's Unix socket.
@@ -129,7 +189,7 @@ impl TestController {
     pub async fn enrollment_client(&self) -> EnrollmentClient<Channel> {
         let uri = format!("https://{}", self.tcp_addr());
         let tls = ClientTlsConfig::new()
-            .ca_certificate(Certificate::from_pem(self.running.ca_bundle_pem()))
+            .ca_certificate(Certificate::from_pem(self.running().ca_bundle_pem()))
             .domain_name("127.0.0.1");
         let channel = Channel::from_shared(uri)
             .expect("controller TCP addr must form a valid URI")
@@ -237,25 +297,91 @@ impl StubGateway {
     /// for verifying the *server*). Returns the raw streaming response —
     /// callers drive it with `tokio_stream::StreamExt::next()`.
     pub async fn open_sync(&self) -> tonic::Streaming<SyncMessage> {
-        let uri = format!("https://{}", self.sync_addr);
+        self.dial_sync(self.sync_addr)
+            .await
+            .expect("StubGateway::open_sync")
+    }
+
+    /// Re-opens `Sync.Watch` after a controller restart, presenting this
+    /// gateway's EXISTING (already-enrolled) client certificate + key — it
+    /// never re-runs `Enrollment.Enroll`, which is the whole point: this is
+    /// what `fail_static.rs` drives to prove C-7 (a restarted controller
+    /// still recognizes an already-issued gateway cert and resyncs it,
+    /// rather than requiring re-enrollment).
+    ///
+    /// Unlike `open_sync` (which dials the address captured at enroll time),
+    /// this reads `controller`'s CURRENT `sync_tcp_addr()` — after
+    /// `TestController::restart`, the new controller instance may be
+    /// listening on a new OS-assigned port, so re-dialing the stale
+    /// pre-restart address would connect to nothing (or, in the small window
+    /// before the OS recycles the port, to the wrong process).
+    ///
+    /// Returns a `Result` (rather than panicking like `open_sync`) because a
+    /// failure here — e.g. the restarted controller rejecting this cert —
+    /// would be the actual finding under test, not a harness bug.
+    pub async fn reconnect(
+        &self,
+        controller: &TestController,
+    ) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
+        self.dial_sync(controller.sync_tcp_addr()).await
+    }
+
+    /// Shared mTLS-dial + `Sync.Watch` logic behind `open_sync`/`reconnect`:
+    /// connects to `addr` presenting this gateway's cert/key and trusting the
+    /// controller's CA bundle, then opens the `Sync.Watch` stream.
+    async fn dial_sync(&self, addr: SocketAddr) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
+        let uri = format!("https://{addr}");
         let tls = ClientTlsConfig::new()
             .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
             .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
             .domain_name("127.0.0.1");
         let channel = Channel::from_shared(uri)
-            .expect("controller Sync TCP addr must form a valid URI")
+            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
             .tls_config(tls)
-            .expect("configuring StubGateway mTLS: presenting its cert + trusting the controller CA")
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "configuring StubGateway mTLS: presenting its cert + trusting the controller CA: {e}"
+                )
+            })?
             .connect()
             .await
-            .expect("connecting to the controller's Sync (mTLS) TCP port");
+            .map_err(|e| {
+                anyhow::anyhow!("connecting to the controller's Sync (mTLS) TCP port: {e}")
+            })?;
 
         let mut client = SyncClient::new(channel);
-        client
+        let stream = client
             .watch(WatchRequest {})
             .await
-            .expect("Sync.Watch failed")
-            .into_inner()
+            .map_err(|status| anyhow::anyhow!("Sync.Watch failed: {status}"))?
+            .into_inner();
+        Ok(stream)
+    }
+
+    /// Ensures this gateway's identity bundle (leaf cert, private key
+    /// (`0600`), CA bundle) is durably on disk under `state_dir()` — the
+    /// fail-static posture `fail_static.rs` exercises: a gateway must not
+    /// depend on the controller (or its own in-memory state) being alive to
+    /// still hold a usable identity across a restart. `enroll()` already
+    /// writes these same three files at enrollment time, so in the common
+    /// case this just re-writes identical bytes (a truthful no-op); it's a
+    /// real write, not a check, so it stays correct even if a future change
+    /// makes enrollment lazier about persisting to disk.
+    pub fn persist_state(&self) {
+        std::fs::write(self.state_dir_path.join("cert.pem"), &self.cert_pem)
+            .expect("persisting cert.pem in StubGateway::persist_state");
+        std::fs::write(self.state_dir_path.join("ca_bundle.pem"), &self.ca_bundle_pem)
+            .expect("persisting ca_bundle.pem in StubGateway::persist_state");
+
+        let key_path = self.state_dir_path.join("key.pem");
+        std::fs::write(&key_path, &self.key_pem)
+            .expect("persisting key.pem in StubGateway::persist_state");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+                .expect("setting key.pem permissions in StubGateway::persist_state");
+        }
     }
 
     /// This gateway's signed leaf certificate, PEM-encoded.
