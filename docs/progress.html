@@ -1,0 +1,440 @@
+<title>AetherLink · Build Progress</title>
+<style>
+  :root {
+    --paper: #E7EDF3;
+    --surface: #FBFCFE;
+    --surface-2: #EFF3F8;
+    --ink: #101820;
+    --ink-soft: #46586B;
+    --ink-faint: #72859A;
+    --line: #D3DCE5;
+    --accent: #0C8B9B;
+    --accent-ink: #075863;
+    --go: #1F8F5F;
+    --caveat: #B67512;
+    --pending: #6B7C90;
+    --risk: #C74B32;
+    --radius: 10px;
+    --shadow: 0 1px 2px rgba(16,24,32,.06), 0 8px 24px rgba(16,24,32,.05);
+    --sans: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0B1118;
+      --surface: #131D27;
+      --surface-2: #0F1822;
+      --ink: #DEE7F0;
+      --ink-soft: #93A4B7;
+      --ink-faint: #66798D;
+      --line: #24313E;
+      --accent: #2CC5D6;
+      --accent-ink: #8FE4EE;
+      --go: #37B87E;
+      --caveat: #D9A038;
+      --pending: #8194A8;
+      --risk: #E4694D;
+      --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.25);
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #E7EDF3; --surface: #FBFCFE; --surface-2: #EFF3F8;
+    --ink: #101820; --ink-soft: #46586B; --ink-faint: #72859A; --line: #D3DCE5;
+    --accent: #0C8B9B; --accent-ink: #075863;
+    --go: #1F8F5F; --caveat: #B67512; --pending: #6B7C90; --risk: #C74B32;
+    --shadow: 0 1px 2px rgba(16,24,32,.06), 0 8px 24px rgba(16,24,32,.05);
+  }
+  :root[data-theme="dark"] {
+    --paper: #0B1118; --surface: #131D27; --surface-2: #0F1822;
+    --ink: #DEE7F0; --ink-soft: #93A4B7; --ink-faint: #66798D; --line: #24313E;
+    --accent: #2CC5D6; --accent-ink: #8FE4EE;
+    --go: #37B87E; --caveat: #D9A038; --pending: #8194A8; --risk: #E4694D;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.25);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--paper);
+    color: var(--ink);
+    font-family: var(--sans);
+    line-height: 1.55;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; padding: clamp(24px, 5vw, 64px) clamp(18px, 4vw, 40px) 80px; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 12px;
+    letter-spacing: .16em;
+    text-transform: uppercase;
+    color: var(--accent-ink);
+    margin: 0 0 14px;
+  }
+  h1 {
+    font-size: clamp(28px, 4.4vw, 42px);
+    line-height: 1.08;
+    letter-spacing: -.02em;
+    text-wrap: balance;
+    margin: 0 0 12px;
+    font-weight: 720;
+  }
+  .lede { font-size: 17px; color: var(--ink-soft); max-width: 62ch; margin: 0; }
+  .stamp {
+    font-family: var(--mono);
+    font-size: 12.5px;
+    color: var(--ink-faint);
+    margin-top: 18px;
+  }
+  .stamp b { color: var(--ink-soft); font-weight: 600; }
+
+  section { margin-top: clamp(40px, 6vw, 64px); }
+  h2 {
+    font-size: 13px;
+    font-family: var(--mono);
+    letter-spacing: .13em;
+    text-transform: uppercase;
+    color: var(--ink-soft);
+    margin: 0 0 20px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--line);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  h2 .count { color: var(--ink-faint); font-size: 12px; }
+
+  /* ---- summary metric strip ---- */
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 1px;
+    background: var(--line);
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    overflow: hidden;
+    margin-top: 28px;
+  }
+  .metric { background: var(--surface); padding: 18px 20px; }
+  .metric .k {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .11em;
+    text-transform: uppercase; color: var(--ink-faint); margin: 0 0 8px;
+  }
+  .metric .v {
+    font-size: 26px; font-weight: 700; letter-spacing: -.01em;
+    font-variant-numeric: tabular-nums; line-height: 1;
+  }
+  .metric .v small { font-size: 15px; font-weight: 500; color: var(--ink-faint); }
+  .metric .sub { font-family: var(--mono); font-size: 11.5px; color: var(--ink-soft); margin-top: 7px; }
+
+  /* ---- schematic (blueprint) panels for mermaid ---- */
+  .schematic {
+    background:
+      linear-gradient(0deg, rgba(58,169,184,.045) 1px, transparent 1px) 0 0 / 100% 28px,
+      linear-gradient(90deg, rgba(58,169,184,.045) 1px, transparent 1px) 0 0 / 28px 100%,
+      #0D1A22;
+    border: 1px solid #21414D;
+    border-radius: var(--radius);
+    padding: 26px 20px;
+    overflow-x: auto;
+    box-shadow: var(--shadow);
+  }
+  .schematic pre.mermaid { margin: 0; text-align: center; background: transparent; min-width: 560px; }
+  .schematic-cap {
+    font-family: var(--mono); font-size: 11.5px; color: #6f97a3;
+    letter-spacing: .06em; margin: 14px 2px 0; text-align: center;
+  }
+
+  /* ---- cycle cards ---- */
+  .cycles { display: grid; gap: 14px; }
+  .cycle {
+    background: var(--surface);
+    border: 1px solid var(--line);
+    border-left: 3px solid var(--edge, var(--pending));
+    border-radius: var(--radius);
+    padding: 20px 22px;
+    box-shadow: var(--shadow);
+  }
+  .cycle[data-status="done"] { --edge: var(--go); }
+  .cycle[data-status="progress"] { --edge: var(--caveat); }
+  .cycle[data-status="pending"] { --edge: var(--pending); }
+  .cycle-head { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  .cycle-no { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); letter-spacing: .08em; }
+  .cycle h3 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -.01em; flex: 1; min-width: 200px; }
+  .cycle p { margin: 12px 0 0; color: var(--ink-soft); font-size: 14.5px; }
+  .cycle .dep { font-family: var(--mono); font-size: 12px; color: var(--ink-faint); margin-top: 12px; }
+  .cycle .dep b { color: var(--ink-soft); font-weight: 600; }
+
+  /* ---- status pill + severity chip ---- */
+  .pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    font-family: var(--mono); font-size: 11.5px; font-weight: 600;
+    letter-spacing: .05em; text-transform: uppercase;
+    padding: 4px 11px 4px 9px; border-radius: 100px;
+    border: 1px solid currentColor;
+  }
+  .pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+  .pill.done { color: var(--go); }
+  .pill.progress { color: var(--caveat); }
+  .pill.pending { color: var(--pending); }
+  .pill.risk { color: var(--risk); }
+  .pill span { color: var(--ink); }
+
+  /* ---- Phase 0 bets grid ---- */
+  .bets { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  .bet {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 16px 18px; box-shadow: var(--shadow);
+    display: flex; flex-direction: column; gap: 10px;
+  }
+  .bet .bt { font-family: var(--mono); font-size: 11px; letter-spacing: .1em; color: var(--ink-faint); text-transform: uppercase; }
+  .bet .bn { font-weight: 620; font-size: 14.5px; line-height: 1.35; }
+  .bet .bnote { font-size: 13px; color: var(--ink-soft); margin-top: auto; }
+
+  /* ---- risk list ---- */
+  .risks { display: grid; gap: 10px; }
+  .risk-item {
+    background: var(--surface); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 15px 18px;
+    display: grid; grid-template-columns: auto 1fr; gap: 14px; align-items: start;
+  }
+  .chip {
+    font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: .07em;
+    text-transform: uppercase; padding: 4px 9px; border-radius: 6px;
+    white-space: nowrap; align-self: start;
+  }
+  .chip.top { background: color-mix(in srgb, var(--risk) 15%, transparent); color: var(--risk); border: 1px solid color-mix(in srgb, var(--risk) 40%, transparent); }
+  .chip.sec { background: color-mix(in srgb, var(--caveat) 15%, transparent); color: var(--caveat); border: 1px solid color-mix(in srgb, var(--caveat) 40%, transparent); }
+  .chip.note { background: color-mix(in srgb, var(--pending) 15%, transparent); color: var(--pending); border: 1px solid color-mix(in srgb, var(--pending) 40%, transparent); }
+  .risk-item .rt { font-size: 14.5px; }
+  .risk-item .rt b { font-weight: 640; }
+  .risk-item .rt .rd { color: var(--ink-soft); font-size: 13.5px; display: block; margin-top: 3px; }
+
+  /* ---- session log ---- */
+  .log { display: grid; gap: 0; border-left: 2px solid var(--line); margin-left: 6px; }
+  .entry { position: relative; padding: 0 0 24px 26px; }
+  .entry:last-child { padding-bottom: 0; }
+  .entry::before {
+    content: ""; position: absolute; left: -7px; top: 5px;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--surface); border: 2px solid var(--accent);
+  }
+  .entry .date { font-family: var(--mono); font-size: 12px; color: var(--accent-ink); letter-spacing: .05em; font-weight: 600; }
+  .entry h4 { margin: 4px 0 8px; font-size: 15.5px; font-weight: 620; }
+  .entry ul { margin: 0; padding-left: 18px; color: var(--ink-soft); font-size: 14px; }
+  .entry ul li { margin: 3px 0; }
+  .entry ul li b { color: var(--ink); font-weight: 600; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 10px 20px; margin-top: 22px; }
+  .legend .l { display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 11.5px; color: var(--ink-soft); }
+  .legend .dot { width: 9px; height: 9px; border-radius: 50%; }
+
+  footer { margin-top: 60px; padding-top: 20px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 12px; color: var(--ink-faint); }
+  a { color: var(--accent-ink); }
+</style>
+
+<div class="wrap">
+
+  <header>
+    <p class="eyebrow">AetherLink · Build Progress</p>
+    <h1>Zero-trust network fabric — cycle-by-cycle build tracker</h1>
+    <p class="lede">Open-source (Apache-2.0), self-hosted, cloud-agnostic L3/L4 network fabric in Rust: WireGuard data plane, default-deny eBPF policy, one gateway per segment, no agents on workloads. The engineering design ships as four plan cycles; this page tracks what's done, in flight, and next.</p>
+    <p class="stamp">Last updated <b>2026-07-16</b> · main @ <b>09a9b54</b> · spec v0.2 (approved)</p>
+  </header>
+
+  <div class="metrics">
+    <div class="metric">
+      <p class="k">Plan cycles</p>
+      <div class="v">1<small> / 4 complete</small></div>
+      <p class="sub">Cycle 2 in design</p>
+    </div>
+    <div class="metric">
+      <p class="k">Phase 0 bets</p>
+      <div class="v">5<small> / 5 decided</small></div>
+      <p class="sub">4 go · 1 go-with-caveats</p>
+    </div>
+    <div class="metric">
+      <p class="k">Spike test suite</p>
+      <div class="v">14<small> / 14 green</small></div>
+      <p class="sub">0 failed · 0 skipped</p>
+    </div>
+    <div class="metric">
+      <p class="k">Current focus</p>
+      <div class="v" style="font-size:19px;">Controller core</div>
+      <p class="sub">Cycle 2 · brainstorming</p>
+    </div>
+  </div>
+
+  <section>
+    <h2>Plan-cycle dependency graph</h2>
+    <div class="schematic">
+<pre class="mermaid">
+%%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, monospace','fontSize':'13px','lineColor':'#3aa9b8','primaryTextColor':'#dbe9f0','clusterBkg':'transparent'}}}%%
+flowchart LR
+  P0["PHASE 0 · Spike<br/>5 de-risk bets<br/>merged 09a9b54"]:::done
+  C2["CYCLE 2 · Controller core<br/>CA · data model<br/>Enroll / Sync / Admin"]:::progress
+  C3["CYCLE 3 · Policy pipeline<br/>DSL &rarr; IR &rarr;<br/>eBPF / nftables"]:::pending
+  C4["CYCLE 4 · Gateway + Relay<br/>tunnel mgr · NAT matrix<br/>relay path"]:::pending
+  P0 --> C2
+  C2 --> C3
+  C2 --> C4
+  C3 --> C4
+  P0 -. "crates graduate" .-> C4
+  classDef done fill:#123528,stroke:#37b87e,color:#c2f0d8,stroke-width:1.5px;
+  classDef progress fill:#3a2c12,stroke:#d9a038,color:#f5e0b4,stroke-width:1.5px;
+  classDef pending fill:#182430,stroke:#4d5f70,color:#9db0c2,stroke-width:1.5px;
+</pre>
+    </div>
+    <p class="schematic-cap">Cycle 2 unblocks 3 and 4 · Cycle 3 feeds enforcement backends into Cycle 4 · Phase 0 crates (natlab, enforcer, relay, punch) graduate into the gateway</p>
+    <div class="legend">
+      <span class="l"><span class="dot" style="background:var(--go)"></span>done</span>
+      <span class="l"><span class="dot" style="background:var(--caveat)"></span>in progress</span>
+      <span class="l"><span class="dot" style="background:var(--pending)"></span>pending</span>
+      <span class="l"><span class="dot" style="background:var(--risk)"></span>open risk</span>
+    </div>
+  </section>
+
+  <section>
+    <h2>Cycles <span class="count">4 total</span></h2>
+    <div class="cycles">
+
+      <article class="cycle" data-status="done">
+        <div class="cycle-head">
+          <span class="cycle-no">01</span>
+          <h3>Phase 0 — De-risk spike</h3>
+          <span class="pill done"><span>Complete · 2026-07-15</span></span>
+        </div>
+        <p>Five throwaway-but-test-proven Rust crates validating the riskiest data-plane assumptions before committing to the design. Merged to <code>main</code> at <code>09a9b54</code> after subagent-driven execution (15 tasks, independent per-task + whole-branch review).</p>
+        <p class="dep"><b>Proved:</b> boringtun embed, tc-BPF stateful ACL, QUIC relay + WG-over-relay at MTU 1280, UDP hole punch, NAT matrix harness.</p>
+      </article>
+
+      <article class="cycle" data-status="progress">
+        <div class="cycle-head">
+          <span class="cycle-no">02</span>
+          <h3>Controller core</h3>
+          <span class="pill progress"><span>In design</span></span>
+        </div>
+        <p>The single-tenant control plane: embedded-SQLite data model, embedded fabric CA + enrollment/rebind trust flow, the Enrollment / Sync / Admin gRPC services plus the UDP observation endpoint, WireGuard key-epoch lifecycle bookkeeping, full-mesh route computation, audit log, and the pluggable <code>SecretStore</code> / <code>CertificateIssuer</code> provider seams. Includes the proto and trait definitions.</p>
+        <p class="dep"><b>Depends on:</b> Phase 0 (validated data-plane contracts) · <b>Scope note:</b> no policy compiler, no gateway/relay binaries — those are cycles 3 &amp; 4.</p>
+      </article>
+
+      <article class="cycle" data-status="pending">
+        <div class="cycle-head">
+          <span class="cycle-no">03</span>
+          <h3>Policy pipeline</h3>
+          <span class="pill pending"><span>Pending</span></span>
+        </div>
+        <p>The YAML DSL → versioned IR → both enforcement backends (eBPF primary, nftables fallback), plus the conformance packet-suite that proves behavioral parity between backends, ICMP semantics included.</p>
+        <p class="dep"><b>Depends on:</b> Cycle 2 (IR delivered over Sync; data model). <b>Reuses:</b> Phase 0 <code>enforcer</code> program structure.</p>
+      </article>
+
+      <article class="cycle" data-status="pending">
+        <div class="cycle-head">
+          <span class="cycle-no">04</span>
+          <h3>Gateway transport + relay</h3>
+          <span class="pill pending"><span>Pending</span></span>
+        </div>
+        <p>The gateway and relay binaries: tunnel manager (embedded boringtun, per-epoch keys), NAT traversal + brokered hole punch, relay failover, and the full NAT-matrix integration harness. Where the pending G-2 throughput gate is resolved.</p>
+        <p class="dep"><b>Depends on:</b> Cycle 2 (Sync client, enrollment) + Cycle 3 (enforcement backends). <b>Reuses:</b> <code>relay</code>, <code>punch</code>, <code>natlab</code>, <code>udpshim</code> logic.</p>
+      </article>
+
+    </div>
+  </section>
+
+  <section>
+    <h2>Phase 0 outcomes <span class="count">go / no-go per bet</span></h2>
+    <div class="bets">
+      <div class="bet">
+        <span class="bt">Bet 1</span>
+        <span class="bn">boringtun embed + throughput</span>
+        <span class="pill progress" style="align-self:flex-start"><span>go-with-caveats</span></span>
+        <span class="bnote">Embedding proven; ~7.7 Mbit/s container receive-cap unexplained. G-2 cloud run pending.</span>
+      </div>
+      <div class="bet">
+        <span class="bt">Bet 2</span>
+        <span class="bn">tc-BPF stateful ACL on tun</span>
+        <span class="pill done" style="align-self:flex-start"><span>go</span></span>
+        <span class="bnote">5/5: default-deny, atomic A/B flip under traffic, flow table, ICMP embedded-error.</span>
+      </div>
+      <div class="bet">
+        <span class="bt">Bet 3</span>
+        <span class="bn">QUIC relay + WG-over-relay</span>
+        <span class="pill done" style="align-self:flex-start"><span>go</span></span>
+        <span class="bnote">Mandatory mutual TLS; WireGuard end-to-end through the relay at MTU 1280, boundary proven.</span>
+      </div>
+      <div class="bet">
+        <span class="bt">Bet 4</span>
+        <span class="bn">UDP observation + hole punch</span>
+        <span class="pill done" style="align-self:flex-start"><span>go</span></span>
+        <span class="bnote">Port-restricted pair punches; symmetric fails — the negative that justifies the relay.</span>
+      </div>
+      <div class="bet">
+        <span class="bt">Bet 5</span>
+        <span class="bn">NAT matrix harness</span>
+        <span class="pill done" style="align-self:flex-start"><span>go</span></span>
+        <span class="bnote">Endpoint-independent &amp; per-destination NAT cells, behavior-asserted. Graduates to the real harness.</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Open risks &amp; carried items</h2>
+    <div class="risks">
+      <div class="risk-item">
+        <span class="chip top">Top risk</span>
+        <div class="rt"><b>G-2 throughput gate — cloud run pending.</b><span class="rd">The ≥1 Gbps target on a 4-vCPU cloud VM cannot run in the local container. First check: <code>iperf3 -u -b 0</code>, inspect Lost/Total, to settle whether the ~7.7 Mbit/s cap is a Docker-Desktop-VM artifact or a boringtun receive-path issue. Resolves in Cycle 4.</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip sec">MVP-harden</span>
+        <div class="rt"><b>Fail-open rule parser.</b><span class="rd">An unrecognized proto string silently widens a rule to "any" — a fail-open in a default-deny product. Must become a hard parse error before rule-parsing logic ships (Cycle 3).</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip sec">MVP-harden</span>
+        <div class="rt"><b>Sync go-skew constraint (new hard requirement).</b><span class="rd">Phase 0 Bet 4 found the broker's "go" must arrive within one one-way path latency, or NAT mappings self-poison. The controller's Sync brokering (Cycle 2) must honor it; spec §6.1 to be amended.</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip note">Tracked fix</span>
+        <div class="rt"><b>ICMP-echo reverse-key asymmetry.</b><span class="rd">Egress records echo as {id,0}; ingress reverse lookup swaps to {0,id}, so inside-initiated echo replies don't match. ICMP <em>errors</em> work. Dedicated fix in Cycle 3/4.</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip note">Tracked fix</span>
+        <div class="rt"><b>bench.sh global pkill.</b><span class="rd">The throughput harness kills any <code>iperf3</code>/<code>spike-tunnel</code> process host-wide — scope it before running on the shared G-2 cloud host.</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Session log</h2>
+    <div class="log">
+      <div class="entry">
+        <div class="date">2026-07-16</div>
+        <h4>Started MVP planning — Cycle 2 (controller core)</h4>
+        <ul>
+          <li><b>Scoped Cycle 2 to controller core only</b>, per spec §12 — policy pipeline and gateway/relay deferred to their own cycles.</li>
+          <li>Entered the brainstorming flow to turn the controller-core spec sections into a design, then an implementation plan.</li>
+          <li><b>Created this progress tracker</b> — to be updated at the end of each session with what shipped, what's in flight, and what's next.</li>
+        </ul>
+      </div>
+      <div class="entry">
+        <div class="date">2026-07-15</div>
+        <h4>Phase 0 spike — executed, reviewed, merged</h4>
+        <ul>
+          <li>Ran all 15 spike tasks subagent-driven: separate test-author, implementer, and reviewer agents per task; independent whole-branch review.</li>
+          <li><b>All five bets decided</b> (Bets 2–5 go, Bet 1 go-with-caveats); full suite 14/14 green.</li>
+          <li>Merged to <code>main</code> at <code>09a9b54</code>; findings, verdicts, and reuse map recorded in <code>docs/research/phase0-report.md</code>.</li>
+        </ul>
+      </div>
+      <div class="entry">
+        <div class="date">2026-07-15 · earlier</div>
+        <h4>Design &amp; planning groundwork</h4>
+        <ul>
+          <li>Engineering design spec v0.2 approved (§1 decision record resolves all nine PRD open questions).</li>
+          <li>Phase 0 spike plan written (15 tasks, 5 bets); root <code>CLAUDE.md</code> workflow rules established.</li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    AetherLink · updated at the end of each working session · source: docs/progress.html · authority order: spec &gt; PRD &gt; plans
+  </footer>
+
+</div>
