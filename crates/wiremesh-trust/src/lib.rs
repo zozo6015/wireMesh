@@ -10,13 +10,15 @@
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration as StdDuration;
 
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DnType, IsCa, KeyPair,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName, DnType,
+    IsCa, KeyPair,
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
 
@@ -115,6 +117,16 @@ pub struct EmbeddedTrust {
     /// own SQLite store); this set exists so `revoke()` doesn't silently
     /// lie about handles it has never seen.
     revoked: Mutex<std::collections::HashSet<String>>,
+    /// Serializes the read-modify-write-rename in `put` so concurrent writes
+    /// (even to the same key) compute strictly-increasing versions instead
+    /// of racing on read-existing+1. A store-wide lock is more than enough
+    /// for a local-disk embedded default. No `.await` is held across it, so
+    /// the guard never crosses a suspend point.
+    put_lock: Mutex<()>,
+    /// Per-write uniquifier for temp filenames, so two puts (to any keys)
+    /// never share a temp path. Combined with the pid this is unique across
+    /// processes sharing the dir too.
+    tmp_counter: AtomicU64,
 }
 
 impl EmbeddedTrust {
@@ -135,6 +147,8 @@ impl EmbeddedTrust {
             ca_cert,
             ca_key,
             revoked: Mutex::new(std::collections::HashSet::new()),
+            put_lock: Mutex::new(()),
+            tmp_counter: AtomicU64::new(0),
         })
     }
 
@@ -153,30 +167,39 @@ impl CertificateIssuer for EmbeddedTrust {
     }
 
     async fn sign(&self, csr_pem: &str, profile: CertProfile) -> Result<IssuedCert> {
-        let mut csr_params = CertificateSigningRequestParams::from_pem(csr_pem)
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem)
             .context("parsing CSR PEM")?;
 
-        // The CA decides the subject and validity window; nothing from the
-        // CSR's own params is trusted for these beyond the public key and
-        // (best-effort) SANs already parsed onto csr_params.params.
-        csr_params
-            .params
-            .distinguished_name
-            .push(DnType::CommonName, profile.subject_cn.as_str());
+        // The CA fully controls leaf identity: take ONLY the subject public
+        // key from the CSR and rebuild the leaf's parameters from scratch.
+        // Any subject DN entries, SANs, key-usages, or extensions the CSR
+        // requested are discarded — a gateway cannot smuggle a CN, SAN, or
+        // extension of its choosing into the issued cert.
+        let public_key = csr.public_key;
+        let mut params = CertificateParams::new(Vec::<String>::new())
+            .context("building leaf certificate params")?;
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, profile.subject_cn.as_str());
+        params.distinguished_name = dn;
+        params.subject_alt_names.clear();
+        params.key_usages.clear();
+        params.extended_key_usages.clear();
+        params.custom_extensions.clear();
+        params.is_ca = IsCa::NoCa;
 
         let not_before = OffsetDateTime::now_utc();
         let ttl = TimeDuration::try_from(profile.ttl).context("ttl out of range")?;
         let not_after = not_before + ttl;
-        csr_params.params.not_before = not_before;
-        csr_params.params.not_after = not_after;
+        params.not_before = not_before;
+        params.not_after = not_after;
 
         let serial = random_serial();
-        csr_params.params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
         let serial_hex = hex_encode(&serial);
 
-        let leaf = csr_params
-            .signed_by(&self.ca_cert, &self.ca_key)
-            .context("signing CSR with embedded CA")?;
+        let leaf = params
+            .signed_by(&public_key, &self.ca_cert, &self.ca_key)
+            .context("signing leaf with embedded CA")?;
 
         Ok(IssuedCert {
             cert_pem: leaf.pem(),
@@ -209,6 +232,13 @@ impl SecretStore for EmbeddedTrust {
 
     async fn put(&self, key: &str, value: Vec<u8>) -> Result<u64> {
         let path = self.secret_path(key)?;
+
+        // Serialize the whole read-modify-write-rename so concurrent puts
+        // can't read the same "existing version" and both write version N+1.
+        // No `.await` inside this critical section, so the std guard never
+        // crosses a suspend point.
+        let _guard = self.put_lock.lock().expect("put-lock mutex poisoned");
+
         let next_version = match fs::read(&path) {
             Ok(existing) => decode_versioned(&existing)?.version + 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => 1,
@@ -219,9 +249,20 @@ impl SecretStore for EmbeddedTrust {
         buf.extend_from_slice(&next_version.to_le_bytes());
         buf.extend_from_slice(&value);
 
-        // Write to a sibling temp file first, then rename into place, so a
-        // reader never observes a partially written secret.
-        let tmp_path = path.with_extension("tmp");
+        // Write to a temp file, then atomic-rename into place, so a reader
+        // never observes a partially written secret. The temp name is unique
+        // per write — it appends `.<pid>.<counter>.tmp` to the FULL sanitized
+        // filename, so distinct dotted keys (`gw1.wgkey` vs `gw1.token`) get
+        // distinct temp paths instead of both collapsing onto `gw1.tmp` the
+        // way `Path::with_extension("tmp")` did.
+        let uniq = self.tmp_counter.fetch_add(1, Ordering::Relaxed);
+        let pid = std::process::id();
+        let leaf_name = path
+            .file_name()
+            .expect("secret path always has a filename")
+            .to_string_lossy();
+        let tmp_path = path.with_file_name(format!("{leaf_name}.{pid}.{uniq}.tmp"));
+
         write_private_file(&tmp_path, &buf)
             .with_context(|| format!("writing secret {key}"))?;
         fs::rename(&tmp_path, &path)
