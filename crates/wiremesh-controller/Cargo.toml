@@ -38,6 +38,13 @@ x509-parser = "0.16"
 # gRPC method name.
 http = "1"
 tower = { version = "0.4", features = ["util"] }
+# (Task 14) Parses `fabric.yaml` (`crate::apply::FabricSpec`) for
+# `Admin.Apply`. `serde` is already a workspace dependency (used elsewhere
+# for JSON); `serde_yaml`, though officially in maintenance mode upstream, is
+# still the de-facto standard YAML crate in the Rust ecosystem and is
+# perfectly adequate for cycle-2's `serde::Deserialize`-driven parsing.
+serde = { workspace = true }
+serde_yaml = "0.9"
 
 [dev-dependencies]
 ipnet = { workspace = true }

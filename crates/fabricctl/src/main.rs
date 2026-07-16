@@ -25,7 +25,7 @@ use tower::service_fn;
 
 use wiremesh_proto::v1::admin_client::AdminClient;
 use wiremesh_proto::v1::{
-    AuditQueryRequest, CreateSegmentRequest, DeleteSegmentRequest, DrainRequest,
+    ApplyRequest, AuditQueryRequest, CreateSegmentRequest, DeleteSegmentRequest, DrainRequest,
     ListGatewaysRequest, ListRelaysRequest, ListSegmentsRequest, MintApiTokenRequest,
     RegisterRelayRequest, RevokeApiTokenRequest,
 };
@@ -76,6 +76,13 @@ enum Command {
     Audit {
         #[command(subcommand)]
         cmd: AuditCmd,
+    },
+    /// (Task 14) Declaratively applies a `fabric.yaml` (segments/relays,
+    /// policy stanza stubbed) against the controller — idempotent: re-running
+    /// against an unchanged file is a no-op.
+    Apply {
+        #[arg(short = 'f', long = "file")]
+        file: PathBuf,
     },
 }
 
@@ -208,6 +215,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Relay { cmd } => run_relay(&mut client, cmd).await,
         Command::Token { cmd } => run_token(&mut client, cmd).await,
         Command::Audit { cmd } => run_audit(&mut client, cmd).await,
+        Command::Apply { file } => run_apply(&mut client, file).await,
     }
 }
 
@@ -313,6 +321,26 @@ async fn run_token(client: &mut AdminAuthClient, cmd: TokenCmd) -> anyhow::Resul
             println!("revoked api token name={name}");
         }
     }
+    Ok(())
+}
+
+/// (Task 14) Reads `file`, calls `Admin.Apply`, and prints the resulting
+/// diff's counts — a no-op re-apply prints all zeros/false.
+async fn run_apply(client: &mut AdminAuthClient, file: PathBuf) -> anyhow::Result<()> {
+    let fabric_yaml = std::fs::read_to_string(&file)
+        .map_err(|e| anyhow::anyhow!("reading fabric file {}: {e}", file.display()))?;
+    let diff = client
+        .apply(ApplyRequest { fabric_yaml })
+        .await?
+        .into_inner();
+    println!(
+        "created_segments={} updated_segments={} deleted_segments={} policy_updated={} total_changes={}",
+        diff.created_segments,
+        diff.updated_segments,
+        diff.deleted_segments,
+        diff.policy_updated,
+        diff.total_changes,
+    );
     Ok(())
 }
 

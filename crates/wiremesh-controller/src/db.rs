@@ -191,6 +191,85 @@ impl std::fmt::Display for OverlapError {
 
 impl std::error::Error for OverlapError {}
 
+/// Shared insert body behind [`Db::insert_segment`] AND [`Db::apply_fabric`]
+/// (Task 14): inserts one `segment` row plus its declared CIDRs, enforcing
+/// the CIDR-overlap invariant against every OTHER already-registered
+/// segment's CIDRs (and against siblings within this same call, so a single
+/// declaration can't nest two overlapping CIDRs of its own undetected). Does
+/// NOT bump the revision or commit — callers own the surrounding
+/// transaction's lifecycle (a fresh one per call for `insert_segment`, a
+/// shared one spanning the whole apply for `apply_fabric`) precisely so
+/// `apply_fabric` can batch several of these plus a revision bump into ONE
+/// atomic unit. On error, the caller is responsible for rolling back the
+/// transaction — this function only returns `Err`, it never rolls back
+/// itself, since a caller batching multiple calls (`apply_fabric`) needs to
+/// roll back the WHOLE transaction, not just this segment's partial writes.
+fn insert_segment_tx(tx: &Transaction<'_>, name: &str, cidrs: &[Ipv4Net]) -> Result<i64> {
+    tx.execute("INSERT INTO segment (name) VALUES (?1)", params![name])?;
+    let segment_id = tx.last_insert_rowid();
+
+    let mut accepted: Vec<Ipv4Net> = Vec::with_capacity(cidrs.len());
+
+    for cidr in cidrs {
+        // First: self-overlap within the incoming set.
+        if accepted
+            .iter()
+            .any(|prev| cidr.contains(&prev.network()) || prev.contains(&cidr.network()))
+        {
+            return Err(anyhow::Error::new(OverlapError {
+                conflicting_segment: name.to_string(),
+            }));
+        }
+
+        let conflict: Option<(String, String)> = {
+            let mut stmt = tx.prepare(
+                "SELECT c.cidr, s.name \
+                 FROM cidr c JOIN segment s ON s.id = c.segment_id \
+                 WHERE c.segment_id != ?1",
+            )?;
+            let mut rows = stmt.query(params![segment_id])?;
+            let mut found = None;
+            while let Some(row) = rows.next()? {
+                let existing_cidr_str: String = row.get(0)?;
+                let existing_segment: String = row.get(1)?;
+                let existing: Ipv4Net = existing_cidr_str.parse()?;
+                if cidr.contains(&existing.network()) || existing.contains(&cidr.network()) {
+                    found = Some((existing_cidr_str, existing_segment));
+                    break;
+                }
+            }
+            found
+        };
+
+        if let Some((_, conflicting_segment)) = conflict {
+            return Err(anyhow::Error::new(OverlapError { conflicting_segment }));
+        }
+
+        tx.execute(
+            "INSERT INTO cidr (segment_id, cidr) VALUES (?1, ?2)",
+            params![segment_id, cidr.to_string()],
+        )?;
+        accepted.push(*cidr);
+    }
+
+    Ok(segment_id)
+}
+
+/// Result of a successful [`Db::apply_fabric`] call — the mirror of
+/// `wiremesh_proto::v1::ApplyDiff` on the DB layer (kept as a separate type
+/// so `crate::db` doesn't depend on the proto crate). `updated_segments` and
+/// `deleted_segments` are always `0` in cycle-2 (create-only scope — see
+/// `apply_fabric`'s doc comment); kept as fields now (rather than added
+/// later) so the proto shape and `AdminSvc::apply`'s mapping don't need to
+/// change again once update/delete diffing lands.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ApplyOutcome {
+    pub created_segments: u32,
+    pub updated_segments: u32,
+    pub deleted_segments: u32,
+    pub policy_updated: bool,
+}
+
 /// Distinguishes *why* [`Db::enroll_gateway`] failed, so the gRPC layer
 /// (Task 5's `EnrollmentSvc`) can map each case to the right `tonic::Status`
 /// code without string-sniffing an `anyhow::Error`.
@@ -398,68 +477,166 @@ impl Db {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        tx.execute("INSERT INTO segment (name) VALUES (?1)", params![name])?;
-        let segment_id = tx.last_insert_rowid();
-
-        // Accumulates the CIDRs already accepted in *this* call so each
-        // incoming CIDR is also checked against its siblings — the DB query
-        // below only sees rows of *other* segments, so without this a single
-        // declaration could nest two overlapping CIDRs (e.g. 10.0.0.0/16 and
-        // 10.0.1.0/24) undetected.
-        let mut accepted: Vec<Ipv4Net> = Vec::with_capacity(cidrs.len());
-
-        for cidr in cidrs {
-            // First: self-overlap within the incoming set.
-            if accepted
-                .iter()
-                .any(|prev| cidr.contains(&prev.network()) || prev.contains(&cidr.network()))
-            {
+        let segment_id = match insert_segment_tx(&tx, name, cidrs) {
+            Ok(id) => id,
+            Err(e) => {
                 tx.rollback()?;
-                return Err(anyhow::Error::new(OverlapError {
-                    conflicting_segment: name.to_string(),
-                }));
+                return Err(e);
             }
-
-            let conflict: Option<(String, String)> = {
-                let mut stmt = tx.prepare(
-                    "SELECT c.cidr, s.name \
-                     FROM cidr c JOIN segment s ON s.id = c.segment_id \
-                     WHERE c.segment_id != ?1",
-                )?;
-                let mut rows = stmt.query(params![segment_id])?;
-                let mut found = None;
-                while let Some(row) = rows.next()? {
-                    let existing_cidr_str: String = row.get(0)?;
-                    let existing_segment: String = row.get(1)?;
-                    let existing: Ipv4Net = existing_cidr_str.parse()?;
-                    if cidr.contains(&existing.network()) || existing.contains(&cidr.network()) {
-                        found = Some((existing_cidr_str, existing_segment));
-                        break;
-                    }
-                }
-                found
-            };
-
-            if let Some((_, conflicting_segment)) = conflict {
-                tx.rollback()?;
-                return Err(anyhow::Error::new(OverlapError { conflicting_segment }));
-            }
-
-            tx.execute(
-                "INSERT INTO cidr (segment_id, cidr) VALUES (?1, ?2)",
-                params![segment_id, cidr.to_string()],
-            )?;
-            accepted.push(*cidr);
-        }
+        };
 
         // Projection-affecting mutation: a new segment (and its CIDRs) can
         // change any gateway's peer allowed_ips, so bump the persisted
-        // revision in this same transaction — a rollback above returns early
-        // and never reaches here.
+        // revision in this same transaction — the early return above never
+        // reaches here.
         bump_revision_tx(&tx)?;
 
         tx.commit()?;
         Ok(segment_id)
+    }
+
+    /// (Task 14) Diffs a parsed `fabric.yaml`'s `segments:` list (and,
+    /// separately, its optional `policy:` source) against current DB state
+    /// and applies every ACTUAL change in one transaction — this is the
+    /// engine behind `Admin.Apply`.
+    ///
+    /// **Scope (cycle-2 / this task):** CREATE-only for segments — a
+    /// declared segment whose `name` doesn't already exist is inserted (same
+    /// CIDR-overlap invariant as [`Db::insert_segment`], enforced via the
+    /// shared [`insert_segment_tx`] helper); a declared segment whose `name`
+    /// ALREADY exists is treated as a no-op (its CIDRs are not diffed/
+    /// updated, and it is never deleted). Update/delete diffing is
+    /// deliberately partial — see the task report for what's deferred.
+    ///
+    /// **Idempotence is the load-bearing contract:** nothing is written at
+    /// all — no `INSERT`, no audit row, no revision bump — unless at least
+    /// one segment was actually created or the policy source actually
+    /// changed. That's why every existing-name check and the policy
+    /// source-comparison happen BEFORE any mutation: a second, identical
+    /// apply must produce a transaction with zero writes in it, which is
+    /// what makes "zero new audit rows" true rather than merely arranged to
+    /// look true.
+    ///
+    /// `policy_yaml`, if `Some`, is stored as `policy_version.source_yaml`
+    /// and compiled via the STUB [`crate::apply::compile_policy`] (always
+    /// `"[]"`, empty IR v0) — but only as a NEW `policy_version` row (version
+    /// = previous max + 1, or 1 if none exist yet) when `policy_yaml` differs
+    /// from the latest stored `source_yaml`. `None`/identical-to-latest never
+    /// touches the `policy_version` table at all.
+    pub fn apply_fabric(
+        &self,
+        segments: &[(String, Vec<Ipv4Net>)],
+        policy_yaml: Option<&str>,
+        actor: &str,
+        now: &str,
+    ) -> Result<ApplyOutcome> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let existing_names: std::collections::HashSet<String> = {
+            let mut stmt = tx.prepare("SELECT name FROM segment")?;
+            let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+
+        // (entity, diff_json) pairs, accumulated so audit rows are only
+        // actually written once we know the apply as a whole isn't empty.
+        let mut created_segments = 0u32;
+        let mut audit_rows: Vec<(&'static str, String, String)> = Vec::new();
+
+        for (name, cidrs) in segments {
+            if existing_names.contains(name) {
+                // Already present: cycle-2 scope is create + no-op-on-match
+                // (see the doc comment above) — not an update, not an error.
+                continue;
+            }
+            match insert_segment_tx(&tx, name, cidrs) {
+                Ok(_id) => {}
+                Err(e) => {
+                    tx.rollback()?;
+                    return Err(e);
+                }
+            }
+            created_segments += 1;
+            let cidr_strs: Vec<String> = cidrs.iter().map(|c| c.to_string()).collect();
+            audit_rows.push((
+                "apply-create-segment",
+                format!("segment/{name}"),
+                format!(r#"{{"name":"{name}","cidrs":{cidr_strs:?}}}"#),
+            ));
+        }
+
+        // Policy stub seam: only touched when a `policy:` stanza was
+        // actually declared AND its source text differs from whatever is
+        // currently the latest `policy_version.source_yaml` (a fresh DB has
+        // none, which counts as "differs").
+        let mut policy_updated = false;
+        if let Some(source_yaml) = policy_yaml {
+            let latest: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT version, source_yaml FROM policy_version \
+                     ORDER BY version DESC LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+
+            let changed = match &latest {
+                Some((_, existing_source)) => existing_source != source_yaml,
+                None => true,
+            };
+
+            if changed {
+                let new_version = latest.map(|(v, _)| v + 1).unwrap_or(1);
+                let compiled_ir = crate::apply::compile_policy(source_yaml);
+                tx.execute(
+                    "INSERT INTO policy_version (version, source_yaml, compiled_ir, created_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![new_version, source_yaml, compiled_ir, actor, now],
+                )?;
+                policy_updated = true;
+                audit_rows.push((
+                    "apply-policy",
+                    format!("policy_version/{new_version}"),
+                    format!(r#"{{"version":{new_version}}}"#),
+                ));
+            }
+        }
+
+        if created_segments == 0 && !policy_updated {
+            // True no-op: nothing was written above (every branch that
+            // writes also increments one of these), so there is nothing to
+            // audit and no revision to bump — roll back the (empty, but
+            // still-open) transaction rather than committing a no-op write.
+            tx.rollback()?;
+            return Ok(ApplyOutcome {
+                created_segments: 0,
+                updated_segments: 0,
+                deleted_segments: 0,
+                policy_updated: false,
+            });
+        }
+
+        for (action, entity, diff_json) in audit_rows {
+            tx.execute(
+                "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![now, actor, action, entity, diff_json],
+            )?;
+        }
+
+        // Projection-affecting mutation (new segment(s)/policy change both
+        // qualify), so bump the persisted revision in this same transaction
+        // — see `bump_revision_tx`'s doc comment. Only reached when at least
+        // one real change happened, per the early return above.
+        bump_revision_tx(&tx)?;
+
+        tx.commit()?;
+        Ok(ApplyOutcome {
+            created_segments,
+            updated_segments: 0,
+            deleted_segments: 0,
+            policy_updated,
+        })
     }
 
     /// Reads the persisted Sync-projection revision (the single

@@ -36,6 +36,12 @@ service Admin {
   // already-connected gateway's peer set (a Delta with removed_peer_ids),
   // then removes its gateway row and revokes its cert(s).
   rpc Drain(DrainRequest) returns (DrainResponse);
+  // (Task 14) Declarative `fabricctl apply -f fabric.yaml`: parses a
+  // `segments:`/`relays:`/`policy:` YAML document, diffs it against current
+  // controller state, and applies every actual change in one transaction.
+  // An identical re-apply must be a true no-op: empty diff, zero mutations,
+  // zero new audit rows — see `crate::apply`/`crate::db::Db::apply_fabric`.
+  rpc Apply(ApplyRequest) returns (ApplyDiff);
 }
 message CreateSegmentRequest { string name = 1; repeated string cidrs = 2; }
 message Segment { uint64 id = 1; string name = 2; repeated string cidrs = 3; }
@@ -69,6 +75,22 @@ message MintApiTokenRequest { string name = 1; string role = 2; }
 message MintApiTokenResponse { string token = 1; }
 message RevokeApiTokenRequest { string name = 1; }
 message RevokeApiTokenResponse {}
+
+// (Task 14) The raw text of a `fabric.yaml`: a `segments: [{name, cidrs}]`
+// list, plus an optional `relays:` list and `policy:` block (policy is
+// STUBBED cycle-2: accepted/stored as source, compiled to an empty IR v0 —
+// see `crate::apply::compile_policy`).
+message ApplyRequest { string fabric_yaml = 1; }
+// (Task 14) What `Apply` actually changed. `total_changes` is the sum of
+// every count field plus (policy_updated ? 1 : 0) — a fully idempotent
+// re-apply yields every field zero/false, i.e. `total_changes == 0`.
+message ApplyDiff {
+  uint32 created_segments = 1;
+  uint32 updated_segments = 2;
+  uint32 deleted_segments = 3;
+  bool policy_updated = 4;
+  uint32 total_changes = 5;
+}
 
 // limit <= 0 falls back to a small server-side default.
 message AuditQueryRequest { int32 limit = 1; }

@@ -26,7 +26,8 @@ use wiremesh_proto::v1::admin_client::AdminClient;
 use wiremesh_proto::v1::enrollment_client::EnrollmentClient;
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{
-    CreateSegmentRequest, MintApiTokenRequest, MintTokenRequest, SyncMessage, WatchRequest,
+    ApplyDiff, ApplyRequest, CreateSegmentRequest, MintApiTokenRequest, MintTokenRequest,
+    SyncMessage, WatchRequest,
 };
 
 /// (Task 13) Client-side counterpart to `crate::auth`'s bearer-auth
@@ -367,6 +368,41 @@ impl TestController {
         })
         .await
         .expect("gateway_exists blocking task panicked")
+    }
+
+    /// (Task 14) Calls `Admin.Apply` with `fabric_yaml` as the raw `fabric.yaml`
+    /// text, over the controller's Unix socket, and returns the resulting
+    /// `ApplyDiff` — the wire-level equivalent of running `fabricctl apply -f`.
+    /// Used by `tests/apply.rs` to prove the diff engine's idempotence
+    /// contract (re-applying the identical fabric yields an empty diff).
+    pub async fn apply(&self, fabric_yaml: &str) -> ApplyDiff {
+        self.admin_client()
+            .await
+            .apply(ApplyRequest {
+                fabric_yaml: fabric_yaml.to_string(),
+            })
+            .await
+            .expect("Admin.Apply")
+            .into_inner()
+    }
+
+    /// (Task 14 testkit accessor) Total number of `audit_log` rows, read
+    /// straight off the controller's on-disk DB — same
+    /// open-a-second-connection-to-the-same-file pattern as
+    /// [`Self::gateway_exists`] (see that method's doc comment for why this
+    /// is safe: `Db::open` re-enables `foreign_keys` and sets a 5s
+    /// `busy_timeout` on every open). Used by `tests/apply.rs` to prove an
+    /// empty (no-op) re-apply writes zero new audit rows.
+    pub async fn count_audit(&self) -> i64 {
+        let db_path = self.data_dir().join("controller.db");
+        tokio::task::spawn_blocking(move || {
+            let db = wiremesh_controller::db::Db::open(&db_path)
+                .expect("opening controller DB for TestController::count_audit");
+            db.count_audit()
+                .expect("querying count_audit in TestController::count_audit")
+        })
+        .await
+        .expect("count_audit blocking task panicked")
     }
 
     /// Connects a tonic `EnrollmentClient` over the controller's TCP port.

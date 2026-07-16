@@ -17,12 +17,12 @@ use tonic::{Request, Response, Status};
 
 use wiremesh_proto::v1::admin_server::Admin;
 use wiremesh_proto::v1::{
-    AuditEntry, AuditQueryRequest, AuditQueryResponse, CreateSegmentRequest,
-    DebugKeyStatesRequest, DebugKeyStatesResponse, DeleteSegmentRequest, DeleteSegmentResponse,
-    DrainRequest, DrainResponse, GatewayInfo, GatewayKeyState, ListGatewaysRequest,
-    ListGatewaysResponse, ListRelaysRequest, ListRelaysResponse, ListSegmentsRequest,
-    ListSegmentsResponse, MintApiTokenRequest, MintApiTokenResponse, MintTokenRequest,
-    MintTokenResponse, RegisterRelayRequest, Relay, RevokeApiTokenRequest,
+    ApplyDiff, ApplyRequest, AuditEntry, AuditQueryRequest, AuditQueryResponse,
+    CreateSegmentRequest, DebugKeyStatesRequest, DebugKeyStatesResponse, DeleteSegmentRequest,
+    DeleteSegmentResponse, DrainRequest, DrainResponse, GatewayInfo, GatewayKeyState,
+    ListGatewaysRequest, ListGatewaysResponse, ListRelaysRequest, ListRelaysResponse,
+    ListSegmentsRequest, ListSegmentsResponse, MintApiTokenRequest, MintApiTokenResponse,
+    MintTokenRequest, MintTokenResponse, RegisterRelayRequest, Relay, RevokeApiTokenRequest,
     RevokeApiTokenResponse, RotateKeyRequest, RotateKeyResponse, Segment,
 };
 
@@ -621,6 +621,62 @@ impl Admin for AdminSvc {
         });
 
         Ok(Response::new(DrainResponse {}))
+    }
+
+    /// (Task 14) Declarative `fabricctl apply -f fabric.yaml`: parses the
+    /// YAML (`crate::apply::parse_fabric`), validates every segment's CIDRs
+    /// as IPv4 (mirrors `create_segment`), and hands the whole thing to
+    /// [`crate::db_async::DbHandle::apply_fabric`] to diff-and-apply in one
+    /// transaction. See that method's doc comment for the idempotence
+    /// contract this RPC is entirely riding on: a second, identical apply
+    /// must come back with every `ApplyDiff` field zero/false.
+    async fn apply(&self, request: Request<ApplyRequest>) -> Result<Response<ApplyDiff>, Status> {
+        let req = request.into_inner();
+
+        let spec = crate::apply::parse_fabric(&req.fabric_yaml)
+            .map_err(|e| Status::invalid_argument(format!("parsing fabric yaml: {e}")))?;
+
+        let mut segments = Vec::with_capacity(spec.segments.len());
+        for s in &spec.segments {
+            let cidrs: Vec<Ipv4Net> = s
+                .cidrs
+                .iter()
+                .map(|c| {
+                    Ipv4Net::from_str(c).map_err(|e| {
+                        Status::invalid_argument(format!(
+                            "invalid IPv4 CIDR {c:?} in segment {:?}: {e}",
+                            s.name
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
+            segments.push((s.name.clone(), cidrs));
+        }
+
+        let policy_yaml = spec.policy.as_ref().map(crate::apply::policy_source_yaml);
+
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        let outcome = self
+            .db
+            .apply_fabric(segments, policy_yaml, "unix-socket".to_string(), now)
+            .await
+            .map_err(|e| Status::internal(format!("applying fabric: {e}")))?;
+
+        let total_changes = outcome.created_segments
+            + outcome.updated_segments
+            + outcome.deleted_segments
+            + u32::from(outcome.policy_updated);
+
+        Ok(Response::new(ApplyDiff {
+            created_segments: outcome.created_segments,
+            updated_segments: outcome.updated_segments,
+            deleted_segments: outcome.deleted_segments,
+            policy_updated: outcome.policy_updated,
+            total_changes,
+        }))
     }
 }
 

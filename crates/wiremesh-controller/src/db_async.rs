@@ -11,8 +11,8 @@ use ipnet::Ipv4Net;
 
 use crate::db::Db;
 pub use crate::db::{
-    DrainOutcome, EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow, GatewayRow,
-    RotateKeyOutcome,
+    ApplyOutcome, DrainOutcome, EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow,
+    GatewayRow, RotateKeyOutcome,
 };
 
 /// Cheaply cloneable async handle to a [`Db`]. `Db` already serializes access
@@ -255,5 +255,20 @@ impl DbHandle {
     pub async fn list_gateways(&self) -> Result<Vec<(i64, String, String, String, Option<i64>)>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.list_gateways()).await?
+    }
+
+    /// See [`Db::apply_fabric`]. Backs `Admin.Apply`.
+    pub async fn apply_fabric(
+        &self,
+        segments: Vec<(String, Vec<Ipv4Net>)>,
+        policy_yaml: Option<String>,
+        actor: String,
+        now: String,
+    ) -> Result<ApplyOutcome> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            db.apply_fabric(&segments, policy_yaml.as_deref(), &actor, &now)
+        })
+        .await?
     }
 }

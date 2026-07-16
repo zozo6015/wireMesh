@@ -8,6 +8,7 @@
 //! `wiremesh-testkit::TestController` boots it in-process for integration
 //! tests.
 
+pub mod apply;
 pub mod auth;
 pub mod db;
 pub mod db_async;
