@@ -108,6 +108,15 @@ impl Admin for AdminSvc {
             return Err(Status::invalid_argument("token kind must not be empty"));
         }
 
+        // Validate each bound CIDR as IPv4 up front (mirrors CreateSegment) so
+        // a malformed CIDR is rejected at mint time rather than surfacing much
+        // later at enrollment.
+        for c in &req.bound_cidrs {
+            Ipv4Net::from_str(c).map_err(|e| {
+                Status::invalid_argument(format!("invalid IPv4 bound_cidr {c:?}: {e}"))
+            })?;
+        }
+
         let mut secret = [0u8; SECRET_LEN];
         rand::thread_rng().fill_bytes(&mut secret);
         let secret_hex = hex_encode(&secret);
@@ -132,7 +141,7 @@ impl Admin for AdminSvc {
                 token_id,
                 secret_hash_hex,
                 req.kind.clone(),
-                req.bound_cidrs.join(","),
+                encode_bound_cidrs(&req.bound_cidrs),
                 rebind_segment_id,
                 expires_at,
             )
@@ -172,4 +181,30 @@ impl Admin for AdminSvc {
 
 fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
     bytes.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Encode/decode contract for `enrollment_token.bound_cidrs` (consumed by T5
+/// Enrollment + T10 rebind):
+///
+/// - Storage is a comma-joined string of the CIDR strings.
+/// - **An empty set stores the empty string `""`** and MUST decode back to an
+///   empty `Vec`, NOT `[""]`. A naive `s.split(',')` yields one empty element
+///   for `""`, which would then fail CIDR parsing at enrollment — so decoders
+///   MUST short-circuit the empty string to `[]`. [`decode_bound_cidrs`] is
+///   the canonical decoder; T5/T10 should call it rather than re-split.
+///
+/// (Comma-join is safe because every element is a validated IPv4 CIDR — no
+/// element can itself contain a comma.)
+fn encode_bound_cidrs(cidrs: &[String]) -> String {
+    cidrs.join(",")
+}
+
+/// Canonical decoder for [`encode_bound_cidrs`] — treats `""` as the empty
+/// set (see that function's contract). Kept `pub` so the Enrollment/rebind
+/// services parse `bound_cidrs` through exactly this, not an ad-hoc split.
+pub fn decode_bound_cidrs(stored: &str) -> Vec<String> {
+    if stored.is_empty() {
+        return Vec::new();
+    }
+    stored.split(',').map(|s| s.to_string()).collect()
 }

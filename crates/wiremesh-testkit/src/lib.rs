@@ -24,12 +24,19 @@ use wiremesh_proto::v1::admin_client::AdminClient;
 /// A real controller, booted in-process against a temporary data directory,
 /// for integration tests to drive.
 pub struct TestController {
+    // FIELD ORDER IS LOad-BEARING. Rust drops struct fields in declaration
+    // order, so `running` MUST be declared before `_data_dir`: dropping
+    // `running` first fires `RunningController`'s shutdown signal, and only
+    // then does `_data_dir`'s Drop remove the DB/CA/secrets and unlink the
+    // socket. The reverse order would delete the on-disk state (and the UDS)
+    // out from under a still-running server task — which later streaming
+    // tasks (5/7/8) build on this harness and would stress.
+    running: RunningController,
+    socket_path: PathBuf,
     // Held only so the directory (and everything the controller wrote under
     // it — DB, CA, secrets, the socket) is cleaned up on drop; never read
-    // directly, but must outlive `running`.
+    // directly.
     _data_dir: TempDir,
-    socket_path: PathBuf,
-    running: RunningController,
 }
 
 impl TestController {
