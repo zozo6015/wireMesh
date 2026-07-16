@@ -290,11 +290,16 @@ pub struct GatewayIdentity {
     pub segment_name: String,
 }
 
-/// One row of [`Db::active_keys_for_gateway`]: `(epoch, pubkey, state)`.
-/// Cycle-2's Sync projection only reads `state = 'active'` rows (key
-/// management/rotation is Task 11) — this task's tests always see an empty
-/// `Vec` since nothing populates `gateway_key` yet.
+/// One row of [`Db::active_keys_for_gateway`] / [`Db::all_keys_for_gateway`]:
+/// `(epoch, pubkey, state)`.
 pub type GatewayKeyRow = (i64, String, String);
+
+/// Result of a successful [`Db::rotate_key`] call: the new epoch and its
+/// (placeholder) pubkey — always inserted with `state = 'pending'`.
+pub struct RotateKeyOutcome {
+    pub epoch: i64,
+    pub pubkey: String,
+}
 
 /// The controller's embedded SQLite store.
 ///
@@ -735,6 +740,17 @@ impl Db {
             params![cert_serial, gateway_id, issuer_handle, cert_not_after],
         )?;
 
+        // (Task 11) Bookkeeping baseline: every enrolled gateway gets an
+        // epoch-0 `active` GATEWAY_KEY row so a later `RotateKey` always has
+        // something to rotate FROM. The pubkey here is a placeholder, NOT a
+        // real WireGuard public key — cycle-2 is bookkeeping only (no real
+        // WireGuard/data-plane; see the module doc comment and the Task 11
+        // brief). A real gateway-generated pubkey lands in cycle 4.
+        tx.execute(
+            "INSERT INTO gateway_key (gateway_id, epoch, pubkey, state) VALUES (?1, 0, ?2, 'active')",
+            params![gateway_id, format!("placeholder-pubkey-gw{gateway_id}-epoch0")],
+        )?;
+
         // `AND used_at IS NULL` is redundant given the SELECT above already
         // filtered on it under the same held lock, but it costs nothing and
         // means a future refactor that weakens the lock discipline fails
@@ -818,8 +834,11 @@ impl Db {
     }
 
     /// `gateway_key` rows with `state = 'active'` for `gateway_id`, as
-    /// `(epoch, pubkey, state)` — becomes a peer's `keys` in the Sync
-    /// projection. Empty until Task 11 populates `gateway_key`.
+    /// `(epoch, pubkey, state)`. Not currently called by the Sync projection
+    /// (see [`Db::all_keys_for_gateway`], which [`crate::routes::peers_of`]
+    /// uses instead so a peer's `pending`/`retiring` epochs are visible
+    /// too) — kept as a narrower query for any future caller that only
+    /// wants the currently-in-use key.
     pub fn active_keys_for_gateway(&self, gateway_id: i64) -> Result<Vec<GatewayKeyRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
@@ -833,6 +852,123 @@ impl Db {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// ALL `gateway_key` rows (any state — `pending`, `active`, `retiring`)
+    /// for `gateway_id`, as `(epoch, pubkey, state)`. (Task 11) This is what
+    /// [`crate::routes::peers_of`] now reads for a peer's `keys` in the Sync
+    /// projection: a peer must see a gateway's mid-rotation `pending` epoch
+    /// too, not just its currently-`active` one, so an already-connected
+    /// Sync.Watch stream's Delta reflects the same state a fresh snapshot
+    /// would. Also backs the Admin `DebugKeyStates` RPC / testkit's
+    /// `debug_key_states` accessor — a debug-only view into the rotation
+    /// state machine.
+    pub fn all_keys_for_gateway(&self, gateway_id: i64) -> Result<Vec<GatewayKeyRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT epoch, pubkey, state FROM gateway_key \
+             WHERE gateway_id = ?1 \
+             ORDER BY epoch",
+        )?;
+        let rows = stmt
+            .query_map(params![gateway_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// (Task 11) Starts a make-before-break key-epoch rotation for
+    /// `gateway_id`: finds the gateway's current highest `gateway_key`
+    /// epoch (every enrolled gateway has at least an epoch-0 `active` row —
+    /// see `enroll_gateway`'s bookkeeping baseline — but this defensively
+    /// tolerates a gap/legacy row set by falling back to epoch 0 if none
+    /// exists yet), inserts a NEW row at `epoch = max + 1` with
+    /// `state = 'pending'` and a placeholder pubkey (a real gateway-supplied
+    /// pubkey is cycle 4's scope — see the module doc comment), appends an
+    /// audit entry, and bumps the persisted revision — all in ONE
+    /// transaction, so a caller observing success can rely on every side
+    /// effect (including the revision bump the Sync projection depends on)
+    /// having landed together, and a crash mid-rotation can't leave a
+    /// pending epoch un-audited or un-revisioned.
+    ///
+    /// Full make-before-break completion (an ack from the gateway advancing
+    /// `n+1` to `active` and `n` to `retiring`, then removing `n`) is NOT
+    /// implemented here — this is cycle-2's bookkeeping slice: "pending
+    /// epoch created, persisted, and delta'd to peers." See the Task 11
+    /// brief/report for what's deferred to cycle 4's real WireGuard
+    /// handshake-driven ack path.
+    pub fn rotate_key(&self, gateway_id: i64, now: &str) -> Result<RotateKeyOutcome> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway WHERE id = ?1)",
+            params![gateway_id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.rollback()?;
+            anyhow::bail!("RotateKey: no gateway row with id {gateway_id} to rotate a key for");
+        }
+
+        let max_epoch: Option<i64> = tx.query_row(
+            "SELECT MAX(epoch) FROM gateway_key WHERE gateway_id = ?1",
+            params![gateway_id],
+            |row| row.get(0),
+        )?;
+        let new_epoch = max_epoch.map(|e| e + 1).unwrap_or(0);
+        let pubkey = format!("placeholder-pubkey-gw{gateway_id}-epoch{new_epoch}");
+
+        tx.execute(
+            "INSERT INTO gateway_key (gateway_id, epoch, pubkey, state) \
+             VALUES (?1, ?2, ?3, 'pending')",
+            params![gateway_id, new_epoch, pubkey],
+        )?;
+
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                "unix-socket",
+                "key-rotate",
+                format!("gateway/{gateway_id}"),
+                format!(r#"{{"epoch":{new_epoch}}}"#),
+            ],
+        )?;
+
+        // Projection-affecting mutation: a new pending epoch changes what
+        // this gateway's peers see in their `keys` list, so bump the
+        // persisted revision in this same transaction (see `bump_revision_tx`'s
+        // doc comment). The early `tx.rollback()` above never reaches here.
+        bump_revision_tx(&tx)?;
+
+        tx.commit()?;
+        Ok(RotateKeyOutcome { epoch: new_epoch, pubkey })
+    }
+
+    /// Resolves an enrolled gateway by its DB `id` (the same shape
+    /// [`Db::find_gateway_by_name`] returns, just keyed by id instead of
+    /// name) — used after [`Db::rotate_key`] to re-read the segment identity
+    /// needed to build the `ChangeEvent`/`Delta` the Admin `RotateKey` RPC
+    /// publishes.
+    pub fn gateway_identity_by_id(&self, gateway_id: i64) -> Result<Option<GatewayIdentity>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT g.id, g.segment_id, s.name \
+             FROM gateway g JOIN segment s ON s.id = g.segment_id \
+             WHERE g.id = ?1",
+            params![gateway_id],
+            |row| {
+                Ok(GatewayIdentity {
+                    id: row.get(0)?,
+                    segment_id: row.get(1)?,
+                    segment_name: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// Serial numbers of every `certificate` row with `revoked_at NOT NULL`,

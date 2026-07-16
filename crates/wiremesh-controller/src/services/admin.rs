@@ -9,15 +9,18 @@ use ipnet::Ipv4Net;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
 use wiremesh_proto::v1::admin_server::Admin;
 use wiremesh_proto::v1::{
-    CreateSegmentRequest, ListGatewaysRequest, ListGatewaysResponse, MintTokenRequest,
-    MintTokenResponse, Segment,
+    CreateSegmentRequest, DebugKeyStatesRequest, DebugKeyStatesResponse, GatewayKeyState,
+    ListGatewaysRequest, ListGatewaysResponse, MintTokenRequest, MintTokenResponse, RotateKeyRequest,
+    RotateKeyResponse, Segment,
 };
 
 use crate::db_async::DbHandle;
+use crate::projection::ChangeEvent;
 
 /// A freshly minted enrollment token's raw secret is never persisted —
 /// [`enrollment_token.secret_hash`] stores only its sha256. Cycle-2 tokens
@@ -37,14 +40,25 @@ pub struct AdminSvc {
     /// Host (currently the controller's TCP address) stamped into the
     /// `wiremesh://<host>/...` token URL.
     host: String,
+    /// (Task 11) Publishes a [`ChangeEvent::KeyRotated`] after a successful
+    /// `RotateKey`, same fan-out channel `EnrollmentSvc` publishes
+    /// `GatewayEnrolled` on — see `crate::services::sync` for the
+    /// subscriber side.
+    change_tx: broadcast::Sender<ChangeEvent>,
 }
 
 impl AdminSvc {
-    pub fn new(db: DbHandle, ca_root_fingerprint_hex: String, host: String) -> Self {
+    pub fn new(
+        db: DbHandle,
+        ca_root_fingerprint_hex: String,
+        host: String,
+        change_tx: broadcast::Sender<ChangeEvent>,
+    ) -> Self {
         Self {
             db,
             ca_root_fingerprint_hex,
             host,
+            change_tx,
         }
     }
 }
@@ -176,6 +190,111 @@ impl Admin for AdminSvc {
         Err(Status::unimplemented(
             "ListGateways is not implemented yet",
         ))
+    }
+
+    /// (Task 11) Starts a make-before-break key-epoch rotation: see
+    /// [`crate::db::Db::rotate_key`] for the transactional bookkeeping
+    /// (new `pending` epoch + audit + revision bump, all atomic). After that
+    /// commits, re-reads the gateway's segment identity, `allowed_ips`, and
+    /// FULL current key set (including the just-inserted pending row) to
+    /// publish a [`ChangeEvent::KeyRotated`] — this is what pushes a `Delta`
+    /// down every OTHER already-connected gateway's still-open `Sync.Watch`
+    /// stream, same fan-out pattern `EnrollmentSvc::enroll` uses for
+    /// `GatewayEnrolled`.
+    async fn rotate_key(
+        &self,
+        request: Request<RotateKeyRequest>,
+    ) -> Result<Response<RotateKeyResponse>, Status> {
+        let req = request.into_inner();
+        let gateway_id = req.gateway_id as i64;
+
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        let outcome = self.db.rotate_key(gateway_id, now).await.map_err(|e| {
+            let msg = e.to_string();
+            if msg.contains("no gateway row") {
+                Status::not_found(msg)
+            } else {
+                Status::internal(format!("rotating key: {e}"))
+            }
+        })?;
+
+        // Publish so already-connected peers see the new pending key. A
+        // missing identity here would mean the gateway vanished between
+        // `rotate_key`'s existence check and this re-read — treated as an
+        // internal error (shouldn't happen: nothing in cycle-2 deletes
+        // gateway rows).
+        let identity = self
+            .db
+            .gateway_identity_by_id(gateway_id)
+            .await
+            .map_err(|e| Status::internal(format!("re-reading gateway after rotation: {e}")))?
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "gateway {gateway_id} vanished immediately after RotateKey committed"
+                ))
+            })?;
+        let allowed_ips = self
+            .db
+            .cidrs_for_segment(identity.segment_id)
+            .await
+            .map_err(|e| Status::internal(format!("reading segment cidrs after rotation: {e}")))?;
+        let keys = self
+            .db
+            .all_keys_for_gateway(gateway_id)
+            .await
+            .map_err(|e| Status::internal(format!("reading gateway keys after rotation: {e}")))?;
+        let revision = self
+            .db
+            .current_revision()
+            .await
+            .map_err(|e| Status::internal(format!("reading revision after rotation: {e}")))?;
+
+        // `send` errors only when there are currently no `Sync.Watch`
+        // subscribers — nobody to notify, which is not a failure (mirrors
+        // `EnrollmentSvc::enroll`'s identical `let _ =`).
+        let _ = self.change_tx.send(ChangeEvent::KeyRotated {
+            gateway_id,
+            segment_name: identity.segment_name,
+            allowed_ips,
+            keys,
+            revision,
+        });
+
+        Ok(Response::new(RotateKeyResponse {
+            epoch: outcome.epoch as u32,
+            pubkey: outcome.pubkey,
+            state: "pending".to_string(),
+        }))
+    }
+
+    /// (Task 11) Debug/test accessor: every `gateway_key` row (any state)
+    /// for a gateway, straight off the DB — not part of the gateway-facing
+    /// Sync projection. Backs `wiremesh-testkit::TestController::debug_key_states`,
+    /// which `tests/keys.rs` uses to prove the rotation's `pending` epoch
+    /// survives a controller restart (i.e. it's DB-backed, not just
+    /// in-memory).
+    async fn debug_key_states(
+        &self,
+        request: Request<DebugKeyStatesRequest>,
+    ) -> Result<Response<DebugKeyStatesResponse>, Status> {
+        let req = request.into_inner();
+        let rows = self
+            .db
+            .all_keys_for_gateway(req.gateway_id as i64)
+            .await
+            .map_err(|e| Status::internal(format!("reading key states: {e}")))?;
+        Ok(Response::new(DebugKeyStatesResponse {
+            keys: rows
+                .into_iter()
+                .map(|(epoch, _pubkey, state)| GatewayKeyState {
+                    epoch: epoch as u32,
+                    state,
+                })
+                .collect(),
+        }))
     }
 }
 

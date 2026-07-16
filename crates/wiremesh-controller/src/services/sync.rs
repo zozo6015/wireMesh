@@ -102,9 +102,9 @@ impl Sync for SyncSvc {
         // for as long as this gRPC call is alive.
         let delta_stream = BroadcastStream::new(rx).filter_map(move |item| match item {
             Ok(event) => {
-                // A gateway must never receive a delta "adding" itself as
-                // its own peer.
-                if event.new_gateway_id == self_gateway_id {
+                // A gateway must never receive a delta "adding"/"updating"
+                // itself as its own peer.
+                if event.subject_gateway_id() == self_gateway_id {
                     None
                 } else {
                     let delta = projection::delta_for_change(event);

@@ -212,7 +212,7 @@ impl Enrollment for EnrollmentSvc {
         // `send` errors only when there are currently no `Sync.Watch`
         // subscribers (e.g. the very first gateway enrolling into a fresh
         // controller) — nobody to notify, which is not a failure.
-        let _ = self.change_tx.send(ChangeEvent {
+        let _ = self.change_tx.send(ChangeEvent::GatewayEnrolled {
             new_gateway_id: identity.id,
             segment_name: identity.segment_name,
             allowed_ips,
@@ -228,6 +228,7 @@ impl Enrollment for EnrollmentSvc {
         Ok(Response::new(EnrollResponse {
             cert_pem: issued.cert_pem,
             ca_bundle_pem,
+            gateway_id: identity.id as u64,
         }))
     }
 }

@@ -20,53 +20,121 @@ use crate::routes;
 /// A projection-affecting mutation, broadcast (via a
 /// `tokio::sync::broadcast::Sender<ChangeEvent>` shared by every service
 /// that can mutate the projection and every live `Sync.Watch` connection —
-/// see `crate::services::sync` and `crate::services::enrollment`) so an
-/// already-open Sync stream can push an incremental [`Delta`] instead of
-/// waiting for the gateway to reconnect and re-fetch a full snapshot.
+/// see `crate::services::sync`, `crate::services::enrollment`, and
+/// `crate::services::admin`) so an already-open Sync stream can push an
+/// incremental [`Delta`] instead of waiting for the gateway to reconnect
+/// and re-fetch a full snapshot.
 ///
-/// Cycle-2/Task 8 scope: the only event produced today is "a new gateway
-/// enrolled" (a full-mesh peer every OTHER already-connected gateway must
-/// learn about). Key rotation, segment CIDR changes, and revocation are
-/// later tasks' events, added as further variants/fields once they exist —
-/// deliberately not modeled as an enum yet since there's only one case.
+/// Cycle-2 scope: `GatewayEnrolled` (Task 8) and `KeyRotated` (Task 11).
+/// Segment CIDR changes and revocation are later tasks' events, added as
+/// further variants once they exist.
 #[derive(Clone, Debug)]
-pub struct ChangeEvent {
-    /// The newly enrolled gateway's id — a `Sync.Watch` connection for THIS
-    /// SAME gateway must skip its own event (it would otherwise receive a
-    /// delta "adding" itself as its own peer).
-    pub new_gateway_id: i64,
-    pub segment_name: String,
-    /// The new gateway's segment's CIDRs — becomes the upserted peer's
-    /// `allowed_ips`.
-    pub allowed_ips: Vec<String>,
-    /// The persisted revision the mutation bumped to
-    /// ([`crate::db_async::DbHandle::current_revision`], read AFTER the
-    /// mutation's transaction committed) — strictly greater than any
-    /// snapshot/delta revision a connected gateway has already seen.
-    pub revision: u64,
+pub enum ChangeEvent {
+    /// A new gateway enrolled — a full-mesh peer every OTHER
+    /// already-connected gateway must learn about.
+    GatewayEnrolled {
+        new_gateway_id: i64,
+        segment_name: String,
+        /// The new gateway's segment's CIDRs — becomes the upserted peer's
+        /// `allowed_ips`.
+        allowed_ips: Vec<String>,
+        /// The persisted revision the mutation bumped to
+        /// ([`crate::db_async::DbHandle::current_revision`], read AFTER the
+        /// mutation's transaction committed) — strictly greater than any
+        /// snapshot/delta revision a connected gateway has already seen.
+        revision: u64,
+    },
+    /// (Task 11) `Admin.RotateKey` created a new `pending` `gateway_key`
+    /// epoch for `gateway_id` — every OTHER already-connected gateway's
+    /// peer view of it must be upserted with its FULL current key set (all
+    /// epochs/states), so an open Sync.Watch stream stays consistent with
+    /// what a fresh snapshot would show.
+    KeyRotated {
+        gateway_id: i64,
+        segment_name: String,
+        allowed_ips: Vec<String>,
+        /// `(epoch, pubkey, state)` for every `gateway_key` row of
+        /// `gateway_id`, straight off [`crate::db::Db::all_keys_for_gateway`]
+        /// — includes the just-inserted `pending` row.
+        keys: Vec<(i64, String, String)>,
+        revision: u64,
+    },
+}
+
+impl ChangeEvent {
+    /// The gateway id this event is ABOUT. Used by `SyncSvc::watch` to skip
+    /// forwarding an event to the very connection whose own gateway it
+    /// describes — a gateway must never receive a delta "adding"/"updating"
+    /// itself as its own peer (the full-mesh projection always excludes
+    /// self; see `Db::list_other_gateways`).
+    pub fn subject_gateway_id(&self) -> i64 {
+        match self {
+            ChangeEvent::GatewayEnrolled { new_gateway_id, .. } => *new_gateway_id,
+            ChangeEvent::KeyRotated { gateway_id, .. } => *gateway_id,
+        }
+    }
 }
 
 /// Turns a [`ChangeEvent`] into the [`Delta`] a `Sync.Watch` connection
-/// forwards to its gateway. A freshly enrolled gateway has no
-/// `gateway_key` rows yet (key management is Task 11), so `keys` is always
-/// empty here — same as `build_snapshot`'s peers before any key exists.
+/// forwards to its gateway.
 pub fn delta_for_change(event: ChangeEvent) -> Delta {
-    Delta {
-        revision: event.revision,
-        upserted_peers: vec![Peer {
-            gateway_id: event.new_gateway_id as u64,
-            segment_name: event.segment_name,
-            keys: Vec::new(),
-            candidate_endpoints: Vec::new(),
-            allowed_ips: event.allowed_ips,
-        }],
-        removed_peer_ids: Vec::new(),
-        // Relay/policy/revocation deltas are later tasks' scope — cycle-2's
-        // only change source is "a gateway enrolled" (see `ChangeEvent`).
-        relays: Vec::new(),
-        policy_ir: Vec::new(),
-        policy_version: 0,
-        revoked_serials: Vec::new(),
+    match event {
+        ChangeEvent::GatewayEnrolled {
+            new_gateway_id,
+            segment_name,
+            allowed_ips,
+            revision,
+        } => Delta {
+            revision,
+            upserted_peers: vec![Peer {
+                gateway_id: new_gateway_id as u64,
+                segment_name,
+                // A freshly enrolled gateway's epoch-0 baseline key is
+                // deliberately NOT included here: `EnrollmentSvc` publishes
+                // this event before Task 11 existed and a peer will pick up
+                // the baseline key on its next full snapshot/reconnect, or
+                // on the gateway's first `RotateKey`. Keeping this delta
+                // minimal (identity + allowed_ips only) matches the
+                // pre-Task-11 wire shape this test suite already relies on
+                // (`tests/sync_delta.rs` doesn't assert on `keys`).
+                keys: Vec::new(),
+                candidate_endpoints: Vec::new(),
+                allowed_ips,
+            }],
+            removed_peer_ids: Vec::new(),
+            relays: Vec::new(),
+            policy_ir: Vec::new(),
+            policy_version: 0,
+            revoked_serials: Vec::new(),
+        },
+        ChangeEvent::KeyRotated {
+            gateway_id,
+            segment_name,
+            allowed_ips,
+            keys,
+            revision,
+        } => Delta {
+            revision,
+            upserted_peers: vec![Peer {
+                gateway_id: gateway_id as u64,
+                segment_name,
+                keys: keys
+                    .into_iter()
+                    .map(|(epoch, pubkey, state)| PeerKey {
+                        epoch: epoch as u32,
+                        pubkey,
+                        state,
+                    })
+                    .collect(),
+                candidate_endpoints: Vec::new(),
+                allowed_ips,
+            }],
+            removed_peer_ids: Vec::new(),
+            relays: Vec::new(),
+            policy_ir: Vec::new(),
+            policy_version: 0,
+            revoked_serials: Vec::new(),
+        },
     }
 }
 

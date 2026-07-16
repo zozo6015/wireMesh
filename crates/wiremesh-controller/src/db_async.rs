@@ -10,7 +10,9 @@ use anyhow::Result;
 use ipnet::Ipv4Net;
 
 use crate::db::Db;
-pub use crate::db::{EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow, GatewayRow};
+pub use crate::db::{
+    EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow, GatewayRow, RotateKeyOutcome,
+};
 
 /// Cheaply cloneable async handle to a [`Db`]. `Db` already serializes access
 /// internally (a `Mutex<Connection>`), so `Arc<Db>` — rather than a pool — is
@@ -125,6 +127,24 @@ impl DbHandle {
     pub async fn active_keys_for_gateway(&self, gateway_id: i64) -> Result<Vec<GatewayKeyRow>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.active_keys_for_gateway(gateway_id)).await?
+    }
+
+    /// See [`Db::all_keys_for_gateway`].
+    pub async fn all_keys_for_gateway(&self, gateway_id: i64) -> Result<Vec<GatewayKeyRow>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.all_keys_for_gateway(gateway_id)).await?
+    }
+
+    /// See [`Db::rotate_key`].
+    pub async fn rotate_key(&self, gateway_id: i64, now: String) -> Result<RotateKeyOutcome> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.rotate_key(gateway_id, &now)).await?
+    }
+
+    /// See [`Db::gateway_identity_by_id`].
+    pub async fn gateway_identity_by_id(&self, gateway_id: i64) -> Result<Option<GatewayIdentity>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.gateway_identity_by_id(gateway_id)).await?
     }
 
     /// See [`Db::revoked_serials`].

@@ -54,6 +54,13 @@ const SERVER_IDENTITY_TTL: StdDuration = StdDuration::from_secs(365 * 24 * 3600)
 /// operator-driven, low-frequency event, not a hot path).
 const CHANGE_EVENT_CHANNEL_CAPACITY: usize = 64;
 
+/// How long [`RunningController::shutdown`] waits for a gracefully-signaled
+/// server task to finish before force-`abort()`ing it. Short enough that a
+/// restart with an open `Sync.Watch` stream completes promptly (the whole
+/// point — see `shutdown`'s doc comment), long enough that a task genuinely
+/// draining a brief in-flight unary request finishes gracefully first.
+const SHUTDOWN_GRACE: StdDuration = StdDuration::from_millis(500);
+
 /// Everything [`serve`] needs to boot a controller instance.
 ///
 /// `tcp_port = 0` asks the OS to pick a free port (used by tests and by the
@@ -134,7 +141,24 @@ impl RunningController {
         &self.ca_bundle_pem
     }
 
-    /// Signals all servers to stop and waits for their tasks to finish.
+    /// Signals all servers to stop and waits (bounded) for their tasks to
+    /// finish, force-aborting any that don't wind down promptly.
+    ///
+    /// tonic's `serve_with_incoming_shutdown` does a GRACEFUL shutdown: after
+    /// the signal fires it waits for every in-flight request to complete
+    /// before its `serve` future resolves. That's the right default, but a
+    /// `Sync.Watch` connection is a server-streaming RPC that stays in-flight
+    /// for as long as the CLIENT holds the stream open — an effectively
+    /// infinite request. If a caller (e.g. `TestController::restart`, or a
+    /// real operator restarting a controller with gateways still connected)
+    /// shuts down while a `Watch` stream is open, a purely graceful
+    /// `join.await` would block FOREVER waiting for that stream to end on its
+    /// own. So after signaling, each server task is awaited only up to
+    /// [`SHUTDOWN_GRACE`]; on timeout it's `abort()`ed, which force-closes the
+    /// listener (and thus the lingering stream) so shutdown always completes
+    /// in bounded time. The clean case — no open long-lived streams (e.g.
+    /// `fail_static.rs`, which drops its stream first) — still finishes
+    /// gracefully well within the grace window and is never aborted.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.admin_shutdown_tx.take() {
             let _ = tx.send(());
@@ -145,13 +169,27 @@ impl RunningController {
         if let Some(tx) = self.sync_shutdown_tx.take() {
             let _ = tx.send(());
         }
-        if let Some(join) = self.admin_join.take() {
-            let _ = join.await;
-        }
-        if let Some(join) = self.enroll_join.take() {
-            let _ = join.await;
-        }
-        if let Some(join) = self.sync_join.take() {
+        join_bounded(self.admin_join.take()).await;
+        join_bounded(self.enroll_join.take()).await;
+        join_bounded(self.sync_join.take()).await;
+    }
+}
+
+/// Awaits a server task's `JoinHandle` for at most [`SHUTDOWN_GRACE`], then
+/// `abort()`s it if it hasn't finished — see [`RunningController::shutdown`]
+/// for why an unbounded await can hang on an open `Sync.Watch` stream.
+async fn join_bounded(join: Option<JoinHandle<()>>) {
+    let Some(mut join) = join else {
+        return;
+    };
+    // `&mut JoinHandle` is itself a `Future` (JoinHandle: Future + Unpin), so
+    // a timeout that elapses leaves the handle intact to `abort()`.
+    match tokio::time::timeout(SHUTDOWN_GRACE, &mut join).await {
+        Ok(_) => {}
+        Err(_) => {
+            join.abort();
+            // Reap the now-cancelled task so its resources are released
+            // before we return (the abort makes this resolve promptly).
             let _ = join.await;
         }
     }
@@ -251,7 +289,21 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         .with_context(|| format!("binding unix socket at {}", config.socket_path.display()))?;
     let uds_stream = UnixListenerStream::new(uds);
 
-    let admin_svc = AdminSvc::new(db_handle.clone(), ca_fingerprint, tcp_addr.to_string());
+    // Shared fan-out channel for Task 8's Sync delta stream: every
+    // projection-affecting mutation site (`EnrollmentSvc`, and — Task 11 —
+    // `AdminSvc::rotate_key`) publishes here; every `SyncSvc::watch`
+    // connection subscribes its own receiver. See `projection::ChangeEvent`'s
+    // doc comment. Constructed before `AdminSvc`/`EnrollmentSvc` so both can
+    // hold a clone of the sender.
+    let (change_tx, _) =
+        broadcast::channel::<projection::ChangeEvent>(CHANGE_EVENT_CHANNEL_CAPACITY);
+
+    let admin_svc = AdminSvc::new(
+        db_handle.clone(),
+        ca_fingerprint,
+        tcp_addr.to_string(),
+        change_tx.clone(),
+    );
 
     let (admin_shutdown_tx, admin_shutdown_rx) = oneshot::channel::<()>();
     let admin_server = Server::builder()
@@ -265,13 +317,6 @@ pub async fn serve(config: Config) -> Result<RunningController> {
             eprintln!("wiremesh-controller: admin server error: {e}");
         }
     });
-
-    // Shared fan-out channel for Task 8's Sync delta stream: `EnrollmentSvc`
-    // (the only projection-affecting mutation site today) publishes here;
-    // every `SyncSvc::watch` connection subscribes its own receiver. See
-    // `projection::ChangeEvent`'s doc comment.
-    let (change_tx, _) =
-        broadcast::channel::<projection::ChangeEvent>(CHANGE_EVENT_CHANNEL_CAPACITY);
 
     let enrollment_svc = EnrollmentSvc::new(db_handle.clone(), trust, change_tx.clone());
     let enroll_tls_config = ServerTlsConfig::new().identity(tls_identity.clone());

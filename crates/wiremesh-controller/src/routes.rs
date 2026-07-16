@@ -15,9 +15,13 @@ use crate::db_async::DbHandle;
 pub struct PeerRoute {
     pub gateway_id: i64,
     pub segment_name: String,
-    /// `(epoch, pubkey, state)` — always `state = "active"` rows (see
-    /// [`crate::db::Db::active_keys_for_gateway`]). Empty until Task 11
-    /// populates `gateway_key`.
+    /// `(epoch, pubkey, state)` for EVERY `gateway_key` row of this peer —
+    /// `pending`/`active`/`retiring` alike (see
+    /// [`crate::db::Db::all_keys_for_gateway`]), so a mid-rotation `pending`
+    /// epoch (Task 11's `RotateKey`) is visible to peers the same way it
+    /// would be in a fresh snapshot. Empty only if the peer somehow has no
+    /// `gateway_key` rows at all (shouldn't happen post-Task-11: every
+    /// enrolled gateway gets an epoch-0 `active` baseline).
     pub keys: Vec<(i64, String, String)>,
     /// The peer's segment's CIDRs — this peer's `allowed_ips`.
     pub allowed_ips: Vec<String>,
@@ -33,7 +37,7 @@ pub async fn peers_of(db: &DbHandle, self_gateway_id: i64) -> anyhow::Result<Vec
     let mut peers = Vec::with_capacity(others.len());
     for gw in others {
         let allowed_ips = db.cidrs_for_segment(gw.segment_id).await?;
-        let keys = db.active_keys_for_gateway(gw.id).await?;
+        let keys = db.all_keys_for_gateway(gw.id).await?;
         peers.push(PeerRoute {
             gateway_id: gw.id,
             segment_name: gw.segment_name,

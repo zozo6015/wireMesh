@@ -175,6 +175,24 @@ impl TestController {
         AdminClient::new(channel)
     }
 
+    /// (Task 11) Debug/test accessor: every `GATEWAY_KEY` row (any state —
+    /// `pending`, `active`, `retiring`) for `gateway_id`, as `(epoch, state)`
+    /// pairs — read via `Admin.DebugKeyStates` over the controller's Unix
+    /// socket (not a direct file-level DB read), so it exercises the same
+    /// running-controller path a real debug/ops surface would, and works
+    /// unchanged after `restart()` swaps in a new `RunningController` over
+    /// the same on-disk DB.
+    pub async fn debug_key_states(&self, gateway_id: u64) -> Vec<(u32, String)> {
+        let resp = self
+            .admin_client()
+            .await
+            .debug_key_states(wiremesh_proto::v1::DebugKeyStatesRequest { gateway_id })
+            .await
+            .expect("Admin.DebugKeyStates")
+            .into_inner();
+        resp.keys.into_iter().map(|k| (k.epoch, k.state)).collect()
+    }
+
     /// Connects a tonic `EnrollmentClient` over the controller's TCP port.
     ///
     /// Enrollment is server-TLS only (the caller has no client cert yet —
@@ -219,6 +237,12 @@ pub struct StubGateway {
     cert_pem: String,
     key_pem: String,
     ca_bundle_pem: String,
+    // (Task 11) The DB row id the controller assigned this gateway at
+    // enrollment — `EnrollResponse.gateway_id`, threaded straight through
+    // like `cert_pem`/`ca_bundle_pem` (unlike `segment_id`, which
+    // `EnrollResponse` never carried and had to be threaded in separately
+    // via `enroll_one`/`set_segment_id`).
+    gateway_id: i64,
     // The controller's Sync (mTLS) TCP endpoint, captured at enroll time so
     // `open_sync` can dial it without the caller having to pass the
     // `TestController` back in — mirrors what a real gateway does (it learns
@@ -292,6 +316,7 @@ impl StubGateway {
             cert_pem: resp.cert_pem,
             key_pem,
             ca_bundle_pem: resp.ca_bundle_pem,
+            gateway_id: resp.gateway_id as i64,
             sync_addr: controller.sync_tcp_addr(),
             _state_dir: state_dir,
             state_dir_path,
@@ -438,6 +463,14 @@ impl StubGateway {
             "StubGateway::segment_id() called on a gateway whose segment id was never \
              recorded — only enroll_one() sets it (enroll() has no way to learn it)",
         ) as u64
+    }
+
+    /// This gateway's DB row id, as the controller assigned it at
+    /// enrollment (`EnrollResponse.gateway_id`, Task 11) — always available
+    /// (unlike `segment_id()`, which only `enroll_one` populates), since
+    /// `enroll()` itself reads it straight off the enrollment response.
+    pub fn id(&self) -> u64 {
+        self.gateway_id as u64
     }
 
     /// This gateway's leaf certificate's serial number, as a lowercase hex

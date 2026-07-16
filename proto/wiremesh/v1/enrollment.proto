@@ -2,4 +2,8 @@ syntax = "proto3";
 package wiremesh.v1;
 service Enrollment { rpc Enroll(EnrollRequest) returns (EnrollResponse); }
 message EnrollRequest { string token = 1; string csr_pem = 2; repeated string cidrs = 3; }
-message EnrollResponse { string cert_pem = 1; string ca_bundle_pem = 2; }
+// (Task 11) `gateway_id` is the DB row id the controller assigned this
+// enrollment — lets a caller (e.g. `wiremesh-testkit::StubGateway::id`)
+// address itself in later Admin ops (e.g. `RotateKey`) without a dedicated
+// lookup RPC.
+message EnrollResponse { string cert_pem = 1; string ca_bundle_pem = 2; uint64 gateway_id = 3; }
