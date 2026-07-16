@@ -1,0 +1,4 @@
+//! tonic service implementations. Each submodule owns one gRPC service
+//! defined in `wiremesh-proto`.
+
+pub mod admin;

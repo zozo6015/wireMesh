@@ -4,3 +4,16 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+wiremesh-proto = { path = "../wiremesh-proto" }
+wiremesh-controller = { path = "../wiremesh-controller" }
+tempfile = "3"
+# Connect a tonic `Channel` to the controller's Unix socket: `tower::service_fn`
+# supplies the custom connector, `hyper-util`'s `TokioIo` adapts a
+# `tokio::net::UnixStream` to the `hyper::rt::{Read,Write}` traits tonic's
+# hyper-1.x-based transport expects (a plain `UnixStream` no longer
+# implements the connector's required traits directly, unlike older tonic).
+tower = { version = "0.4", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }

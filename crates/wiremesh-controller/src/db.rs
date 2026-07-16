@@ -308,4 +308,28 @@ impl Db {
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM audit_log", [], |row| row.get(0))?;
         Ok(count)
     }
+
+    /// Inserts one `enrollment_token` row. `secret_hash` is the sha256 (hex)
+    /// of the token's random secret — the raw secret itself is never
+    /// persisted anywhere, only its hash, so a stolen DB backup can't be used
+    /// to mint enrollments. `bound_cidrs` is a plain comma-joined string
+    /// (cycle-2 stand-in; no query currently needs it structured).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_enrollment_token(
+        &self,
+        id: &str,
+        secret_hash: &str,
+        kind: &str,
+        bound_cidrs: &str,
+        rebind_segment_id: Option<i64>,
+        expires_at: &str,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO enrollment_token (id, secret_hash, kind, bound_cidrs, rebind_segment_id, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id, secret_hash, kind, bound_cidrs, rebind_segment_id, expires_at],
+        )?;
+        Ok(())
+    }
 }
