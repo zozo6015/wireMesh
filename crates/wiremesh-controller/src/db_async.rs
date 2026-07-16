@@ -246,9 +246,26 @@ impl DbHandle {
     pub async fn audit_query(
         &self,
         limit: i64,
+        action: Option<String>,
+        actor: Option<String>,
+        entity: Option<String>,
     ) -> Result<Vec<(i64, String, String, String, String, String)>> {
         let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.audit_query(limit)).await?
+        tokio::task::spawn_blocking(move || {
+            db.audit_query(
+                limit,
+                action.as_deref(),
+                actor.as_deref(),
+                entity.as_deref(),
+            )
+        })
+        .await?
+    }
+
+    /// See [`Db::revoke_cert`].
+    pub async fn revoke_cert(&self, serial: String, now: String) -> Result<bool> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.revoke_cert(&serial, &now)).await?
     }
 
     /// See [`Db::list_gateways`].

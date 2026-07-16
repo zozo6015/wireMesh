@@ -4,7 +4,10 @@
 //! bookkeeping (`RegisterRelay`/`ListRelays`), API-bearer-token minting/
 //! revocation (`MintApiToken`/`RevokeApiToken` — the credential
 //! `crate::auth`'s TCP bearer-auth middleware checks; distinct from
-//! `MintToken`'s gateway/relay enrollment tokens), and `AuditQuery`.
+//! `MintToken`'s gateway/relay enrollment tokens), single-certificate
+//! revocation (`RevokeCert` — Task 16; distinct from `Drain`, which revokes a
+//! cert as a side effect of removing the whole gateway), and `AuditQuery`
+//! (Task 16 adds `action`/`actor`/`entity` filters).
 
 use std::str::FromStr;
 
@@ -23,7 +26,8 @@ use wiremesh_proto::v1::{
     ListGatewaysRequest, ListGatewaysResponse, ListRelaysRequest, ListRelaysResponse,
     ListSegmentsRequest, ListSegmentsResponse, MintApiTokenRequest, MintApiTokenResponse,
     MintTokenRequest, MintTokenResponse, RegisterRelayRequest, Relay, RevokeApiTokenRequest,
-    RevokeApiTokenResponse, RotateKeyRequest, RotateKeyResponse, Segment,
+    RevokeApiTokenResponse, RevokeCertRequest, RevokeCertResponse, RotateKeyRequest,
+    RotateKeyResponse, Segment,
 };
 
 use crate::db_async::DbHandle;
@@ -432,8 +436,16 @@ impl Admin for AdminSvc {
         Ok(Response::new(RevokeApiTokenResponse {}))
     }
 
-    /// (Task 13) Most-recent-first audit log entries — backs
-    /// `fabricctl audit query`.
+    /// (Task 13; Task 16 adds the `action` filter) Most-recent-first audit
+    /// log entries — backs `fabricctl audit query`/`audit export`. Read-only
+    /// (listed in `crate::auth::READONLY_METHODS`), so a `read-only`-role
+    /// bearer token may call it. An empty `action` means "no filter" (proto3
+    /// can't distinguish "unset" from "empty string" for a plain `string`
+    /// field, and `action` is always non-empty in practice, so treating
+    /// `""` as "don't filter" is unambiguous). `Db::audit_query` also
+    /// accepts `actor`/`entity` filters, unused here — see
+    /// `AuditQueryRequest`'s doc comment for why the wire contract doesn't
+    /// (yet) expose them.
     async fn audit_query(
         &self,
         request: Request<AuditQueryRequest>,
@@ -444,10 +456,11 @@ impl Admin for AdminSvc {
         } else {
             DEFAULT_AUDIT_LIMIT
         };
+        let action = (!req.action.is_empty()).then_some(req.action);
 
         let rows = self
             .db
-            .audit_query(limit)
+            .audit_query(limit, action, None, None)
             .await
             .map_err(|e| Status::internal(format!("querying audit log: {e}")))?;
 
@@ -621,6 +634,58 @@ impl Admin for AdminSvc {
         });
 
         Ok(Response::new(DrainResponse {}))
+    }
+
+    /// (Task 16) Revokes a single certificate by serial WITHOUT touching any
+    /// gateway row — see [`crate::db::Db::revoke_cert`] for the transactional
+    /// "revoke + audit + bump revision" mutation this maps to. `NotFound` if
+    /// no `certificate` row has this serial at all; idempotent (no error) if
+    /// it's already revoked. Publishes a [`ChangeEvent::CertRevoked`] AFTER
+    /// the mutation commits, same "mutate durably first, then notify" order
+    /// `RotateKey`/`Drain` use — this is what pushes the serial into every
+    /// already-connected gateway's next Delta's `revoked_serials` without
+    /// waiting for a reconnect/fresh snapshot.
+    async fn revoke_cert(
+        &self,
+        request: Request<RevokeCertRequest>,
+    ) -> Result<Response<RevokeCertResponse>, Status> {
+        let req = request.into_inner();
+        if req.serial.is_empty() {
+            return Err(Status::invalid_argument("serial must not be empty"));
+        }
+
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        let found = self
+            .db
+            .revoke_cert(req.serial.clone(), now)
+            .await
+            .map_err(|e| Status::internal(format!("revoking certificate: {e}")))?;
+        if !found {
+            return Err(Status::not_found(format!(
+                "no certificate row with serial {:?}",
+                req.serial
+            )));
+        }
+
+        let revision = self
+            .db
+            .current_revision()
+            .await
+            .map_err(|e| Status::internal(format!("reading revision after revocation: {e}")))?;
+
+        // `send` errors only when there are currently no `Sync.Watch`
+        // subscribers — nobody to notify, which is not a failure (mirrors
+        // `EnrollmentSvc::enroll`/`AdminSvc::rotate_key`/`AdminSvc::drain`'s
+        // identical `let _ =`).
+        let _ = self.change_tx.send(ChangeEvent::CertRevoked {
+            serial: req.serial,
+            revision,
+        });
+
+        Ok(Response::new(RevokeCertResponse {}))
     }
 
     /// (Task 14) Declarative `fabricctl apply -f fabric.yaml`: parses the

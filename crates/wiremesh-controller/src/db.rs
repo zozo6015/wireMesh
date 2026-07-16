@@ -1269,6 +1269,57 @@ impl Db {
         })
     }
 
+    /// (Task 16) Revokes a single `certificate` row by `serial`: stamps
+    /// `revoked_at = now` (idempotent — a serial that's already revoked
+    /// keeps its ORIGINAL `revoked_at`, and the `UPDATE ... WHERE revoked_at
+    /// IS NULL` guard below simply touches zero rows the second time), audits
+    /// it (`action = "revoke"`, `entity = certificate/<serial>`), and bumps
+    /// the persisted revision — all in ONE transaction, mirroring
+    /// [`Db::drain_gateway`]'s "mutate + audit + bump" shape.
+    ///
+    /// Returns `false` (rather than erroring) if no `certificate` row with
+    /// this serial exists at all, so `AdminSvc::revoke_cert` can map that to
+    /// `NotFound` — no mutation, no audit row, no revision bump in that case.
+    pub fn revoke_cert(&self, serial: &str, now: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM certificate WHERE serial = ?1)",
+            params![serial],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            tx.rollback()?;
+            return Ok(false);
+        }
+
+        tx.execute(
+            "UPDATE certificate SET revoked_at = ?1 WHERE serial = ?2 AND revoked_at IS NULL",
+            params![now, serial],
+        )?;
+
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                "unix-socket",
+                "revoke",
+                format!("certificate/{serial}"),
+                "{}",
+            ],
+        )?;
+
+        // Projection-affecting mutation (the serial joins/stays in the
+        // revoked-serials denylist), so bump the persisted revision in this
+        // same transaction (see `bump_revision_tx`'s doc comment). The early
+        // `tx.rollback()` above never reaches here.
+        bump_revision_tx(&tx)?;
+
+        tx.commit()?;
+        Ok(true)
+    }
+
     /// (Task 12 testkit accessor) `true` iff a `gateway` row with this id
     /// exists AND is currently `status = 'active'` — `false` both for an id
     /// that never existed and for one that's `'removed'` (drained) or
@@ -1488,17 +1539,55 @@ impl Db {
         .map_err(Into::into)
     }
 
-    /// (Task 13) Most-recent-first `audit_log` rows, up to `limit` (clamped
-    /// to at least 1) — backs `Admin.AuditQuery` / `fabricctl audit query`.
-    pub fn audit_query(&self, limit: i64) -> Result<Vec<(i64, String, String, String, String, String)>> {
+    /// (Task 13; Task 16 adds `action`/`actor`/`entity` filters) Most-recent-
+    /// first `audit_log` rows, up to `limit` (clamped to at least 1) — backs
+    /// `Admin.AuditQuery` / `fabricctl audit query`/`audit export`.
+    ///
+    /// Each of `action`/`actor`/`entity` is an optional EXACT-match filter:
+    /// `None` (or, at the RPC layer, an empty string — see
+    /// `AdminSvc::audit_query`) means "don't filter on this column"; every
+    /// filter that IS supplied is ANDed together. Exact match (rather than a
+    /// `LIKE`/substring match) is deliberate: `action` values are a small
+    /// fixed vocabulary ("create"/"mint"/"revoke"/"drain"/...), so exact
+    /// match is unambiguous and lets a caller filter precisely (e.g.
+    /// `action = "revoke"` — see `tests/revoke_audit.rs`) without a wildcard
+    /// character convention this cycle doesn't otherwise need.
+    pub fn audit_query(
+        &self,
+        limit: i64,
+        action: Option<&str>,
+        actor: Option<&str>,
+        entity: Option<&str>,
+    ) -> Result<Vec<(i64, String, String, String, String, String)>> {
         let conn = self.conn.lock().unwrap();
         let limit = limit.max(1);
-        let mut stmt = conn.prepare(
-            "SELECT id, ts, actor, action, entity, diff_json FROM audit_log \
-             ORDER BY id DESC LIMIT ?1",
-        )?;
+
+        let mut sql = String::from(
+            "SELECT id, ts, actor, action, entity, diff_json FROM audit_log WHERE 1=1",
+        );
+        // Boxed so `action`/`actor`/`entity` (each borrowed `&str`, live only
+        // for this call) and `limit` (an owned `i64`) can share one
+        // dynamically-built parameter list.
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        if let Some(a) = action {
+            sql.push_str(" AND action = ?");
+            bound.push(Box::new(a.to_string()));
+        }
+        if let Some(a) = actor {
+            sql.push_str(" AND actor = ?");
+            bound.push(Box::new(a.to_string()));
+        }
+        if let Some(e) = entity {
+            sql.push_str(" AND entity = ?");
+            bound.push(Box::new(e.to_string()));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        bound.push(Box::new(limit));
+
+        let mut stmt = conn.prepare(&sql)?;
+        let params_refs: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| b.as_ref()).collect();
         let rows = stmt
-            .query_map(params![limit], |row| {
+            .query_map(params_refs.as_slice(), |row| {
                 Ok((
                     row.get(0)?,
                     row.get(1)?,

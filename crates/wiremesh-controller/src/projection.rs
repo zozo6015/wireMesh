@@ -90,6 +90,16 @@ pub enum ChangeEvent {
         candidate_endpoint: String,
         revision: u64,
     },
+    /// (Task 16) `Admin.RevokeCert` revoked a single certificate by serial —
+    /// distinct from `GatewayDrained`: this does NOT remove any gateway row
+    /// or peer (a gateway can have its cert revoked without being drained,
+    /// e.g. ahead of a planned re-enrollment), so no `upserted_peers`/
+    /// `removed_peer_ids` change — only the revoked-serials denylist grows.
+    /// Every already-connected gateway's next `Delta` must carry `serial` in
+    /// `revoked_serials` so it doesn't have to wait for a reconnect/fresh
+    /// snapshot to see it denylisted, mirroring `GatewayDrained`'s identical
+    /// push.
+    CertRevoked { serial: String, revision: u64 },
 }
 
 impl ChangeEvent {
@@ -104,6 +114,15 @@ impl ChangeEvent {
             ChangeEvent::KeyRotated { gateway_id, .. } => *gateway_id,
             ChangeEvent::GatewayDrained { gateway_id, .. } => *gateway_id,
             ChangeEvent::EndpointObserved { gateway_id, .. } => *gateway_id,
+            // Not "about" any single gateway (a revoked cert's serial is
+            // known, but which gateway subject_id it belonged to is not
+            // threaded through this event) — `0` is never a real
+            // AUTOINCREMENT `gateway.id` (SQLite AUTOINCREMENT starts at 1),
+            // so this never accidentally matches a real `self_gateway_id`
+            // and skips forwarding to someone who should see it. Every
+            // connected gateway, including the one whose own cert was just
+            // revoked, is meant to learn about a revocation.
+            ChangeEvent::CertRevoked { .. } => 0,
         }
     }
 }
@@ -211,6 +230,16 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
+        },
+        ChangeEvent::CertRevoked { serial, revision } => Delta {
+            revision,
+            // No peer identity changes — see this variant's doc comment.
+            upserted_peers: Vec::new(),
+            removed_peer_ids: Vec::new(),
+            relays: Vec::new(),
+            policy_ir: Vec::new(),
+            policy_version: 0,
+            revoked_serials: vec![serial],
         },
     }
 }

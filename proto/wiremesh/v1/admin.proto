@@ -36,6 +36,15 @@ service Admin {
   // already-connected gateway's peer set (a Delta with removed_peer_ids),
   // then removes its gateway row and revokes its cert(s).
   rpc Drain(DrainRequest) returns (DrainResponse);
+  // (Task 16) Revokes a single certificate by serial: sets its
+  // `certificate.revoked_at` (idempotent — revoking an already-revoked
+  // serial is not an error), audits it (action "revoke"), and pushes the
+  // serial into every already-connected gateway's next Delta's
+  // `revoked_serials`, the same "mutate durably first, then notify" order
+  // Drain/RotateKey use. Distinct from Drain: this revokes a cert WITHOUT
+  // removing any gateway row. NotFound if no `certificate` row has this
+  // serial at all.
+  rpc RevokeCert(RevokeCertRequest) returns (RevokeCertResponse);
   // (Task 14) Declarative `fabricctl apply -f fabric.yaml`: parses a
   // `segments:`/`relays:`/`policy:` YAML document, diffs it against current
   // controller state, and applies every actual change in one transaction.
@@ -57,6 +66,12 @@ message GatewayKeyState { uint32 epoch = 1; string state = 2; } // pending|activ
 message DebugKeyStatesResponse { repeated GatewayKeyState keys = 1; }
 message DrainRequest { uint64 gateway_id = 1; }
 message DrainResponse {}
+
+// (Task 16) `serial`: the hex-encoded certificate serial to revoke — the
+// same shape `certificate.serial` / `Delta.revoked_serials` /
+// `StateSnapshot.revoked_serials` already use.
+message RevokeCertRequest { string serial = 1; }
+message RevokeCertResponse {}
 
 message ListSegmentsRequest {}
 message ListSegmentsResponse { repeated Segment segments = 1; }
@@ -92,8 +107,19 @@ message ApplyDiff {
   uint32 total_changes = 5;
 }
 
-// limit <= 0 falls back to a small server-side default.
-message AuditQueryRequest { int32 limit = 1; }
+// limit <= 0 falls back to a small server-side default. `action` (Task 16)
+// is an optional EXACT-match filter — an empty string means "no filter".
+// (The RED test `tests/revoke_audit.rs` fixes this message's shape to
+// exactly `{limit, action}`, constructed as a plain struct literal with no
+// `..Default::default()` spread — so no further fields can be added here
+// without also touching that test, which this task must not modify. The
+// DB layer (`Db::audit_query`) additionally accepts `actor`/`entity`
+// filters for future callers; only `action` is wired through the wire
+// contract for now.)
+message AuditQueryRequest {
+  int32 limit = 1;
+  string action = 2;
+}
 message AuditEntry {
   uint64 id = 1;
   string ts = 2;

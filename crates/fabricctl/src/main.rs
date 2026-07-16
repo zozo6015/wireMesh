@@ -134,13 +134,50 @@ enum TokenCmd {
     Revoke { name: String },
 }
 
+/// (Task 16) `limit <= 0` (or omitted) falls back to the server-side
+/// default — see `Admin.AuditQuery`'s doc comment. `action` is an optional
+/// EXACT-match filter; omitted (or passed as an empty string) means "no
+/// filter" on that column. (`AuditQueryRequest`'s wire shape is fixed by
+/// `tests/revoke_audit.rs` to exactly `{limit, action}` — no `actor`/
+/// `entity` filter is wired through the RPC yet; see that message's proto
+/// doc comment.)
 #[derive(Subcommand)]
 enum AuditCmd {
     /// Most-recent-first audit log entries.
     Query {
         #[arg(long, default_value_t = 50)]
         limit: i32,
+        /// Exact-match filter on `action` (e.g. "revoke", "create", "mint").
+        #[arg(long, default_value_t = String::new())]
+        action: String,
     },
+    /// (Task 16) Streams every matching audit-log entry to stdout as one
+    /// JSON object per line (JSON Lines / ndjson) — a machine-readable
+    /// counterpart to `Query`'s tab-separated human output, meant for
+    /// piping into `jq`/log-shipping rather than reading directly. With no
+    /// filter, exports the whole audit log (up to `--limit`, defaulting to
+    /// a large-but-bounded value rather than the server's small
+    /// human-oriented default).
+    Export {
+        #[arg(long, default_value_t = 1_000_000)]
+        limit: i32,
+        /// Exact-match filter on `action`.
+        #[arg(long, default_value_t = String::new())]
+        action: String,
+    },
+}
+
+/// One `audit export` JSON line's shape — field names match `AuditEntry`'s
+/// wire fields 1:1 so the export is a direct, lossless JSON rendering of
+/// the proto message (not a re-interpreted/renamed view).
+#[derive(serde::Serialize)]
+struct AuditEntryJson {
+    id: u64,
+    ts: String,
+    actor: String,
+    action: String,
+    entity: String,
+    diff_json: String,
 }
 
 /// Client-side counterpart to `wiremesh_controller::auth`'s bearer-auth
@@ -346,15 +383,39 @@ async fn run_apply(client: &mut AdminAuthClient, file: PathBuf) -> anyhow::Resul
 
 async fn run_audit(client: &mut AdminAuthClient, cmd: AuditCmd) -> anyhow::Result<()> {
     match cmd {
-        AuditCmd::Query { limit } => {
+        AuditCmd::Query { limit, action } => {
             let resp = client
-                .audit_query(AuditQueryRequest { limit })
+                .audit_query(AuditQueryRequest { limit, action })
                 .await?
                 .into_inner();
             for e in resp.entries {
                 println!(
                     "{}\t{}\t{}\t{}\t{}\t{}",
                     e.id, e.ts, e.actor, e.action, e.entity, e.diff_json
+                );
+            }
+        }
+        // (Task 16) A real client: calls the same `Admin.AuditQuery` RPC as
+        // `Query` above, then serializes each returned `AuditEntry` as one
+        // JSON object per line to stdout.
+        AuditCmd::Export { limit, action } => {
+            let resp = client
+                .audit_query(AuditQueryRequest { limit, action })
+                .await?
+                .into_inner();
+            for e in resp.entries {
+                let line = AuditEntryJson {
+                    id: e.id,
+                    ts: e.ts,
+                    actor: e.actor,
+                    action: e.action,
+                    entity: e.entity,
+                    diff_json: e.diff_json,
+                };
+                println!(
+                    "{}",
+                    serde_json::to_string(&line)
+                        .map_err(|e| anyhow::anyhow!("serializing audit entry as JSON: {e}"))?
                 );
             }
         }

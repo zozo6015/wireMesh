@@ -12,6 +12,10 @@ anyhow = { workspace = true }
 clap = { version = "4", features = ["derive"] }
 tokio = { workspace = true }
 tonic = { workspace = true }
+# (Task 16) `audit export` streams each `AuditEntry` as one JSON-line to
+# stdout — see `run_audit`'s `AuditCmd::Export` arm.
+serde = { workspace = true }
+serde_json = { workspace = true }
 wiremesh-proto = { path = "../wiremesh-proto" }
 # UDS transport (`--socket`): same `tower::service_fn` + `hyper-util::TokioIo`
 # connector pattern `wiremesh-testkit::TestController::admin_client` uses —
