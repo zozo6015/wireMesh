@@ -33,7 +33,7 @@ CREATE TABLE cidr (
 
 CREATE TABLE gateway (
     id         INTEGER PRIMARY KEY,
-    segment_id INTEGER REFERENCES segment(id),
+    segment_id INTEGER NOT NULL REFERENCES segment(id),
     name       TEXT NOT NULL UNIQUE,
     status     TEXT NOT NULL,
     backend    TEXT NOT NULL,
@@ -54,7 +54,8 @@ CREATE TABLE tunnel_pair (
     transport   TEXT NOT NULL CHECK (transport IN ('direct', 'relayed')),
     state       TEXT NOT NULL,
     last_change TEXT,
-    PRIMARY KEY (gw_a, gw_b)
+    PRIMARY KEY (gw_a, gw_b),
+    CHECK (gw_a < gw_b)
 );
 
 CREATE TABLE relay (
@@ -166,6 +167,10 @@ impl Db {
     /// migrations.
     pub fn open(path: &Path) -> Result<Db> {
         let conn = Connection::open(path)?;
+        // FK enforcement is per-connection and defaults OFF in SQLite, so it
+        // must be re-enabled on every open (it is not persisted in the file).
+        // Without this, all REFERENCES clauses in the schema are decorative.
+        conn.pragma_update(None, "foreign_keys", true)?;
         let db = Db {
             conn: Mutex::new(conn),
         };
@@ -177,6 +182,8 @@ impl Db {
     /// any embedded/ephemeral deployment mode.
     pub fn open_memory() -> Result<Db> {
         let conn = Connection::open_in_memory()?;
+        // See `open`: FK enforcement is per-connection and defaults OFF.
+        conn.pragma_update(None, "foreign_keys", true)?;
         let db = Db {
             conn: Mutex::new(conn),
         };
@@ -227,7 +234,25 @@ impl Db {
         tx.execute("INSERT INTO segment (name) VALUES (?1)", params![name])?;
         let segment_id = tx.last_insert_rowid();
 
+        // Accumulates the CIDRs already accepted in *this* call so each
+        // incoming CIDR is also checked against its siblings — the DB query
+        // below only sees rows of *other* segments, so without this a single
+        // declaration could nest two overlapping CIDRs (e.g. 10.0.0.0/16 and
+        // 10.0.1.0/24) undetected.
+        let mut accepted: Vec<Ipv4Net> = Vec::with_capacity(cidrs.len());
+
         for cidr in cidrs {
+            // First: self-overlap within the incoming set.
+            if accepted
+                .iter()
+                .any(|prev| cidr.contains(&prev.network()) || prev.contains(&cidr.network()))
+            {
+                tx.rollback()?;
+                return Err(anyhow::Error::new(OverlapError {
+                    conflicting_segment: name.to_string(),
+                }));
+            }
+
             let conflict: Option<(String, String)> = {
                 let mut stmt = tx.prepare(
                     "SELECT c.cidr, s.name \
@@ -257,6 +282,7 @@ impl Db {
                 "INSERT INTO cidr (segment_id, cidr) VALUES (?1, ?2)",
                 params![segment_id, cidr.to_string()],
             )?;
+            accepted.push(*cidr);
         }
 
         tx.commit()?;
