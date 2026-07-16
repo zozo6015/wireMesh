@@ -26,6 +26,11 @@ section as phases complete.
   test.** Dispatch separate subagents for test authoring and implementation.
 - **Reviews are done by a different agent than the one that wrote the code.** Never
   review your own artifacts inline; dispatch independent reviewer subagents.
+- **Tests are executed by a dedicated agent — neither the agent that wrote the code
+  nor the agent that wrote the tests.** Whoever has a stake in a green run must not
+  be the one that runs it and reports the result. Dispatch a separate agent to run
+  the suite and relay the raw output, per superpowers:test-driven-development
+  (and superpowers:subagent-driven-development for the per-task flow).
 - **Tests must ALWAYS pass before declaring a goal reached.** No "done" claims with
   failing, skipped, or unrun tests — show the passing output.
 - **When tests fail, fix the code — never arrange the tests to match the code.**
