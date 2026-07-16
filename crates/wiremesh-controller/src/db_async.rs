@@ -10,7 +10,7 @@ use anyhow::Result;
 use ipnet::Ipv4Net;
 
 use crate::db::Db;
-pub use crate::db::{EnrollError, EnrollOutcome};
+pub use crate::db::{EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow, GatewayRow};
 
 /// Cheaply cloneable async handle to a [`Db`]. `Db` already serializes access
 /// internally (a `Mutex<Connection>`), so `Arc<Db>` — rather than a pool — is
@@ -106,5 +106,35 @@ impl DbHandle {
                 "enroll_gateway blocking task panicked: {join_err}"
             ))),
         }
+    }
+
+    /// See [`Db::list_other_gateways`].
+    pub async fn list_other_gateways(&self, exclude_gateway_id: i64) -> Result<Vec<GatewayRow>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.list_other_gateways(exclude_gateway_id)).await?
+    }
+
+    /// See [`Db::cidrs_for_segment`].
+    pub async fn cidrs_for_segment(&self, segment_id: i64) -> Result<Vec<String>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.cidrs_for_segment(segment_id)).await?
+    }
+
+    /// See [`Db::active_keys_for_gateway`].
+    pub async fn active_keys_for_gateway(&self, gateway_id: i64) -> Result<Vec<GatewayKeyRow>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.active_keys_for_gateway(gateway_id)).await?
+    }
+
+    /// See [`Db::revoked_serials`].
+    pub async fn revoked_serials(&self) -> Result<Vec<String>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.revoked_serials()).await?
+    }
+
+    /// See [`Db::find_gateway_by_name`].
+    pub async fn find_gateway_by_name(&self, name: String) -> Result<Option<GatewayIdentity>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.find_gateway_by_name(&name)).await?
     }
 }

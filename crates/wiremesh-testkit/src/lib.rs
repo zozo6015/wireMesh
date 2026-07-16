@@ -15,12 +15,14 @@ use std::path::{Path, PathBuf};
 use hyper_util::rt::TokioIo;
 use tempfile::TempDir;
 use tokio::net::UnixStream;
-use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Uri};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Uri};
 use tower::service_fn;
 
 use wiremesh_controller::{serve, Config, RunningController};
 use wiremesh_proto::v1::admin_client::AdminClient;
 use wiremesh_proto::v1::enrollment_client::EnrollmentClient;
+use wiremesh_proto::v1::sync_client::SyncClient;
+use wiremesh_proto::v1::{CreateSegmentRequest, MintTokenRequest, SyncMessage, WatchRequest};
 
 /// A real controller, booted in-process against a temporary data directory,
 /// for integration tests to drive.
@@ -52,6 +54,7 @@ impl TestController {
         let config = Config {
             data_dir: data_dir.path().to_path_buf(),
             tcp_port: 0,
+            sync_tcp_port: 0,
             socket_path: socket_path.clone(),
         };
 
@@ -71,11 +74,17 @@ impl TestController {
         &self.socket_path
     }
 
-    /// The controller's bound TCP address (Enrollment/Sync aren't served on
-    /// it yet in this task, but the address is real and stable for the
-    /// instance's lifetime).
+    /// The controller's bound TCP address the Enrollment service (server-TLS
+    /// only) listens on.
     pub fn tcp_addr(&self) -> SocketAddr {
         self.running.tcp_addr()
+    }
+
+    /// The controller's bound TCP address the Sync service (mTLS: client
+    /// cert required) listens on — a separate listener/port from
+    /// `tcp_addr()` (see `wiremesh_controller::serve`'s doc comment for why).
+    pub fn sync_tcp_addr(&self) -> SocketAddr {
+        self.running.sync_tcp_addr()
     }
 
     /// The temp directory backing this instance's DB/CA/secrets.
@@ -150,6 +159,12 @@ pub struct StubGateway {
     cert_pem: String,
     key_pem: String,
     ca_bundle_pem: String,
+    // The controller's Sync (mTLS) TCP endpoint, captured at enroll time so
+    // `open_sync` can dial it without the caller having to pass the
+    // `TestController` back in — mirrors what a real gateway does (it learns
+    // the controller's address once, at enrollment, and dials Sync
+    // independently thereafter).
+    sync_addr: SocketAddr,
     // Held only for its `Drop` (removes `state_dir` on disk); never read
     // directly — mirrors `TestController::_data_dir`.
     _state_dir: TempDir,
@@ -207,9 +222,40 @@ impl StubGateway {
             cert_pem: resp.cert_pem,
             key_pem,
             ca_bundle_pem: resp.ca_bundle_pem,
+            sync_addr: controller.sync_tcp_addr(),
             _state_dir: state_dir,
             state_dir_path,
         })
+    }
+
+    /// Opens `Sync.Watch` against the controller's mTLS Sync endpoint,
+    /// presenting this gateway's own enrolled client certificate + key —
+    /// this is the mTLS handshake the brief calls out: `rustls`/tonic
+    /// reject the connection outright if the presented cert doesn't chain
+    /// to the controller's embedded CA (`ca_bundle_pem`, pinned here as the
+    /// trust root the same way `TestController::enrollment_client` pins it
+    /// for verifying the *server*). Returns the raw streaming response —
+    /// callers drive it with `tokio_stream::StreamExt::next()`.
+    pub async fn open_sync(&self) -> tonic::Streaming<SyncMessage> {
+        let uri = format!("https://{}", self.sync_addr);
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
+            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .expect("controller Sync TCP addr must form a valid URI")
+            .tls_config(tls)
+            .expect("configuring StubGateway mTLS: presenting its cert + trusting the controller CA")
+            .connect()
+            .await
+            .expect("connecting to the controller's Sync (mTLS) TCP port");
+
+        let mut client = SyncClient::new(channel);
+        client
+            .watch(WatchRequest {})
+            .await
+            .expect("Sync.Watch failed")
+            .into_inner()
     }
 
     /// This gateway's signed leaf certificate, PEM-encoded.
@@ -280,6 +326,39 @@ impl StubGateway {
         buf[16 - stripped.len()..].copy_from_slice(stripped);
         Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
     }
+}
+
+/// Convenience wrapper mirroring the pattern already exercised by
+/// `tests/enroll.rs`: creates a fresh segment named `segment_name` bound to
+/// `cidr`, mints a single-use `gateway` token scoped to that same `cidr`,
+/// and redeems it via [`StubGateway::enroll`]. Panics (via `.expect`) on any
+/// failure — this is test-setup plumbing, not something callers need to
+/// handle a partial-failure path for.
+pub async fn enroll_one(h: &TestController, segment_name: &str, cidr: &str) -> StubGateway {
+    let mut admin = h.admin_client().await;
+
+    admin
+        .create_segment(CreateSegmentRequest {
+            name: segment_name.to_string(),
+            cidrs: vec![cidr.to_string()],
+        })
+        .await
+        .expect("creating segment for enroll_one");
+
+    let token = admin
+        .mint_token(MintTokenRequest {
+            kind: "gateway".to_string(),
+            bound_cidrs: vec![cidr.to_string()],
+            rebind_segment_id: 0,
+        })
+        .await
+        .expect("minting gateway token for enroll_one")
+        .into_inner()
+        .token;
+
+    StubGateway::enroll(h, &token, &[cidr])
+        .await
+        .expect("enrolling stub gateway in enroll_one")
 }
 
 /// Generates a fresh keypair and a PEM-encoded CSR with common name `cn` —

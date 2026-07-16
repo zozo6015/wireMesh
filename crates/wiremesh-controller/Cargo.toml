@@ -20,8 +20,15 @@ tokio-stream = { version = "0.1", features = ["net"] }
 sha2 = "0.10"
 rand = "0.8"
 # Only used to decode the CA's PEM cert body back to DER so the root
-# fingerprint can be computed over the exact bytes trust_bundle() returns.
+# fingerprint can be computed over the exact bytes trust_bundle() returns
+# (also reused by `services::sync` to re-PEM-encode the mTLS peer cert's DER
+# for `StateSnapshot::self_cert_pem`).
 base64 = "0.22"
+# Parses the Sync mTLS peer certificate's DER (from tonic's `peer_certs()`)
+# to pull out the subject CN that identifies the calling gateway. Same
+# version `wiremesh-testkit`/`wiremesh-trust` already use for the analogous
+# job on the client side.
+x509-parser = "0.16"
 
 [dev-dependencies]
 ipnet = { workspace = true }
@@ -29,3 +36,5 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 wiremesh-proto = { path = "../wiremesh-proto" }
 wiremesh-testkit = { path = "../wiremesh-testkit" }
+# StreamExt::next() to consume StubGateway::open_sync()'s Sync.Watch stream.
+tokio-stream = "0.1"

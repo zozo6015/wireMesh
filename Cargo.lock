@@ -1640,6 +1640,7 @@ dependencies = [
  "wiremesh-proto",
  "wiremesh-testkit",
  "wiremesh-trust",
+ "x509-parser",
 ]
 
 [[package]]

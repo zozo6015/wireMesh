@@ -3,3 +3,4 @@
 
 pub mod admin;
 pub mod enrollment;
+pub mod sync;

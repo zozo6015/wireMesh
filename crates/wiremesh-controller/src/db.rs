@@ -208,6 +208,30 @@ pub struct EnrollOutcome {
     pub gateway_id: i64,
 }
 
+/// One row of [`Db::list_other_gateways`] — an enrolled gateway's identity
+/// and the segment it belongs to. Feeds `routes::peers_of`'s full-mesh
+/// projection (Task 7).
+pub struct GatewayRow {
+    pub id: i64,
+    pub segment_id: i64,
+    pub segment_name: String,
+}
+
+/// The enrolled gateway a Sync mTLS client cert's subject CN resolved to
+/// (see [`Db::find_gateway_by_name`]) — used to turn "the peer cert with
+/// this CN" into "gateway id N in segment S" for the projection.
+pub struct GatewayIdentity {
+    pub id: i64,
+    pub segment_id: i64,
+    pub segment_name: String,
+}
+
+/// One row of [`Db::active_keys_for_gateway`]: `(epoch, pubkey, state)`.
+/// Cycle-2's Sync projection only reads `state = 'active'` rows (key
+/// management/rotation is Task 11) — this task's tests always see an empty
+/// `Vec` since nothing populates `gateway_key` yet.
+pub type GatewayKeyRow = (i64, String, String);
+
 /// The controller's embedded SQLite store.
 ///
 /// The connection is held behind a `Mutex` purely for interior mutability
@@ -552,5 +576,97 @@ impl Db {
 
         tx.commit()?;
         Ok(EnrollOutcome { segment_id, gateway_id })
+    }
+
+    /// The other N-1 enrolled gateways (every `gateway` row except
+    /// `exclude_gateway_id`), each with the segment it belongs to. Used by
+    /// `routes::peers_of` to build the full-mesh peer set for a Sync
+    /// snapshot. Ordered by id for deterministic output.
+    pub fn list_other_gateways(&self, exclude_gateway_id: i64) -> Result<Vec<GatewayRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT g.id, g.segment_id, s.name \
+             FROM gateway g JOIN segment s ON s.id = g.segment_id \
+             WHERE g.id != ?1 \
+             ORDER BY g.id",
+        )?;
+        let rows = stmt
+            .query_map(params![exclude_gateway_id], |row| {
+                Ok(GatewayRow {
+                    id: row.get(0)?,
+                    segment_id: row.get(1)?,
+                    segment_name: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Every CIDR registered to `segment_id`, sorted for deterministic
+    /// output — becomes a peer's `allowed_ips` in the Sync projection.
+    pub fn cidrs_for_segment(&self, segment_id: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
+        let rows = stmt
+            .query_map(params![segment_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// `gateway_key` rows with `state = 'active'` for `gateway_id`, as
+    /// `(epoch, pubkey, state)` — becomes a peer's `keys` in the Sync
+    /// projection. Empty until Task 11 populates `gateway_key`.
+    pub fn active_keys_for_gateway(&self, gateway_id: i64) -> Result<Vec<GatewayKeyRow>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT epoch, pubkey, state FROM gateway_key \
+             WHERE gateway_id = ?1 AND state = 'active' \
+             ORDER BY epoch",
+        )?;
+        let rows = stmt
+            .query_map(params![gateway_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Serial numbers of every `certificate` row with `revoked_at NOT NULL`,
+    /// sorted for deterministic output — the Sync snapshot's
+    /// `revoked_serials`.
+    pub fn revoked_serials(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT serial FROM certificate WHERE revoked_at IS NOT NULL ORDER BY serial")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Resolves an enrolled gateway by its `gateway.name` — the same value
+    /// `EnrollmentSvc` derives deterministically from the enrollment token
+    /// (`gw-<secret_hash_hex>`) and stamps as the issued leaf cert's subject
+    /// CN. This is how Sync's mTLS layer turns "the peer cert with this CN"
+    /// into a gateway identity: it never trusts a client-supplied id, only
+    /// the CN pulled off the cert tonic/rustls already validated chains to
+    /// the CA.
+    pub fn find_gateway_by_name(&self, name: &str) -> Result<Option<GatewayIdentity>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT g.id, g.segment_id, s.name \
+             FROM gateway g JOIN segment s ON s.id = g.segment_id \
+             WHERE g.name = ?1",
+            params![name],
+            |row| {
+                Ok(GatewayIdentity {
+                    id: row.get(0)?,
+                    segment_id: row.get(1)?,
+                    segment_name: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
     }
 }

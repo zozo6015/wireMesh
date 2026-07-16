@@ -10,6 +10,8 @@
 
 pub mod db;
 pub mod db_async;
+pub mod projection;
+pub mod routes;
 pub mod services;
 
 use std::path::{Path, PathBuf};
@@ -21,14 +23,16 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
-use tonic::transport::{Identity, Server, ServerTlsConfig};
+use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use db::Db;
 use db_async::DbHandle;
 use services::admin::AdminSvc;
 use services::enrollment::EnrollmentSvc;
+use services::sync::SyncSvc;
 use wiremesh_proto::v1::admin_server::AdminServer;
 use wiremesh_proto::v1::enrollment_server::EnrollmentServer;
+use wiremesh_proto::v1::sync_server::SyncServer;
 use wiremesh_trust::{CertificateIssuer, EmbeddedTrust};
 
 /// Lifetime of the controller's own TLS server-identity certificate (issued
@@ -46,8 +50,16 @@ pub struct Config {
     /// Directory holding the SQLite DB, the embedded CA, and secrets. Created
     /// if absent.
     pub data_dir: PathBuf,
-    /// TCP port for the (future) Enrollment/Sync services. `0` = OS-assigned.
+    /// TCP port for the Enrollment service (server-TLS only — no client
+    /// cert required, since an unenrolled gateway has none yet). `0` =
+    /// OS-assigned.
     pub tcp_port: u16,
+    /// TCP port for the Sync service. Deliberately a SEPARATE listener from
+    /// `tcp_port`, with its own `ServerTlsConfig` that REQUIRES a client
+    /// certificate chaining to the embedded CA (mTLS) — see [`serve`]'s doc
+    /// comment for why Enrollment and Sync can't safely share one
+    /// TLS-config'd listener. `0` = OS-assigned.
+    pub sync_tcp_port: u16,
     /// Unix-domain-socket path the Admin service is served on. Its parent
     /// directory is created (if absent) and forced to mode `0700`.
     pub socket_path: PathBuf,
@@ -58,17 +70,21 @@ pub struct Config {
 /// across cases.
 pub struct RunningController {
     tcp_addr: std::net::SocketAddr,
+    sync_tcp_addr: std::net::SocketAddr,
     socket_path: PathBuf,
     data_dir: PathBuf,
     /// PEM trust bundle of the embedded CA — exposed so a TLS client (e.g.
     /// `wiremesh-testkit::TestController::enrollment_client`) can trust the
     /// server-TLS identity presented on `tcp_addr` without needing its own
-    /// filesystem access to the controller's data dir.
+    /// filesystem access to the controller's data dir. The same bundle is
+    /// also what a Sync client must present a client cert chaining to.
     ca_bundle_pem: String,
     admin_shutdown_tx: Option<oneshot::Sender<()>>,
     admin_join: Option<JoinHandle<()>>,
     enroll_shutdown_tx: Option<oneshot::Sender<()>>,
     enroll_join: Option<JoinHandle<()>>,
+    sync_shutdown_tx: Option<oneshot::Sender<()>>,
+    sync_join: Option<JoinHandle<()>>,
 }
 
 impl RunningController {
@@ -76,6 +92,13 @@ impl RunningController {
     /// the Enrollment service (server-TLS) listens on.
     pub fn tcp_addr(&self) -> std::net::SocketAddr {
         self.tcp_addr
+    }
+
+    /// The bound TCP address (host+port the OS assigned, if `sync_tcp_port`
+    /// was 0) the Sync service (mTLS: client cert required) listens on —
+    /// deliberately a different listener/port than `tcp_addr` (see [`serve`]).
+    pub fn sync_tcp_addr(&self) -> std::net::SocketAddr {
+        self.sync_tcp_addr
     }
 
     /// The Unix-domain-socket path the Admin service listens on.
@@ -90,19 +113,24 @@ impl RunningController {
     }
 
     /// PEM trust bundle (one or more root certs) of the embedded CA that
-    /// signed this instance's TLS server identity on `tcp_addr` — a TLS
-    /// client dialing the Enrollment/Sync port trusts the server by
-    /// pinning this bundle as its CA root.
+    /// signed this instance's TLS server identity on `tcp_addr`/
+    /// `sync_tcp_addr` — a TLS client dialing the Enrollment port trusts the
+    /// server by pinning this bundle as its CA root, and a Sync client must
+    /// additionally present a client certificate chaining to this same
+    /// bundle (it's also the Sync listener's `client_ca_root`).
     pub fn ca_bundle_pem(&self) -> &str {
         &self.ca_bundle_pem
     }
 
-    /// Signals both servers to stop and waits for their tasks to finish.
+    /// Signals all servers to stop and waits for their tasks to finish.
     pub async fn shutdown(mut self) {
         if let Some(tx) = self.admin_shutdown_tx.take() {
             let _ = tx.send(());
         }
         if let Some(tx) = self.enroll_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = self.sync_shutdown_tx.take() {
             let _ = tx.send(());
         }
         if let Some(join) = self.admin_join.take() {
@@ -111,13 +139,16 @@ impl RunningController {
         if let Some(join) = self.enroll_join.take() {
             let _ = join.await;
         }
+        if let Some(join) = self.sync_join.take() {
+            let _ = join.await;
+        }
     }
 }
 
 impl Drop for RunningController {
     fn drop(&mut self) {
         // Best-effort: if `shutdown()` was never called explicitly, at least
-        // signal both servers to stop so their tasks don't outlive this
+        // signal every server to stop so their tasks don't outlive this
         // handle. We can't `.await` the join handles here (Drop is sync), so
         // we don't try — they're spawned tokio tasks and quit promptly once
         // their shutdown signal fires.
@@ -127,19 +158,34 @@ impl Drop for RunningController {
         if let Some(tx) = self.enroll_shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(tx) = self.sync_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
     }
 }
 
 /// Boots the controller: opens the SQLite DB and embedded CA under
 /// `config.data_dir`, binds the Admin service on `config.socket_path` (a Unix
-/// socket, directory forced to `0700`), and serves the Enrollment service on
-/// a TCP listener at `config.tcp_port` with server-side TLS (the embedded CA
-/// issues the controller its own server identity at startup — see
-/// [`SERVER_IDENTITY_TTL`]). Sync (Task 7) adds mTLS/client-cert
-/// verification to the same TCP port; Enrollment itself is server-TLS only
-/// since the caller has no client cert yet.
+/// socket, directory forced to `0700`), serves Enrollment on a TCP listener
+/// at `config.tcp_port` with server-side TLS only, and serves Sync on a
+/// SEPARATE TCP listener at `config.sync_tcp_port` with mTLS — the embedded
+/// CA issues the controller its own server identity at startup for both
+/// listeners (see [`SERVER_IDENTITY_TTL`]), and Sync's `ServerTlsConfig`
+/// additionally sets `client_ca_root` to the same CA's bundle with
+/// `client_auth_optional` left at its default `false`, so tonic/rustls
+/// refuse the TLS handshake itself for any Sync connection that doesn't
+/// present a client certificate chaining to it.
 ///
-/// Returns once both services are actually listening.
+/// Enrollment and Sync are two listeners, not one, because they need
+/// opposite TLS postures: an unenrolled gateway calling `Enrollment.Enroll`
+/// has no client certificate yet (that's the whole point of enrollment), so
+/// that listener must accept connections without one, while `Sync.Watch`
+/// must reject connections without one (mTLS is how a Sync caller's gateway
+/// identity is established — see `services::sync`). tonic's
+/// `ServerTlsConfig` is one config per listener with no per-RPC override, so
+/// getting both postures right means two listeners.
+///
+/// Returns once all three services are actually listening.
 pub async fn serve(config: Config) -> Result<RunningController> {
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
@@ -175,6 +221,14 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     let tcp_addr = tcp_listener.local_addr().context("reading bound TCP addr")?;
     let tcp_stream = TcpListenerStream::new(tcp_listener);
 
+    let sync_tcp_listener = TcpListener::bind(("127.0.0.1", config.sync_tcp_port))
+        .await
+        .context("binding controller Sync TCP listener")?;
+    let sync_tcp_addr = sync_tcp_listener
+        .local_addr()
+        .context("reading bound Sync TCP addr")?;
+    let sync_tcp_stream = TcpListenerStream::new(sync_tcp_listener);
+
     bind_uds_dir(&config.socket_path)?;
     if config.socket_path.exists() {
         std::fs::remove_file(&config.socket_path).with_context(|| {
@@ -200,8 +254,8 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         }
     });
 
-    let enrollment_svc = EnrollmentSvc::new(db_handle, trust);
-    let enroll_tls_config = ServerTlsConfig::new().identity(tls_identity);
+    let enrollment_svc = EnrollmentSvc::new(db_handle.clone(), trust);
+    let enroll_tls_config = ServerTlsConfig::new().identity(tls_identity.clone());
 
     let (enroll_shutdown_tx, enroll_shutdown_rx) = oneshot::channel::<()>();
     let enroll_server = Server::builder()
@@ -218,8 +272,34 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         }
     });
 
+    let sync_svc = SyncSvc::new(db_handle);
+    // `client_auth_optional` defaults to `false` — i.e. REQUIRED — so this
+    // is exactly the mTLS posture Sync needs: the Sync listener rejects any
+    // TLS handshake that doesn't present a client cert chaining to
+    // `client_ca_root`. Same embedded CA/server identity as Enrollment;
+    // only the client-cert requirement differs.
+    let sync_tls_config = ServerTlsConfig::new()
+        .identity(tls_identity)
+        .client_ca_root(Certificate::from_pem(&ca_bundle_pem));
+
+    let (sync_shutdown_tx, sync_shutdown_rx) = oneshot::channel::<()>();
+    let sync_server = Server::builder()
+        .tls_config(sync_tls_config)
+        .context("configuring Sync server mTLS")?
+        .add_service(SyncServer::new(sync_svc))
+        .serve_with_incoming_shutdown(sync_tcp_stream, async {
+            let _ = sync_shutdown_rx.await;
+        });
+
+    let sync_join = tokio::spawn(async move {
+        if let Err(e) = sync_server.await {
+            eprintln!("wiremesh-controller: sync server error: {e}");
+        }
+    });
+
     Ok(RunningController {
         tcp_addr,
+        sync_tcp_addr,
         socket_path: config.socket_path,
         data_dir: config.data_dir,
         ca_bundle_pem,
@@ -227,6 +307,8 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         admin_join: Some(admin_join),
         enroll_shutdown_tx: Some(enroll_shutdown_tx),
         enroll_join: Some(enroll_join),
+        sync_shutdown_tx: Some(sync_shutdown_tx),
+        sync_join: Some(sync_join),
     })
 }
 
