@@ -165,6 +165,13 @@ pub enum EnrollError {
     /// The declared cidrs don't all resolve to exactly one already
     /// registered segment.
     NoMatchingSegment,
+    /// The declared cidrs don't match the set the token was minted bound to
+    /// (or a `gateway` token was minted with an empty, unscoped bound set):
+    /// the token is authorized only for its own segment's cidrs, so it can't
+    /// be redeemed into a different segment by declaring that segment's
+    /// cidrs. Kept distinct from `InvalidToken` so the gRPC layer can pick
+    /// the mapping (this task maps it to `PermissionDenied`).
+    BoundCidrMismatch,
     /// Anything else — a genuine DB/storage error.
     Other(anyhow::Error),
 }
@@ -178,6 +185,10 @@ impl std::fmt::Display for EnrollError {
             EnrollError::NoMatchingSegment => {
                 write!(f, "no segment is registered for the declared cidrs")
             }
+            EnrollError::BoundCidrMismatch => write!(
+                f,
+                "declared cidrs are outside the token's minted bound_cidrs scope"
+            ),
             EnrollError::Other(e) => write!(f, "{e}"),
         }
     }
@@ -380,9 +391,11 @@ impl Db {
 
     /// Redeems a single-use `enrollment_token` for a signed gateway
     /// certificate, ALL in one transaction: validates the token (right
-    /// kind, unexpired, unused), resolves the segment that owns every
-    /// declared `cidrs` entry, inserts the `gateway` row, records the
-    /// `certificate`, marks the token `used_at`, and appends an audit entry.
+    /// kind, unexpired, unused), enforces that the declared `cidrs` match the
+    /// set the token was minted bound to (`bound_cidrs`), resolves the
+    /// segment that owns every declared `cidrs` entry, inserts the `gateway`
+    /// row, records the `certificate`, marks the token `used_at`, and appends
+    /// an audit entry.
     ///
     /// Holding the connection mutex for the whole operation (same pattern as
     /// [`Db::insert_segment`]) is what makes the token's single-use
@@ -415,22 +428,60 @@ impl Db {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        let token_id: Option<String> = {
+        let token_row: Option<(String, String)> = {
             let mut stmt = tx.prepare(
-                "SELECT id FROM enrollment_token \
+                "SELECT id, bound_cidrs FROM enrollment_token \
                  WHERE secret_hash = ?1 AND kind = ?2 AND used_at IS NULL AND expires_at > ?3",
             )?;
             let mut rows = stmt.query(params![secret_hash, kind, now])?;
             match rows.next()? {
-                Some(row) => Some(row.get(0)?),
+                // bound_cidrs is NULL-able in the schema; treat NULL as "" so
+                // the T4 decode contract (""→[]) applies uniformly.
+                Some(row) => Some((row.get(0)?, row.get::<_, Option<String>>(1)?.unwrap_or_default())),
                 None => None,
             }
         };
 
-        let Some(token_id) = token_id else {
+        let Some((token_id, bound_cidrs_raw)) = token_row else {
             tx.rollback()?;
             return Err(EnrollError::InvalidToken);
         };
+
+        // Authorization scope: the declared `cidrs` must match the CIDR set
+        // this token was minted bound to (MintToken stored them, comma-joined,
+        // in `bound_cidrs`). Decoded through the canonical T4 decoder
+        // (`decode_bound_cidrs`: ""→[]). A `gateway` token with an EMPTY
+        // bound set is unscoped and rejected outright — it would otherwise be
+        // a bearer credential for every segment. (`rebind` tokens legitimately
+        // carry empty bound_cidrs and steer by `rebind_segment_id` instead,
+        // but only `gateway`-kind tokens reach this method today; rebind is
+        // Task 10.) Comparison is set-based over parsed `Ipv4Net` values so
+        // it's order- and formatting-insensitive but still exact (no
+        // subnet-of slack). Checked BEFORE marking the token used, and a
+        // mismatch rolls the transaction back, so a rejected enroll does NOT
+        // consume the single-use token — same discipline as NoMatchingSegment.
+        let bound: std::collections::BTreeSet<Ipv4Net> = {
+            let decoded = crate::services::admin::decode_bound_cidrs(&bound_cidrs_raw);
+            let mut set = std::collections::BTreeSet::new();
+            for c in decoded {
+                let net: Ipv4Net = c.parse().map_err(|e| {
+                    EnrollError::Other(anyhow::anyhow!(
+                        "stored bound_cidr {c:?} is not valid IPv4: {e}"
+                    ))
+                })?;
+                set.insert(net);
+            }
+            set
+        };
+        if bound.is_empty() {
+            tx.rollback()?;
+            return Err(EnrollError::BoundCidrMismatch);
+        }
+        let declared: std::collections::BTreeSet<Ipv4Net> = cidrs.iter().copied().collect();
+        if declared != bound {
+            tx.rollback()?;
+            return Err(EnrollError::BoundCidrMismatch);
+        }
 
         // Resolve the segment that owns EVERY declared cidr — all of them
         // must belong to the same, already-registered segment (cycle-2

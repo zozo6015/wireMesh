@@ -139,6 +139,9 @@ impl Enrollment for EnrollmentSvc {
                 EnrollError::NoMatchingSegment => Status::failed_precondition(
                     "no segment is registered for the declared cidrs",
                 ),
+                EnrollError::BoundCidrMismatch => Status::permission_denied(
+                    "declared cidrs are outside this token's authorized scope",
+                ),
                 EnrollError::Other(e) => Status::internal(format!("enrollment failed: {e}")),
             });
         }
