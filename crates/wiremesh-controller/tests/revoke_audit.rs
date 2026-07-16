@@ -1,4 +1,4 @@
-//! Task 16's failing test: `Admin.RevokeCert(serial)` must (1) push the
+//! Task 16's contract: `Admin.RevokeCert(serial)` must (1) push the
 //! revoked serial into the `revoked_serials` denylist of the next `Delta`
 //! delivered to every gateway with an already-open `Sync.Watch` stream, and
 //! (2) append an audit-log row with `action == "revoke"` that `Admin.AuditQuery`
@@ -7,28 +7,16 @@
 //! Boots a real controller, enrolls gateway A ("aws") — which will observe
 //! the revocation via its own still-open Sync stream — and a second gateway,
 //! "victim" ("gcp"), whose leaf cert serial gets revoked. After consuming A's
-//! initial `StateSnapshot`, this calls the (not-yet-existing)
+//! initial `StateSnapshot`, this calls
 //! `Admin.RevokeCert(RevokeCertRequest{ serial })` for the victim's cert
 //! serial and asserts:
 //!
 //!   1. A's still-open Sync stream receives a `Delta` whose `revoked_serials`
 //!      contains the victim's serial (bounded by a timeout so a missing push
 //!      fails fast instead of hanging the suite);
-//!   2. `Admin.AuditQuery` (filtered to `action == "revoke"`, via an assumed
-//!      `AuditQueryRequest.action` field) returns at least one entry whose
+//!   2. `Admin.AuditQuery` (filtered to `action == "revoke"` via
+//!      `AuditQueryRequest.action`) returns at least one entry whose
 //!      `action` is exactly `"revoke"`.
-//!
-//! None of this exists yet: `RevokeCertRequest`/`RevokeCertResponse` aren't
-//! defined on `wiremesh_proto::v1` (only `Admin.Drain` revokes certs today,
-//! as a side effect of removing a gateway entirely — there is no standalone
-//! "revoke just this cert" RPC), `AdminClient::revoke_cert` doesn't exist,
-//! and `AuditQueryRequest` today has only a `limit` field (see
-//! `proto/wiremesh/v1/admin.proto`) — no `action` filter. So today this file
-//! does not even COMPILE — that's the expected RED state for this step. The
-//! implementer adds `RevokeCert`/`RevokeCertRequest` to `admin.proto`, an
-//! `action` filter field on `AuditQueryRequest`, the `src/services/admin.rs`
-//! handler (denylist push via `src/projection.rs` + `db.audit(..., "revoke", ...)`),
-//! and the `fabricctl audit export` surface, to turn this green.
 use std::time::Duration;
 
 use tokio_stream::StreamExt;

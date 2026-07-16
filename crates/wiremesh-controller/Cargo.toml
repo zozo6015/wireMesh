@@ -45,6 +45,10 @@ tower = { version = "0.4", features = ["util"] }
 # perfectly adequate for cycle-2's `serde::Deserialize`-driven parsing.
 serde = { workspace = true }
 serde_yaml = "0.9"
+# Structured (rather than string-interpolated) audit `diff_json` payloads —
+# a name/CIDR/etc. containing a quote or control character must not be able
+# to produce invalid JSON in the audit log.
+serde_json = { workspace = true }
 
 [dev-dependencies]
 ipnet = { workspace = true }

@@ -248,22 +248,44 @@ impl Drop for RunningController {
         // Best-effort: if `shutdown()` was never called explicitly, at least
         // signal every server to stop so their tasks don't outlive this
         // handle. We can't `.await` the join handles here (Drop is sync), so
-        // we don't try — they're spawned tokio tasks and quit promptly once
-        // their shutdown signal fires.
+        // we don't try to wait for them — but a graceful shutdown signal
+        // alone isn't enough: a `Sync.Watch` server-streaming call stays
+        // in-flight for as long as its CLIENT holds the stream open (see
+        // `shutdown`'s doc comment), so a signal-only Drop could leave that
+        // task running indefinitely after this handle is gone. `abort()` is
+        // synchronous and non-blocking (unlike `join_bounded`'s `.await`),
+        // so it's safe to call directly here: it forcibly cancels the task
+        // (force-closing its listener) regardless of whether the graceful
+        // signal above was heeded in time.
         if let Some(tx) = self.admin_shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        if let Some(join) = self.admin_join.take() {
+            join.abort();
         }
         if let Some(tx) = self.admin_tcp_shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(join) = self.admin_tcp_join.take() {
+            join.abort();
+        }
         if let Some(tx) = self.enroll_shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        if let Some(join) = self.enroll_join.take() {
+            join.abort();
         }
         if let Some(tx) = self.sync_shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(join) = self.sync_join.take() {
+            join.abort();
+        }
         if let Some(tx) = self.observe_shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        if let Some(join) = self.observe_join.take() {
+            join.abort();
         }
     }
 }
@@ -344,7 +366,7 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         .local_addr()
         .context("reading bound observation UDP addr")?;
 
-    bind_uds_dir(&config.socket_path)?;
+    bind_uds_dir(&config.socket_path, &config.data_dir)?;
     if config.socket_path.exists() {
         std::fs::remove_file(&config.socket_path).with_context(|| {
             format!("removing stale socket at {}", config.socket_path.display())
@@ -352,6 +374,18 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     }
     let uds = UnixListener::bind(&config.socket_path)
         .with_context(|| format!("binding unix socket at {}", config.socket_path.display()))?;
+    // Belt-and-braces: restrict the socket FILE itself to owner-only,
+    // regardless of whether `bind_uds_dir` was able to tighten its parent
+    // directory (see that function's doc comment for why it deliberately
+    // does NOT chmod a directory this process doesn't own). Every
+    // filesystem this process can bind a socket into, it can also chmod the
+    // socket it just created.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config.socket_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("setting 0600 on {}", config.socket_path.display()))?;
+    }
     let uds_stream = UnixListenerStream::new(uds);
 
     // Shared fan-out channel for Task 8's Sync delta stream: every
@@ -488,10 +522,20 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     })
 }
 
-/// Creates (if absent) the Unix socket's parent directory and forces it to
-/// mode `0700` — the socket itself inherits no meaningful permissions of its
-/// own on most platforms, so the directory is the actual access boundary.
-fn bind_uds_dir(socket_path: &Path) -> Result<()> {
+/// Creates (if absent) the Unix socket's parent directory and, if that
+/// directory is the controller's OWN `data_dir` (or nested under it),
+/// tightens it to mode `0700`.
+///
+/// Deliberately does NOT chmod a parent directory outside `data_dir`: a
+/// misconfigured `socket_path` (e.g. `/tmp/wiremesh.sock`) would otherwise
+/// have this function force a SHARED system directory like `/tmp` to
+/// `0700`, potentially breaking every other tenant of that path — this
+/// process has no business re-mode-ing a directory it doesn't own. The
+/// bound socket FILE itself is separately restricted to `0600` by
+/// [`serve`] right after `bind`, which is safe unconditionally (the
+/// process just created that file, so it unambiguously owns it) and is
+/// the actual access boundary in that unsafe-parent case.
+fn bind_uds_dir(socket_path: &Path, data_dir: &Path) -> Result<()> {
     let Some(parent) = socket_path.parent() else {
         return Ok(());
     };
@@ -503,10 +547,28 @@ fn bind_uds_dir(socket_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            .with_context(|| format!("setting 0700 on {}", parent.display()))?;
+        if owns_dir(parent, data_dir) {
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("setting 0700 on {}", parent.display()))?;
+        }
     }
     Ok(())
+}
+
+/// `true` iff `dir` IS `data_dir`, or is nested under it — the only case
+/// where this process can be confident it's safe to chmod `dir`, since
+/// `data_dir` itself is exclusively this controller instance's own
+/// directory (created, if absent, at the top of [`serve`]). Falls back to
+/// the given paths verbatim if `canonicalize` fails (e.g. a path that
+/// doesn't exist yet) rather than erroring — worst case this is overly
+/// conservative (skips the chmod) rather than chmod-ing the wrong thing.
+#[cfg(unix)]
+fn owns_dir(dir: &Path, data_dir: &Path) -> bool {
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let data_dir = data_dir
+        .canonicalize()
+        .unwrap_or_else(|_| data_dir.to_path_buf());
+    dir == data_dir || dir.starts_with(&data_dir)
 }
 
 /// sha256 of the CA root certificate's DER bytes (not the PEM text), hex

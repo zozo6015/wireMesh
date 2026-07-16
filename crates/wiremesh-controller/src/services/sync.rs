@@ -100,35 +100,53 @@ impl Sync for SyncSvc {
         // published on `change_tx` (currently only gateway enrollment —
         // see `crate::services::enrollment`) is forwarded as a `Delta`,
         // for as long as this gRPC call is alive.
-        let delta_stream = BroadcastStream::new(rx).filter_map(move |item| match item {
-            Ok(event) => {
-                // A gateway must never receive a delta "adding"/"updating"
-                // itself as its own peer.
-                if event.subject_gateway_id() == self_gateway_id {
-                    None
-                } else {
-                    let delta = projection::delta_for_change(event);
-                    Some(Ok(SyncMessage {
-                        body: Some(Body::Delta(delta)),
-                    }))
+        // `lagged` latches once this connection's receiver falls behind the
+        // broadcast channel's ring buffer: from that point on, the
+        // gateway's view of the projection is provably INCOMPLETE (deltas
+        // it never saw were dropped), so silently continuing (the old
+        // behavior) would leave it stale indefinitely with no client-side
+        // way to detect the gap. Instead, `map_while` below emits exactly
+        // ONE final `Err(Unavailable)` item and then ends the stream (once
+        // `lagged` is set, every subsequent poll returns `None`, which
+        // `map_while` treats as end-of-stream) — tonic surfaces that `Err`
+        // item as the RPC's final status, forcing the gateway to reconnect
+        // and re-fetch a fresh, fully-consistent snapshot rather than
+        // silently trusting a gapped delta stream.
+        let mut lagged = false;
+        let delta_stream = BroadcastStream::new(rx)
+            .map_while(move |item| {
+                if lagged {
+                    return None;
                 }
-            }
-            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
-                // This connection's receiver fell behind the broadcast
-                // channel's ring buffer and `skipped` events were dropped
-                // before it could read them. Rather than crash the
-                // connection (or the server), log and keep going: the
-                // gateway is left relying on its next `Sync.Watch`
-                // reconnect (which re-fetches a full, consistent snapshot)
-                // to recover from any deltas it missed here.
-                eprintln!(
-                    "wiremesh-controller: Sync.Watch for gateway {self_gateway_id} lagged behind \
-                     the change broadcast by {skipped} event(s); those deltas were dropped — \
-                     the gateway must reconnect to Sync.Watch to fully resync"
-                );
-                None
-            }
-        });
+                match item {
+                    Ok(event) => {
+                        // A gateway must never receive a delta
+                        // "adding"/"updating" itself as its own peer —
+                        // skip it (`Some(None)`), but keep the stream open.
+                        if event.subject_gateway_id() == self_gateway_id {
+                            Some(None)
+                        } else {
+                            let delta = projection::delta_for_change(event);
+                            Some(Some(Ok(SyncMessage {
+                                body: Some(Body::Delta(delta)),
+                            })))
+                        }
+                    }
+                    Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                        eprintln!(
+                            "wiremesh-controller: Sync.Watch for gateway {self_gateway_id} lagged \
+                             behind the change broadcast by {skipped} event(s); terminating the \
+                             stream so the gateway reconnects and re-snapshots"
+                        );
+                        lagged = true;
+                        Some(Some(Err(Status::unavailable(format!(
+                            "Sync.Watch lagged behind the change broadcast by {skipped} event(s); \
+                             reconnect to receive a fresh, consistent snapshot"
+                        )))))
+                    }
+                }
+            })
+            .filter_map(|opt| opt);
 
         let stream: Self::WatchStream =
             Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(delta_stream));

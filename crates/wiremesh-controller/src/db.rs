@@ -530,6 +530,49 @@ impl Db {
         Ok(segment_id)
     }
 
+    /// Same as [`Db::insert_segment`], but also appends the `create` audit
+    /// row IN THE SAME TRANSACTION — this is what `AdminSvc::create_segment`
+    /// calls, so a failure appending the audit entry rolls back the segment
+    /// insert too, rather than leaving a committed-but-unaudited mutation
+    /// (the two used to be separate `Db`/`DbHandle` calls with no shared
+    /// transaction). [`Db::insert_segment`] itself is left audit-less and
+    /// unchanged, since `tests/db.rs` exercises it directly as a pure
+    /// segment/CIDR-overlap primitive with no audit concern.
+    pub fn create_segment_audited(
+        &self,
+        name: &str,
+        cidrs: &[Ipv4Net],
+        actor: &str,
+        now: &str,
+    ) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let segment_id = match insert_segment_tx(&tx, name, cidrs) {
+            Ok(id) => id,
+            Err(e) => {
+                tx.rollback()?;
+                return Err(e);
+            }
+        };
+
+        let cidr_strs: Vec<String> = cidrs.iter().map(|c| c.to_string()).collect();
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                actor,
+                "create",
+                format!("segment/{name}"),
+                serde_json::json!({"name": name, "cidrs": cidr_strs}).to_string(),
+            ],
+        )?;
+
+        bump_revision_tx(&tx)?;
+        tx.commit()?;
+        Ok(segment_id)
+    }
+
     /// (Task 14) Diffs a parsed `fabric.yaml`'s `segments:` list (and,
     /// separately, its optional `policy:` source) against current DB state
     /// and applies every ACTUAL change in one transaction — this is the
@@ -597,7 +640,7 @@ impl Db {
             audit_rows.push((
                 "apply-create-segment",
                 format!("segment/{name}"),
-                format!(r#"{{"name":"{name}","cidrs":{cidr_strs:?}}}"#),
+                serde_json::json!({"name": name, "cidrs": cidr_strs}).to_string(),
             ));
         }
 
@@ -724,13 +767,32 @@ impl Db {
         bound_cidrs: &str,
         rebind_segment_id: Option<i64>,
         expires_at: &str,
+        actor: &str,
+        now: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute(
             "INSERT INTO enrollment_token (id, secret_hash, kind, bound_cidrs, rebind_segment_id, expires_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, secret_hash, kind, bound_cidrs, rebind_segment_id, expires_at],
         )?;
+
+        // Audited atomically with the insert — see `Db::delete_segment`'s
+        // doc comment.
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                actor,
+                "mint",
+                "enrollment_token",
+                serde_json::json!({"kind": kind}).to_string(),
+            ],
+        )?;
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -1136,18 +1198,25 @@ impl Db {
     /// epoch created, persisted, and delta'd to peers." See the Task 11
     /// brief/report for what's deferred to cycle 4's real WireGuard
     /// handshake-driven ack path.
-    pub fn rotate_key(&self, gateway_id: i64, now: &str) -> Result<RotateKeyOutcome> {
+    pub fn rotate_key(&self, gateway_id: i64, actor: &str, now: &str) -> Result<RotateKeyOutcome> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
+        // Only an `active` gateway may have its key rotated — a `removed`
+        // (drained) or `replaced` (superseded by a rebind) gateway is
+        // intentionally excluded from the active projection, so creating a
+        // new pending epoch (and bumping the revision) for one would just
+        // be dead state nothing ever reads, plus a spurious revision bump.
         let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM gateway WHERE id = ?1)",
+            "SELECT EXISTS(SELECT 1 FROM gateway WHERE id = ?1 AND status = 'active')",
             params![gateway_id],
             |row| row.get(0),
         )?;
         if !exists {
             tx.rollback()?;
-            anyhow::bail!("RotateKey: no gateway row with id {gateway_id} to rotate a key for");
+            anyhow::bail!(
+                "RotateKey: no ACTIVE gateway row with id {gateway_id} to rotate a key for"
+            );
         }
 
         let max_epoch: Option<i64> = tx.query_row(
@@ -1168,7 +1237,7 @@ impl Db {
             "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 now,
-                "unix-socket",
+                actor,
                 "key-rotate",
                 format!("gateway/{gateway_id}"),
                 format!(r#"{{"epoch":{new_epoch}}}"#),
@@ -1211,7 +1280,7 @@ impl Db {
     /// call revokes nothing further and returns an empty `revoked_serials`)
     /// rather than surfacing a confusing "no such gateway" for a gateway
     /// that unambiguously did exist a moment ago.
-    pub fn drain_gateway(&self, gateway_id: i64, now: &str) -> Result<DrainOutcome> {
+    pub fn drain_gateway(&self, gateway_id: i64, actor: &str, now: &str) -> Result<DrainOutcome> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -1249,7 +1318,7 @@ impl Db {
             "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 now,
-                "unix-socket",
+                actor,
                 "drain",
                 format!("gateway/{gateway_id}"),
                 format!(r#"{{"gateway_id":{gateway_id},"revoked_serials":{certs_to_revoke:?}}}"#),
@@ -1280,7 +1349,7 @@ impl Db {
     /// Returns `false` (rather than erroring) if no `certificate` row with
     /// this serial exists at all, so `AdminSvc::revoke_cert` can map that to
     /// `NotFound` — no mutation, no audit row, no revision bump in that case.
-    pub fn revoke_cert(&self, serial: &str, now: &str) -> Result<bool> {
+    pub fn revoke_cert(&self, serial: &str, actor: &str, now: &str) -> Result<bool> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -1303,7 +1372,7 @@ impl Db {
             "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 now,
-                "unix-socket",
+                actor,
                 "revoke",
                 format!("certificate/{serial}"),
                 "{}",
@@ -1380,10 +1449,17 @@ impl Db {
     /// exist (the caller already resolved it from the mTLS peer cert, so
     /// that should never happen in practice).
     pub fn set_applied_version(&self, gateway_id: i64, applied_version: u64) -> Result<()> {
+        // `applied_version` is a caller-supplied (gateway-reported) `u64`
+        // but the column is a SQLite signed `INTEGER`: an `as i64` cast on a
+        // value above `i64::MAX` would silently wrap to a negative number
+        // rather than erroring, corrupting the persisted applied-version
+        // bookkeeping. Reject it instead.
+        let applied_version = i64::try_from(applied_version)
+            .map_err(|_| anyhow::anyhow!("applied_version {applied_version} exceeds SQLite INTEGER range"))?;
         let conn = self.conn.lock().unwrap();
         let updated = conn.execute(
             "UPDATE gateway SET applied_version = ?1 WHERE id = ?2",
-            params![applied_version as i64, gateway_id],
+            params![applied_version, gateway_id],
         )?;
         if updated != 1 {
             anyhow::bail!(
@@ -1422,7 +1498,7 @@ impl Db {
     /// operator must drain/replace those first. Also errors (message
     /// contains `"no segment row"`, mapped to `NotFound`) if the id doesn't
     /// exist.
-    pub fn delete_segment(&self, segment_id: i64) -> Result<()> {
+    pub fn delete_segment(&self, segment_id: i64, actor: &str, now: &str) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -1452,6 +1528,15 @@ impl Db {
         tx.execute("DELETE FROM cidr WHERE segment_id = ?1", params![segment_id])?;
         tx.execute("DELETE FROM segment WHERE id = ?1", params![segment_id])?;
 
+        // Audited atomically with the mutation itself (rather than a
+        // separate, later `Db::audit` call) so a failure appending the
+        // audit row can't leave the segment deleted with no record of who
+        // did it — the whole point of an audit log.
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![now, actor, "delete", format!("segment/{segment_id}"), "{}"],
+        )?;
+
         bump_revision_tx(&tx)?;
         tx.commit()?;
         Ok(())
@@ -1461,13 +1546,32 @@ impl Db {
     /// yet). Returns the new relay's id. A duplicate `name` surfaces as a
     /// `rusqlite::Error` (UNIQUE constraint) — `AdminSvc::register_relay`
     /// maps that to `AlreadyExists`, mirroring `insert_segment`'s pattern.
-    pub fn insert_relay(&self, name: &str, endpoint: &str) -> Result<i64> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+    pub fn insert_relay(&self, name: &str, endpoint: &str, actor: &str, now: &str) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute(
             "INSERT INTO relay (name, endpoint, status, last_seen) VALUES (?1, ?2, 'active', NULL)",
             params![name, endpoint],
         )?;
-        Ok(conn.last_insert_rowid())
+        let relay_id = tx.last_insert_rowid();
+
+        // Audited atomically with the insert — see `Db::delete_segment`'s
+        // doc comment for why this matters (a failed audit write must not
+        // leave a silently-unaudited mutation committed).
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                actor,
+                "create",
+                format!("relay/{name}"),
+                serde_json::json!({"name": name, "endpoint": endpoint}).to_string(),
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(relay_id)
     }
 
     /// (Task 13) Every registered relay, ordered by id.
@@ -1490,6 +1594,7 @@ impl Db {
     /// before this call). `expires_at` is `None` for cycle-2's API
     /// tokens — no TTL/renewal path yet (mirrors how `RevokeApiToken` is the
     /// only way to invalidate one early).
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_api_token(
         &self,
         id: &str,
@@ -1497,12 +1602,31 @@ impl Db {
         role: &str,
         secret_hash: &str,
         expires_at: Option<&str>,
+        actor: &str,
+        now: &str,
     ) -> Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        tx.execute(
             "INSERT INTO api_token (id, name, role, secret_hash, expires_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![id, name, role, secret_hash, expires_at],
         )?;
+
+        // Audited atomically with the insert — see `Db::delete_segment`'s
+        // doc comment.
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                actor,
+                "mint",
+                format!("api_token/{name}"),
+                serde_json::json!({"role": role}).to_string(),
+            ],
+        )?;
+
+        tx.commit()?;
         Ok(())
     }
 
@@ -1511,13 +1635,28 @@ impl Db {
     /// exists — `AdminSvc::revoke_api_token` maps that to `NotFound`.
     /// Idempotent: revoking an already-revoked token just re-stamps
     /// `revoked_at` and still returns `true`.
-    pub fn revoke_api_token(&self, name: &str, now: &str) -> Result<bool> {
-        let conn = self.conn.lock().unwrap();
-        let updated = conn.execute(
+    pub fn revoke_api_token(&self, name: &str, actor: &str, now: &str) -> Result<bool> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let updated = tx.execute(
             "UPDATE api_token SET revoked_at = ?1 WHERE name = ?2",
             params![now, name],
         )?;
-        Ok(updated > 0)
+        if updated == 0 {
+            tx.rollback()?;
+            return Ok(false);
+        }
+
+        // Audited atomically with the mutation — see `Db::delete_segment`'s
+        // doc comment.
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![now, actor, "revoke", format!("api_token/{name}"), "{}"],
+        )?;
+
+        tx.commit()?;
+        Ok(true)
     }
 
     /// (Task 13) The `role` of the unrevoked, unexpired `api_token` row
@@ -1527,13 +1666,27 @@ impl Db {
     /// non-disclosure posture as `EnrollError::InvalidToken`: a caller can't
     /// distinguish which).
     pub fn find_active_api_token_role(&self, secret_hash: &str, now: &str) -> Result<Option<String>> {
+        self.find_active_api_token(secret_hash, now)
+            .map(|opt| opt.map(|(_name, role)| role))
+    }
+
+    /// Same lookup as [`Db::find_active_api_token_role`], but also returns
+    /// the token's `name` — the authenticated principal `crate::auth`'s
+    /// bearer-auth middleware stamps onto the request so `AdminSvc`'s audit
+    /// rows can record who ACTUALLY made a TCP-bearer-authenticated
+    /// mutation instead of the UDS-only `"unix-socket"` placeholder.
+    pub fn find_active_api_token(
+        &self,
+        secret_hash: &str,
+        now: &str,
+    ) -> Result<Option<(String, String)>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
-            "SELECT role FROM api_token \
+            "SELECT name, role FROM api_token \
              WHERE secret_hash = ?1 AND revoked_at IS NULL \
              AND (expires_at IS NULL OR expires_at > ?2)",
             params![secret_hash, now],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
         .map_err(Into::into)
@@ -1682,25 +1835,44 @@ impl Db {
     /// probe's MAC against an active gateway's key moments earlier) can treat
     /// that as an internal inconsistency rather than silently no-op'ing.
     /// Bumps the persisted revision in the same transaction, since this
-    /// changes what every OTHER gateway's projection shows. Returns the new
-    /// revision.
-    pub fn set_candidate_endpoint(&self, gateway_id: i64, addr: &str) -> Result<u64> {
+    /// changes what every OTHER gateway's projection shows. Returns
+    /// `Some(new_revision)` when the candidate endpoint actually changed —
+    /// `None` (no write, no revision bump) when `addr` is IDENTICAL to what
+    /// was already stored, so a flood of routine/replayed probes for an
+    /// unchanged endpoint doesn't churn the revision or trigger a delta
+    /// broadcast on every single one (see `crate::observe::handle_probe`,
+    /// the sole caller, which skips publishing when this returns `None`).
+    pub fn set_candidate_endpoint(&self, gateway_id: i64, addr: &str) -> Result<Option<u64>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
-        let updated = tx.execute(
-            "UPDATE gateway SET candidate_endpoint = ?1 WHERE id = ?2 AND status = 'active'",
-            params![addr, gateway_id],
-        )?;
-        if updated != 1 {
+        let existing: Option<Option<String>> = tx
+            .query_row(
+                "SELECT candidate_endpoint FROM gateway WHERE id = ?1 AND status = 'active'",
+                params![gateway_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+
+        let Some(existing_endpoint) = existing else {
             tx.rollback()?;
             anyhow::bail!(
                 "set_candidate_endpoint: no active gateway row with id {gateway_id}"
             );
+        };
+
+        if existing_endpoint.as_deref() == Some(addr) {
+            tx.rollback()?;
+            return Ok(None);
         }
+
+        tx.execute(
+            "UPDATE gateway SET candidate_endpoint = ?1 WHERE id = ?2 AND status = 'active'",
+            params![addr, gateway_id],
+        )?;
 
         let revision = bump_revision_tx(&tx)?;
         tx.commit()?;
-        Ok(revision)
+        Ok(Some(revision))
     }
 }

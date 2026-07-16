@@ -89,13 +89,10 @@ async fn read_only_token_can_list() {
         .expect("a read-only-role bearer token must be allowed to ListSegments (a read)");
 }
 
-/// A caller presenting NO valid credential on the TCP Admin port must be
+/// A caller presenting an INVALID credential on the TCP Admin port must be
 /// rejected `Unauthenticated` (distinct from `PermissionDenied`, which is
-/// "valid credential, insufficient role"). The harness only exposes
-/// `admin_client_with_bearer`, so there's no token-less TCP client helper —
-/// we drive the same rejection path with an obviously-invalid bearer token,
-/// which the interceptor can't resolve to any `api_token` row and so must
-/// treat as unauthenticated, exactly as it would a missing one.
+/// "valid credential, insufficient role"). The interceptor can't resolve
+/// this obviously-invalid bearer token to any `api_token` row.
 #[tokio::test]
 async fn no_token_is_unauthenticated() {
     let h = wiremesh_testkit::TestController::start().await;
@@ -113,5 +110,30 @@ async fn no_token_is_unauthenticated() {
         err.code(),
         tonic::Code::Unauthenticated,
         "expected Unauthenticated for a request with no valid bearer token, got: {err:?}"
+    );
+}
+
+/// A caller presenting NO `authorization` header AT ALL on the TCP Admin
+/// port must ALSO be rejected `Unauthenticated` — this is the genuinely
+/// absent-header branch of `wiremesh_controller::auth`'s middleware
+/// (`extract_bearer` returning `None`), distinct from the invalid-token
+/// case above (where a header IS present, just unresolvable). Both must
+/// converge on the same `Unauthenticated` status, but only this test
+/// actually exercises the missing-header code path.
+#[tokio::test]
+async fn missing_bearer_header_is_unauthenticated() {
+    let h = wiremesh_testkit::TestController::start().await;
+
+    let mut admin = h.admin_client_tcp_no_auth().await;
+
+    let err = admin
+        .list_segments(ListSegmentsRequest {})
+        .await
+        .expect_err("a request with no authorization header at all must be rejected, not served");
+
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unauthenticated,
+        "expected Unauthenticated for a request with no bearer header at all, got: {err:?}"
     );
 }

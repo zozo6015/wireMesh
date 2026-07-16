@@ -353,7 +353,25 @@ fn load_or_create_ca(data_dir: &Path) -> Result<(rcgen::Certificate, KeyPair, St
     let ca_key_path = data_dir.join("ca.key");
     let ca_pem_path = data_dir.join("ca.pem");
 
-    if ca_key_path.exists() && ca_pem_path.exists() {
+    let key_exists = ca_key_path.exists();
+    let cert_exists = ca_pem_path.exists();
+
+    if key_exists != cert_exists {
+        bail!(
+            "incomplete CA state: expected both {} and {} to exist (or neither); \
+             found only {}. Refusing to regenerate the CA, which would silently \
+             rotate the trust anchor and invalidate all enrolled certificates.",
+            ca_key_path.display(),
+            ca_pem_path.display(),
+            if key_exists {
+                ca_key_path.display()
+            } else {
+                ca_pem_path.display()
+            }
+        );
+    }
+
+    if key_exists && cert_exists {
         let key_pem = fs::read_to_string(&ca_key_path)
             .with_context(|| format!("reading {}", ca_key_path.display()))?;
         let cert_pem = fs::read_to_string(&ca_pem_path)

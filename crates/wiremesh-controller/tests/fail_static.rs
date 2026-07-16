@@ -1,15 +1,11 @@
 //! Proves C-7 (fail-static / restore): after a controller restart against
 //! the SAME data-dir (same SQLite DB + CA key — see
 //! `wiremesh_testkit::TestController::restart`), an already-enrolled gateway
-//! reconnects to `Sync.Watch` **with its existing cert** (no re-enrollment)
-//! and the controller still serves it — proving the controller's identity
-//! and state are durable across a restart, not re-created from scratch.
-//!
-//! `TestController::restart`, `StubGateway::persist_state`, and
-//! `StubGateway::reconnect` do not exist yet — they're added by the Task 9
-//! implementer alongside the restart/persist/reconnect harness plumbing this
-//! test drives. Until then this fails to compile, which is the expected RED
-//! state for this step.
+//! reconnects to `Sync.Watch` **with its existing cert, reloaded fresh off
+//! disk** (no re-enrollment) and the controller still serves it — proving
+//! both the controller's identity/state AND the gateway's persisted
+//! identity bundle are durable across a restart, not re-created from
+//! scratch or merely still resident in this test's own memory.
 use tokio_stream::StreamExt;
 use wiremesh_proto::v1::sync_message;
 
@@ -42,13 +38,17 @@ async fn gateway_resyncs_after_controller_restart_without_reenrolling() {
     // had crashed and restarted, or the host rebooted.
     h.restart().await;
 
-    // Reconnect with the SAME cert — must succeed (no re-enroll) and yield a
-    // fresh snapshot, proving the restarted controller still recognizes this
-    // gateway's existing certificate as valid and knows its enrolled state.
+    // Reconnect with the SAME cert — RELOADED FRESH OFF DISK (not `gw`'s
+    // in-memory fields, which would still work even if `persist_state`'s
+    // on-disk format were broken) — must succeed (no re-enroll) and yield a
+    // fresh snapshot, proving both the restarted controller still
+    // recognizes this gateway's existing certificate as valid AND the
+    // gateway's own persisted identity bundle is genuinely restorable from
+    // disk.
     let mut s2 = gw
-        .reconnect(&h)
+        .reconnect_from_disk(&h)
         .await
-        .expect("reconnecting with the existing cert after controller restart must succeed");
+        .expect("reconnecting with the disk-reloaded cert after controller restart must succeed");
     let msg = s2
         .next()
         .await

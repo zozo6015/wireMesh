@@ -48,3 +48,46 @@ async fn apply_is_idempotent() {
         "an empty (no-op) apply must not add any audit rows"
     );
 }
+
+/// A typo'd key (`cidr:` instead of `cidrs:`) must be rejected at parse time
+/// rather than silently accepted as an empty `cidrs: []`, which would apply a
+/// segment with no CIDRs and mask the typo.
+#[test]
+fn misspelled_segment_key_is_rejected() {
+    const TYPO_FABRIC: &str = r#"
+segments:
+  - name: aws
+    cidr: ["10.0.0.0/16"]
+"#;
+    let err = wiremesh_controller::apply::parse_fabric(TYPO_FABRIC)
+        .expect_err("a misspelled `cidr:` key must fail to parse, not silently be dropped");
+    assert!(
+        err.to_string().contains("cidr"),
+        "parse error should mention the unknown field, got: {err}"
+    );
+}
+
+/// Same contract for `relays:` and the top-level document: unknown keys must
+/// be rejected rather than ignored.
+#[test]
+fn misspelled_relay_and_top_level_keys_are_rejected() {
+    const TYPO_RELAY: &str = r#"
+relays:
+  - name: r1
+    endpont: "1.2.3.4:4443"
+"#;
+    assert!(
+        wiremesh_controller::apply::parse_fabric(TYPO_RELAY).is_err(),
+        "a misspelled `endpont:` key on a relay must fail to parse"
+    );
+
+    const TYPO_TOP_LEVEL: &str = r#"
+segmentz:
+  - name: aws
+    cidrs: ["10.0.0.0/16"]
+"#;
+    assert!(
+        wiremesh_controller::apply::parse_fabric(TYPO_TOP_LEVEL).is_err(),
+        "a misspelled top-level `segmentz:` key must fail to parse"
+    );
+}

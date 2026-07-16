@@ -77,6 +77,18 @@ const READONLY_METHODS: &[&str] = &[
     "DebugKeyStates",
 ];
 
+/// The authenticated caller's identity, stamped into the request's
+/// `http::Extensions` by [`BearerAuthMiddleware`] on every successfully
+/// authenticated TCP request — `http::Request`'s extensions survive tonic's
+/// decode into a typed `tonic::Request<T>`, so `services::admin::AdminSvc`
+/// handlers can read this back out (before calling `.into_inner()`, which
+/// discards it) to record the REAL bearer-token identity in an audit row
+/// instead of the UDS-only `"unix-socket"` placeholder. Never present on
+/// the UDS listener (which has no `BearerAuthLayer`), so `AdminSvc` falls
+/// back to `"unix-socket"` whenever this extension is absent.
+#[derive(Clone, Debug)]
+pub struct Principal(pub String);
+
 /// A `tower::Layer` that wraps the Admin `Routes` service with bearer-token
 /// auth — see the module doc comment for why this is a `Layer` around the
 /// whole router rather than a `tonic::service::Interceptor`.
@@ -127,6 +139,7 @@ impl Service<Request<BoxBody>> for BearerAuthMiddleware {
         let db = self.db.clone();
 
         Box::pin(async move {
+            let mut req = req;
             let method = req
                 .uri()
                 .path()
@@ -136,7 +149,10 @@ impl Service<Request<BoxBody>> for BearerAuthMiddleware {
                 .to_string();
 
             match authorize(&db, req.headers(), &method).await {
-                Ok(()) => inner.call(req).await,
+                Ok(principal) => {
+                    req.extensions_mut().insert(principal);
+                    inner.call(req).await
+                }
                 Err(status) => Ok(status.into_http()),
             }
         })
@@ -145,8 +161,10 @@ impl Service<Request<BoxBody>> for BearerAuthMiddleware {
 
 /// Validates the bearer token in `headers` against `api_token` and enforces
 /// role vs. `method`'s mutating-ness. See the module doc comment for the
-/// header/classification contract.
-async fn authorize(db: &DbHandle, headers: &HeaderMap, method: &str) -> Result<(), Status> {
+/// header/classification contract. On success, returns the token's `name`
+/// as a [`Principal`] — see that type's doc comment for how it reaches
+/// `AdminSvc`'s audit rows.
+async fn authorize(db: &DbHandle, headers: &HeaderMap, method: &str) -> Result<Principal, Status> {
     let token =
         extract_bearer(headers).ok_or_else(|| Status::unauthenticated("missing bearer token"))?;
     // The bearer token IS the hex-encoded raw secret (`MintApiTokenResponse.token`,
@@ -165,8 +183,8 @@ async fn authorize(db: &DbHandle, headers: &HeaderMap, method: &str) -> Result<(
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
 
-    let role = db
-        .find_active_api_token_role(secret_hash, now)
+    let (name, role) = db
+        .find_active_api_token(secret_hash, now)
         .await
         .map_err(|e| Status::internal(format!("looking up API token: {e}")))?
         .ok_or_else(|| Status::unauthenticated("invalid, expired, or revoked API token"))?;
@@ -181,7 +199,7 @@ async fn authorize(db: &DbHandle, headers: &HeaderMap, method: &str) -> Result<(
             "a read-only API token cannot call this Admin RPC",
         ));
     }
-    Ok(())
+    Ok(Principal(name))
 }
 
 /// Pulls the raw token out of an `authorization: Bearer <token>` header —

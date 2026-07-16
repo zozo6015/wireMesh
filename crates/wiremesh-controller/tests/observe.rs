@@ -8,13 +8,11 @@
 //! `StateSnapshot` must list A as a peer whose `candidate_endpoints` contains
 //! the exact echoed address.
 //!
-//! This is Task 15's Step 1: the failing test for the UDP observation
-//! endpoint (`crates/wiremesh-controller/src/observe.rs`, wired up in
-//! `main.rs`, surfaced into `src/projection.rs`) — none of that exists yet.
-//! `TestController::observe_addr()` and `StubGateway::probe_observe()` are
-//! added by the Task 15 implementer alongside the endpoint itself, so today
-//! this fails to COMPILE (unresolved `observe_addr`/`probe_observe`), which
-//! is the expected RED state for this step.
+//! This is Task 15's contract for the UDP observation endpoint
+//! (`crates/wiremesh-controller/src/observe.rs`, wired up in `main.rs`,
+//! surfaced into `src/projection.rs`) — an authenticated probe from an
+//! enrolled gateway must be echoed and durably recorded as that gateway's
+//! candidate endpoint, visible to peers on their next fresh snapshot.
 use std::time::Duration;
 
 use tokio::net::UdpSocket;

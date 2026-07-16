@@ -3,17 +3,14 @@
 //! that same segment's CIDRs WITHOUT tripping the CIDR self-overlap check
 //! that would reject an ordinary `gateway` token trying to claim CIDRs
 //! already owned by a segment — and, on success, the replaced gateway's old
-//! cert serial is pushed onto the revoked denylist (visible in a fresh
-//! `Sync.Watch` snapshot's `revoked_serials`), so the retired gateway can no
-//! longer authenticate.
-//!
-//! `StubGateway::segment_id()` does not exist yet — it's added by the Task 10
-//! implementer alongside the rebind branch in `services::enrollment`/`db`/
-//! `services::admin` this test drives. Until then this fails to compile,
-//! which is the expected RED state for this step. Once it compiles, the
-//! remaining RED is behavioral: the rebind token's enroll being rejected as
-//! a CIDR overlap, and/or the old serial being absent from
-//! `revoked_serials`.
+//! cert serial is pushed onto the revoked denylist: it's marked
+//! `revoked_at` in the DB and appears in a fresh `Sync.Watch` snapshot's
+//! `revoked_serials`. That denylist bookkeeping is ALL this test proves —
+//! it does NOT prove the retired gateway can no longer authenticate: its
+//! cert is still TLS-valid, and cycle-2's Sync mTLS handshake does not yet
+//! check `revoked_serials` against the presented client cert (a documented
+//! cycle-4 gap — see `docs/research/cycle2-controller-notes.md`), so a
+//! replaced gateway could still open a `Sync.Watch` connection this cycle.
 use tokio_stream::StreamExt;
 use wiremesh_proto::v1::{
     sync_message, CreateSegmentRequest, EnrollRequest, MintTokenRequest,

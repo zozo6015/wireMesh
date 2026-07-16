@@ -19,6 +19,7 @@ use serde::Deserialize;
 
 /// One `segments:` entry.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SegmentSpec {
     pub name: String,
     #[serde(default)]
@@ -29,6 +30,7 @@ pub struct SegmentSpec {
 /// but NOT yet diffed/applied by [`crate::db::Db::apply_fabric`] — see that
 /// method's doc comment and the task report's "partial" note.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RelaySpec {
     pub name: String,
     pub endpoint: String,
@@ -38,6 +40,7 @@ pub struct RelaySpec {
 /// defaults to absent so a fabric with only `segments:` (the shape
 /// `tests/apply.rs` exercises) parses without any other stanza present.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FabricSpec {
     #[serde(default)]
     pub segments: Vec<SegmentSpec>,

@@ -156,6 +156,12 @@ fn mac_eq(a: &[u8], b: &[u8]) -> bool {
 /// silently dropped — never echoed, never recorded, and never logged with
 /// its raw bytes (which could be attacker-controlled garbage) beyond the
 /// (already-public) source address and a short reason.
+/// Only log every Nth rejected probe (plus, implicitly, whichever ones land
+/// on that stride) — see [`spawn`]'s doc comment on why an unauthenticated
+/// flood of malformed/replayed/forged datagrams must not turn into an
+/// unbounded, synchronous `eprintln!` per datagram.
+const REJECTED_PROBE_LOG_SAMPLE: u64 = 128;
+
 pub fn spawn(
     socket: UdpSocket,
     db: DbHandle,
@@ -167,6 +173,13 @@ pub fn spawn(
         // generous headroom; anything bigger is oversized/malformed and
         // gets dropped by the length check in `handle_probe` regardless.
         let mut buf = [0u8; 512];
+        // Counts every REJECTED probe (not every datagram) — see the
+        // sampled `eprintln!` below, which only fires every
+        // `REJECTED_PROBE_LOG_SAMPLE`th rejection so an anonymous sender
+        // flooding the endpoint with bad probes can't flood stderr (or
+        // meaningfully block the runtime worker on synchronous I/O) by
+        // simply sending enough of them.
+        let mut rejected_count: u64 = 0;
         loop {
             let (n, from) = tokio::select! {
                 res = socket.recv_from(&mut buf) => match res {
@@ -180,9 +193,14 @@ pub fn spawn(
             };
 
             if let Err(reason) = handle_probe(&buf[..n], from, &socket, &db, &change_tx).await {
-                eprintln!(
-                    "wiremesh-controller: dropped observation probe from {from}: {reason}"
-                );
+                rejected_count += 1;
+                if rejected_count % REJECTED_PROBE_LOG_SAMPLE == 1 {
+                    eprintln!(
+                        "wiremesh-controller: dropped observation probe from {from}: {reason} \
+                         ({rejected_count} rejected probe(s) so far; logging 1 in \
+                         {REJECTED_PROBE_LOG_SAMPLE})"
+                    );
+                }
             }
         }
     })
@@ -230,6 +248,16 @@ async fn handle_probe(
         .set_candidate_endpoint(gateway_id as i64, observed.clone())
         .await
         .map_err(|_| "recording candidate endpoint failed")?;
+
+    // `None` means the candidate endpoint was UNCHANGED from what was
+    // already stored (see `Db::set_candidate_endpoint`'s doc comment) — no
+    // write, no revision bump happened, so there is nothing new to publish.
+    // This is the common case for a routine periodic (or replayed — see
+    // this module's doc comment on replayability) probe from a gateway
+    // whose observed address hasn't moved.
+    let Some(revision) = revision else {
+        return Ok(());
+    };
 
     // Publish a Delta so an already-open Sync.Watch stream sees the new
     // candidate without waiting for a reconnect (bonus — see

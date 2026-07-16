@@ -130,6 +130,21 @@ impl Enrollment for EnrollmentSvc {
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting cert not_after: {e}")))?;
 
+        // Fetched BEFORE the single-use token is spent below: this is the
+        // one piece of response data (`EnrollResponse.ca_bundle_pem`) that
+        // isn't already produced by `enroll_gateway` itself, so it's the
+        // only genuinely fallible "response prep" step. Doing it here means
+        // a transient failure reading the CA bundle rejects the request
+        // (InvalidArgument-adjacent — actually Internal, but pre-commit)
+        // WITHOUT ever touching the token, so the caller can simply retry
+        // with the same (still-unused) token — see the doc comment below on
+        // why everything AFTER the commit must instead be best-effort.
+        let ca_bundle_pem = self
+            .trust
+            .trust_bundle()
+            .await
+            .map_err(|e| Status::internal(format!("reading trust bundle: {e}")))?;
+
         let outcome = self
             .db
             .enroll_gateway(
@@ -179,9 +194,14 @@ impl Enrollment for EnrollmentSvc {
 
         // Projection-affecting mutation succeeded (and its transaction
         // already bumped the persisted revision — see
-        // `Db::enroll_gateway`'s doc comment). Publish a `ChangeEvent` so
-        // every OTHER already-connected gateway's open `Sync.Watch` stream
-        // learns about this new peer without needing to reconnect.
+        // `Db::enroll_gateway`'s doc comment) and the single-use token is
+        // now spent. From here on EVERYTHING is best-effort: the gateway
+        // row, certificate, and (if a rebind) revocations are already
+        // durably committed, so a failure in this section must NEVER turn
+        // into an error response — the token can't be retried, and the
+        // client's cert (built from `outcome`/`issued`/`ca_bundle_pem`,
+        // none of which depend on anything below) is already ready to
+        // return regardless of what happens here.
         //
         // Re-reads the just-inserted gateway's identity/cidrs/revision
         // through the same DB handle rather than threading extra return
@@ -189,46 +209,31 @@ impl Enrollment for EnrollmentSvc {
         // `cidrs_for_segment` already exist for exactly this shape of
         // lookup (the Sync projection uses them the same way), and the
         // gateway is guaranteed to exist (this same call just created it).
-        let identity = self
-            .db
-            .find_gateway_by_name(gateway_name.clone())
-            .await
-            .map_err(|e| Status::internal(format!("re-reading enrolled gateway: {e}")))?
-            .ok_or_else(|| {
-                Status::internal(format!(
-                    "enrolled gateway {gateway_name:?} vanished immediately after enrollment"
-                ))
-            })?;
-        let allowed_ips = self
-            .db
-            .cidrs_for_segment(identity.segment_id)
-            .await
-            .map_err(|e| Status::internal(format!("reading enrolled gateway's segment cidrs: {e}")))?;
-        let revision = self
-            .db
-            .current_revision()
-            .await
-            .map_err(|e| Status::internal(format!("reading revision after enrollment: {e}")))?;
-        // `send` errors only when there are currently no `Sync.Watch`
-        // subscribers (e.g. the very first gateway enrolling into a fresh
-        // controller) — nobody to notify, which is not a failure.
-        let _ = self.change_tx.send(ChangeEvent::GatewayEnrolled {
-            new_gateway_id: identity.id,
-            segment_name: identity.segment_name,
-            allowed_ips,
-            revision,
-        });
-
-        let ca_bundle_pem = self
-            .trust
-            .trust_bundle()
-            .await
-            .map_err(|e| Status::internal(format!("reading trust bundle: {e}")))?;
+        // Any lookup failure here just means the broadcast is skipped —
+        // other already-connected gateways fall back to their next
+        // reconnect/resync to see the new peer, same as the "no current
+        // subscribers" case below.
+        if let Ok(Some(identity)) = self.db.find_gateway_by_name(gateway_name.clone()).await {
+            if let Ok(allowed_ips) = self.db.cidrs_for_segment(identity.segment_id).await {
+                if let Ok(revision) = self.db.current_revision().await {
+                    // `send` errors only when there are currently no
+                    // `Sync.Watch` subscribers (e.g. the very first gateway
+                    // enrolling into a fresh controller) — nobody to
+                    // notify, which is not a failure.
+                    let _ = self.change_tx.send(ChangeEvent::GatewayEnrolled {
+                        new_gateway_id: identity.id,
+                        segment_name: identity.segment_name,
+                        allowed_ips,
+                        revision,
+                    });
+                }
+            }
+        }
 
         Ok(Response::new(EnrollResponse {
             cert_pem: issued.cert_pem,
             ca_bundle_pem,
-            gateway_id: identity.id as u64,
+            gateway_id: outcome.gateway_id as u64,
             // (Task 15) The only time this gateway's UDP-observation
             // authenticator ever crosses the wire — see `crate::observe`'s
             // module doc comment.

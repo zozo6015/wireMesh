@@ -1,25 +1,18 @@
-//! Task 12's failing test: `Drain(gateway_id)` withdraws a gateway from its
+//! Task 12's contract: `Drain(gateway_id)` withdraws a gateway from its
 //! peers' projected state and removes it (revoking its cert) — G-7.
 //!
 //! Boots a real controller, enrolls gateway A ("aws") and gateway B ("gcp")
 //! (a full-mesh peer of A), opens A's `Sync.Watch` stream and consumes its
-//! initial snapshot (which already carries B as a peer), then calls the
-//! (not-yet-existing) `Admin.Drain(gateway_id = b.id())`. That must:
+//! initial snapshot (which already carries B as a peer), then calls
+//! `Admin.Drain(gateway_id = b.id())`. That must:
 //!
 //!   1. push a `Delta` down A's still-open Sync stream whose
-//!      `removed_peer_ids` contains B's gateway id (B withdrawn as a peer);
-//!   2. remove B's gateway row entirely (and revoke its cert) — checked via
-//!      the testkit's `gateway_exists` accessor returning `false` for B
-//!      afterward.
-//!
-//! None of this exists yet: `DrainRequest` doesn't exist on
-//! `wiremesh_proto::v1`, `AdminClient::drain` doesn't exist, and
-//! `TestController::gateway_exists` doesn't exist. So today this file does
-//! not even COMPILE — that's the expected RED state for this step. The
-//! implementer adds all three (growing `admin.proto` with `Drain` and
-//! `DrainRequest{gateway_id}`, the drain/withdrawal logic in
-//! `src/services/admin.rs`/`src/routes.rs`/`src/projection.rs`, and the
-//! testkit accessor) to turn this green.
+//!      `removed_peer_ids` contains B's gateway id (B withdrawn as a peer)
+//!      AND whose `revoked_serials` contains B's certificate serial (B's
+//!      cert actually revoked, not just its gateway row marked inactive);
+//!   2. mark B's gateway row inactive (`status = 'removed'`) and its cert
+//!      revoked — checked via the testkit's `gateway_exists` accessor
+//!      returning `false` for B afterward.
 use std::time::Duration;
 
 use tokio_stream::StreamExt;
@@ -30,6 +23,7 @@ async fn drain_withdraws_the_gateway_from_its_peers() {
     let h = wiremesh_testkit::TestController::start().await;
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
     let b = wiremesh_testkit::enroll_one(&h, "gcp", "10.1.0.0/16").await;
+    let b_serial = b.cert_serial().expect("reading B's certificate serial");
 
     let mut a_stream = a.open_sync().await;
     // Consume A's initial StateSnapshot (enrolling B after A is already up
@@ -73,6 +67,11 @@ async fn drain_withdraws_the_gateway_from_its_peers() {
          got: {:?}",
         b.id(),
         delta.removed_peer_ids
+    );
+    assert!(
+        delta.revoked_serials.contains(&b_serial),
+        "draining B must revoke certificate serial {b_serial}; got: {:?}",
+        delta.revoked_serials
     );
 
     // B's gateway row must be gone (and its cert revoked) after drain.

@@ -14,19 +14,15 @@
 //!      testkit's `debug_key_states` admin/debug helper), proving the
 //!      rotation's bookkeeping is DB-backed, not just in-memory.
 //!
-//! None of this exists yet: `RotateKeyRequest` doesn't exist on
-//! `wiremesh_proto::v1`, `AdminClient::rotate_key` doesn't exist,
-//! `StubGateway::id()` doesn't exist (only `segment_id()` does), and
-//! `TestController::debug_key_states` doesn't exist. So today this file does
-//! not even COMPILE — that's the expected RED state for this step. The
-//! implementer adds all four (growing `admin.proto` with `RotateKey` and
-//! `RotateKeyRequest{gateway_id}`, a `src/keys.rs` state machine wired into
-//! `src/services/admin.rs`, a `src/projection.rs` peer-key emission, and the
-//! testkit accessors) to turn this green.
 use std::time::Duration;
 
 use tokio_stream::StreamExt;
 use wiremesh_proto::v1::{sync_message, RotateKeyRequest};
+
+/// Bounds the wait for the initial `Sync.Watch` snapshot so a controller
+/// that never emits one (a real regression) fails this test fast instead of
+/// hanging the whole suite.
+const INITIAL_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::test]
 async fn key_rotation_advances_epoch_states_and_survives_restart() {
@@ -38,16 +34,33 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
     let mut b_stream = b.open_sync().await;
     // Consume B's initial StateSnapshot (enrolling B after A is already up
     // means the snapshot already contains A as a peer — with no pending
-    // epoch key yet, since rotation hasn't happened).
-    let snap_msg = b_stream
-        .next()
+    // epoch key yet, since rotation hasn't happened). Capture A's
+    // pre-rotation key states here too, so the post-rotation assertions
+    // below can prove the rotation strictly ADDS a new, higher-epoch
+    // pending key rather than reusing the current epoch or replacing the
+    // existing active one.
+    let snap_msg = tokio::time::timeout(INITIAL_SNAPSHOT_TIMEOUT, b_stream.next())
         .await
+        .expect("timed out waiting for B's initial Sync.Watch snapshot")
         .expect("Sync.Watch stream ended before delivering B's initial snapshot")
         .expect("Sync.Watch stream yielded an error instead of B's initial snapshot");
-    match snap_msg.body {
-        Some(sync_message::Body::Snapshot(_)) => {}
+    let pre_rotation_a_keys: Vec<(u32, String)> = match snap_msg.body {
+        Some(sync_message::Body::Snapshot(s)) => s
+            .peers
+            .iter()
+            .find(|p| p.gateway_id == a.id())
+            .map(|p| p.keys.iter().map(|k| (k.epoch, k.state.clone())).collect())
+            .unwrap_or_default(),
         other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
-    }
+    };
+    let pre_rotation_max_epoch = pre_rotation_a_keys.iter().map(|(e, _)| *e).max();
+    assert!(
+        pre_rotation_a_keys
+            .iter()
+            .any(|(_, st)| st == "active"),
+        "expected gateway A to already have an active epoch-0 key before any rotation, \
+         got: {pre_rotation_a_keys:?}"
+    );
 
     h.admin_client()
         .await
@@ -82,12 +95,45 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
                 delta.upserted_peers
             )
         });
-    assert!(
-        a_peer.keys.iter().any(|k| k.state == "pending"),
-        "expected gateway A's peer entry in the rotation delta to carry a PeerKey \
-         with state == \"pending\", got keys: {:?}",
-        a_peer.keys
-    );
+    let pending_key = a_peer
+        .keys
+        .iter()
+        .find(|k| k.state == "pending")
+        .unwrap_or_else(|| {
+            panic!(
+                "expected gateway A's peer entry in the rotation delta to carry a PeerKey \
+                 with state == \"pending\", got keys: {:?}",
+                a_peer.keys
+            )
+        });
+    // A broken rotation that reuses the current epoch (rather than
+    // allocating a new, strictly higher one) must be caught here, not just
+    // "some pending key exists".
+    if let Some(prior_max) = pre_rotation_max_epoch {
+        assert!(
+            pending_key.epoch > prior_max,
+            "expected the new pending epoch ({}) to be strictly greater than the prior \
+             max epoch ({prior_max}), got keys: {:?}",
+            pending_key.epoch,
+            a_peer.keys
+        );
+    }
+    // The previous active epoch must still be present — make-before-break
+    // means rotation ADDS a pending key, it must never REPLACE the existing
+    // active one.
+    for (epoch, state) in &pre_rotation_a_keys {
+        if state == "active" {
+            assert!(
+                a_peer
+                    .keys
+                    .iter()
+                    .any(|k| k.epoch == *epoch && k.state == "active"),
+                "expected the pre-rotation active epoch {epoch} to remain active after \
+                 rotation, got keys: {:?}",
+                a_peer.keys
+            );
+        }
+    }
 
     // Restart mid-rotation: the pending epoch's bookkeeping must resume from
     // the DB snapshot, not just live in the pre-restart controller's memory.
@@ -95,8 +141,22 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
 
     let states = h.debug_key_states(a.id()).await;
     assert!(
-        states.iter().any(|(_, st)| st == "pending"),
-        "expected a pending GATEWAY_KEY epoch for gateway A to survive the \
-         controller restart, got states: {states:?}"
+        states
+            .iter()
+            .any(|(epoch, st)| *epoch == pending_key.epoch && st == "pending"),
+        "expected pending GATEWAY_KEY epoch {} for gateway A to survive the controller \
+         restart, got states: {states:?}",
+        pending_key.epoch
     );
+    for (epoch, state) in &pre_rotation_a_keys {
+        if state == "active" {
+            assert!(
+                states
+                    .iter()
+                    .any(|(e, st)| e == epoch && st == "active"),
+                "expected the original active epoch {epoch} to also survive the \
+                 controller restart, got states: {states:?}"
+            );
+        }
+    }
 }

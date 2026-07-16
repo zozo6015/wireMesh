@@ -36,6 +36,19 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.insert_segment(&name, &cidrs)).await?
     }
 
+    /// See [`Db::create_segment_audited`].
+    pub async fn create_segment_audited(
+        &self,
+        name: String,
+        cidrs: Vec<Ipv4Net>,
+        actor: String,
+        now: String,
+    ) -> Result<i64> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.create_segment_audited(&name, &cidrs, &actor, &now))
+            .await?
+    }
+
     /// See [`Db::audit`].
     pub async fn audit(
         &self,
@@ -58,6 +71,8 @@ impl DbHandle {
         bound_cidrs: String,
         rebind_segment_id: Option<i64>,
         expires_at: String,
+        actor: String,
+        now: String,
     ) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || {
@@ -68,6 +83,8 @@ impl DbHandle {
                 &bound_cidrs,
                 rebind_segment_id,
                 &expires_at,
+                &actor,
+                &now,
             )
         })
         .await?
@@ -137,9 +154,14 @@ impl DbHandle {
     }
 
     /// See [`Db::rotate_key`].
-    pub async fn rotate_key(&self, gateway_id: i64, now: String) -> Result<RotateKeyOutcome> {
+    pub async fn rotate_key(
+        &self,
+        gateway_id: i64,
+        actor: String,
+        now: String,
+    ) -> Result<RotateKeyOutcome> {
         let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.rotate_key(gateway_id, &now)).await?
+        tokio::task::spawn_blocking(move || db.rotate_key(gateway_id, &actor, &now)).await?
     }
 
     /// See [`Db::gateway_identity_by_id`].
@@ -174,9 +196,14 @@ impl DbHandle {
     }
 
     /// See [`Db::drain_gateway`].
-    pub async fn drain_gateway(&self, gateway_id: i64, now: String) -> Result<DrainOutcome> {
+    pub async fn drain_gateway(
+        &self,
+        gateway_id: i64,
+        actor: String,
+        now: String,
+    ) -> Result<DrainOutcome> {
         let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.drain_gateway(gateway_id, &now)).await?
+        tokio::task::spawn_blocking(move || db.drain_gateway(gateway_id, &actor, &now)).await?
     }
 
     /// See [`Db::gateway_is_active`].
@@ -192,15 +219,21 @@ impl DbHandle {
     }
 
     /// See [`Db::delete_segment`].
-    pub async fn delete_segment(&self, segment_id: i64) -> Result<()> {
+    pub async fn delete_segment(&self, segment_id: i64, actor: String, now: String) -> Result<()> {
         let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.delete_segment(segment_id)).await?
+        tokio::task::spawn_blocking(move || db.delete_segment(segment_id, &actor, &now)).await?
     }
 
     /// See [`Db::insert_relay`].
-    pub async fn insert_relay(&self, name: String, endpoint: String) -> Result<i64> {
+    pub async fn insert_relay(
+        &self,
+        name: String,
+        endpoint: String,
+        actor: String,
+        now: String,
+    ) -> Result<i64> {
         let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.insert_relay(&name, &endpoint)).await?
+        tokio::task::spawn_blocking(move || db.insert_relay(&name, &endpoint, &actor, &now)).await?
     }
 
     /// See [`Db::list_relays`].
@@ -210,6 +243,7 @@ impl DbHandle {
     }
 
     /// See [`Db::insert_api_token`].
+    #[allow(clippy::too_many_arguments)]
     pub async fn insert_api_token(
         &self,
         id: String,
@@ -217,18 +251,28 @@ impl DbHandle {
         role: String,
         secret_hash: String,
         expires_at: Option<String>,
+        actor: String,
+        now: String,
     ) -> Result<()> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || {
-            db.insert_api_token(&id, &name, &role, &secret_hash, expires_at.as_deref())
+            db.insert_api_token(
+                &id,
+                &name,
+                &role,
+                &secret_hash,
+                expires_at.as_deref(),
+                &actor,
+                &now,
+            )
         })
         .await?
     }
 
     /// See [`Db::revoke_api_token`].
-    pub async fn revoke_api_token(&self, name: String, now: String) -> Result<bool> {
+    pub async fn revoke_api_token(&self, name: String, actor: String, now: String) -> Result<bool> {
         let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.revoke_api_token(&name, &now)).await?
+        tokio::task::spawn_blocking(move || db.revoke_api_token(&name, &actor, &now)).await?
     }
 
     /// See [`Db::find_active_api_token_role`]. Used by
@@ -240,6 +284,16 @@ impl DbHandle {
     ) -> Result<Option<String>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.find_active_api_token_role(&secret_hash, &now)).await?
+    }
+
+    /// See [`Db::find_active_api_token`].
+    pub async fn find_active_api_token(
+        &self,
+        secret_hash: String,
+        now: String,
+    ) -> Result<Option<(String, String)>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.find_active_api_token(&secret_hash, &now)).await?
     }
 
     /// See [`Db::audit_query`].
@@ -263,9 +317,9 @@ impl DbHandle {
     }
 
     /// See [`Db::revoke_cert`].
-    pub async fn revoke_cert(&self, serial: String, now: String) -> Result<bool> {
+    pub async fn revoke_cert(&self, serial: String, actor: String, now: String) -> Result<bool> {
         let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.revoke_cert(&serial, &now)).await?
+        tokio::task::spawn_blocking(move || db.revoke_cert(&serial, &actor, &now)).await?
     }
 
     /// See [`Db::list_gateways`].
@@ -281,7 +335,11 @@ impl DbHandle {
     }
 
     /// See [`Db::set_candidate_endpoint`].
-    pub async fn set_candidate_endpoint(&self, gateway_id: i64, addr: String) -> Result<u64> {
+    pub async fn set_candidate_endpoint(
+        &self,
+        gateway_id: i64,
+        addr: String,
+    ) -> Result<Option<u64>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.set_candidate_endpoint(gateway_id, &addr)).await?
     }

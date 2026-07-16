@@ -5,14 +5,13 @@
 //! controller must push a `Delta` down A's still-open stream announcing B as
 //! a new peer, with a `revision` strictly newer than the snapshot's.
 //!
-//! This is Task 8's Step 1: the failing test for delta fan-out on mutation
+//! This is Task 8's contract for delta fan-out on mutation
 //! (`crates/wiremesh-controller/src/projection.rs`'s broadcast fan-out,
-//! `src/services/admin.rs` publishing on mutation) — none of that exists
-//! yet, so today this test compiles cleanly against the T4-T7 helpers
-//! (`TestController`, `enroll_one`, `StubGateway::open_sync`) but fails at
-//! RUNTIME: no delta is ever pushed, so the bounded `timeout` below fires
-//! instead of yielding a message. That's the expected RED state for this
-//! step.
+//! `src/services/admin.rs`/`services::enrollment` publishing on mutation):
+//! a projection-affecting mutation must push a `Delta` to every other
+//! already-connected gateway's open `Sync.Watch` stream, bounded by the
+//! `timeout` below so a regression (no delta ever pushed) fails fast
+//! instead of hanging the suite.
 use std::time::Duration;
 
 use tokio_stream::StreamExt;

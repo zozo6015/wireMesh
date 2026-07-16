@@ -338,6 +338,26 @@ impl TestController {
         AdminClient::with_interceptor(channel, BearerCredential(token.to_string()))
     }
 
+    /// Connects a PLAIN `AdminClient` to the bearer-auth-gated TCP Admin
+    /// listener (`admin_tcp_addr()`) with NO `authorization` header attached
+    /// at all — unlike [`Self::admin_client_with_bearer`], which always
+    /// attaches SOME bearer credential (even an invalid one). This is what
+    /// actually exercises the "header entirely absent" branch of
+    /// `wiremesh_controller::auth`'s middleware (`extract_bearer` returning
+    /// `None`), which an invalid-but-present token never reaches the same
+    /// way (`extract_bearer` succeeds either way; only the DB lookup
+    /// differs) — both paths currently converge on `Unauthenticated`, but
+    /// only this one proves the missing-header case specifically.
+    pub async fn admin_client_tcp_no_auth(&self) -> AdminClient<Channel> {
+        let uri = format!("http://{}", self.admin_tcp_addr());
+        let channel = Channel::from_shared(uri)
+            .expect("controller Admin TCP addr must form a valid URI")
+            .connect()
+            .await
+            .expect("connecting AdminClient over the controller's Admin TCP port");
+        AdminClient::new(channel)
+    }
+
     /// (Task 11) Debug/test accessor: every `GATEWAY_KEY` row (any state —
     /// `pending`, `active`, `retiring`) for `gateway_id`, as `(epoch, state)`
     /// pairs — read via `Admin.DebugKeyStates` over the controller's Unix
@@ -590,14 +610,59 @@ impl StubGateway {
         self.dial_sync(controller.sync_tcp_addr()).await
     }
 
+    /// Like [`Self::reconnect`], but reads the identity bundle (cert/key/CA
+    /// bundle) BACK OFF DISK from [`Self::state_dir`] first, and dials using
+    /// ONLY those freshly-read bytes — never touching `self`'s in-memory
+    /// `cert_pem`/`key_pem`/`ca_bundle_pem` fields at all. `persist_state`
+    /// (or `enroll`, which writes the same files) must have already run.
+    ///
+    /// This is what actually exercises the fail-static restore PATH:
+    /// reusing `self`'s in-memory fields (as a plain `reconnect()` call
+    /// would) proves nothing about whether the on-disk persistence format
+    /// is genuinely readable/restorable — it would pass even if
+    /// `persist_state` wrote garbage, since the in-memory identity used to
+    /// reconnect never came from disk at all.
+    pub async fn reconnect_from_disk(
+        &self,
+        controller: &TestController,
+    ) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
+        let cert_pem = std::fs::read_to_string(self.state_dir_path.join("cert.pem"))
+            .map_err(|e| anyhow::anyhow!("reading persisted cert.pem: {e}"))?;
+        let key_pem = std::fs::read_to_string(self.state_dir_path.join("key.pem"))
+            .map_err(|e| anyhow::anyhow!("reading persisted key.pem: {e}"))?;
+        let ca_bundle_pem = std::fs::read_to_string(self.state_dir_path.join("ca_bundle.pem"))
+            .map_err(|e| anyhow::anyhow!("reading persisted ca_bundle.pem: {e}"))?;
+
+        Self::dial_sync_with(
+            controller.sync_tcp_addr(),
+            &cert_pem,
+            &key_pem,
+            &ca_bundle_pem,
+        )
+        .await
+    }
+
     /// Shared mTLS-dial + `Sync.Watch` logic behind `open_sync`/`reconnect`:
     /// connects to `addr` presenting this gateway's cert/key and trusting the
     /// controller's CA bundle, then opens the `Sync.Watch` stream.
     async fn dial_sync(&self, addr: SocketAddr) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
+        Self::dial_sync_with(addr, &self.cert_pem, &self.key_pem, &self.ca_bundle_pem).await
+    }
+
+    /// Free-function core of [`Self::dial_sync`]: takes the identity PEMs
+    /// explicitly (rather than reading `self`) so [`Self::reconnect_from_disk`]
+    /// can dial with bytes read fresh off disk instead of `self`'s in-memory
+    /// copies.
+    async fn dial_sync_with(
+        addr: SocketAddr,
+        cert_pem: &str,
+        key_pem: &str,
+        ca_bundle_pem: &str,
+    ) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
         let uri = format!("https://{addr}");
         let tls = ClientTlsConfig::new()
-            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
-            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .identity(Identity::from_pem(cert_pem, key_pem))
+            .ca_certificate(Certificate::from_pem(ca_bundle_pem))
             .domain_name("127.0.0.1");
         let channel = Channel::from_shared(uri)
             .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
@@ -778,21 +843,91 @@ impl StubGateway {
         // The controller records exactly 16 raw unmasked bytes (wiremesh-trust
         // `random_serial` → `hex_encode([u8;16])`), so after normalization
         // cert_serial() is ALWAYS 32 lowercase-hex chars equal to that record.
-        let raw = cert.raw_serial();
-        let stripped: &[u8] = match raw {
-            [0x00, rest @ ..] if rest.len() == 16 => rest,
-            _ => raw,
-        };
-        if stripped.len() > 16 {
-            anyhow::bail!(
-                "cert serial is {} bytes after sign-pad strip, expected <= 16 \
-                 (controller records a 16-byte serial): {stripped:02x?}",
-                stripped.len()
-            );
-        }
-        let mut buf = [0u8; 16];
-        buf[16 - stripped.len()..].copy_from_slice(stripped);
+        let buf = normalize_serial_to_16_bytes(cert.raw_serial())?;
         Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+    }
+}
+
+/// The width-normalization at the core of [`StubGateway::cert_serial`],
+/// extracted into a pure function of raw bytes so it can be unit-tested
+/// deterministically against CRAFTED over-/under-length inputs — a single
+/// randomly generated certificate only exercises the sign-pad-strip branch
+/// on the ~50% of runs whose real serial happens to have its top byte
+/// `>= 0x80`, and essentially never exercises the leading-zero-restore
+/// branch (which needs a serial with 1-2 leading zero bytes — astronomically
+/// unlikely for a random 16-byte value). See `tests` below for both cases
+/// exercised directly.
+fn normalize_serial_to_16_bytes(raw: &[u8]) -> anyhow::Result<[u8; 16]> {
+    let stripped: &[u8] = match raw {
+        [0x00, rest @ ..] if rest.len() == 16 => rest,
+        _ => raw,
+    };
+    if stripped.len() > 16 {
+        anyhow::bail!(
+            "cert serial is {} bytes after sign-pad strip, expected <= 16 \
+             (controller records a 16-byte serial): {stripped:02x?}",
+            stripped.len()
+        );
+    }
+    let mut buf = [0u8; 16];
+    buf[16 - stripped.len()..].copy_from_slice(stripped);
+    Ok(buf)
+}
+
+#[cfg(test)]
+mod serial_normalization_tests {
+    use super::normalize_serial_to_16_bytes;
+
+    /// Exact 16 bytes: no stripping, no padding — passed through unchanged.
+    #[test]
+    fn exact_16_bytes_passes_through() {
+        let raw: [u8; 16] = [0x7f; 16];
+        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), raw);
+    }
+
+    /// OVER-length (17 bytes, `0x00` sign-pad prefix): the real 16-byte
+    /// serial had its top byte `>= 0x80` (e.g. starting `0xff, 0x01, ..`),
+    /// so minimal-DER `raw_serial()` prepends a pad byte to keep the ASN.1
+    /// INTEGER non-negative. Must be stripped back to exactly the original
+    /// 16 bytes.
+    #[test]
+    fn over_length_sign_pad_is_stripped() {
+        let inner: [u8; 16] = [0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let mut raw = vec![0x00u8];
+        raw.extend_from_slice(&inner);
+        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), inner);
+    }
+
+    /// UNDER-length (15 bytes): the real serial's leading byte was itself
+    /// `0x00`, which minimal-DER drops entirely (no pad needed — a leading
+    /// zero followed by a byte `< 0x80` is still non-negative without one).
+    /// Must be restored to 16 bytes via a single left-padding `0x00`.
+    #[test]
+    fn under_length_by_one_is_left_padded() {
+        let raw: [u8; 15] = [0x7f, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
+        let mut expected = [0u8; 16];
+        expected[1..].copy_from_slice(&raw);
+        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), expected);
+    }
+
+    /// UNDER-length by two (14 bytes): two genuine leading zero bytes were
+    /// dropped by minimal DER — must be restored with two left-padding
+    /// `0x00` bytes.
+    #[test]
+    fn under_length_by_two_is_left_padded() {
+        let raw: [u8; 14] = [0x03, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d];
+        let mut expected = [0u8; 16];
+        expected[2..].copy_from_slice(&raw);
+        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), expected);
+    }
+
+    /// Over-length that is NOT exactly a 16-byte sign-pad (e.g. 18 bytes, or
+    /// 17 bytes whose pad byte isn't `0x00`) must be rejected as an
+    /// internal inconsistency rather than silently truncated/misread.
+    #[test]
+    fn implausible_over_length_is_rejected() {
+        let raw = [0xAAu8; 18];
+        assert!(normalize_serial_to_16_bytes(&raw).is_err());
     }
 }
 

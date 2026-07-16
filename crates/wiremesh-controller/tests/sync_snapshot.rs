@@ -13,12 +13,15 @@
 //! `revision` is a monotonic counter starting at (or above) 1 for the first
 //! snapshot ever produced.
 //!
-//! `wiremesh_testkit::enroll_one` and `StubGateway::open_sync` do not exist
-//! yet — they're added by the Task 7 implementer alongside the projection +
-//! mTLS Sync service this test drives. Until then this fails to compile,
-//! which is the expected RED state for this step.
+use std::time::Duration;
+
 use tokio_stream::StreamExt;
 use wiremesh_proto::v1::sync_message;
+
+/// Bounds the wait for the initial `Sync.Watch` snapshot so a controller
+/// that never emits one (a real regression) fails this test fast instead of
+/// hanging the whole suite.
+const INITIAL_SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[tokio::test]
 async fn single_gateway_receives_a_full_snapshot() {
@@ -26,9 +29,9 @@ async fn single_gateway_receives_a_full_snapshot() {
     let gw = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
 
     let mut stream = gw.open_sync().await;
-    let msg = stream
-        .next()
+    let msg = tokio::time::timeout(INITIAL_SNAPSHOT_TIMEOUT, stream.next())
         .await
+        .expect("timed out waiting for the initial Sync.Watch snapshot")
         .expect("Sync.Watch stream ended before delivering a message")
         .expect("Sync.Watch stream yielded an error instead of a message");
 
@@ -46,9 +49,10 @@ async fn single_gateway_receives_a_full_snapshot() {
         "only one gateway is enrolled, so full-mesh peering must yield no peers, got: {:?}",
         snap.peers
     );
-    assert!(
-        !snap.self_cert_pem.is_empty(),
-        "self_cert_pem must be populated with the gateway's own leaf cert"
+    assert_eq!(
+        snap.self_cert_pem,
+        gw.cert_pem(),
+        "self_cert_pem must be the enrolled gateway's own leaf certificate"
     );
     assert!(
         snap.revision >= 1,

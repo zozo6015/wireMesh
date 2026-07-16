@@ -50,6 +50,34 @@ const VALID_API_TOKEN_ROLES: &[&str] = &["admin", "read-only"];
 /// Default `AuditQuery` page size when the caller passes `limit <= 0`.
 const DEFAULT_AUDIT_LIMIT: i64 = 50;
 
+/// Hard ceiling on `AuditQuery`'s page size, regardless of what the caller
+/// requests: cycle-2 has no pagination/cursor support (see the DB layer's
+/// doc comment), so every matching row is materialized into memory and one
+/// gRPC response — an unbounded (or merely very large) client-supplied
+/// `limit` would let even a `read-only` bearer token force the server to
+/// load the entire, ever-growing audit log. `fabricctl audit export`
+/// defaults its own `--limit` to 1,000,000 expecting "the whole log"; this
+/// cap means a log bigger than [`MAX_AUDIT_LIMIT`] is truncated rather than
+/// exhausting memory — an accepted cycle-2 limitation until real pagination
+/// lands.
+const MAX_AUDIT_LIMIT: i64 = 1_000;
+
+/// Reads the authenticated bearer-token identity `crate::auth`'s middleware
+/// stamped onto this request's extensions (TCP Admin listener only), for
+/// use as the audit log's `actor`. Falls back to `"unix-socket"` when
+/// absent — the UDS listener has no `BearerAuthLayer`, and is
+/// implicit-admin-trusted by socket-directory permissions alone (see
+/// `crate::bind_uds_dir`), so every UDS-originated mutation is legitimately
+/// attributed to `"unix-socket"`. MUST be called before `request.into_inner()`
+/// consumes the request (which drops its extensions).
+fn actor_of<T>(request: &Request<T>) -> String {
+    request
+        .extensions()
+        .get::<crate::auth::Principal>()
+        .map(|p| p.0.clone())
+        .unwrap_or_else(|| "unix-socket".to_string())
+}
+
 #[derive(Clone)]
 pub struct AdminSvc {
     db: DbHandle,
@@ -89,6 +117,7 @@ impl Admin for AdminSvc {
         &self,
         request: Request<CreateSegmentRequest>,
     ) -> Result<Response<Segment>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
 
         if req.name.is_empty() {
@@ -104,9 +133,17 @@ impl Admin for AdminSvc {
             })
             .collect::<Result<_, _>>()?;
 
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        // Insert + audit happen atomically in one DB transaction (see
+        // `Db::create_segment_audited`'s doc comment) so a failure
+        // appending the audit row rolls back the segment insert too,
+        // rather than leaving a committed-but-unaudited mutation.
         let segment_id = self
             .db
-            .insert_segment(req.name.clone(), cidrs)
+            .create_segment_audited(req.name.clone(), cidrs, actor, now)
             .await
             .map_err(|e| {
                 // `OverlapError` (and any other insert failure) surfaces as
@@ -114,16 +151,6 @@ impl Admin for AdminSvc {
                 // besides a bad request.
                 Status::already_exists(e.to_string())
             })?;
-
-        self.db
-            .audit(
-                "unix-socket".into(),
-                "create".into(),
-                format!("segment/{}", req.name),
-                format!(r#"{{"name":"{}","cidrs":{:?}}}"#, req.name, req.cidrs),
-            )
-            .await
-            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
 
         Ok(Response::new(Segment {
             id: segment_id as u64,
@@ -136,6 +163,7 @@ impl Admin for AdminSvc {
         &self,
         request: Request<MintTokenRequest>,
     ) -> Result<Response<MintTokenResponse>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
 
         if req.kind.is_empty() {
@@ -170,6 +198,11 @@ impl Admin for AdminSvc {
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting token expiry: {e}")))?;
 
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        // Insert + audit happen atomically in one DB transaction.
         self.db
             .insert_enrollment_token(
                 token_id,
@@ -178,19 +211,11 @@ impl Admin for AdminSvc {
                 encode_bound_cidrs(&req.bound_cidrs),
                 rebind_segment_id,
                 expires_at,
+                actor,
+                now,
             )
             .await
             .map_err(|e| Status::internal(format!("storing enrollment token: {e}")))?;
-
-        self.db
-            .audit(
-                "unix-socket".into(),
-                "mint".into(),
-                "enrollment_token".into(),
-                format!(r#"{{"kind":"{}"}}"#, req.kind),
-            )
-            .await
-            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
 
         let token = format!(
             "wiremesh://{}/#tok_{}@sha256:{}",
@@ -258,29 +283,28 @@ impl Admin for AdminSvc {
         &self,
         request: Request<DeleteSegmentRequest>,
     ) -> Result<Response<DeleteSegmentResponse>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
         let segment_id = req.segment_id as i64;
 
-        self.db.delete_segment(segment_id).await.map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("no segment row") {
-                Status::not_found(msg)
-            } else if msg.contains("has associated gateway") {
-                Status::failed_precondition(msg)
-            } else {
-                Status::internal(format!("deleting segment: {e}"))
-            }
-        })?;
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
 
+        // Mutation + audit happen atomically in one DB transaction.
         self.db
-            .audit(
-                "unix-socket".into(),
-                "delete".into(),
-                format!("segment/{segment_id}"),
-                "{}".into(),
-            )
+            .delete_segment(segment_id, actor, now)
             .await
-            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("no segment row") {
+                    Status::not_found(msg)
+                } else if msg.contains("has associated gateway") {
+                    Status::failed_precondition(msg)
+                } else {
+                    Status::internal(format!("deleting segment: {e}"))
+                }
+            })?;
 
         Ok(Response::new(DeleteSegmentResponse {}))
     }
@@ -292,6 +316,7 @@ impl Admin for AdminSvc {
         &self,
         request: Request<RegisterRelayRequest>,
     ) -> Result<Response<Relay>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
         if req.name.is_empty() {
             return Err(Status::invalid_argument("relay name must not be empty"));
@@ -300,21 +325,16 @@ impl Admin for AdminSvc {
             return Err(Status::invalid_argument("relay endpoint must not be empty"));
         }
 
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        // Insert + audit happen atomically in one DB transaction.
         let relay_id = self
             .db
-            .insert_relay(req.name.clone(), req.endpoint.clone())
+            .insert_relay(req.name.clone(), req.endpoint.clone(), actor, now)
             .await
             .map_err(|e| Status::already_exists(e.to_string()))?;
-
-        self.db
-            .audit(
-                "unix-socket".into(),
-                "create".into(),
-                format!("relay/{}", req.name),
-                format!(r#"{{"name":"{}","endpoint":"{}"}}"#, req.name, req.endpoint),
-            )
-            .await
-            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
 
         Ok(Response::new(Relay {
             id: relay_id as u64,
@@ -359,6 +379,7 @@ impl Admin for AdminSvc {
         &self,
         request: Request<MintApiTokenRequest>,
     ) -> Result<Response<MintApiTokenResponse>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
         if req.name.is_empty() {
             return Err(Status::invalid_argument("token name must not be empty"));
@@ -379,20 +400,23 @@ impl Admin for AdminSvc {
         rand::thread_rng().fill_bytes(&mut id_bytes);
         let token_id = hex_encode(&id_bytes);
 
-        self.db
-            .insert_api_token(token_id, req.name.clone(), req.role.clone(), secret_hash_hex, None)
-            .await
-            .map_err(|e| Status::already_exists(e.to_string()))?;
+        let now = OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
 
+        // Insert + audit happen atomically in one DB transaction.
         self.db
-            .audit(
-                "unix-socket".into(),
-                "mint".into(),
-                format!("api_token/{}", req.name),
-                format!(r#"{{"role":"{}"}}"#, req.role),
+            .insert_api_token(
+                token_id,
+                req.name.clone(),
+                req.role.clone(),
+                secret_hash_hex,
+                None,
+                actor,
+                now,
             )
             .await
-            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
+            .map_err(|e| Status::already_exists(e.to_string()))?;
 
         Ok(Response::new(MintApiTokenResponse { token: secret_hex }))
     }
@@ -405,15 +429,17 @@ impl Admin for AdminSvc {
         &self,
         request: Request<RevokeApiTokenRequest>,
     ) -> Result<Response<RevokeApiTokenResponse>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
 
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
 
+        // Mutation + audit happen atomically in one DB transaction.
         let found = self
             .db
-            .revoke_api_token(req.name.clone(), now)
+            .revoke_api_token(req.name.clone(), actor, now)
             .await
             .map_err(|e| Status::internal(format!("revoking API token: {e}")))?;
         if !found {
@@ -422,16 +448,6 @@ impl Admin for AdminSvc {
                 req.name
             )));
         }
-
-        self.db
-            .audit(
-                "unix-socket".into(),
-                "revoke".into(),
-                format!("api_token/{}", req.name),
-                "{}".into(),
-            )
-            .await
-            .map_err(|e| Status::internal(format!("audit append failed: {e}")))?;
 
         Ok(Response::new(RevokeApiTokenResponse {}))
     }
@@ -452,7 +468,7 @@ impl Admin for AdminSvc {
     ) -> Result<Response<AuditQueryResponse>, Status> {
         let req = request.into_inner();
         let limit = if req.limit > 0 {
-            req.limit as i64
+            (req.limit as i64).min(MAX_AUDIT_LIMIT)
         } else {
             DEFAULT_AUDIT_LIMIT
         };
@@ -492,6 +508,7 @@ impl Admin for AdminSvc {
         &self,
         request: Request<RotateKeyRequest>,
     ) -> Result<Response<RotateKeyResponse>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
         let gateway_id = req.gateway_id as i64;
 
@@ -499,9 +516,9 @@ impl Admin for AdminSvc {
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
 
-        let outcome = self.db.rotate_key(gateway_id, now).await.map_err(|e| {
+        let outcome = self.db.rotate_key(gateway_id, actor, now).await.map_err(|e| {
             let msg = e.to_string();
-            if msg.contains("no gateway row") {
+            if msg.contains("no ACTIVE gateway row") {
                 Status::not_found(msg)
             } else {
                 Status::internal(format!("rotating key: {e}"))
@@ -602,6 +619,7 @@ impl Admin for AdminSvc {
         &self,
         request: Request<DrainRequest>,
     ) -> Result<Response<DrainResponse>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
         let gateway_id = req.gateway_id as i64;
 
@@ -609,7 +627,7 @@ impl Admin for AdminSvc {
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
 
-        let outcome = self.db.drain_gateway(gateway_id, now).await.map_err(|e| {
+        let outcome = self.db.drain_gateway(gateway_id, actor, now).await.map_err(|e| {
             let msg = e.to_string();
             if msg.contains("no gateway row") {
                 Status::not_found(msg)
@@ -649,6 +667,7 @@ impl Admin for AdminSvc {
         &self,
         request: Request<RevokeCertRequest>,
     ) -> Result<Response<RevokeCertResponse>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
         if req.serial.is_empty() {
             return Err(Status::invalid_argument("serial must not be empty"));
@@ -660,7 +679,7 @@ impl Admin for AdminSvc {
 
         let found = self
             .db
-            .revoke_cert(req.serial.clone(), now)
+            .revoke_cert(req.serial.clone(), actor, now)
             .await
             .map_err(|e| Status::internal(format!("revoking certificate: {e}")))?;
         if !found {
@@ -696,6 +715,7 @@ impl Admin for AdminSvc {
     /// contract this RPC is entirely riding on: a second, identical apply
     /// must come back with every `ApplyDiff` field zero/false.
     async fn apply(&self, request: Request<ApplyRequest>) -> Result<Response<ApplyDiff>, Status> {
+        let actor = actor_of(&request);
         let req = request.into_inner();
 
         let spec = crate::apply::parse_fabric(&req.fabric_yaml)
@@ -726,7 +746,7 @@ impl Admin for AdminSvc {
 
         let outcome = self
             .db
-            .apply_fabric(segments, policy_yaml, "unix-socket".to_string(), now)
+            .apply_fabric(segments, policy_yaml, actor, now)
             .await
             .map_err(|e| Status::internal(format!("applying fabric: {e}")))?;
 
