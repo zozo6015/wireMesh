@@ -249,11 +249,21 @@ impl StubGateway {
         let cert = pem
             .parse_x509()
             .map_err(|e| anyhow::anyhow!("parsing cert_pem's DER as X.509: {e}"))?;
-        Ok(cert
-            .raw_serial()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect())
+        // `raw_serial()` returns the DER INTEGER *contents*, which per ASN.1's
+        // canonical positive-integer rule carry a leading 0x00 pad byte
+        // whenever the true leading byte's MSB is set (>= 0x80) — otherwise
+        // the value would parse as negative. The controller records the serial
+        // as exactly 16 raw unmasked bytes (wiremesh-trust `random_serial` →
+        // hex of 16 bytes), so to match it we strip ONLY that sign-pad byte:
+        // the len==17 + leading-0x00 case. A legitimate serial whose first
+        // random byte happens to be 0x00 is 16 bytes long and must be kept
+        // verbatim — so this is deliberately not a strip-all-leading-zeros.
+        let raw = cert.raw_serial();
+        let bytes = match raw {
+            [0x00, rest @ ..] if rest.len() == 16 => rest,
+            _ => raw,
+        };
+        Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
     }
 }
 
