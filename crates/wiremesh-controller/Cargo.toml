@@ -4,3 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = { workspace = true }
+rusqlite = { workspace = true }
+ipnet = { workspace = true }
+time = { version = "0.3", features = ["formatting"] }
+
+[dev-dependencies]
+ipnet = { workspace = true }
