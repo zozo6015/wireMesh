@@ -1,0 +1,29 @@
+syntax = "proto3";
+package wiremesh.v1;
+
+service Sync {
+  rpc Watch(WatchRequest) returns (stream SyncMessage);
+  rpc Report(ReportRequest) returns (ReportResponse);
+}
+message WatchRequest {}
+message SyncMessage { oneof body { StateSnapshot snapshot = 1; Delta delta = 2; } }
+message PeerKey { uint32 epoch = 1; string pubkey = 2; string state = 3; } // pending|active|retiring
+message Peer {
+  uint64 gateway_id = 1;
+  string segment_name = 2;
+  repeated PeerKey keys = 3;
+  repeated string candidate_endpoints = 4;
+  repeated string allowed_ips = 5;      // peer segment CIDRs
+}
+message StateSnapshot {
+  uint64 revision = 1;
+  string self_cert_pem = 2;
+  repeated Peer peers = 3;
+  repeated string relays = 4;
+  bytes policy_ir = 5;                    // empty IR v0 in cycle 2
+  uint64 policy_version = 6;
+  repeated string revoked_serials = 7;
+}
+message Delta { uint64 revision = 1; repeated Peer upserted_peers = 2; repeated uint64 removed_peer_ids = 3; repeated string relays = 4; bytes policy_ir = 5; uint64 policy_version = 6; repeated string revoked_serials = 7; }
+message ReportRequest { uint64 applied_version = 1; }
+message ReportResponse {}

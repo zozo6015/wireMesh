@@ -1,0 +1,35 @@
+[package]
+name = "wiremesh-testkit"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+wiremesh-proto = { path = "../wiremesh-proto" }
+wiremesh-controller = { path = "../wiremesh-controller" }
+tempfile = "3"
+# (Task 13) `mint_api_token`'s random name suffix (so repeated calls in one
+# test never collide on `api_token.name`'s UNIQUE constraint) — same crate
+# version `wiremesh-controller` already uses for the analogous job.
+rand = "0.8"
+# Connect a tonic `Channel` to the controller's Unix socket: `tower::service_fn`
+# supplies the custom connector, `hyper-util`'s `TokioIo` adapts a
+# `tokio::net::UnixStream` to the `hyper::rt::{Read,Write}` traits tonic's
+# hyper-1.x-based transport expects (a plain `UnixStream` no longer
+# implements the connector's required traits directly, unlike older tonic).
+tower = { version = "0.4", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+# `gen_csr` (implementer's helper for Enrollment tests): builds a gateway-side
+# CSR the same way a real gateway would, mirroring Phase 0's
+# spike/relay/src/bin/mkcerts.rs. Default features (crypto+pem+ring) are
+# enough — building/serializing a CSR doesn't need the `x509-parser` feature
+# (that's only for *parsing* one back, done in wiremesh-trust).
+rcgen = { workspace = true }
+# `StubGateway::cert_serial` parses the serial number back out of its issued
+# leaf cert's PEM. Already present transitively (rcgen's own `x509-parser`
+# feature, used by wiremesh-trust, pulls in this exact version per
+# Cargo.lock) — declaring it directly here just makes the dependency
+# explicit rather than relying on an incidental transitive edge.
+x509-parser = "0.16"

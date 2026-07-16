@@ -1,0 +1,62 @@
+[package]
+name = "wiremesh-controller"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = { workspace = true }
+rusqlite = { workspace = true }
+ipnet = { workspace = true }
+time = { version = "0.3", features = ["formatting"] }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+wiremesh-proto = { path = "../wiremesh-proto" }
+wiremesh-trust = { path = "../wiremesh-trust" }
+# UnixListenerStream — feeds a UnixListener's accept loop into tonic's
+# serve_with_incoming_shutdown as a Stream (tonic's Server has no built-in
+# UDS incoming type). "sync" additionally pulls in BroadcastStream (Task 8's
+# Sync delta fan-out: wraps a `tokio::sync::broadcast::Receiver` as a Stream).
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+sha2 = "0.10"
+rand = "0.8"
+# Only used to decode the CA's PEM cert body back to DER so the root
+# fingerprint can be computed over the exact bytes trust_bundle() returns
+# (also reused by `services::sync` to re-PEM-encode the mTLS peer cert's DER
+# for `StateSnapshot::self_cert_pem`).
+base64 = "0.22"
+# Parses the Sync mTLS peer certificate's DER (from tonic's `peer_certs()`)
+# to pull out the subject CN that identifies the calling gateway. Same
+# version `wiremesh-testkit`/`wiremesh-trust` already use for the analogous
+# job on the client side.
+x509-parser = "0.16"
+# (Task 13) `crate::auth`'s bearer-auth middleware wraps the Admin TCP
+# listener's `tonic::service::Routes` as a `tower::Layer`/`Service` operating
+# on raw `http::Request<BoxBody>`/`http::Response<BoxBody>` — see that
+# module's doc comment for why a `tower::Layer` (not a
+# `tonic::service::Interceptor`) is what it takes to classify a request by
+# gRPC method name.
+http = "1"
+tower = { version = "0.4", features = ["util"] }
+# (Task 14) Parses `fabric.yaml` (`crate::apply::FabricSpec`) for
+# `Admin.Apply`. `serde` is already a workspace dependency (used elsewhere
+# for JSON); `serde_yaml`, though officially in maintenance mode upstream, is
+# still the de-facto standard YAML crate in the Rust ecosystem and is
+# perfectly adequate for cycle-2's `serde::Deserialize`-driven parsing.
+serde = { workspace = true }
+serde_yaml = "0.9"
+# Structured (rather than string-interpolated) audit `diff_json` payloads —
+# a name/CIDR/etc. containing a quote or control character must not be able
+# to produce invalid JSON in the audit log.
+serde_json = { workspace = true }
+
+[dev-dependencies]
+ipnet = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+wiremesh-proto = { path = "../wiremesh-proto" }
+wiremesh-testkit = { path = "../wiremesh-testkit" }
+# StreamExt::next() to consume StubGateway::open_sync()'s Sync.Watch stream.
+tokio-stream = "0.1"
+# Real on-disk DB file path for the persisted-revision reopen test.
+tempfile = "3"

@@ -1,0 +1,39 @@
+[package]
+name = "fabricctl"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "fabricctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+tokio = { workspace = true }
+tonic = { workspace = true }
+# (Task 16) `audit export` streams each `AuditEntry` as one JSON-line to
+# stdout — see `run_audit`'s `AuditCmd::Export` arm.
+serde = { workspace = true }
+serde_json = { workspace = true }
+wiremesh-proto = { path = "../wiremesh-proto" }
+# UDS transport (`--socket`): same `tower::service_fn` + `hyper-util::TokioIo`
+# connector pattern `wiremesh-testkit::TestController::admin_client` uses —
+# fabricctl can't depend on wiremesh-testkit itself (that's test-only
+# plumbing, and would be a real->test-harness dependency backwards), so this
+# duplicates the small connector rather than sharing it.
+tower = { version = "0.4", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[dev-dependencies]
+# Boots a real in-process controller (UDS + TCP Admin) for `tests/cli.rs` to
+# drive the BUILT `fabricctl` binary against, the same harness the
+# wiremesh-controller integration tests use. No cycle: wiremesh-testkit
+# depends on wiremesh-controller (never on fabricctl), and nothing in
+# wiremesh-controller's own dependency graph depends on fabricctl either — so
+# this is a one-directional dev-dep edge (fabricctl -[dev]-> wiremesh-testkit
+# -> wiremesh-controller), not a cycle. Flagged per the task brief in case a
+# later step's Cargo.lock resolution disagrees.
+wiremesh-testkit = { path = "../wiremesh-testkit" }
+tokio = { workspace = true }
+tonic = { workspace = true }
