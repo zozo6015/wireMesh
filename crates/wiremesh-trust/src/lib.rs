@@ -25,6 +25,12 @@ use time::{Duration as TimeDuration, OffsetDateTime};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+/// Minimum leaf TTL the embedded issuer will grant, per the master spec
+/// §3.4 (manager-owned rotation: min granted TTL 24h, refused below).
+/// [`EmbeddedTrust::sign`] returns `Err` for any `profile.ttl` below this
+/// floor rather than silently issuing a shorter-lived leaf.
+pub const MIN_TTL: StdDuration = StdDuration::from_secs(24 * 3600);
+
 /// Opaque handle returned by [`CertificateIssuer::sign`], accepted back by
 /// [`CertificateIssuer::revoke`]. For the embedded issuer this is the
 /// certificate's serial number (hex-encoded), but callers must not assume
@@ -210,6 +216,18 @@ impl CertificateIssuer for EmbeddedTrust {
     }
 
     async fn sign(&self, csr_pem: &str, profile: CertProfile) -> Result<IssuedCert> {
+        // Provider-contract invariant (master spec §3.4, manager-owned
+        // rotation): min granted TTL is 24h, refused below. Reject before
+        // touching the CSR or minting a serial, so a too-short request never
+        // gets partway through issuance.
+        if profile.ttl < MIN_TTL {
+            bail!(
+                "requested TTL below 24h minimum: {:?} < {:?}",
+                profile.ttl,
+                MIN_TTL
+            );
+        }
+
         let csr = CertificateSigningRequestParams::from_pem(csr_pem)
             .context("parsing CSR PEM")?;
 
