@@ -6,4 +6,11 @@ message EnrollRequest { string token = 1; string csr_pem = 2; repeated string ci
 // enrollment — lets a caller (e.g. `wiremesh-testkit::StubGateway::id`)
 // address itself in later Admin ops (e.g. `RotateKey`) without a dedicated
 // lookup RPC.
-message EnrollResponse { string cert_pem = 1; string ca_bundle_pem = 2; uint64 gateway_id = 3; }
+// (Task 15) `observe_key` is a random per-gateway secret, generated at
+// enrollment, that authenticates this gateway's UDP observation probes
+// against the controller's observation endpoint (see
+// `wiremesh_controller::observe`) — a cycle-2 stand-in for the real
+// WG-socket-authenticated probe cycle 4 replaces this with. This is the
+// ONLY time the raw key crosses the wire; the gateway must hold onto it
+// (mirrors how `cert_pem`/`key_pem` are only ever handed over once).
+message EnrollResponse { string cert_pem = 1; string ca_bundle_pem = 2; uint64 gateway_id = 3; string observe_key = 4; }

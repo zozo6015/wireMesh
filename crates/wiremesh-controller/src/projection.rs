@@ -73,6 +73,23 @@ pub enum ChangeEvent {
         revoked_serials: Vec<String>,
         revision: u64,
     },
+    /// (Task 15) The controller's UDP observation endpoint recorded a new
+    /// candidate endpoint for `gateway_id` — every OTHER already-connected
+    /// gateway's peer view of it must be upserted with its FULL current
+    /// state (keys + allowed_ips + the new candidate), so an open
+    /// `Sync.Watch` stream stays consistent with what a fresh snapshot
+    /// would show. Bonus over this task's minimum bar (a fresh snapshot
+    /// already reflects the candidate — see `crate::observe`'s module doc
+    /// comment) but costs little given `KeyRotated` already established the
+    /// full-peer-refresh pattern.
+    EndpointObserved {
+        gateway_id: i64,
+        segment_name: String,
+        allowed_ips: Vec<String>,
+        keys: Vec<(i64, String, String)>,
+        candidate_endpoint: String,
+        revision: u64,
+    },
 }
 
 impl ChangeEvent {
@@ -86,6 +103,7 @@ impl ChangeEvent {
             ChangeEvent::GatewayEnrolled { new_gateway_id, .. } => *new_gateway_id,
             ChangeEvent::KeyRotated { gateway_id, .. } => *gateway_id,
             ChangeEvent::GatewayDrained { gateway_id, .. } => *gateway_id,
+            ChangeEvent::EndpointObserved { gateway_id, .. } => *gateway_id,
         }
     }
 }
@@ -165,6 +183,35 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             policy_version: 0,
             revoked_serials,
         },
+        ChangeEvent::EndpointObserved {
+            gateway_id,
+            segment_name,
+            allowed_ips,
+            keys,
+            candidate_endpoint,
+            revision,
+        } => Delta {
+            revision,
+            upserted_peers: vec![Peer {
+                gateway_id: gateway_id as u64,
+                segment_name,
+                keys: keys
+                    .into_iter()
+                    .map(|(epoch, pubkey, state)| PeerKey {
+                        epoch: epoch as u32,
+                        pubkey,
+                        state,
+                    })
+                    .collect(),
+                candidate_endpoints: vec![candidate_endpoint],
+                allowed_ips,
+            }],
+            removed_peer_ids: Vec::new(),
+            relays: Vec::new(),
+            policy_ir: Vec::new(),
+            policy_version: 0,
+            revoked_serials: Vec::new(),
+        },
     }
 }
 
@@ -198,9 +245,12 @@ pub async fn build_snapshot(
                     state,
                 })
                 .collect(),
-            // Candidate endpoints (NAT-traversal discovery) are Task 15's
-            // scope — always empty in cycle-2's Sync projection.
-            candidate_endpoints: Vec::new(),
+            // (Task 15) At most one candidate: the peer's most recently
+            // observed address, if the controller's UDP observation
+            // endpoint has ever recorded one for it. Cycle-2 keeps a single
+            // last-observed-wins candidate rather than a bounded history
+            // (see `Db::set_candidate_endpoint`'s doc comment).
+            candidate_endpoints: p.candidate_endpoint.into_iter().collect(),
             allowed_ips: p.allowed_ips,
         })
         .collect();

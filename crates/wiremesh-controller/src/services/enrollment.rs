@@ -229,6 +229,10 @@ impl Enrollment for EnrollmentSvc {
             cert_pem: issued.cert_pem,
             ca_bundle_pem,
             gateway_id: identity.id as u64,
+            // (Task 15) The only time this gateway's UDP-observation
+            // authenticator ever crosses the wire — see `crate::observe`'s
+            // module doc comment.
+            observe_key: outcome.observe_key,
         }))
     }
 }

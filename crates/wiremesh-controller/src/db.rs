@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use ipnet::Ipv4Net;
+use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 /// Increments the persisted `state_revision` counter and returns the NEW
@@ -21,6 +22,18 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 /// revision. Every projection-affecting mutation ([`Db::insert_segment`],
 /// [`Db::enroll_gateway`], and — as later tasks land them — key rotate /
 /// drain / revoke / policy apply) must call this inside its own transaction.
+/// (Task 15) Generates a fresh random per-gateway `observe_key`: 32 random
+/// bytes, hex-encoded (64 hex chars) — same "raw random bytes, hex encoded"
+/// shape `services::admin::mint_token`'s enrollment-token secret uses,
+/// just kept as a plain string end-to-end (unlike that secret, this key
+/// itself — not a hash of it — is what the MAC verifier needs, since the
+/// controller must recompute the exact same MAC the gateway did).
+fn generate_observe_key() -> String {
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 fn bump_revision_tx(tx: &Transaction<'_>) -> rusqlite::Result<u64> {
     tx.execute(
         "UPDATE state_revision SET revision = revision + 1 WHERE id = 0",
@@ -63,7 +76,20 @@ CREATE TABLE gateway (
     -- surfacing (`fabricctl policy status`); this column is the minimal
     -- "does the controller know what this gateway last applied" fact T8
     -- needs today.
-    applied_version INTEGER
+    applied_version INTEGER,
+    -- (Task 15) Random per-gateway secret, generated at enrollment and
+    -- handed to the gateway exactly once (in `EnrollResponse.observe_key`),
+    -- that authenticates this gateway's UDP observation probes — see
+    -- `crate::observe`. Nullable only because SQLite requires a column to
+    -- accept NULL absent a DEFAULT; every row inserted by `enroll_gateway`
+    -- always supplies one.
+    observe_key     TEXT,
+    -- (Task 15) The `ip:port` the controller's UDP observation endpoint most
+    -- recently observed a verified probe from this gateway arrive from —
+    -- surfaced to peers as this gateway's candidate endpoint
+    -- (`crate::routes`/`crate::projection`). NULL until the gateway's first
+    -- successful probe.
+    candidate_endpoint TEXT
 );
 
 CREATE TABLE gateway_key (
@@ -349,6 +375,11 @@ pub struct EnrollOutcome {
     /// committed by the time this is returned), not that call, is
     /// authoritative.
     pub revoked_issuer_handles: Vec<String>,
+    /// (Task 15) The random `observe_key` freshly generated and stored for
+    /// this gateway — the caller (`EnrollmentSvc`) returns it to the gateway
+    /// once, in `EnrollResponse.observe_key`. See `crate::observe`'s module
+    /// doc comment for how it's used.
+    pub observe_key: String,
 }
 
 /// One row of [`Db::list_other_gateways`] — an enrolled gateway's identity
@@ -358,6 +389,10 @@ pub struct GatewayRow {
     pub id: i64,
     pub segment_id: i64,
     pub segment_name: String,
+    /// (Task 15) This peer's most recently observed candidate endpoint
+    /// (`gateway.candidate_endpoint`), if the controller's UDP observation
+    /// endpoint has ever recorded one for it.
+    pub candidate_endpoint: Option<String>,
 }
 
 /// The enrolled gateway a Sync mTLS client cert's subject CN resolved to
@@ -922,10 +957,16 @@ impl Db {
             }
         }
 
+        // (Task 15) A fresh random observe_key for this gateway's UDP
+        // observation probes — generated here (not by the caller) since it's
+        // pure DB-row bookkeeping with no crypto dependency, mirroring how
+        // `rotate_key`'s placeholder pubkey is generated inline too.
+        let observe_key = generate_observe_key();
+
         tx.execute(
-            "INSERT INTO gateway (segment_id, name, status, backend, last_seen) \
-             VALUES (?1, ?2, 'active', 'wireguard', NULL)",
-            params![segment_id, gateway_name],
+            "INSERT INTO gateway (segment_id, name, status, backend, last_seen, observe_key) \
+             VALUES (?1, ?2, 'active', 'wireguard', NULL, ?3)",
+            params![segment_id, gateway_name, observe_key],
         )?;
         let gateway_id = tx.last_insert_rowid();
 
@@ -984,6 +1025,7 @@ impl Db {
             segment_id,
             gateway_id,
             revoked_issuer_handles,
+            observe_key,
         })
     }
 
@@ -1000,7 +1042,7 @@ impl Db {
     pub fn list_other_gateways(&self, exclude_gateway_id: i64) -> Result<Vec<GatewayRow>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT g.id, g.segment_id, s.name \
+            "SELECT g.id, g.segment_id, s.name, g.candidate_endpoint \
              FROM gateway g JOIN segment s ON s.id = g.segment_id \
              WHERE g.id != ?1 AND g.status = 'active' \
              ORDER BY g.id",
@@ -1011,6 +1053,7 @@ impl Db {
                     id: row.get(0)?,
                     segment_id: row.get(1)?,
                     segment_name: row.get(2)?,
+                    candidate_endpoint: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1519,5 +1562,56 @@ impl Db {
         )
         .optional()
         .map_err(Into::into)
+    }
+
+    /// (Task 15) The `observe_key` issued to `gateway_id` at enrollment, if
+    /// it currently exists AND is `status = 'active'` — `None` for an
+    /// unknown gateway_id and for one that's been drained/replaced, so a
+    /// probe claiming a stale/superseded identity can never authenticate
+    /// (mirrors `gateway_is_active`'s active-only posture). This is the
+    /// controller's UDP observation endpoint's sole lookup for verifying a
+    /// probe's MAC — see `crate::observe`.
+    pub fn gateway_observe_key(&self, gateway_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT observe_key FROM gateway WHERE id = ?1 AND status = 'active'",
+            params![gateway_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|opt| opt.flatten())
+        .map_err(Into::into)
+    }
+
+    /// (Task 15) Records `addr` (a UDP `ip:port` string, as observed on the
+    /// wire by `crate::observe`) as `gateway_id`'s candidate endpoint —
+    /// last-observed-wins (cycle-2 keeps exactly one candidate per gateway;
+    /// see `crate::projection::build_snapshot`/`crate::routes::peers_of` for
+    /// how it's surfaced to peers). Only touches an ACTIVE gateway row (same
+    /// posture as `gateway_observe_key`) — errors if `gateway_id` doesn't
+    /// currently resolve to one, so the caller (which already verified the
+    /// probe's MAC against an active gateway's key moments earlier) can treat
+    /// that as an internal inconsistency rather than silently no-op'ing.
+    /// Bumps the persisted revision in the same transaction, since this
+    /// changes what every OTHER gateway's projection shows. Returns the new
+    /// revision.
+    pub fn set_candidate_endpoint(&self, gateway_id: i64, addr: &str) -> Result<u64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let updated = tx.execute(
+            "UPDATE gateway SET candidate_endpoint = ?1 WHERE id = ?2 AND status = 'active'",
+            params![addr, gateway_id],
+        )?;
+        if updated != 1 {
+            tx.rollback()?;
+            anyhow::bail!(
+                "set_candidate_endpoint: no active gateway row with id {gateway_id}"
+            );
+        }
+
+        let revision = bump_revision_tx(&tx)?;
+        tx.commit()?;
+        Ok(revision)
     }
 }

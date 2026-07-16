@@ -12,6 +12,7 @@ pub mod apply;
 pub mod auth;
 pub mod db;
 pub mod db_async;
+pub mod observe;
 pub mod projection;
 pub mod routes;
 pub mod services;
@@ -94,6 +95,13 @@ pub struct Config {
     /// `fabricctl --token`/`TestController::admin_client_with_bearer` dial.
     /// `0` = OS-assigned.
     pub admin_tcp_port: u16,
+    /// (Task 15) UDP port for the observation endpoint (`crate::observe`) —
+    /// deliberately UDP, not TCP: NATs map TCP/UDP independently, so a
+    /// TCP-observed address would be useless for the UDP data plane this
+    /// endpoint exists to help a gateway discover its own reachable address
+    /// for. `0` = OS-assigned, same convention as every other port in this
+    /// struct.
+    pub observe_udp_port: u16,
 }
 
 /// A live, in-process controller instance. Dropping it stops both servers
@@ -111,6 +119,7 @@ pub struct RunningController {
     /// filesystem access to the controller's data dir. The same bundle is
     /// also what a Sync client must present a client cert chaining to.
     ca_bundle_pem: String,
+    observe_addr: std::net::SocketAddr,
     admin_shutdown_tx: Option<oneshot::Sender<()>>,
     admin_join: Option<JoinHandle<()>>,
     admin_tcp_shutdown_tx: Option<oneshot::Sender<()>>,
@@ -119,6 +128,8 @@ pub struct RunningController {
     enroll_join: Option<JoinHandle<()>>,
     sync_shutdown_tx: Option<oneshot::Sender<()>>,
     sync_join: Option<JoinHandle<()>>,
+    observe_shutdown_tx: Option<oneshot::Sender<()>>,
+    observe_join: Option<JoinHandle<()>>,
 }
 
 impl RunningController {
@@ -146,6 +157,12 @@ impl RunningController {
     /// `sync_tcp_addr()` (Enrollment/Sync's listeners).
     pub fn admin_tcp_addr(&self) -> std::net::SocketAddr {
         self.admin_tcp_addr
+    }
+
+    /// (Task 15) The bound UDP address the observation endpoint
+    /// (`crate::observe`) listens on — see [`Config::observe_udp_port`].
+    pub fn observe_addr(&self) -> std::net::SocketAddr {
+        self.observe_addr
     }
 
     /// The data directory this instance was opened against (DB + CA +
@@ -195,10 +212,14 @@ impl RunningController {
         if let Some(tx) = self.sync_shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(tx) = self.observe_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
         join_bounded(self.admin_join.take()).await;
         join_bounded(self.admin_tcp_join.take()).await;
         join_bounded(self.enroll_join.take()).await;
         join_bounded(self.sync_join.take()).await;
+        join_bounded(self.observe_join.take()).await;
     }
 }
 
@@ -239,6 +260,9 @@ impl Drop for RunningController {
             let _ = tx.send(());
         }
         if let Some(tx) = self.sync_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = self.observe_shutdown_tx.take() {
             let _ = tx.send(());
         }
     }
@@ -309,6 +333,17 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         .context("reading bound Sync TCP addr")?;
     let sync_tcp_stream = TcpListenerStream::new(sync_tcp_listener);
 
+    // (Task 15) The observation endpoint's UDP socket — bound here (UDP, not
+    // one of the TCP/UDS listeners above) since NATs map TCP/UDP
+    // independently; see `Config::observe_udp_port`'s doc comment and
+    // `crate::observe`'s module doc comment for the full scheme.
+    let observe_socket = tokio::net::UdpSocket::bind(("127.0.0.1", config.observe_udp_port))
+        .await
+        .context("binding controller observation UDP socket")?;
+    let observe_addr = observe_socket
+        .local_addr()
+        .context("reading bound observation UDP addr")?;
+
     bind_uds_dir(&config.socket_path)?;
     if config.socket_path.exists() {
         std::fs::remove_file(&config.socket_path).with_context(|| {
@@ -327,6 +362,18 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     // hold a clone of the sender.
     let (change_tx, _) =
         broadcast::channel::<projection::ChangeEvent>(CHANGE_EVENT_CHANNEL_CAPACITY);
+
+    // (Task 15) The observation endpoint's receive loop — spawned like every
+    // other server task below, with its own shutdown signal so
+    // `RunningController::shutdown`/`Drop` can tear it down the same
+    // bounded-join-then-abort way as the TCP/UDS listeners.
+    let (observe_shutdown_tx, observe_shutdown_rx) = oneshot::channel::<()>();
+    let observe_join = observe::spawn(
+        observe_socket,
+        db_handle.clone(),
+        change_tx.clone(),
+        observe_shutdown_rx,
+    );
 
     let admin_svc = AdminSvc::new(
         db_handle.clone(),
@@ -424,6 +471,7 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         tcp_addr,
         sync_tcp_addr,
         admin_tcp_addr,
+        observe_addr,
         socket_path: config.socket_path,
         data_dir: config.data_dir,
         ca_bundle_pem,
@@ -435,6 +483,8 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         enroll_join: Some(enroll_join),
         sync_shutdown_tx: Some(sync_shutdown_tx),
         sync_join: Some(sync_join),
+        observe_shutdown_tx: Some(observe_shutdown_tx),
+        observe_join: Some(observe_join),
     })
 }
 

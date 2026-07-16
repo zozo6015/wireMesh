@@ -31,6 +31,10 @@ async fn main() -> Result<()> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
+    let observe_udp_port: u16 = std::env::var("WIREMESH_OBSERVE_UDP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
 
     let config = Config {
         data_dir,
@@ -38,15 +42,17 @@ async fn main() -> Result<()> {
         sync_tcp_port,
         socket_path,
         admin_tcp_port,
+        observe_udp_port,
     };
 
     let running = serve(config).await?;
     eprintln!(
-        "wiremesh-controller listening: tcp={} sync_tcp={} uds={} admin_tcp={}",
+        "wiremesh-controller listening: tcp={} sync_tcp={} uds={} admin_tcp={} observe_udp={}",
         running.tcp_addr(),
         running.sync_tcp_addr(),
         running.socket_path().display(),
-        running.admin_tcp_addr()
+        running.admin_tcp_addr(),
+        running.observe_addr()
     );
 
     tokio::signal::ctrl_c().await?;

@@ -25,6 +25,10 @@ pub struct PeerRoute {
     pub keys: Vec<(i64, String, String)>,
     /// The peer's segment's CIDRs — this peer's `allowed_ips`.
     pub allowed_ips: Vec<String>,
+    /// (Task 15) This peer's most recently observed candidate endpoint, if
+    /// the controller's UDP observation endpoint has ever recorded one for
+    /// it — becomes this peer's (singleton) `candidate_endpoints` entry.
+    pub candidate_endpoint: Option<String>,
 }
 
 /// The full-mesh peer set for `self_gateway_id`: every other enrolled
@@ -43,6 +47,7 @@ pub async fn peers_of(db: &DbHandle, self_gateway_id: i64) -> anyhow::Result<Vec
             segment_name: gw.segment_name,
             keys,
             allowed_ips,
+            candidate_endpoint: gw.candidate_endpoint,
         });
     }
     Ok(peers)

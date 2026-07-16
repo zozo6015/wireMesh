@@ -143,6 +143,7 @@ impl TestController {
             sync_tcp_port: 0,
             socket_path: socket_path.clone(),
             admin_tcp_port: 0,
+            observe_udp_port: 0,
         };
 
         let server_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -200,6 +201,7 @@ impl TestController {
             sync_tcp_port: 0,
             socket_path: self.socket_path.clone(),
             admin_tcp_port: 0,
+            observe_udp_port: 0,
         };
 
         // (Task 13) Reuse the SAME `server_runtime` across a restart (rather
@@ -253,6 +255,13 @@ impl TestController {
     /// exercises for the first time.
     pub fn admin_tcp_addr(&self) -> SocketAddr {
         self.running().admin_tcp_addr()
+    }
+
+    /// (Task 15) The controller's bound UDP address the observation
+    /// endpoint (`wiremesh_controller::observe`) listens on — what
+    /// [`StubGateway::probe_observe`] dials.
+    pub fn observe_addr(&self) -> SocketAddr {
+        self.running().observe_addr()
     }
 
     /// The temp directory backing this instance's DB/CA/secrets.
@@ -455,6 +464,12 @@ pub struct StubGateway {
     // `EnrollResponse` never carried and had to be threaded in separately
     // via `enroll_one`/`set_segment_id`).
     gateway_id: i64,
+    // (Task 15) The random per-gateway secret the controller generated and
+    // returned exactly once, in `EnrollResponse.observe_key` — this stub
+    // holds onto it (mirroring how a real gateway would) so
+    // `probe_observe` can build an authenticated probe. See
+    // `wiremesh_controller::observe`'s module doc comment for the scheme.
+    observe_key: String,
     // The controller's Sync (mTLS) TCP endpoint, captured at enroll time so
     // `open_sync` can dial it without the caller having to pass the
     // `TestController` back in — mirrors what a real gateway does (it learns
@@ -529,6 +544,7 @@ impl StubGateway {
             key_pem,
             ca_bundle_pem: resp.ca_bundle_pem,
             gateway_id: resp.gateway_id as i64,
+            observe_key: resp.observe_key,
             sync_addr: controller.sync_tcp_addr(),
             _state_dir: state_dir,
             state_dir_path,
@@ -604,6 +620,57 @@ impl StubGateway {
             .map_err(|status| anyhow::anyhow!("Sync.Watch failed: {status}"))?
             .into_inner();
         Ok(stream)
+    }
+
+    /// (Task 15) Sends an authenticated UDP observation probe to the
+    /// controller's observation endpoint at `observe_addr`
+    /// (`TestController::observe_addr()`) and returns the `ip:port` the
+    /// controller echoed back as this gateway's observed source address.
+    ///
+    /// Builds the probe via `wiremesh_controller::observe::build_probe`
+    /// (the SAME function the controller's own verifier's expected-MAC
+    /// computation is built from — see that module's doc comment for the
+    /// wire format/scheme), using this gateway's `observe_key` learned once
+    /// at enrollment. Binds a fresh ephemeral local UDP socket (NOT the
+    /// Sync mTLS connection — this is a deliberately separate, unrelated
+    /// transport, matching how a real gateway's data-plane WG socket has no
+    /// relation to its control-plane TLS connection) so the observed
+    /// source address is this call's own, not shared with anything else.
+    pub async fn probe_observe(&self, observe_addr: SocketAddr) -> anyhow::Result<String> {
+        let sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+            .await
+            .map_err(|e| anyhow::anyhow!("binding local UDP socket for probe_observe: {e}"))?;
+
+        let probe = wiremesh_controller::observe::build_probe(&self.observe_key, self.id());
+        sock.send_to(&probe, observe_addr)
+            .await
+            .map_err(|e| anyhow::anyhow!("sending observation probe to {observe_addr}: {e}"))?;
+
+        let mut buf = [0u8; 128];
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!(
+                    "no observation reply from {observe_addr} within the probe_observe timeout"
+                );
+            }
+            match tokio::time::timeout(remaining, sock.recv_from(&mut buf)).await {
+                Ok(Ok((n, from))) if from == observe_addr => {
+                    return Ok(String::from_utf8_lossy(&buf[..n]).into_owned());
+                }
+                // A reply from anyone other than the controller itself
+                // isn't the answer we're waiting for — keep listening
+                // rather than treating it as this probe's result.
+                Ok(Ok(_)) => continue,
+                Ok(Err(e)) => {
+                    anyhow::bail!("receiving observation reply from {observe_addr}: {e}")
+                }
+                Err(_) => anyhow::bail!(
+                    "no observation reply from {observe_addr} within the probe_observe timeout"
+                ),
+            }
+        }
     }
 
     /// Ensures this gateway's identity bundle (leaf cert, private key
