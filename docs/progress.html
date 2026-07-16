@@ -237,14 +237,19 @@
     <p class="eyebrow">WireMesh · Build Progress</p>
     <h1>Zero-trust network fabric — cycle-by-cycle build tracker</h1>
     <p class="lede">Open-source (Apache-2.0), self-hosted, cloud-agnostic L3/L4 network fabric in Rust: WireGuard data plane, default-deny eBPF policy, one gateway per segment, no agents on workloads. The engineering design ships as four plan cycles; this page tracks what's done, in flight, and next.</p>
-    <p class="stamp">Last updated <b>2026-07-16</b> · main @ <b>09a9b54</b> · spec v0.2 (approved)</p>
+    <p class="stamp">Last updated <b>2026-07-16</b> · Phase 0 + Cycle 2 complete · Cycle 2 on GitHub (PR open, ruleset-gated)</p>
   </header>
 
   <div class="metrics">
     <div class="metric">
       <p class="k">Plan cycles</p>
-      <div class="v">1<small> / 4 complete</small></div>
-      <p class="sub">Cycle 2 in design</p>
+      <div class="v">2<small> / 4 complete</small></div>
+      <p class="sub">Cycle 3 up next</p>
+    </div>
+    <div class="metric">
+      <p class="k">Cycle 2 tasks</p>
+      <div class="v">18<small> / 18 done</small></div>
+      <p class="sub">suite 34/34 green</p>
     </div>
     <div class="metric">
       <p class="k">Phase 0 bets</p>
@@ -252,14 +257,9 @@
       <p class="sub">4 go · 1 go-with-caveats</p>
     </div>
     <div class="metric">
-      <p class="k">Spike test suite</p>
-      <div class="v">14<small> / 14 green</small></div>
-      <p class="sub">0 failed · 0 skipped</p>
-    </div>
-    <div class="metric">
       <p class="k">Current focus</p>
-      <div class="v" style="font-size:19px;">Controller core</div>
-      <p class="sub">Cycle 2 · brainstorming</p>
+      <div class="v" style="font-size:19px;">On GitHub</div>
+      <p class="sub">PR open · ruleset-gated</p>
     </div>
   </div>
 
@@ -270,7 +270,7 @@
 %%{init: {'theme':'base','themeVariables':{'fontFamily':'ui-monospace, monospace','fontSize':'13px','lineColor':'#3aa9b8','primaryTextColor':'#dbe9f0','clusterBkg':'transparent'}}}%%
 flowchart LR
   P0["PHASE 0 · Spike<br/>5 de-risk bets<br/>merged 09a9b54"]:::done
-  C2["CYCLE 2 · Controller core<br/>CA · data model<br/>Enroll / Sync / Admin"]:::progress
+  C2["CYCLE 2 · Controller core<br/>CA · data model<br/>Enroll / Sync / Admin"]:::done
   C3["CYCLE 3 · Policy pipeline<br/>DSL &rarr; IR &rarr;<br/>eBPF / nftables"]:::pending
   C4["CYCLE 4 · Gateway + Relay<br/>tunnel mgr · NAT matrix<br/>relay path"]:::pending
   P0 --> C2
@@ -306,14 +306,14 @@ flowchart LR
         <p class="dep"><b>Proved:</b> boringtun embed, tc-BPF stateful ACL, QUIC relay + WG-over-relay at MTU 1280, UDP hole punch, NAT matrix harness.</p>
       </article>
 
-      <article class="cycle" data-status="progress">
+      <article class="cycle" data-status="done">
         <div class="cycle-head">
           <span class="cycle-no">02</span>
           <h3>Controller core</h3>
-          <span class="pill progress"><span>In design</span></span>
+          <span class="pill done"><span>Complete · 2026-07-16</span></span>
         </div>
-        <p>The single-tenant control plane: embedded-SQLite data model, embedded fabric CA + enrollment/rebind trust flow, the Enrollment / Sync / Admin gRPC services plus the UDP observation endpoint, WireGuard key-epoch lifecycle bookkeeping, full-mesh route computation, audit log, and the pluggable <code>SecretStore</code> / <code>CertificateIssuer</code> provider seams. Includes the proto and trait definitions.</p>
-        <p class="dep"><b>Depends on:</b> Phase 0 (validated data-plane contracts) · <b>Scope note:</b> no policy compiler, no gateway/relay binaries — those are cycles 3 &amp; 4.</p>
+        <p>The single-tenant control plane, built subagent-driven across 18 tasks (suite 34/34 green): 5-crate cargo workspace — proto wire contract, embedded trust (CA + secret store + conformance suite), SQLite data model + persistent revision, single-use enrollment (bound-CIDR scoping, rebind, one-gateway-per-segment), mTLS Sync projection (snapshot + broadcast deltas + Report), key-epoch rotation bookkeeping, drain, full Admin CRUD + <code>fabricctl</code> + fail-closed bearer/UDS auth, declarative <code>apply -f</code> (idempotent, policy stubbed), authenticated UDP observation, revocation denylist + audit query/export.</p>
+        <p class="dep"><b>Done bar proven:</b> enroll → Sync snapshot/delta → ack → fail-static/restore against a stub gateway. <b>Deferred by design:</b> policy compiler (cycle 3), OpenBao (cycle 2b), data plane (cycle 4). <b>On GitHub:</b> PR open, gated on the repo's Code-Scanning ruleset.</p>
       </article>
 
       <article class="cycle" data-status="pending">
@@ -404,6 +404,15 @@ flowchart LR
   <section>
     <h2>Session log</h2>
     <div class="log">
+      <div class="entry">
+        <div class="date">2026-07-16 · later</div>
+        <h4>Cycle 2 (controller core) — built, reviewed, on GitHub</h4>
+        <ul>
+          <li><b>Executed all 18 tasks subagent-driven</b> (separate test-author / implementer / reviewer per task; many with fix cycles catching real bugs — a Sync lost-update race, a shutdown-on-open-stream deadlock, a fail-open auth default, a token-scope gap). <b>Full suite 34/34 green.</b></li>
+          <li><b>Whole-branch review cleared it to merge</b>, no Critical. One security seam (a revoked/drained gateway can still open Sync) elevated to a tracked cycle-4 blocker — no traffic-authz consequence without a data plane.</li>
+          <li><b>Published to GitHub</b> (github.com/zozo6015/wireMesh): reconciled the Apache-2.0 LICENSE, pushed the branches, opened PR #1 (project import). PR #2 (Cycle 2) and merges are gated by the repo's Code-Scanning ruleset — awaiting config.</li>
+        </ul>
+      </div>
       <div class="entry">
         <div class="date">2026-07-16</div>
         <h4>Started MVP planning — Cycle 2 (controller core)</h4>
