@@ -4,3 +4,23 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+anyhow = { workspace = true }
+async-trait = "0.1"
+# `x509-parser` unlocks CertificateSigningRequestParams::from_pem /
+# CertificateParams::from_ca_cert_pem — parsing externally-generated CSRs and
+# reloading our own persisted CA cert across restarts. `pem` is already a
+# default feature.
+rcgen = { workspace = true, features = ["x509-parser"] }
+time = "0.3"
+rand = "0.8"
+
+[dev-dependencies]
+tokio = { workspace = true }
+rcgen = { workspace = true }
+tempfile = "3"
+# Chain-verification helper (test-only): rustls-webpki is already pulled in
+# transitively (via rustls/quinn/tonic elsewhere in the workspace) so this
+# adds no new supply-chain surface, just a direct dev-dependency on it.
+webpki = { package = "rustls-webpki", version = "0.103", features = ["ring", "std"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
