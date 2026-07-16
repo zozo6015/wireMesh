@@ -249,21 +249,36 @@ impl StubGateway {
         let cert = pem
             .parse_x509()
             .map_err(|e| anyhow::anyhow!("parsing cert_pem's DER as X.509: {e}"))?;
-        // `raw_serial()` returns the DER INTEGER *contents*, which per ASN.1's
-        // canonical positive-integer rule carry a leading 0x00 pad byte
-        // whenever the true leading byte's MSB is set (>= 0x80) — otherwise
-        // the value would parse as negative. The controller records the serial
-        // as exactly 16 raw unmasked bytes (wiremesh-trust `random_serial` →
-        // hex of 16 bytes), so to match it we strip ONLY that sign-pad byte:
-        // the len==17 + leading-0x00 case. A legitimate serial whose first
-        // random byte happens to be 0x00 is 16 bytes long and must be kept
-        // verbatim — so this is deliberately not a strip-all-leading-zeros.
+        // `raw_serial()` returns the *minimal* DER INTEGER contents, which
+        // differs from the controller's fixed 16-byte record in BOTH
+        // directions, so we width-normalize back to exactly 16 bytes:
+        //
+        //  - OVER-length: per ASN.1's canonical positive-integer rule, a
+        //    leading 0x00 pad byte is prepended whenever the true leading byte
+        //    has its MSB set (>= 0x80), else the value would parse as negative
+        //    → 17 bytes. Strip that single sign-pad byte.
+        //  - UNDER-length: minimal DER also DROPS genuine leading zero bytes,
+        //    so e.g. `00 7f..` comes back as 15 bytes and `00 00 03..` as 14.
+        //    Left-pad with 0x00 back up to 16.
+        //
+        // The controller records exactly 16 raw unmasked bytes (wiremesh-trust
+        // `random_serial` → `hex_encode([u8;16])`), so after normalization
+        // cert_serial() is ALWAYS 32 lowercase-hex chars equal to that record.
         let raw = cert.raw_serial();
-        let bytes = match raw {
+        let stripped: &[u8] = match raw {
             [0x00, rest @ ..] if rest.len() == 16 => rest,
             _ => raw,
         };
-        Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
+        if stripped.len() > 16 {
+            anyhow::bail!(
+                "cert serial is {} bytes after sign-pad strip, expected <= 16 \
+                 (controller records a 16-byte serial): {stripped:02x?}",
+                stripped.len()
+            );
+        }
+        let mut buf = [0u8; 16];
+        buf[16 - stripped.len()..].copy_from_slice(stripped);
+        Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
     }
 }
 
