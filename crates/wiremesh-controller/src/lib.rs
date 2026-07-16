@@ -20,7 +20,7 @@ use std::time::Duration as StdDuration;
 
 use anyhow::{Context, Result};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::oneshot;
+use tokio::sync::{broadcast, oneshot};
 use tokio::task::JoinHandle;
 use tokio_stream::wrappers::{TcpListenerStream, UnixListenerStream};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -41,6 +41,18 @@ use wiremesh_trust::{CertificateIssuer, EmbeddedTrust};
 /// for cycle-2; a later task can persist/rotate this if the process is
 /// expected to run for years uninterrupted.
 const SERVER_IDENTITY_TTL: StdDuration = StdDuration::from_secs(365 * 24 * 3600);
+
+/// Capacity of the [`projection::ChangeEvent`] broadcast channel shared by
+/// every service that can mutate the projection (currently just
+/// `EnrollmentSvc` — see [`services::enrollment`]) and every live
+/// `Sync.Watch` connection (`SyncSvc`, [`services::sync`]). A lagging
+/// subscriber that falls more than this many events behind gets a
+/// `Lagged` error on its next read rather than blocking the sender —
+/// `SyncSvc::watch` handles that by logging and relying on the gateway's
+/// next reconnect to fully resync (see that module's doc comment). 64 is
+/// generous for cycle-2's mutation rate (gateway enrollment is an
+/// operator-driven, low-frequency event, not a hot path).
+const CHANGE_EVENT_CHANNEL_CAPACITY: usize = 64;
 
 /// Everything [`serve`] needs to boot a controller instance.
 ///
@@ -254,7 +266,14 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         }
     });
 
-    let enrollment_svc = EnrollmentSvc::new(db_handle.clone(), trust);
+    // Shared fan-out channel for Task 8's Sync delta stream: `EnrollmentSvc`
+    // (the only projection-affecting mutation site today) publishes here;
+    // every `SyncSvc::watch` connection subscribes its own receiver. See
+    // `projection::ChangeEvent`'s doc comment.
+    let (change_tx, _) =
+        broadcast::channel::<projection::ChangeEvent>(CHANGE_EVENT_CHANNEL_CAPACITY);
+
+    let enrollment_svc = EnrollmentSvc::new(db_handle.clone(), trust, change_tx.clone());
     let enroll_tls_config = ServerTlsConfig::new().identity(tls_identity.clone());
 
     let (enroll_shutdown_tx, enroll_shutdown_rx) = oneshot::channel::<()>();
@@ -272,7 +291,7 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         }
     });
 
-    let sync_svc = SyncSvc::new(db_handle);
+    let sync_svc = SyncSvc::new(db_handle, change_tx);
     // `client_auth_optional` defaults to `false` — i.e. REQUIRED — so this
     // is exactly the mTLS posture Sync needs: the Sync listener rejects any
     // TLS handshake that doesn't present a client cert chaining to

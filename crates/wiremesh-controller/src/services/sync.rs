@@ -19,7 +19,10 @@
 use std::pin::Pin;
 
 use base64::Engine as _;
-use tokio_stream::Stream;
+use tokio::sync::broadcast;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
 use wiremesh_proto::v1::sync_server::Sync;
@@ -27,17 +30,23 @@ use wiremesh_proto::v1::sync_message::Body;
 use wiremesh_proto::v1::{ReportRequest, ReportResponse, SyncMessage, WatchRequest};
 
 use crate::db_async::DbHandle;
-use crate::projection;
+use crate::projection::{self, ChangeEvent};
 
 pub type WatchStream = Pin<Box<dyn Stream<Item = Result<SyncMessage, Status>> + Send + 'static>>;
 
 pub struct SyncSvc {
     db: DbHandle,
+    /// Fan-out source for delta events (Task 8): every projection-affecting
+    /// mutation that adds/changes a gateway publishes one
+    /// [`ChangeEvent`] here (see `crate::services::enrollment`); every live
+    /// `Sync.Watch` connection below subscribes its own receiver and
+    /// forwards relevant events as `Delta`s down its still-open stream.
+    change_tx: broadcast::Sender<ChangeEvent>,
 }
 
 impl SyncSvc {
-    pub fn new(db: DbHandle) -> Self {
-        Self { db }
+    pub fn new(db: DbHandle, change_tx: broadcast::Sender<ChangeEvent>) -> Self {
+        Self { db, change_tx }
     }
 }
 
@@ -66,22 +75,76 @@ impl Sync for SyncSvc {
             .await
             .map_err(|e| Status::internal(format!("building Sync snapshot: {e}")))?;
 
-        let msg = SyncMessage {
+        let snapshot_msg = SyncMessage {
             body: Some(Body::Snapshot(snapshot)),
         };
-        let stream: Self::WatchStream = Box::pin(tokio_stream::once(Ok(msg)));
+        // First message on the stream is always the full snapshot (must
+        // stay true — `tests/sync_snapshot.rs` asserts it). The stream then
+        // stays OPEN: every subsequent projection-affecting mutation
+        // published on `change_tx` (currently only gateway enrollment —
+        // see `crate::services::enrollment`) is forwarded as a `Delta`,
+        // for as long as this gRPC call is alive.
+        let self_gateway_id = gw.id;
+        let rx = self.change_tx.subscribe();
+        let delta_stream = BroadcastStream::new(rx).filter_map(move |item| match item {
+            Ok(event) => {
+                // A gateway must never receive a delta "adding" itself as
+                // its own peer.
+                if event.new_gateway_id == self_gateway_id {
+                    None
+                } else {
+                    let delta = projection::delta_for_change(event);
+                    Some(Ok(SyncMessage {
+                        body: Some(Body::Delta(delta)),
+                    }))
+                }
+            }
+            Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                // This connection's receiver fell behind the broadcast
+                // channel's ring buffer and `skipped` events were dropped
+                // before it could read them. Rather than crash the
+                // connection (or the server), log and keep going: the
+                // gateway is left relying on its next `Sync.Watch`
+                // reconnect (which re-fetches a full, consistent snapshot)
+                // to recover from any deltas it missed here.
+                eprintln!(
+                    "wiremesh-controller: Sync.Watch for gateway {self_gateway_id} lagged behind \
+                     the change broadcast by {skipped} event(s); those deltas were dropped — \
+                     the gateway must reconnect to Sync.Watch to fully resync"
+                );
+                None
+            }
+        });
+
+        let stream: Self::WatchStream =
+            Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(delta_stream));
         Ok(Response::new(stream))
     }
 
     async fn report(
         &self,
-        _request: Request<ReportRequest>,
+        request: Request<ReportRequest>,
     ) -> Result<Response<ReportResponse>, Status> {
-        // Policy-ack reporting is out of this task's scope (the policy
-        // pipeline that would give `applied_version` any meaning doesn't
-        // exist yet) — explicit Unimplemented rather than silently
-        // accepting and discarding acks.
-        Err(Status::unimplemented("Report is not implemented yet"))
+        let (gateway_name, _self_cert_pem) = peer_identity(&request)?;
+
+        let gw = self
+            .db
+            .find_gateway_by_name(gateway_name)
+            .await
+            .map_err(|e| Status::internal(format!("looking up gateway by cert CN: {e}")))?
+            .ok_or_else(|| {
+                Status::permission_denied(
+                    "client certificate's CN does not match any enrolled gateway",
+                )
+            })?;
+
+        let applied_version = request.into_inner().applied_version;
+        self.db
+            .set_applied_version(gw.id, applied_version)
+            .await
+            .map_err(|e| Status::internal(format!("recording applied_version: {e}")))?;
+
+        Ok(Response::new(ReportResponse {}))
     }
 }
 

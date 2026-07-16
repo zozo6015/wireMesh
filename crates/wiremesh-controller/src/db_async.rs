@@ -138,6 +138,13 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.current_revision()).await?
     }
 
+    /// See [`Db::set_applied_version`].
+    pub async fn set_applied_version(&self, gateway_id: i64, applied_version: u64) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.set_applied_version(gateway_id, applied_version))
+            .await?
+    }
+
     /// See [`Db::find_gateway_by_name`].
     pub async fn find_gateway_by_name(&self, name: String) -> Result<Option<GatewayIdentity>> {
         let db = self.inner.clone();

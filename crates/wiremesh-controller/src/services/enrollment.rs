@@ -18,6 +18,7 @@ use std::time::Duration as StdDuration;
 use ipnet::Ipv4Net;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use tokio::sync::broadcast;
 use tonic::{Request, Response, Status};
 
 use wiremesh_proto::v1::enrollment_server::Enrollment;
@@ -25,6 +26,7 @@ use wiremesh_proto::v1::{EnrollRequest, EnrollResponse};
 use wiremesh_trust::{CertProfile, CertificateIssuer};
 
 use crate::db_async::{DbHandle, EnrollError};
+use crate::projection::ChangeEvent;
 
 /// Cycle-2 leaf certs (gateway enrollment) are valid for 90 days from
 /// issuance — no renewal path yet (a later task can make this configurable
@@ -38,11 +40,23 @@ const TOKEN_KIND_GATEWAY: &str = "gateway";
 pub struct EnrollmentSvc {
     db: DbHandle,
     trust: Arc<dyn CertificateIssuer>,
+    /// Publishes a [`ChangeEvent`] after every successful enrollment (Task
+    /// 8) — Enrollment and Sync are two separate services/connections
+    /// (see `wiremesh_controller::serve`'s doc comment for why), so this is
+    /// how a newly enrolled gateway reaches every OTHER already-connected
+    /// gateway's still-open `Sync.Watch` stream as an incremental `Delta`
+    /// instead of requiring a reconnect. Shared with `SyncSvc` via the same
+    /// `broadcast::Sender` constructed once in `serve()`.
+    change_tx: broadcast::Sender<ChangeEvent>,
 }
 
 impl EnrollmentSvc {
-    pub fn new(db: DbHandle, trust: Arc<dyn CertificateIssuer>) -> Self {
-        Self { db, trust }
+    pub fn new(
+        db: DbHandle,
+        trust: Arc<dyn CertificateIssuer>,
+        change_tx: broadcast::Sender<ChangeEvent>,
+    ) -> Self {
+        Self { db, trust, change_tx }
     }
 }
 
@@ -123,7 +137,7 @@ impl Enrollment for EnrollmentSvc {
                 secret_hash_hex,
                 TOKEN_KIND_GATEWAY.to_string(),
                 cidrs,
-                gateway_name,
+                gateway_name.clone(),
                 issued.serial.clone(),
                 issued.handle.clone(),
                 not_after,
@@ -145,6 +159,48 @@ impl Enrollment for EnrollmentSvc {
                 EnrollError::Other(e) => Status::internal(format!("enrollment failed: {e}")),
             });
         }
+
+        // Projection-affecting mutation succeeded (and its transaction
+        // already bumped the persisted revision — see
+        // `Db::enroll_gateway`'s doc comment). Publish a `ChangeEvent` so
+        // every OTHER already-connected gateway's open `Sync.Watch` stream
+        // learns about this new peer without needing to reconnect.
+        //
+        // Re-reads the just-inserted gateway's identity/cidrs/revision
+        // through the same DB handle rather than threading extra return
+        // values through `EnrollOutcome`: `find_gateway_by_name` and
+        // `cidrs_for_segment` already exist for exactly this shape of
+        // lookup (the Sync projection uses them the same way), and the
+        // gateway is guaranteed to exist (this same call just created it).
+        let identity = self
+            .db
+            .find_gateway_by_name(gateway_name.clone())
+            .await
+            .map_err(|e| Status::internal(format!("re-reading enrolled gateway: {e}")))?
+            .ok_or_else(|| {
+                Status::internal(format!(
+                    "enrolled gateway {gateway_name:?} vanished immediately after enrollment"
+                ))
+            })?;
+        let allowed_ips = self
+            .db
+            .cidrs_for_segment(identity.segment_id)
+            .await
+            .map_err(|e| Status::internal(format!("reading enrolled gateway's segment cidrs: {e}")))?;
+        let revision = self
+            .db
+            .current_revision()
+            .await
+            .map_err(|e| Status::internal(format!("reading revision after enrollment: {e}")))?;
+        // `send` errors only when there are currently no `Sync.Watch`
+        // subscribers (e.g. the very first gateway enrolling into a fresh
+        // controller) — nobody to notify, which is not a failure.
+        let _ = self.change_tx.send(ChangeEvent {
+            new_gateway_id: identity.id,
+            segment_name: identity.segment_name,
+            allowed_ips,
+            revision,
+        });
 
         let ca_bundle_pem = self
             .trust

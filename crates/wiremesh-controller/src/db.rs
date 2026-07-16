@@ -51,12 +51,19 @@ CREATE TABLE cidr (
 );
 
 CREATE TABLE gateway (
-    id         INTEGER PRIMARY KEY,
-    segment_id INTEGER NOT NULL REFERENCES segment(id),
-    name       TEXT NOT NULL UNIQUE,
-    status     TEXT NOT NULL,
-    backend    TEXT NOT NULL,
-    last_seen  TEXT
+    id              INTEGER PRIMARY KEY,
+    segment_id      INTEGER NOT NULL REFERENCES segment(id),
+    name            TEXT NOT NULL UNIQUE,
+    status          TEXT NOT NULL,
+    backend         TEXT NOT NULL,
+    last_seen       TEXT,
+    -- Last policy version this gateway acked via `Sync.Report` (Task 8).
+    -- NULL until the gateway's first Report call. The full `policy_status`
+    -- history table above already exists for a later task's ack-log
+    -- surfacing (`fabricctl policy status`); this column is the minimal
+    -- "does the controller know what this gateway last applied" fact T8
+    -- needs today.
+    applied_version INTEGER
 );
 
 CREATE TABLE gateway_key (
@@ -703,6 +710,27 @@ impl Db {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// Records the policy version `gateway_id` has applied and acked via
+    /// `Sync.Report` (Task 8) — just the `gateway.applied_version` column;
+    /// the richer `policy_status` history table is a later task's scope
+    /// (this task's brief only requires the controller remember each
+    /// gateway's last-applied version). Errors if `gateway_id` doesn't
+    /// exist (the caller already resolved it from the mTLS peer cert, so
+    /// that should never happen in practice).
+    pub fn set_applied_version(&self, gateway_id: i64, applied_version: u64) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE gateway SET applied_version = ?1 WHERE id = ?2",
+            params![applied_version as i64, gateway_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!(
+                "Report: no gateway row with id {gateway_id} to record applied_version on"
+            );
+        }
+        Ok(())
     }
 
     /// Resolves an enrolled gateway by its `gateway.name` — the same value

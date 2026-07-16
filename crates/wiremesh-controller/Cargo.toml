@@ -15,8 +15,9 @@ wiremesh-proto = { path = "../wiremesh-proto" }
 wiremesh-trust = { path = "../wiremesh-trust" }
 # UnixListenerStream — feeds a UnixListener's accept loop into tonic's
 # serve_with_incoming_shutdown as a Stream (tonic's Server has no built-in
-# UDS incoming type).
-tokio-stream = { version = "0.1", features = ["net"] }
+# UDS incoming type). "sync" additionally pulls in BroadcastStream (Task 8's
+# Sync delta fan-out: wraps a `tokio::sync::broadcast::Receiver` as a Stream).
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
 sha2 = "0.10"
 rand = "0.8"
 # Only used to decode the CA's PEM cert body back to DER so the root
