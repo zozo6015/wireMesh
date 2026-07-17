@@ -168,3 +168,101 @@ fn probe_attaches_ebpf_and_applies_empty_policy_on_wg0() {
 
     drop(lab);
 }
+
+/// Task 7 review finding (Important): `EbpfEnforcer` discards the `LinkId`s
+/// its two tc-classifier `.attach()` calls return and has no `Drop` impl of
+/// its own -- so whether dropping an `Enforcer` actually detaches the tc
+/// classifier (clean teardown) or leaks it in the kernel was unverified.
+/// Task 8's reload path (drop the current `Enforcer`, then `probe()` the
+/// same still-live iface again) depends on the answer either way. This test
+/// investigates empirically rather than assuming:
+///
+///  1. `probe("wg0")`, `apply()` an EMPTY policy (default-deny -- the same
+///     already-proven-observable mechanism
+///     `spike/enforcer/enforcer/tests/enforce.rs`'s
+///     `default_deny_drops_overlay_ping_and_counts` uses): ping a->b must
+///     now FAIL, confirming enforcement is live.
+///  2. `drop()` the first `Enforcer`, then -- the STRONGEST form, attempted
+///     per the brief rather than skipped -- ping a->b BEFORE re-probing:
+///     if the tc classifier was cleanly detached on drop, default-deny is
+///     gone and ping should SUCCEED again; if it's still blocked, the
+///     attachment outlived the Rust value that "owned" it. Logged via
+///     `eprintln!` either way (not asserted on) -- see the note below on
+///     why this is observation, not a pass/fail gate.
+///  3. `probe("wg0")` a SECOND time, on the same live iface, must still
+///     succeed (Task 8's exact dependency) and `apply()` on the new handle
+///     must succeed and actively re-enforce default-deny (ping fails
+///     again) -- true regardless of what step 2 found, since a leaked
+///     first attachment would at worst stack with the second, not prevent
+///     it from also denying.
+///
+/// Deliberately not a hard assertion on step 2's outcome: this is a real
+/// open question about aya's tc attach semantics on this kernel (legacy
+/// netlink tc filters historically outlive the loader process; the design
+/// doc's §6 mentions the newer TCX link API on >= 6.6 kernels, which DOES
+/// tie attachment lifetime to an open link fd -- this container's kernel is
+/// 6.12.x) that this test is designed to answer by running it, not to
+/// enforce a predetermined answer -- per CLAUDE.md, a "failing" behavior
+/// here would be a real finding about the design, investigated and
+/// recorded, not a test to weaken until it's green. Steps 1 and 3 (the
+/// re-probe-succeeds contract Task 8 needs) ARE hard assertions.
+#[test]
+fn dropping_enforcer_detaches_and_allows_reprobe_on_same_iface() {
+    let (lab, a, b) = wg_lab();
+    join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
+
+    // Sanity: the kernel-WG tunnel alone (no enforcer attached yet) passes ICMP.
+    assert!(
+        a.exec(&["ping", "-c", "1", "-W", "3", "10.10.0.2"]).is_ok(),
+        "overlay ping should work before any enforcer is attached"
+    );
+
+    let empty_ir = wiremesh_policy::PolicyIR {
+        schema: 1,
+        version: 0,
+        blocks: vec![],
+    };
+
+    // --- First instance: attach + default-deny, confirm it's live. ---
+    let mut enforcer1 =
+        wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+            .expect("first probe should load + attach eBPF on wg0");
+    enforcer1
+        .apply(&empty_ir)
+        .expect("apply of an empty policy IR should succeed on the first instance");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        a.exec(&["ping", "-c", "2", "-W", "2", "10.10.0.2"]).is_err(),
+        "default-deny from the first Enforcer instance should block ping"
+    );
+
+    // --- Drop it, then observe whether the tc attachment actually went away. ---
+    drop(enforcer1);
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let ping_after_drop = a.exec(&["ping", "-c", "2", "-W", "2", "10.10.0.2"]);
+    eprintln!(
+        "dropping_enforcer_detaches_and_allows_reprobe_on_same_iface: ping after drop, \
+         before re-probe: {}",
+        if ping_after_drop.is_ok() {
+            "SUCCEEDED -- tc classifier appears to have cleanly detached on Drop"
+        } else {
+            "still BLOCKED -- tc attachment outlived Drop (leaked); Task 8's reload path \
+             will need an explicit detach, not just letting the Enforcer fall out of scope"
+        }
+    );
+
+    // --- Re-probe the SAME live iface: Task 8's exact dependency. ---
+    let mut enforcer2 =
+        wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+            .expect("re-probe on the same iface after dropping the first instance must succeed");
+    enforcer2
+        .apply(&empty_ir)
+        .expect("apply on the re-probed instance must succeed");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    assert!(
+        a.exec(&["ping", "-c", "2", "-W", "2", "10.10.0.2"]).is_err(),
+        "default-deny from the SECOND Enforcer instance should block ping again"
+    );
+
+    drop(lab);
+}
