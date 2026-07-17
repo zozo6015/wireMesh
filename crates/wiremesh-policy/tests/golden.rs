@@ -136,6 +136,40 @@ fn ports_with_proto_omitted_is_a_compile_error() {
 }
 
 #[test]
+fn invalid_proto_without_ports_is_a_compile_error() {
+    // Follow-up finding from the Task 2 implementer: `proto: sctp` (or any
+    // value other than tcp|udp|icmp|absent) with NO `ports:` was passing
+    // `parse_policy` — `validate_ports` only checked `proto` inside its
+    // ports-present branch — and then panicking `compile()`'s
+    // `unreachable!()`. Decided behavior: invalid `proto` is a
+    // `CompileError` from `parse_policy` unconditionally, so `compile()`
+    // may keep assuming validity.
+    let errors = expect_errors(include_str!("fixtures/invalid_proto_no_ports.yaml"));
+    assert_eq!(errors.len(), 1, "errors: {errors:?}");
+    assert_eq!(errors[0].block, Some(0));
+    assert_eq!(errors[0].rule, Some(0));
+    assert!(
+        errors[0].msg.to_lowercase().contains("proto"),
+        "msg: {}",
+        errors[0].msg
+    );
+}
+
+#[test]
+fn valid_proto_values_without_ports_still_parse_ok() {
+    // Companion to the test above: tcp/udp/icmp/omitted must still parse
+    // fine with no `ports:` present — the fix for the invalid-proto gap
+    // must not overcorrect into rejecting these too.
+    let yaml = include_str!("fixtures/valid_proto_no_ports.yaml");
+    let result = parse_policy(yaml, &segments());
+    assert!(
+        result.is_ok(),
+        "tcp/udp/icmp/omitted proto with no ports should still parse, got {:?}",
+        result.err()
+    );
+}
+
+#[test]
 fn malformed_cidr_is_a_compile_error() {
     let errors = expect_errors(include_str!("fixtures/malformed_cidr.yaml"));
     assert_eq!(errors.len(), 1, "errors: {errors:?}");
