@@ -126,3 +126,24 @@ pub fn probe(iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforce
         ))),
     }
 }
+
+/// Task 12, Step 1 (test author) scaffold: a forced-choice counterpart to
+/// [`probe`], used ONLY by `tests/nft_backend.rs` to drive the nftables
+/// backend deterministically without depending on `probe`'s real "eBPF
+/// attempt, then nftables fallback" branching (which Step 3, the
+/// implementer, still owns) or on any env var / knob to defeat eBPF's
+/// availability in the privileged dev container (where eBPF always
+/// succeeds). Per `.superpowers/sdd/task-12-brief.md`'s Interfaces section:
+/// "an env/knob-free forced choice for tests: `probe_with(BackendKind, ...)`".
+///
+/// `todo!()` body is allowed scaffold (not implementation) — Step 3 fills
+/// this in for real (`Ebpf => probe`'s existing eBPF-only path;
+/// `Nftables => NftEnforcer::new(iface, cfg)`, once that type exists) and
+/// most likely re-expresses `probe` itself in terms of this function's
+/// `Nftables` arm for its fallback branch. Every test in
+/// `tests/nft_backend.rs` calls `probe_with(BackendKind::Nftables, ..)`
+/// and panics here (RED) until then.
+pub fn probe_with(kind: BackendKind, iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforcer>> {
+    let _ = (kind, iface, cfg);
+    todo!("Task 12 Step 3: BackendKind::Ebpf -> probe's existing path; BackendKind::Nftables -> NftEnforcer::new")
+}
