@@ -119,13 +119,16 @@ struct GenerationState {
     /// on. `Some` after every subsequent flip.
     pending_reap: Option<PendingReap>,
     /// Per-`rule_id` hit counts folded out of `COUNTERS[0..old_len)` by
-    /// [`fold_and_reset_counters`] at the START of every `apply()` (using
-    /// the OLD, about-to-be-superseded `idx_to_rule_id` mapping), before
-    /// that idx range gets zeroed and re-homed to the new generation's
-    /// rules. `counters()` sums this with the CURRENT generation's live
-    /// `COUNTERS` reads so a rule's total survives being shifted to a new
-    /// idx by a later `apply()`, keyed by its stable `rule_id` rather than
-    /// its position.
+    /// [`fold_and_reset_counters`], called immediately before every
+    /// `apply()`'s `ACTIVE` flip (using the OLD, about-to-be-superseded
+    /// `idx_to_rule_id` mapping), before that idx range gets zeroed and
+    /// re-homed to the new generation's rules. `counters()` sums this with
+    /// the CURRENT generation's live `COUNTERS` reads so a rule's total
+    /// survives being shifted to a new idx by a later `apply()`, keyed by
+    /// its stable `rule_id` rather than its position. [`prune_retired_counters`]
+    /// removes an entry the moment its rule_id is no longer present in a
+    /// new generation — a rule's counter survives being MOVED, not being
+    /// DELETED; this map is bounded at ≤ `MAX_RULES` entries as a result.
     counter_accum: BTreeMap<String, u64>,
     /// Same idea as `counter_accum`, for the single default-deny slot
     /// (`COUNTERS[MAX_RULES]`). Default-deny isn't actually subject to the
@@ -263,6 +266,16 @@ impl Enforcer for EbpfEnforcer {
     /// therefore reflects a rule's FULL history across `apply()` calls,
     /// not just whatever raw count currently sits at its (possibly brand
     /// new, possibly reused-from-a-different-rule) current idx.
+    ///
+    /// **Survival semantics** (re-review finding, coordinator-relayed):
+    /// this survival guarantee is for rules PRESENT in the current policy
+    /// across an `apply()` — a rule whose idx moves keeps its history. It
+    /// is NOT a promise that a REMOVED rule's history is kept forever:
+    /// [`prune_retired_counters`] drops a `counter_accum` entry the moment
+    /// its `rule_id` no longer appears in the applied policy, so
+    /// `by_rule` never reports a stale entry for a rule that's gone —
+    /// consistent with nft named-counter semantics, where a counter tied
+    /// to a deleted rule doesn't outlive it.
     fn counters(&mut self) -> Result<Counters> {
         let counters: Array<&MapData, u64> =
             Array::try_from(self.ebpf.map("COUNTERS").context("COUNTERS")?)?;
@@ -500,18 +513,41 @@ fn install_generation(
 /// it can't leak into whatever new rule the CURRENT `apply()` assigns to
 /// that idx.
 ///
+/// **Call-site timing is load-bearing** (re-review finding, coordinator-
+/// relayed): this must run AFTER `install_generation` succeeds and
+/// IMMEDIATELY before the `ACTIVE` flip — not at the top of `apply()`,
+/// before `install_generation` runs. `ACTIVE` still points at the OLD
+/// generation for this whole function's duration (the flip hasn't
+/// happened yet), so a packet can still match the old generation's rule at
+/// idx `i` and increment `COUNTERS[i]` at any point before this function
+/// zeroes it. Running this fold BEFORE `install_generation` (the original,
+/// since-corrected placement) left that window open for
+/// `install_generation`'s ENTIRE duration — standalone LPM trie/`Array`
+/// creation and population, which scales with policy size, not a fixed
+/// cost — during which any such hit would survive the zeroing (since it
+/// happened after) and then, once `gen.idx_to_rule_id` is published to the
+/// NEW mapping and the flip completes, get silently MISATTRIBUTED to
+/// whatever new rule `counters()` finds at that same idx — worse than a
+/// mere undercount. Calling this immediately before the flip instead (with
+/// `gen.idx_to_rule_id` only overwritten to the new mapping AFTER the flip,
+/// in `apply_generation`) bounds the exposure to this function's OWN
+/// O(`reset_len`) duration (a fixed-size loop over map reads/writes, not
+/// install cost) plus the single subsequent `ACTIVE` write: for the LAST
+/// slot this loop touches, the residual window really is just that one
+/// flip write; for earlier slots in the loop, it's that same flip write
+/// plus whatever loop iterations remain after them — still bounded and
+/// small, never install-cost-sized.
+///
 /// **Known, accepted, bounded race** (documented per the coordinator's
-/// review): a packet can still match the OLD (still-active — `ACTIVE`
-/// hasn't flipped yet at this point in `apply_generation`) generation's
-/// rule at idx `i` in the narrow window between this function reading
-/// `COUNTERS[i]` and zeroing it. Such an increment is lost rather than
-/// folded (the read-then-immediate-zero-per-slot loop below, rather than
-/// reading the whole range THEN zeroing the whole range, minimizes this
-/// window to a single map read + write per slot instead of exposing the
-/// whole `reset_len` range at once). This is an accepted, bounded
-/// undercount, not eliminated — the coordinator's explicit call given the
-/// design's existing "10s reap grace" tolerance for similar small
-/// in-flight windows elsewhere in this same atomic-flip design.
+/// review, now describing the ACTUAL residual window above rather than
+/// overstating a single read+write in isolation): a packet landing in that
+/// window increments a just-zeroed slot whose OLD meaning has already been
+/// folded away; that increment is lost rather than folded — an accepted
+/// undercount, not eliminated, matching the design's existing "10s reap
+/// grace" tolerance for similarly small in-flight windows elsewhere in
+/// this same atomic-flip design. The read-then-immediate-zero-per-slot
+/// loop below (rather than reading the whole range then zeroing the whole
+/// range) keeps this as tight as the mechanism allows.
 fn fold_and_reset_counters(ebpf: &mut Ebpf, gen: &mut GenerationState, new_len: usize) -> Result<()> {
     let old_len = gen.idx_to_rule_id.len();
     let reset_len = old_len.max(new_len).min(MAX_RULES);
@@ -541,6 +577,38 @@ fn fold_and_reset_counters(ebpf: &mut Ebpf, gen: &mut GenerationState, new_len: 
     }
 
     Ok(())
+}
+
+/// Drops every `gen.counter_accum` entry whose `rule_id` is NOT present in
+/// `new_idx_to_rule_id` (the mapping about to become live) — a rule
+/// removed entirely from the policy stops appearing in `counters().by_rule`
+/// rather than keeping an ever-stale counter around forever.
+///
+/// Task 8 re-review finding (coordinator-relayed, RED-locked by
+/// `tests/generations.rs`'s `counters_for_removed_rules_are_pruned_at_apply`):
+/// [`fold_and_reset_counters`] makes a rule's counter survive being
+/// RE-HOMED to a different idx across an `apply()`, but `counter_accum`
+/// itself was never pruned, so a rule that's REMOVED entirely kept
+/// accumulating a phantom entry forever — unbounded growth over a
+/// gateway's whole policy-edit history, and a deleted rule's counter
+/// staying visible indefinitely. This is consistent with nft named-counter
+/// semantics (a counter tied to a deleted rule doesn't outlive it) and
+/// doesn't weaken the survival guarantee: that guarantee only ever covers
+/// rules PRESENT in the current policy across an update (their counter
+/// must not reset just because their idx moved), never a promise that a
+/// deleted rule's history is kept forever. `default_deny_accum` is never
+/// pruned — it isn't tied to any specific rule_id, so it's always current
+/// by construction.
+///
+/// Call this AFTER `fold_and_reset_counters` (so a just-removed rule's
+/// final pre-removal count is folded in first) and it bounds
+/// `counter_accum` at ≤ `MAX_RULES` entries (one per rule_id that could
+/// possibly exist in `new_idx_to_rule_id`, which itself never exceeds
+/// `MAX_RULES`).
+fn prune_retired_counters(gen: &mut GenerationState, new_idx_to_rule_id: &[String]) {
+    let live: std::collections::BTreeSet<&str> =
+        new_idx_to_rule_id.iter().map(String::as_str).collect();
+    gen.counter_accum.retain(|rule_id, _| live.contains(rule_id.as_str()));
 }
 
 /// Builds a fresh generation from `flat` and installs it via a single
@@ -579,19 +647,27 @@ fn apply_generation(ebpf: &mut Ebpf, flat: &[FlatRule], gen: &mut GenerationStat
         }
     }
 
-    // Fold the CURRENT (about-to-be-superseded) generation's per-idx
-    // counters into `gen`'s stable-by-rule_id accumulators, then zero those
-    // slots, BEFORE this generation's idx→rule_id mapping is overwritten
-    // below. Must happen before `build_rules`/`gen.idx_to_rule_id = ...` —
-    // see `fold_and_reset_counters`'s doc comment for why (positional-idx
-    // reuse across `apply()` calls, the Task 8 review finding).
-    fold_and_reset_counters(ebpf, gen, flat.len())?;
-
     let (rules, idx_to_rule_id) = build_rules(flat);
     let src_entries = build_lpm_entries(flat, Side::Src);
     let dst_entries = build_lpm_entries(flat, Side::Dst);
 
     install_generation(ebpf, target, &src_entries, &dst_entries, &rules)?;
+
+    // Fold the CURRENT (about-to-be-superseded, but STILL ACTIVE until the
+    // flip a few lines below) generation's per-idx counters into `gen`'s
+    // stable-by-rule_id accumulators, zero those slots, then prune any
+    // accumulator entry for a rule_id that isn't in the NEW mapping (a
+    // removed rule's history is dropped, not kept forever — see
+    // `prune_retired_counters`'s doc comment). Deliberately placed HERE —
+    // immediately before the flip, after `install_generation` has already
+    // done its (policy-size-dependent, non-trivial) work — rather than at
+    // the top of this function: see `fold_and_reset_counters`'s doc comment
+    // for why call-site timing is load-bearing (a re-review finding). Both
+    // calls use `gen.idx_to_rule_id`, which still holds the OLD mapping —
+    // it is deliberately NOT overwritten to `idx_to_rule_id` (the new
+    // mapping) until after the flip below.
+    fold_and_reset_counters(ebpf, gen, flat.len())?;
+    prune_retired_counters(gen, &idx_to_rule_id);
 
     {
         let mut active: Array<&mut MapData, u32> =
@@ -600,7 +676,7 @@ fn apply_generation(ebpf: &mut Ebpf, flat: &[FlatRule], gen: &mut GenerationStat
     }
 
     gen.pending_reap = Some(PendingReap { slot: active_now, flipped_at: Instant::now() });
-    gen.idx_to_rule_id = idx_to_rule_id;
+    gen.idx_to_rule_id = idx_to_rule_id; // published only now, AFTER the flip
 
     Ok(())
 }
