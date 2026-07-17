@@ -15,8 +15,13 @@
 //! therefore takes `segments: &[SegmentDef]` as a second argument, and does
 //! parsing (`dsl.rs`) and validation (`validate.rs`) in one pure call.
 
+mod compile;
 mod dsl;
+mod ir;
 mod validate;
+
+pub use compile::{compile, rule_id};
+pub use ir::{IrAction, IrBlock, IrProto, IrRule, PolicyIR};
 
 use std::fmt;
 

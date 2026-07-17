@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# `PolicyIR::from_json` (ir.rs, Task 2) returns `anyhow::Result`.
+anyhow = { workspace = true }
 # `PolicyDoc`/`BlockSrc`/`RuleSrc`/`RuleBody` (dsl.rs, Task 1 Step 3) derive
 # `Deserialize` off this.
 serde = { workspace = true }

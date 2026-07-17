@@ -1825,6 +1825,7 @@ dependencies = [
 name = "wiremesh-policy"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "ipnet",
  "serde",
  "serde_yaml",

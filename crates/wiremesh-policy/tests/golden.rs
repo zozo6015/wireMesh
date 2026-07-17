@@ -13,7 +13,9 @@
 //! implementer's (Task 1 Step 3) to choose, as long as it says what these
 //! substrings say it must.
 
-use wiremesh_policy::{parse_policy, CompileError, SegmentDef};
+use wiremesh_policy::{
+    compile, parse_policy, rule_id, CompileError, IrAction, IrProto, IrRule, PolicyIR, SegmentDef,
+};
 
 /// The fixed segment table every fixture in this file is validated
 /// against: three non-overlapping /16s plus one wider /12, named so
@@ -304,5 +306,161 @@ fn multiple_independent_errors_are_all_collected() {
         errors[2].msg.contains("ports require proto tcp|udp"),
         "msg: {}",
         errors[2].msg
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Task 2 — IR types, canonical JSON, `rule_id`, `compile()` (design §5 /
+// D-C3-1 / D-C3-3). Segment table below is distinct from `segments()`
+// above: names/CIDRs match the master spec §5.1 worked example and the
+// policy-pipeline design doc's §5 "concretized" IR example
+// (proxmox-lab -> aws-prod), not Task 1's seg-a/b/c error-class fixtures.
+// ---------------------------------------------------------------------------
+
+/// The segment table the design-§5 example (and its rule_id-stability
+/// variants) validate against: `proxmox-lab` / `aws-prod`, CIDRs taken
+/// directly from the design doc's §5 concretized IR example so this
+/// fixture's expected `src_cidrs`/`dst_cidrs` match it exactly.
+fn ir_segments() -> Vec<SegmentDef> {
+    vec![
+        SegmentDef {
+            name: "proxmox-lab".into(),
+            cidrs: vec!["10.10.0.0/16".parse().unwrap()],
+        },
+        SegmentDef {
+            name: "aws-prod".into(),
+            cidrs: vec!["172.16.0.0/12".parse().unwrap()],
+        },
+    ]
+}
+
+/// Parses `yaml` against [`ir_segments`] and compiles it at `version`,
+/// panicking with full detail on either failure. Every fixture used in
+/// this section is expected to be valid — Task 1's `golden.rs` tests above
+/// already cover the error paths, so failures here are unconditionally a
+/// test bug or a real regression, never an expected-error case.
+fn compile_ok(yaml: &str, version: u64) -> PolicyIR {
+    let src = parse_policy(yaml, &ir_segments())
+        .unwrap_or_else(|errors| panic!("expected valid policy, got errors: {errors:?}"));
+    compile(&src, &ir_segments(), version)
+        .unwrap_or_else(|errors| panic!("expected compile to succeed, got errors: {errors:?}"))
+}
+
+/// (a) The design-§5 example DSL compiles to the exact expected IR JSON,
+/// byte-compared against `to_canonical_json()`. The fixture's `rule_id`
+/// values were hand-derived per the brief's exact hash recipe (first 8
+/// bytes of sha256 of the normalized-field preimage string, hex) — see
+/// `task-2-tests-report.md` for the literal preimage strings hashed. This
+/// is the one test in this file that pins those literal hex values; every
+/// other rule_id-related test below is a relative (equal/not-equal)
+/// comparison instead.
+#[test]
+fn design_s5_example_compiles_to_exact_canonical_json() {
+    let yaml = include_str!("fixtures/design_s5_example.yaml");
+    let ir = compile_ok(yaml, 42);
+    let expected = include_str!("fixtures/design_s5_example.ir.json");
+    assert_eq!(ir.to_canonical_json(), expected);
+}
+
+/// (b) Compiling the same source against the same segment table twice
+/// produces byte-identical canonical JSON (design §4's determinism
+/// guarantee: "two compiles of the same source produce byte-identical
+/// JSON").
+#[test]
+fn compiling_twice_is_byte_identical() {
+    let yaml = include_str!("fixtures/design_s5_example.yaml");
+    let first = compile_ok(yaml, 42).to_canonical_json();
+    let second = compile_ok(yaml, 42).to_canonical_json();
+    assert_eq!(first, second);
+}
+
+/// (c) part 1: `rule_id` is stable under an edit to an *unrelated* rule in
+/// the same block (design D-C3-3: "stable across versions when the rule
+/// text is unchanged"). `rule_id_stable_changed.yaml` edits only the
+/// second rule's port (5432 -> 5433); the first rule's id must be
+/// unaffected, and the edited rule's own id must change.
+#[test]
+fn rule_id_stable_when_unrelated_rule_in_same_block_changes() {
+    let base = compile_ok(include_str!("fixtures/rule_id_stable_base.yaml"), 1);
+    let changed = compile_ok(include_str!("fixtures/rule_id_stable_changed.yaml"), 1);
+
+    assert_eq!(
+        base.blocks[0].rules[0].rule_id, changed.blocks[0].rules[0].rule_id,
+        "unrelated edit to rule 1 must not change rule 0's rule_id"
+    );
+    assert_ne!(
+        base.blocks[0].rules[1].rule_id, changed.blocks[0].rules[1].rule_id,
+        "the edited rule's own rule_id must change"
+    );
+}
+
+/// (c) part 2: the identical rule body placed in a different (from, to)
+/// block pair gets a different `rule_id` — the hash preimage includes
+/// `from`/`to` (design D-C3-3's recipe), so `rule_id` is not just a hash
+/// of the rule body in isolation. Calls `rule_id` directly (no `compile`
+/// needed) since it depends only on its three arguments.
+#[test]
+fn rule_id_differs_across_block_pairs_for_the_same_rule_body() {
+    let rule = IrRule {
+        rule_id: String::new(), // not read by rule_id() — it computes fresh
+        action: IrAction::Deny,
+        proto: IrProto::Tcp,
+        src: vec![],
+        dst: vec![],
+        ports: vec![(22, 22)],
+    };
+
+    let forward = rule_id("proxmox-lab", "aws-prod", &rule);
+    let reversed = rule_id("aws-prod", "proxmox-lab", &rule);
+    assert_ne!(
+        forward, reversed,
+        "the same rule body in a different (from, to) pair must hash differently"
+    );
+}
+
+/// (d) `from_json` rejects a document declaring an unsupported `schema`
+/// (this crate currently only produces/accepts `1`).
+#[test]
+fn from_json_rejects_unsupported_schema() {
+    let bytes = br#"{"schema":2,"version":1,"blocks":[]}"#;
+    let result = PolicyIR::from_json(bytes);
+    assert!(
+        result.is_err(),
+        "schema: 2 must be rejected, got {result:?}"
+    );
+}
+
+/// (e) Omitted `src`/`dst` serialize as `[]` (not omitted, not `null`);
+/// a single DSL port `22` becomes the pair `[22,22]` (not a bare `22`).
+#[test]
+fn omitted_src_dst_and_single_port_serialize_as_expected() {
+    let ir = compile_ok(include_str!("fixtures/design_s5_example.yaml"), 42);
+    let json = ir.to_canonical_json();
+    assert!(
+        json.contains(r#""src":[],"dst":[],"ports":[[22,22]]"#),
+        "expected omitted src/dst as [] and single port 22 as [[22,22]], got: {json}"
+    );
+}
+
+/// (f) `blocks_fingerprint` is the version-independent equality key
+/// (design D-C3-8): equal across two compiles that differ only in
+/// `version`, and different when a rule actually changes.
+#[test]
+fn blocks_fingerprint_ignores_version_but_reflects_rule_changes() {
+    let yaml = include_str!("fixtures/design_s5_example.yaml");
+    let v1 = compile_ok(yaml, 1);
+    let v2 = compile_ok(yaml, 999);
+    assert_eq!(
+        v1.blocks_fingerprint(),
+        v2.blocks_fingerprint(),
+        "fingerprint must not depend on `version`"
+    );
+
+    let base = compile_ok(include_str!("fixtures/rule_id_stable_base.yaml"), 1);
+    let changed = compile_ok(include_str!("fixtures/rule_id_stable_changed.yaml"), 1);
+    assert_ne!(
+        base.blocks_fingerprint(),
+        changed.blocks_fingerprint(),
+        "fingerprint must change when a rule changes"
     );
 }
