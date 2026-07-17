@@ -1,0 +1,47 @@
+# `wiremesh-enforcer-ebpf` — the graduated Phase 0 eBPF-enforcer spike
+# (`spike/enforcer/{enforcer-ebpf,enforcer-common}`), Task 7. STANDALONE
+# workspace: the aya template ships its own `[workspace]` and must not be
+# nested inside the root workspace (same reason every `spike/*` crate is
+# standalone — see CLAUDE.md's "Execution rules" and root `Cargo.toml`'s
+# `exclude = ["crates/wiremesh-enforcer-ebpf", "spike"]`).
+#
+# `common`'s `#[repr(C)]` types (`Rule`/`FlowKey`) and count constants are
+# shared, target-agnostic layout; `program` is the actual `#![no_std]
+# #![no_main]` tc classifier, built ONLY via `aya_build::build_ebpf` from the
+# sibling `crates/wiremesh-enforcer` crate's `build.rs` (cross-compiled to
+# the `bpfel-unknown-none` target on the nightly toolchain + `bpf-linker`) —
+# never via a plain `cargo build` in this workspace, which is why `program`
+# is excluded from `default-members` below (its `[lib]` target is a trivial
+# `#![no_std]` stub that compiles on the host purely so it can be named as a
+# path build-dependency for cargo's own change-tracking; its real logic
+# lives behind its `[[bin]]` target, which only `aya_build` ever builds).
+[workspace]
+resolver = "2"
+members = [
+    "common",
+    "program",
+]
+default-members = ["common"]
+
+[workspace.package]
+license = "Apache-2.0"
+edition = "2024"
+
+[workspace.dependencies]
+aya = { version = "0.14.0", default-features = false }
+aya-build = { version = "0.2.0", default-features = false }
+aya-ebpf = { version = "0.2.1", default-features = false }
+aya-log = { version = "0.3.0", default-features = false }
+aya-log-ebpf = { version = "0.2.0", default-features = false }
+
+anyhow = { version = "1", default-features = false }
+cargo_metadata = { version = "0.23.0", default-features = false }
+which = { version = "6.0.0", default-features = false }
+
+# Mirrors `spike/enforcer/Cargo.toml`'s `[profile.release.package.enforcer-ebpf]`
+# (debug info for BTF/verifier diagnostics; single codegen unit + no strip so
+# `bpf-linker` sees a whole, unstripped module to link).
+[profile.release.package.wiremesh-enforcer-program]
+debug = 2
+codegen-units = 1
+strip = false

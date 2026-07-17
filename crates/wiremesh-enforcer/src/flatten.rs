@@ -23,8 +23,7 @@
 //!    (design §6: "the controller rejects at compile time, not the gateway
 //!    at load time").
 //!
-//! Task 7 Step 1 (test author) skeleton: `flatten`'s body is `todo!()` — no
-//! real logic. Step 3 (implementer) fills it in.
+//! Task 7 Step 3 (implementer): implemented below.
 
 use ipnet::Ipv4Net;
 use wiremesh_policy::{IrAction, IrProto, PolicyIR};
@@ -52,13 +51,84 @@ pub struct FlatRule {
     pub port_hi: u16,
 }
 
+/// Parses a slice of normalized CIDR strings (as [`wiremesh_policy::IrBlock`]/
+/// [`wiremesh_policy::IrRule`] carry them) into [`Ipv4Net`]s. `wiremesh-policy`
+/// guarantees every entry it hands out already parsed successfully once (at
+/// `parse_policy`/`compile` time) — a failure here would mean `wiremesh-policy`
+/// handed out a malformed string, which is a bug in that crate, not a normal
+/// `flatten` error path.
+fn parse_cidrs(raw: &[String]) -> anyhow::Result<Vec<Ipv4Net>> {
+    raw.iter()
+        .map(|s| {
+            s.parse::<Ipv4Net>()
+                .map_err(|e| anyhow::anyhow!("wiremesh-policy handed flatten an invalid CIDR '{s}': {e}"))
+        })
+        .collect()
+}
+
 /// Flattens `ir` per the module-level contract above. `Err` if the resulting
 /// list would exceed [`MAX_RULES`] entries.
 pub fn flatten(ir: &PolicyIR) -> anyhow::Result<Vec<FlatRule>> {
-    let _ = ir;
-    todo!(
-        "Task 7 Step 3: flatten PolicyIR into Vec<FlatRule> — block order, \
-         block-CIDR fallback for empty rule src/dst, port explosion sharing \
-         rule_id, Err if > MAX_RULES ({MAX_RULES})"
-    )
+    let mut flat = Vec::new();
+
+    for block in &ir.blocks {
+        let block_src_cidrs = parse_cidrs(&block.src_cidrs)?;
+        let block_dst_cidrs = parse_cidrs(&block.dst_cidrs)?;
+
+        for rule in &block.rules {
+            let src_cidrs = if rule.src.is_empty() {
+                block_src_cidrs.clone()
+            } else {
+                parse_cidrs(&rule.src)?
+            };
+            let dst_cidrs = if rule.dst.is_empty() {
+                block_dst_cidrs.clone()
+            } else {
+                parse_cidrs(&rule.dst)?
+            };
+
+            // No `ports:` at all -> exactly one FlatRule, "(0,0) = any"
+            // (module doc / brief). Otherwise one FlatRule per port range,
+            // all sharing this rule's `rule_id`.
+            if rule.ports.is_empty() {
+                flat.push(FlatRule {
+                    idx: 0, // fixed up below, once the final length is known
+                    rule_id: rule.rule_id.clone(),
+                    action: rule.action.clone(),
+                    proto: rule.proto.clone(),
+                    src_cidrs: src_cidrs.clone(),
+                    dst_cidrs: dst_cidrs.clone(),
+                    port_lo: 0,
+                    port_hi: 0,
+                });
+            } else {
+                for &(port_lo, port_hi) in &rule.ports {
+                    flat.push(FlatRule {
+                        idx: 0,
+                        rule_id: rule.rule_id.clone(),
+                        action: rule.action.clone(),
+                        proto: rule.proto.clone(),
+                        src_cidrs: src_cidrs.clone(),
+                        dst_cidrs: dst_cidrs.clone(),
+                        port_lo,
+                        port_hi,
+                    });
+                }
+            }
+        }
+    }
+
+    if flat.len() > MAX_RULES {
+        anyhow::bail!(
+            "policy flattens to {} rules, exceeding the {MAX_RULES}-rule limit \
+             (MAX_RULES)",
+            flat.len()
+        );
+    }
+
+    for (i, f) in flat.iter_mut().enumerate() {
+        f.idx = i as u32;
+    }
+
+    Ok(flat)
 }

@@ -13,6 +13,16 @@ use crate::{CompileError, PolicySource, SegmentDef};
 use ipnet::Ipv4Net;
 use sha2::{Digest, Sha256};
 
+/// The max-rules-per-policy limit (design §6: "the controller rejects at
+/// compile time what the gateway would reject at eBPF-load time"). Must be
+/// kept numerically equal to `wiremesh_enforcer::flatten::MAX_RULES` — that
+/// crate cannot be depended on here (it depends on `wiremesh-policy`, not
+/// the other way around), so the constant is duplicated rather than shared;
+/// this is the compile-time half of the check, `flatten`'s is the
+/// (redundant, defense-in-depth) load-time half a gateway would hit if this
+/// guard were ever bypassed.
+const MAX_RULES: usize = 256;
+
 /// Compiles `src` (already validated against `segments` by
 /// [`crate::parse_policy`]) into a [`PolicyIR`] tagged with `version`.
 /// Design §4's determinism guarantee: two calls with the same `src` and
@@ -90,6 +100,28 @@ pub fn compile(
             dst_cidrs,
             rules,
         });
+    }
+
+    // Flattened-rule-count guard (design §6): a rule with no `ports` becomes
+    // exactly one eBPF-table entry ("(0,0) = any", the same convention
+    // `wiremesh_enforcer::flatten` uses); a rule with k port ranges explodes
+    // into k entries sharing one `rule_id`. Reject here — at compile time —
+    // whatever total would blow the eBPF table's MAX_RULES budget at load
+    // time, so a bad policy never even reaches a gateway.
+    let flattened_count: usize = blocks
+        .iter()
+        .flat_map(|b| &b.rules)
+        .map(|r| r.ports.len().max(1))
+        .sum();
+    if flattened_count > MAX_RULES {
+        return Err(vec![CompileError {
+            block: None,
+            rule: None,
+            msg: format!(
+                "policy flattens to {flattened_count} rules, exceeding the \
+                 {MAX_RULES}-rule limit (MAX_RULES; see wiremesh_enforcer::flatten::MAX_RULES)"
+            ),
+        }]);
     }
 
     Ok(PolicyIR {

@@ -13,18 +13,45 @@ anyhow = { workspace = true }
 # `FlatRule::src_cidrs`/`dst_cidrs` are `Vec<ipnet::Ipv4Net>` (Task 7 brief;
 # v1 is IPv4-only per design §4, same crate `wiremesh-policy` already uses).
 ipnet = { workspace = true }
-# Deliberately excluded here (Step 3/implementer's concern, per the Task 7
-# brief's skeleton boundary): any `aya`/`aya-build` dependency, and no
-# `build.rs` — those belong to the real eBPF loader (`src/ebpf.rs`) and its
-# sibling `wiremesh-enforcer-ebpf` workspace, neither of which exists yet.
+# `src/ebpf.rs`'s loader: `Ebpf::load`, `tc::qdisc_add_clsact`,
+# `SchedClassifier`/`TcAttachType`, `Array`/`MapData` -- graduated from
+# `spike/enforcer/enforcer/src/main.rs`. Pinned to the same version as the
+# sibling `wiremesh-enforcer-ebpf` workspace's `aya` (not workspace-inherited
+# from the ROOT workspace's `[workspace.dependencies]`, which has no `aya`
+# entry -- only this one crate needs it).
+aya = { version = "0.14.0", default-features = false }
+# `Rule`/`FlowKey` (the `#[repr(C)]` map value types shared with the eBPF
+# `program` crate) plus their `aya::Pod` impls, gated behind the `user`
+# feature (mirrors `spike/enforcer/enforcer/Cargo.toml`'s identical
+# `enforcer-common = { ..., features = ["user"] }`).
+wiremesh-enforcer-common = { path = "../wiremesh-enforcer-ebpf/common", features = ["user"] }
+# `ensure_bpffs` (graduated verbatim from `spike/enforcer/enforcer/src/main.rs:49`):
+# `libc::statfs`/`libc::mount` to detect/mount bpffs at `/sys/fs/bpf`.
+libc = "0.2"
+
+[build-dependencies]
+# `build.rs`: `aya_build::build_ebpf` via `cargo_metadata` pointed at the
+# sibling standalone `wiremesh-enforcer-ebpf` workspace's `program` package
+# (Task 7 brief). Deliberately NOT also a path build-dependency the way
+# `spike/enforcer/enforcer/Cargo.toml`'s `enforcer-ebpf = { path = ... }`
+# is: that crate lived in the SAME workspace as its depender, so declaring
+# it taught cargo's single resolve graph about it. Here, `program` is a
+# member of the SIBLING standalone workspace's OWN `[workspace]` -- `cargo`
+# does not let one workspace pull a package governed by another workspace's
+# `[workspace]` into its own resolve graph as an ordinary dependency (unlike
+# `natlab`, below, which has no `[workspace]` of its own and so is fair game
+# for exactly that). `build.rs` instead changes its own cwd into the sibling
+# workspace's root before invoking `aya_build::build_ebpf`, so its nested
+# `cargo build -p wiremesh-enforcer-program` subprocess resolves the package
+# name (and that workspace's own profile/dependency pins) directly, with no
+# outer dependency declaration needed; `aya_build` emits its own
+# `cargo:rerun-if-changed` for `program`'s directory regardless.
+anyhow = { workspace = true }
+aya-build = { version = "0.2.0", default-features = false }
+cargo_metadata = { version = "0.23.0", default-features = false }
 
 [dev-dependencies]
 # `tests/ebpf_backend.rs`'s inline `wg_lab()` (adapted from
 # `spike/enforcer/enforcer/tests/common/mod.rs`) needs the same two-node
 # veth+netns lab helper the spike tests use.
 natlab = { path = "../../spike/natlab" }
-# `tests/ebpf_backend.rs`'s `join_netns` helper: `libc::setns`/`CLONE_NEWNET`
-# to move the test's (dedicated, per-`#[test]`-fn) OS thread into the lab's
-# `b` network namespace before calling library code in-process — there is no
-# `wiremesh-enforcer` CLI binary the way the spike had one to `ip netns exec`.
-libc = "0.2"

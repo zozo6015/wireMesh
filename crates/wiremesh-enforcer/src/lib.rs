@@ -9,11 +9,12 @@
 //! [`flatten`]) are the pure, shared front half both backends (eBPF now,
 //! nftables fallback) drive from.
 //!
-//! Task 7 Step 1 (test author) skeleton: every function body below is
-//! `todo!()` — no real logic. Step 3 (a separate implementer agent) fills in
-//! `probe`'s eBPF-load-and-attach path (`src/ebpf.rs`, not yet created) and
-//! `flatten`'s real flattening logic (`src/flatten.rs`).
+//! Task 7 Step 3 (implementer): `probe`'s real eBPF-load-and-attach path
+//! lives in `src/ebpf.rs`; `flatten`'s real flattening logic lives in
+//! `src/flatten.rs`. The nftables fallback (Task 12) is the one piece of
+//! `probe`'s documented behavior not yet implemented.
 
+mod ebpf;
 mod flatten;
 
 pub use flatten::{flatten, FlatRule, MAX_RULES};
@@ -106,13 +107,19 @@ pub struct DenyEvent {
 /// if needed"). Returns whichever one actually succeeded, boxed behind the
 /// shared [`Enforcer`] trait.
 ///
-/// Step 1 (test author) skeleton only — Step 3 (implementer) fills in the
-/// real eBPF-load-and-attach path in `src/ebpf.rs` (not yet created) plus
-/// the nftables fallback.
+/// Task 7 (this task) implements the eBPF half only (`src/ebpf.rs`) — an
+/// eBPF load/attach failure is currently returned as-is (with added
+/// context), not silently swallowed into a fallback: the nftables backend
+/// doesn't exist yet. The nftables fallback (Task 12) will change this
+/// function's `Err` path into a second attempt instead of a final one; the
+/// signature (`Result<Box<dyn Enforcer>>`) already accommodates that
+/// without another breaking change.
 pub fn probe(iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforcer>> {
-    let _ = (iface, cfg);
-    todo!(
-        "Task 7 Step 3: probe = try eBPF (load + attach clsact ingress/egress \
-         on `iface`), fall back to nftables on failure (design §6/D-C3-4)"
-    )
+    match ebpf::EbpfEnforcer::new(iface, cfg) {
+        Ok(enforcer) => Ok(Box::new(enforcer)),
+        Err(e) => Err(e.context(format!(
+            "eBPF backend failed to load/attach on {iface}; no nftables fallback available yet \
+             (design §6/D-C3-4 — that lands in Task 12)"
+        ))),
+    }
 }
