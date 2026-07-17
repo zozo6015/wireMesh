@@ -515,6 +515,93 @@ policy:
     drop(lab);
 }
 
+/// Companion discriminator for the test above, added per coordinator review:
+/// in the briefed order (deny `/32` first, allow `/24` second), a buggy
+/// non-cumulative LPM implementation (a lookup returns only the bits of the
+/// rule inserted at that exact longest-matching prefix, no union of every
+/// *covering* rule's bits) happens to produce the SAME observable outcome as
+/// correct cumulative-bitset first-match — both deny `.8` and allow `.9` —
+/// so that test alone cannot tell the two apart.
+///
+/// This test reverses the order: `allow 10.10.0.0/24` FIRST, `deny
+/// 10.10.0.8/32` SECOND. Correct first-match semantics (with cumulative
+/// bitsets, so the `.8`-prefix's LPM entry carries the union of the allow
+/// rule's bit AND the deny rule's bit, since the allow's `/24` covers `.8`)
+/// must let the earlier (idx 0) allow rule win the scan for a packet from
+/// `.8` — i.e. `.8` must be ALLOWED here, the opposite of the previous
+/// test's outcome, purely because of rule *order*, not prefix length. A
+/// buggy non-cumulative/longest-prefix-wins implementation would instead
+/// return only the narrower `/32` deny rule's bit for `.8` (since that's
+/// the longest prefix with an entry, and no cumulative union folded the
+/// wider allow's bit into it) and wrongly deny it. `.9` is allowed either
+/// way (only the `/24` rule covers it) — asserted too, so a regression that
+/// makes everything permissive can't slip through unnoticed.
+///
+/// RED today: same capacity-bail mechanism as the test above — padded to 72
+/// total rules (2 real + 70 inert), a fresh, distinct pad port range so it
+/// can't be confused with the other test's padding.
+#[test]
+fn lpm_cumulative_bitset_first_match_allows_narrow_host_via_earlier_wide_allow_despite_later_deny_carve_out(
+) {
+    let (lab, a, b) = wg_lab();
+    a.exec(&["ip", "addr", "add", "10.10.0.8/32", "dev", "wg0"])
+        .expect("add secondary source address .8 on a's wg0");
+    a.exec(&["ip", "addr", "add", "10.10.0.9/32", "dev", "wg0"])
+        .expect("add secondary source address .9 on a's wg0");
+    join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
+
+    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+        .expect("probe should load + attach eBPF on wg0");
+
+    let segs = segments_wide();
+    let mut yaml = String::from(
+        "
+policy:
+  - from: seg-a-wide
+    to: seg-b-wide
+    rules:
+      - allow:
+          src: [\"10.10.0.0/24\"]
+          proto: tcp
+          ports: [9091]
+      - deny:
+          src: [\"10.10.0.8/32\"]
+          proto: tcp
+          ports: [9091]
+",
+    );
+    yaml.push_str(&pad_rules_yaml(22101, 70));
+    let ir = compile_with(&yaml, &segs, 1);
+
+    enforcer.apply(&ir).expect(
+        "policy (2 real rules + 70 inert pad rules = 72 total, exceeding today's 64-entry A/B \
+         cap) must apply once Task 8's map-in-map generations lift the cap; this is the \
+         reverse-order discriminator that actually distinguishes cumulative-bitset first-match \
+         from non-cumulative longest-prefix-wins",
+    );
+
+    let mut children = vec![spawn_accept_only_listener(&b, 9091)];
+    std::thread::sleep(Duration::from_millis(200));
+
+    assert!(
+        tcp_connect_from(&a, "10.10.0.8", "10.10.0.2", 9091, 2),
+        "a packet sourced from .8 must be ALLOWED: the earlier (first-match) allow rule's /24 \
+         covers .8, so its bit must be present in .8's cumulative LPM entry and win the scan \
+         over the later, narrower deny /32 -- a non-cumulative/longest-prefix-wins \
+         implementation would wrongly deny this"
+    );
+    assert!(
+        tcp_connect_from(&a, "10.10.0.9", "10.10.0.2", 9091, 2),
+        "a packet sourced from .9 (not covered by the deny /32 either way) must be allowed by \
+         the wide /24 rule"
+    );
+
+    for c in &mut children {
+        let _ = c.kill();
+    }
+    drop(lab);
+}
+
 // --- (d) atomic flip under traffic: zero received-count deficit --------
 
 /// A continuous UDP stream (1 packet/10ms for ~3.5s) allowed by every
