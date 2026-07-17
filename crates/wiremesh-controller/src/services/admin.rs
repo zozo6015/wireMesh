@@ -23,11 +23,11 @@ use wiremesh_proto::v1::{
     ApplyDiff, ApplyRequest, AuditEntry, AuditQueryRequest, AuditQueryResponse,
     CreateSegmentRequest, DebugKeyStatesRequest, DebugKeyStatesResponse, DeleteSegmentRequest,
     DeleteSegmentResponse, DrainRequest, DrainResponse, GatewayInfo, GatewayKeyState,
-    ListGatewaysRequest, ListGatewaysResponse, ListRelaysRequest, ListRelaysResponse,
-    ListSegmentsRequest, ListSegmentsResponse, MintApiTokenRequest, MintApiTokenResponse,
-    MintTokenRequest, MintTokenResponse, RegisterRelayRequest, Relay, RevokeApiTokenRequest,
-    RevokeApiTokenResponse, RevokeCertRequest, RevokeCertResponse, RotateKeyRequest,
-    RotateKeyResponse, Segment,
+    GetPolicyRequest, ListGatewaysRequest, ListGatewaysResponse, ListRelaysRequest,
+    ListRelaysResponse, ListSegmentsRequest, ListSegmentsResponse, MintApiTokenRequest,
+    MintApiTokenResponse, MintTokenRequest, MintTokenResponse, PolicyVersionMsg,
+    RegisterRelayRequest, Relay, RevokeApiTokenRequest, RevokeApiTokenResponse, RevokeCertRequest,
+    RevokeCertResponse, RotateKeyRequest, RotateKeyResponse, Segment,
 };
 
 use crate::db_async::DbHandle;
@@ -872,6 +872,17 @@ impl Admin for AdminSvc {
             policy_updated: outcome.policy_updated,
             total_changes,
         }))
+    }
+
+    /// (Task 6) Not yet implemented — Step 3 (implementer) wires this to
+    /// `Db`'s version lookup (0 = latest, else exact match, NotFound
+    /// otherwise). This stub exists only so the wire contract compiles
+    /// against RED tests written in Step 1.
+    async fn get_policy(
+        &self,
+        _request: Request<GetPolicyRequest>,
+    ) -> Result<Response<PolicyVersionMsg>, Status> {
+        Err(Status::unimplemented("Task 6"))
     }
 }
 

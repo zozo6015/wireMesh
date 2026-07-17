@@ -51,6 +51,11 @@ service Admin {
   // An identical re-apply must be a true no-op: empty diff, zero mutations,
   // zero new audit rows — see `crate::apply`/`crate::db::Db::apply_fabric`.
   rpc Apply(ApplyRequest) returns (ApplyDiff);
+  // (Task 6) Fetches one compiled policy version (0 = latest) — backs
+  // `fabricctl policy show`/`status`. Read-only role suffices (same auth
+  // tier as `ListSegments`). NotFound if no `policy_version` row matches
+  // (including "no policy has ever been applied" for version 0).
+  rpc GetPolicy(GetPolicyRequest) returns (PolicyVersionMsg);
 }
 message CreateSegmentRequest { string name = 1; repeated string cidrs = 2; }
 message Segment { uint64 id = 1; string name = 2; repeated string cidrs = 3; }
@@ -105,6 +110,15 @@ message ApplyDiff {
   uint32 deleted_segments = 3;
   bool policy_updated = 4;
   uint32 total_changes = 5;
+}
+
+message GetPolicyRequest { uint64 version = 1; } // 0 = latest
+message PolicyVersionMsg {
+  uint64 version = 1;
+  string source_yaml = 2;
+  bytes compiled_ir = 3;
+  string created_by = 4;
+  string created_at = 5;
 }
 
 // limit <= 0 falls back to a small server-side default. `action` (Task 16)
