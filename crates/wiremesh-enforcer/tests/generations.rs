@@ -796,3 +796,159 @@ policy:
     }
     drop(lab);
 }
+
+// --- counters must survive rule insertion, keyed by rule_id --------------
+
+/// Task 8 review finding (Important, relayed by the coordinator): `COUNTERS`
+/// is a flat, generation-independent `Array<u64>` indexed by each rule's
+/// FLATTENED POSITIONAL idx, and `apply()` never resets/re-homes those
+/// slots. `counters()` aggregates by reading the CURRENT generation's
+/// idx->`rule_id` mapping against those same raw (stale) per-idx slots — so
+/// inserting a new rule BEFORE an existing one shifts every later rule's
+/// idx, and an existing rule's already-accumulated hit count is left behind
+/// at its OLD idx, now mislabeled with whichever rule occupies that idx in
+/// the new generation. Concretely: v1 = `[allowA (idx0), allowB (idx1)]`; A
+/// accrues `k` hits at idx0. v2 = `[allowC (NEW, idx0), allowA (idx1),
+/// allowB (idx2)]` — idx0's `k` hits (A's history) get attributed to C,
+/// while idx1 (B's old, untouched slot) gets attributed to A, reading 0.
+///
+/// Decided behavior (design: "per-rule counters survive policy updates",
+/// keyed by the content-hash `rule_id` — stable across reorderings since it
+/// never depends on position, only on a rule's own `from`/`to`/action/
+/// proto/src/dst/ports, see `wiremesh_policy::compile::rule_id`'s doc
+/// comment): after v2, A's pre-v2 hits must still be attributed to A's
+/// `rule_id`, and C's `rule_id` must read 0 until traffic actually matches
+/// it.
+///
+/// RED today: the misattribution assertions below fail — A's count reads 0
+/// (its history was left behind at the old idx1, which is B's fresh,
+/// never-hit slot) while C reads `k` (inheriting idx0's stale count, which
+/// is really A's history).
+#[test]
+fn counters_survive_rule_insertion_keyed_by_rule_id() {
+    let (lab, a, b) = wg_lab();
+    join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
+
+    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+        .expect("probe should load + attach eBPF on wg0");
+
+    let segs = segments_exact();
+    let v1_yaml = "
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+          ports: [9200]
+      - allow:
+          proto: tcp
+          ports: [9201]
+";
+    let v1 = compile_with(v1_yaml, &segs, 1);
+    let rule_a_id = v1.blocks[0].rules[0].rule_id.clone();
+    enforcer
+        .apply(&v1)
+        .expect("v1 (two small allow rules, no padding needed) must apply");
+
+    let mut children = vec![
+        spawn_accept_only_listener(&b, 9200),
+        spawn_accept_only_listener(&b, 9201),
+        spawn_accept_only_listener(&b, 9202),
+    ];
+    std::thread::sleep(Duration::from_millis(200));
+
+    // k = 3 distinct connections matching rule A -- each is its own fresh
+    // flow (distinct ephemeral src port), so each independently hits
+    // `scan_rules`/A's own counter rather than short-circuiting via FLOWS.
+    let k = 3u64;
+    for _ in 0..k {
+        assert!(
+            tcp_connect(&a, "10.10.0.2", 9200, 2),
+            "connection matching rule A (port 9200) should succeed under v1"
+        );
+    }
+    let snapshot = enforcer.counters().expect("counters() should succeed after v1 traffic");
+    assert_eq!(
+        snapshot.by_rule.get(&rule_a_id).copied().unwrap_or(0),
+        k,
+        "rule A should show exactly k={k} hits before any v2 apply: {:?}",
+        snapshot.by_rule
+    );
+
+    // v2: the SAME two rules, PLUS a brand-new rule C inserted BEFORE A --
+    // this shifts A from idx0 to idx1, and B from idx1 to idx2.
+    let v2_yaml = "
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+          ports: [9202]
+      - allow:
+          proto: tcp
+          ports: [9200]
+      - allow:
+          proto: tcp
+          ports: [9201]
+";
+    let v2 = compile_with(v2_yaml, &segs, 2);
+    let rule_c_id = v2.blocks[0].rules[0].rule_id.clone();
+    assert_ne!(rule_c_id, rule_a_id, "C must be a genuinely distinct rule from A");
+    assert_eq!(
+        v2.blocks[0].rules[1].rule_id, rule_a_id,
+        "rule_id is a content hash independent of position -- A's rule_id must be unchanged \
+         across v1/v2 despite shifting from idx0 to idx1"
+    );
+
+    // apply() may internally block out the remainder of v1's post-flip reap
+    // grace (>=10s total since v1's flip) before returning -- acceptable
+    // per the coordinator's note; no explicit sleep needed here.
+    enforcer.apply(&v2).expect(
+        "v2 (the same 2 rules plus 1 new rule inserted before A, 3 total -- no padding needed, \
+         small policies apply fast) must apply",
+    );
+
+    let after_v2 = enforcer.counters().expect("counters() should succeed after v2 apply");
+    assert!(
+        after_v2.by_rule.get(&rule_a_id).copied().unwrap_or(0) >= k,
+        "rule A's pre-v2 history (k={k} hits) must survive being re-homed to a new idx, keyed \
+         by its stable rule_id, not left behind at its old idx: {:?}",
+        after_v2.by_rule
+    );
+    assert_eq!(
+        after_v2.by_rule.get(&rule_c_id).copied().unwrap_or(0),
+        0,
+        "rule C is brand new in v2 and has not matched any traffic yet -- it must read 0, not \
+         inherit A's stale idx0 history: {:?}",
+        after_v2.by_rule
+    );
+
+    // Now actually exercise C and confirm it counts independently, without
+    // disturbing A's retained history.
+    let k2 = 2u64;
+    for _ in 0..k2 {
+        assert!(
+            tcp_connect(&a, "10.10.0.2", 9202, 2),
+            "connection matching rule C (port 9202) should succeed under v2"
+        );
+    }
+    let final_counters = enforcer.counters().expect("counters() should succeed after C's traffic");
+    assert_eq!(
+        final_counters.by_rule.get(&rule_c_id).copied().unwrap_or(0),
+        k2,
+        "rule C should now show exactly k2={k2} hits of its own: {:?}",
+        final_counters.by_rule
+    );
+    assert!(
+        final_counters.by_rule.get(&rule_a_id).copied().unwrap_or(0) >= k,
+        "rule A's retained history must not be clobbered by C's own traffic: {:?}",
+        final_counters.by_rule
+    );
+
+    for c in &mut children {
+        let _ = c.kill();
+    }
+    drop(lab);
+}
