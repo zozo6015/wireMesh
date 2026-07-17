@@ -256,58 +256,78 @@ fn rate_allows(src: u32, now: u64) -> bool {
     }
 }
 
-/// The shared token-bucket check behind both deny-event log sampling
+/// Read-only "would this bucket admit one more token right now" check for
+/// the shared token-bucket shape behind both deny-event log sampling
 /// budgets (`LOG_RULE_BUDGET`/`LOG_AGG_BUDGET`, Task 10) — the exact same
-/// rolling-1s-window shape as [`rate_allows`]'s `Some` arm above, generalized
-/// over an `Array<RateVal>` keyed by a plain `u32` idx instead of
-/// `rate_allows`'s `LruHashMap<u32, RateVal>` keyed by source IP (an `Array`
-/// slot always exists once declared with enough entries — there is no
-/// `LruHashMap`-style "never seen this key before" case to special-case;
+/// rolling-1s-window arithmetic as [`rate_allows`]'s `Some` arm above,
+/// generalized over an `Array<RateVal>` keyed by a plain `u32` idx instead
+/// of `rate_allows`'s `LruHashMap<u32, RateVal>` keyed by source IP (an
+/// `Array` slot always exists once declared with enough entries — there is
+/// no `LruHashMap`-style "never seen this key before" case to special-case;
 /// a zero-initialized slot's `window_start_ns == 0` already falls into the
 /// "window elapsed" branch below on the very first real call, since `now`
 /// is always far more than `RATE_WINDOW_NS` past the kernel boot epoch in
 /// any test/production scenario this design targets — no separate
 /// first-touch branch needed).
 ///
-/// Same non-atomic-RMW caveat as `rate_allows`/`bump`: `get_ptr_mut` +
-/// plain reads/writes, not a CAS loop. Two CPUs racing on the SAME idx
-/// (same rule denying concurrently on multiple cores) could each observe
-/// `count < cap` and both increment, momentarily over-admitting by a small,
-/// bounded amount within one window — consistent with this design's
-/// existing precedent (`bump`'s counter increments and `rate_allows`'s rate
-/// cap are both the same non-atomic shape) and acceptable here for the same
-/// reason: sampling is a best-effort volume bound, not a hard security
-/// guarantee, so a rare, small over-admission under real concurrency is a
-/// documented, accepted trade-off rather than a bug.
+/// Deliberately does NOT mutate the slot (see [`budget_commit`], its
+/// mutating counterpart, and [`log_allows`]'s doc comment for why the two
+/// are split rather than one combined check-and-increment call: committing
+/// a per-rule token before also confirming the aggregate budget has room
+/// would burn that token even on an emission that never actually happens).
 ///
-/// Returns `true` (and records this attempt against the current window)
-/// iff `idx`'s budget has room for one more emission right now; `false`
-/// means this window's cap for `idx` is already spent. `idx` out of the
-/// array's declared range (never expected from this file's own call sites)
+/// Returns `true` iff `idx`'s budget currently has room for one more
+/// emission (window elapsed, or `count < cap`); `false` means this
+/// window's cap for `idx` is already spent. `idx` out of the array's
+/// declared range (never expected from this file's own call sites)
 /// conservatively returns `false` (skip emission) rather than panicking.
-fn budget_allows(arr: &Array<RateVal>, idx: u32, cap: u32, now: u64) -> bool {
-    match arr.get_ptr_mut(idx) {
+fn budget_would_allow(arr: &Array<RateVal>, idx: u32, cap: u32, now: u64) -> bool {
+    match arr.get_ptr(idx) {
         None => false,
         Some(ptr) => {
             let window_start = unsafe { (*ptr).window_start_ns };
             if now.saturating_sub(window_start) > RATE_WINDOW_NS {
-                // Window elapsed (or never started -- a zero-initialized
-                // slot's `window_start_ns == 0` takes this same branch on
-                // its very first real call): start a fresh one at `now`.
-                unsafe {
-                    (*ptr).window_start_ns = now;
-                    (*ptr).count = 1;
-                }
-                true
+                true // window elapsed (or never started): would admit fresh
             } else {
-                let count = unsafe { (*ptr).count };
-                if count < cap {
-                    unsafe { (*ptr).count = count.saturating_add(1) };
-                    true
-                } else {
-                    false
-                }
+                unsafe { (*ptr).count < cap }
             }
+        }
+    }
+}
+
+/// The mutating counterpart to [`budget_would_allow`]: records one token
+/// against `idx`'s bucket, using the SAME window-elapsed/count arithmetic
+/// -- called only after the caller has already confirmed (via
+/// `budget_would_allow`) that this bucket currently allows one more; this
+/// function itself does not re-check `cap` (there is nothing left to
+/// gate -- committing is the unconditional "yes, and here is the resulting
+/// state" half of the pair).
+///
+/// Same non-atomic-RMW caveat as `rate_allows`/`bump`, WIDENED by this
+/// peek/commit split (documented honestly, per the review that introduced
+/// it, rather than restating the narrower single-op version): `get_ptr`/
+/// `get_ptr_mut` + plain reads/writes, not a CAS loop, and now with a
+/// window between the peek and the commit during which a CONCURRENT packet
+/// on another CPU touching the SAME idx could also commit. Two CPUs racing
+/// on the same idx could each peek "room available", then each commit,
+/// momentarily over-admitting by a small, bounded amount within one window
+/// -- consistent with this design's existing precedent (`bump`'s counter
+/// increments and `rate_allows`'s rate cap are both the same non-atomic
+/// shape) and acceptable here for the same reason: sampling is a
+/// best-effort volume bound, not a hard security guarantee, so a rare,
+/// small over-admission under real concurrency is a documented, accepted
+/// trade-off rather than a bug.
+fn budget_commit(arr: &Array<RateVal>, idx: u32, now: u64) {
+    if let Some(ptr) = arr.get_ptr_mut(idx) {
+        let window_start = unsafe { (*ptr).window_start_ns };
+        if now.saturating_sub(window_start) > RATE_WINDOW_NS {
+            unsafe {
+                (*ptr).window_start_ns = now;
+                (*ptr).count = 1;
+            }
+        } else {
+            let count = unsafe { (*ptr).count };
+            unsafe { (*ptr).count = count.saturating_add(1) };
         }
     }
 }
@@ -315,18 +335,40 @@ fn budget_allows(arr: &Array<RateVal>, idx: u32, cap: u32, now: u64) -> bool {
 /// Task 10 brief: deny-event emission is gated by BOTH the per-rule AND the
 /// aggregate sampling budget -- an over-budget deny still counts (`bump`
 /// already ran in every caller before this is reached), it just doesn't
-/// emit. Per-rule is checked first: a rule already over its OWN budget
-/// never touches the shared aggregate slot at all, a minor fairness
-/// kindness to other rules' aggregate headroom, though not load-bearing for
-/// this task's own tests (which only ever exercise a single denying rule at
-/// a time).
+/// emit.
+///
+/// **Both-or-neither commit (post-review fix):** the two budgets are first
+/// PEEKED (`budget_would_allow`, read-only) and only COMMITTED
+/// (`budget_commit`, mutating) if BOTH peeks agree to admit. The original
+/// version of this function checked-and-COMMITTED the per-rule budget
+/// first, then checked-and-committed the aggregate budget -- which meant
+/// an aggregate-rejected attempt still burned a per-rule token even though
+/// no event was ever emitted. Under multi-rule denial traffic sharing one
+/// aggregate budget, that let a rule's own per-rule tokens get silently
+/// drained by OTHER rules' traffic pushing the aggregate over its cap,
+/// potentially starving that rule down to zero emissions for a window
+/// despite its own per-rule budget never having been the actual reason.
+/// The peek-then-commit-both-or-neither shape here fixes BOTH directions
+/// of that asymmetry: neither budget's counter moves unless the event will
+/// actually be emitted, so a rule is never charged for another rule's
+/// aggregate pressure, and the aggregate is never charged for a rule that
+/// was already over its own budget (per-rule is still peeked first purely
+/// as a cheap short-circuit -- an already-exhausted per-rule budget skips
+/// even reading the aggregate slot -- but that ordering no longer has any
+/// mutating side effect either way).
 fn log_allows(rule_idx: u32, now: u64) -> bool {
     let per_rule_cap = cfg_or_default(CFG_LOG_PER_RULE, DEFAULT_LOG_PER_RULE) as u32;
-    if !budget_allows(&LOG_RULE_BUDGET, rule_idx, per_rule_cap, now) {
+    if !budget_would_allow(&LOG_RULE_BUDGET, rule_idx, per_rule_cap, now) {
         return false;
     }
     let agg_cap = cfg_or_default(CFG_LOG_AGGREGATE, DEFAULT_LOG_AGGREGATE) as u32;
-    budget_allows(&LOG_AGG_BUDGET, 0, agg_cap, now)
+    if !budget_would_allow(&LOG_AGG_BUDGET, 0, agg_cap, now) {
+        return false;
+    }
+
+    budget_commit(&LOG_RULE_BUDGET, rule_idx, now);
+    budget_commit(&LOG_AGG_BUDGET, 0, now);
+    true
 }
 
 /// Emits one sampled `DenyEventRaw` into `DENY_RB` for a just-denied packet
