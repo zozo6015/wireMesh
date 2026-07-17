@@ -16,8 +16,10 @@
 
 mod ebpf;
 mod flatten;
+mod nft;
 
 pub use flatten::{flatten, FlatRule, MAX_RULES};
+pub use nft::ruleset;
 
 use wiremesh_policy::PolicyIR;
 

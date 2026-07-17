@@ -1,0 +1,15 @@
+table ip wiremesh_wg0
+flush table ip wiremesh_wg0
+table ip wiremesh_wg0 {
+  counter r_carve_deny {}
+  counter r_carve_allow {}
+  counter default_deny {}
+  chain from_fabric {
+    ct state established,related counter accept
+    ip saddr { 10.5.0.0/16 } ip daddr { 203.0.113.5/32 } tcp dport { 3389 } counter name "r_carve_deny" drop
+    ip saddr { 10.5.0.0/16 } ip daddr { 203.0.113.0/24 } meta l4proto tcp counter name "r_carve_allow" accept
+    counter name "default_deny" drop
+  }
+  chain input { type filter hook input priority 0; policy accept; iifname "wg0" jump from_fabric; }
+  chain forward { type filter hook forward priority 0; policy accept; iifname "wg0" jump from_fabric; }
+}

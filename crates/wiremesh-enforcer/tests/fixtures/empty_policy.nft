@@ -1,0 +1,11 @@
+table ip wiremesh_eth1
+flush table ip wiremesh_eth1
+table ip wiremesh_eth1 {
+  counter default_deny {}
+  chain from_fabric {
+    ct state established,related counter accept
+    counter name "default_deny" drop
+  }
+  chain input { type filter hook input priority 0; policy accept; iifname "eth1" jump from_fabric; }
+  chain forward { type filter hook forward priority 0; policy accept; iifname "eth1" jump from_fabric; }
+}

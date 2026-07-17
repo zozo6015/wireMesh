@@ -1,0 +1,18 @@
+table ip wiremesh_wg0
+flush table ip wiremesh_wg0
+table ip wiremesh_wg0 {
+  counter r_a6332aaa2e0af7cb {}
+  counter r_12703e46657fa6f4 {}
+  counter r_4c673459e3261fa2 {}
+  counter default_deny {}
+  chain from_fabric {
+    ct state established,related counter accept
+    ip saddr { 10.10.0.0/16 } ip daddr { 172.16.0.0/12 } tcp dport { 22 } counter name "r_a6332aaa2e0af7cb" drop
+    ip saddr { 10.10.0.0/16 } ip daddr { 172.16.1.50/32 } tcp dport { 5432 } counter name "r_12703e46657fa6f4" accept
+    ip saddr { 10.10.0.0/16 } ip daddr { 172.16.2.0/24 } tcp dport { 443 } counter name "r_4c673459e3261fa2" accept
+    ip saddr { 10.10.0.0/16 } ip daddr { 172.16.2.0/24 } tcp dport { 8000-8080 } counter name "r_4c673459e3261fa2" accept
+    counter name "default_deny" drop
+  }
+  chain input { type filter hook input priority 0; policy accept; iifname "wg0" jump from_fabric; }
+  chain forward { type filter hook forward priority 0; policy accept; iifname "wg0" jump from_fabric; }
+}
