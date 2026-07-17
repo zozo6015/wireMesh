@@ -96,9 +96,16 @@ pub struct EbpfEnforcer {
 
 /// Per-[`EbpfEnforcer`] state that has nothing to do with the loaded
 /// [`Ebpf`] object itself: which flattened rule idx maps to which
-/// `rule_id` (for [`EbpfEnforcer::counters`]), and whether the OTHER outer-
+/// `rule_id` (for [`EbpfEnforcer::counters`]), whether the OTHER outer-
 /// array slot is still within its post-flip reap grace (for
-/// [`apply_generation`]).
+/// [`apply_generation`]), and the accumulated by-`rule_id` counter history
+/// folded out of earlier generations' now-repurposed idx slots (see
+/// [`fold_and_reset_counters`] — this is the fix for the Task 8 review
+/// finding: `COUNTERS` is a flat, generation-independent array indexed by
+/// POSITION, so without this, inserting a rule ahead of existing ones
+/// shifts every later rule's idx and leaves its accumulated history behind
+/// at the old idx, now mislabeled under whichever rule the new generation
+/// puts there).
 #[derive(Default)]
 struct GenerationState {
     /// `idx_to_rule_id[i]` is the `rule_id` of the flattened rule installed
@@ -111,6 +118,22 @@ struct GenerationState {
     /// array slot has ever been written by us, so there is nothing to wait
     /// on. `Some` after every subsequent flip.
     pending_reap: Option<PendingReap>,
+    /// Per-`rule_id` hit counts folded out of `COUNTERS[0..old_len)` by
+    /// [`fold_and_reset_counters`] at the START of every `apply()` (using
+    /// the OLD, about-to-be-superseded `idx_to_rule_id` mapping), before
+    /// that idx range gets zeroed and re-homed to the new generation's
+    /// rules. `counters()` sums this with the CURRENT generation's live
+    /// `COUNTERS` reads so a rule's total survives being shifted to a new
+    /// idx by a later `apply()`, keyed by its stable `rule_id` rather than
+    /// its position.
+    counter_accum: BTreeMap<String, u64>,
+    /// Same idea as `counter_accum`, for the single default-deny slot
+    /// (`COUNTERS[MAX_RULES]`). Default-deny isn't actually subject to the
+    /// positional-shift misattribution (slot `MAX_RULES` always means
+    /// "default deny", never repurposed for a rule), but folding it through
+    /// the same accumulate-then-zero mechanism keeps the "counters survive
+    /// policy updates" guarantee uniform and honest for every counter kind.
+    default_deny_accum: u64,
 }
 
 /// The outer-array slot a flip just vacated, and when. `apply()`'s `target`
@@ -232,16 +255,21 @@ impl Enforcer for EbpfEnforcer {
         apply_generation(&mut self.ebpf, &flat, &mut self.gen)
     }
 
-    /// Real (Task 8): reads the 258-entry `COUNTERS` array. `by_rule`
-    /// aggregates `COUNTERS[0..len)` by `rule_id`, using the idx→`rule_id`
-    /// mapping retained from the last successful `apply()` — see
-    /// [`GenerationState::idx_to_rule_id`]. `default_deny` reads
-    /// `COUNTERS[MAX_RULES]` (256).
+    /// Real (Task 8, fixed post-review): reads the 258-entry `COUNTERS`
+    /// array and combines it with [`GenerationState::counter_accum`]/
+    /// `default_deny_accum` — the history [`fold_and_reset_counters`]
+    /// folded out of EARLIER generations' now-repurposed idx slots, keyed
+    /// by the stable `rule_id` those slots used to belong to. `by_rule`
+    /// therefore reflects a rule's FULL history across `apply()` calls,
+    /// not just whatever raw count currently sits at its (possibly brand
+    /// new, possibly reused-from-a-different-rule) current idx.
     fn counters(&mut self) -> Result<Counters> {
         let counters: Array<&MapData, u64> =
             Array::try_from(self.ebpf.map("COUNTERS").context("COUNTERS")?)?;
-        let default_deny = counters.get(&CTR_DEFAULT_DENY, 0).unwrap_or(0);
-        let mut by_rule: BTreeMap<String, u64> = BTreeMap::new();
+        let live_default_deny = counters.get(&CTR_DEFAULT_DENY, 0).unwrap_or(0);
+        let default_deny = self.gen.default_deny_accum + live_default_deny;
+
+        let mut by_rule: BTreeMap<String, u64> = self.gen.counter_accum.clone();
         for (idx, rule_id) in self.gen.idx_to_rule_id.iter().enumerate() {
             let c = counters.get(&(idx as u32), 0).unwrap_or(0);
             if c > 0 {
@@ -439,6 +467,82 @@ fn install_generation(
     Ok(())
 }
 
+/// Folds `COUNTERS[0..reset_len)` (`reset_len = max(old_len, new_len)`,
+/// where `old_len`/`new_len` are the CURRENT and NEXT generations'
+/// flattened rule counts) into `gen.counter_accum`, keyed by the OLD
+/// (about-to-be-superseded) `idx_to_rule_id` mapping, then zeroes each
+/// slot — and does the same for the single default-deny slot into
+/// `gen.default_deny_accum`. Must run BEFORE `gen.idx_to_rule_id` is
+/// overwritten for the new generation.
+///
+/// This is the fix for a Task 8 review finding: `COUNTERS` is a flat,
+/// generation-independent `Array<u64>` indexed by each rule's FLATTENED
+/// POSITIONAL idx, and nothing previously reset those slots across
+/// `apply()` calls. Inserting a new rule ahead of existing ones shifts
+/// every later rule's idx — without this fold, an existing rule's
+/// already-accumulated hit count would be left behind at its OLD idx, now
+/// silently mislabeled under whichever rule the NEW generation happens to
+/// place there (`tests/generations.rs`'s
+/// `counters_survive_rule_insertion_keyed_by_rule_id` is the regression
+/// test). Folding into an accumulator keyed by the stable `rule_id` (a
+/// content hash independent of position, see
+/// `wiremesh_policy::compile::rule_id`) instead makes a rule's counter
+/// survive being re-homed to a different idx, and guarantees a BRAND NEW
+/// rule that happens to land on a busy old idx starts at 0 rather than
+/// inheriting that idx's history.
+///
+/// `reset_len` extends past `old_len` up to `new_len` when the new
+/// generation has MORE rules than the old one: any stale, non-zero value
+/// sitting at those higher idxs (left over from some even-older, since-
+/// shrunk generation, well before `old_len`'s current mapping existed) has
+/// no valid `rule_id` in the OLD mapping to attribute to, so it's simply
+/// dropped rather than misattributed — this loop zeroes it either way, so
+/// it can't leak into whatever new rule the CURRENT `apply()` assigns to
+/// that idx.
+///
+/// **Known, accepted, bounded race** (documented per the coordinator's
+/// review): a packet can still match the OLD (still-active — `ACTIVE`
+/// hasn't flipped yet at this point in `apply_generation`) generation's
+/// rule at idx `i` in the narrow window between this function reading
+/// `COUNTERS[i]` and zeroing it. Such an increment is lost rather than
+/// folded (the read-then-immediate-zero-per-slot loop below, rather than
+/// reading the whole range THEN zeroing the whole range, minimizes this
+/// window to a single map read + write per slot instead of exposing the
+/// whole `reset_len` range at once). This is an accepted, bounded
+/// undercount, not eliminated — the coordinator's explicit call given the
+/// design's existing "10s reap grace" tolerance for similar small
+/// in-flight windows elsewhere in this same atomic-flip design.
+fn fold_and_reset_counters(ebpf: &mut Ebpf, gen: &mut GenerationState, new_len: usize) -> Result<()> {
+    let old_len = gen.idx_to_rule_id.len();
+    let reset_len = old_len.max(new_len).min(MAX_RULES);
+
+    let mut counters: Array<&mut MapData, u64> =
+        Array::try_from(ebpf.map_mut("COUNTERS").context("COUNTERS")?)?;
+
+    for idx in 0..reset_len {
+        let idx_u32 = idx as u32;
+        let val = counters.get(&idx_u32, 0).unwrap_or(0);
+        if val > 0 {
+            counters.set(idx_u32, 0u64, 0)?; // zero immediately: minimize the read-to-zero window
+            if idx < old_len {
+                *gen.counter_accum.entry(gen.idx_to_rule_id[idx].clone()).or_insert(0) += val;
+            }
+            // idx >= old_len: stale value from an even-older generation,
+            // with no rule_id in the OLD mapping to attribute it to --
+            // already zeroed above, intentionally dropped rather than
+            // misattributed to whatever new rule lands on this idx.
+        }
+    }
+
+    let dd = counters.get(&CTR_DEFAULT_DENY, 0).unwrap_or(0);
+    if dd > 0 {
+        counters.set(CTR_DEFAULT_DENY, 0u64, 0)?;
+        gen.default_deny_accum += dd;
+    }
+
+    Ok(())
+}
+
 /// Builds a fresh generation from `flat` and installs it via a single
 /// atomic `ACTIVE` flip (graduated in spirit from Task 7's
 /// `apply_flat_rules`, now driving map-in-map generations instead of a
@@ -474,6 +578,14 @@ fn apply_generation(ebpf: &mut Ebpf, flat: &[FlatRule], gen: &mut GenerationStat
             std::thread::sleep(REAP_GRACE - elapsed);
         }
     }
+
+    // Fold the CURRENT (about-to-be-superseded) generation's per-idx
+    // counters into `gen`'s stable-by-rule_id accumulators, then zero those
+    // slots, BEFORE this generation's idx→rule_id mapping is overwritten
+    // below. Must happen before `build_rules`/`gen.idx_to_rule_id = ...` —
+    // see `fold_and_reset_counters`'s doc comment for why (positional-idx
+    // reuse across `apply()` calls, the Task 8 review finding).
+    fold_and_reset_counters(ebpf, gen, flat.len())?;
 
     let (rules, idx_to_rule_id) = build_rules(flat);
     let src_entries = build_lpm_entries(flat, Side::Src);
