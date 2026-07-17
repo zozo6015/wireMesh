@@ -236,6 +236,29 @@ policy:
       - allow: { dst: 172.16.2.0/24, ports: [443, "8000-8080"], proto: tcp }
 "#;
 
+/// (Task 5 review finding) Byte-identical to [`FABRIC_WITH_POLICY`] except
+/// `aws-prod`'s CIDR is re-declared with HOST BITS set —
+/// `172.16.5.9/12` — while remaining the exact same NETWORK as the already
+/// stored, canonical `172.16.0.0/12` (a `/12` covers `172.16.0.0` through
+/// `172.31.255.255`, so `.5.9` is just a host address within that same
+/// network, not a different one). Declared segment CIDRs must be
+/// normalized to their network address (`Ipv4Net::trunc()`) at the parse
+/// boundary, so this must be a PURE no-op — not a real CIDR change.
+const FABRIC_AWS_PROD_CIDR_HOST_BITS_RESTATED: &str = r#"
+segments:
+  - name: proxmox-lab
+    cidrs: ["10.10.0.0/16"]
+  - name: aws-prod
+    cidrs: ["172.16.5.9/12"]
+policy:
+  - from: proxmox-lab
+    to: aws-prod
+    rules:
+      - deny:  { ports: [22], proto: tcp }
+      - allow: { dst: 172.16.1.50/32, ports: [5432], proto: tcp }
+      - allow: { dst: 172.16.2.0/24, ports: [443, "8000-8080"], proto: tcp }
+"#;
+
 /// The controller's on-disk SQLite file path — same file
 /// `wiremesh_testkit::TestController::count_audit`/`gateway_exists` open a
 /// second connection to.
@@ -966,5 +989,64 @@ async fn reapplying_identical_cidr_change_is_a_true_no_op() {
         h.count_audit().await,
         audits_after_change,
         "an idempotent re-apply must not add any audit rows"
+    );
+}
+
+/// (Task 5 review finding) Re-declaring a segment's CIDR with HOST BITS set
+/// but the SAME underlying network (`172.16.5.9/12` vs. the already-stored
+/// canonical `172.16.0.0/12`) must be treated as a PURE no-op — not a real
+/// CIDR change. Without normalizing declared CIDRs to their network address
+/// (`Ipv4Net::trunc()`) at the parse boundary, a naive set-compare on raw
+/// `Ipv4Net` values (which carry the exact address bits given, not just the
+/// network) sees two DIFFERENT values and wrongly churns
+/// `updated_segments`/rows/audit/revision/`SegmentCidrsChanged`, and risks
+/// the non-canonical string ending up in the stored `cidr` rows.
+#[tokio::test]
+async fn host_bits_cidr_restatement_of_the_same_network_is_a_no_op() {
+    let h = TestController::start().await;
+
+    let d0 = h.apply(FABRIC_WITH_POLICY).await;
+    assert!(
+        d0.policy_updated,
+        "baseline apply must compile version 1, got: {:?}",
+        d0
+    );
+
+    let audits_after_baseline = h.count_audit().await;
+
+    let d1 = h.apply(FABRIC_AWS_PROD_CIDR_HOST_BITS_RESTATED).await;
+    assert_eq!(
+        d1.updated_segments, 0,
+        "re-declaring aws-prod's CIDR with host bits set (172.16.5.9/12) but the SAME network \
+         as the stored 172.16.0.0/12 must NOT count as an updated segment, got diff: {:?}",
+        d1
+    );
+    assert!(
+        !d1.policy_updated,
+        "a host-bits-only re-declaration of an unchanged network must not trigger \
+         recompilation, got diff: {:?}",
+        d1
+    );
+    assert!(
+        d1.is_empty(),
+        "the whole apply must be a true no-op (zero total_changes), got diff: {:?}",
+        d1
+    );
+
+    assert_eq!(
+        h.count_audit().await,
+        audits_after_baseline,
+        "a pure no-op apply must not add any audit rows"
+    );
+    assert_eq!(
+        count_policy_versions(&h).await,
+        1,
+        "a pure no-op apply must not create a second policy_version row"
+    );
+    assert_eq!(
+        segment_cidrs(&h, "aws-prod").await,
+        vec!["172.16.0.0/12".to_string()],
+        "the stored cidr row must stay the canonical network form (172.16.0.0/12), never the \
+         non-canonical host-bits string (172.16.5.9/12) the fabric declared"
     );
 }
