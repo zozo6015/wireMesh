@@ -43,6 +43,26 @@
 //!      apply referencing an undeclared segment currently SUCCEEDS instead
 //!      of returning an error.
 //!  (f) same as (c): the stub never populates `policy_rule` at all.
+//!
+//! Task 5 (cycle 3) extends this file: `.superpowers/sdd/task-5-brief.md` —
+//! a declared segment whose CIDR set CHANGES (not just a brand-new segment
+//! name) must have its `cidr` rows replaced, count into
+//! `ApplyOutcome.updated_segments`, trigger recompilation of the latest
+//! stored policy against the new segment table (same fingerprint rule as
+//! Task 4), and fan out a full-peer-refresh delta
+//! (`ChangeEvent::SegmentCidrsChanged`, mirroring `KeyRotated`) to every
+//! OTHER already-connected gateway. RED (current post-Task-4) evidence:
+//!  (a) an existing segment name is still treated as a pure no-op — CIDRs
+//!      are never diffed, so `updated_segments` stays `0` and no delta ever
+//!      arrives (the wait times out).
+//!  (b) same root cause as (a): `updated_segments` stays `0`.
+//!  (c) shrinking a CIDR below what the stored policy needs currently
+//!      SUCCEEDS (no recompilation-against-new-segment-table check exists
+//!      yet), instead of failing.
+//!  (d) its own SETUP step (apply the CIDR-growing fabric once and assert
+//!      that actually changed something) fails first, for the same root
+//!      cause as (a)/(b) — `updated_segments` stays `0` instead of `1`, so
+//!      the test never even reaches its idempotence assertion.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -125,6 +145,95 @@ policy:
     to: prod-db
     rules:
       - allow: { ports: [443], proto: tcp }
+"#;
+
+/// (Task 5) Same segments/policy as [`FABRIC_WITH_POLICY`], but `aws-prod`'s
+/// declared CIDR set gains a SECOND, disjoint CIDR (`172.20.0.0/16`) — the
+/// original `172.16.0.0/12` stays, so both policy rules' `dst`s (which the
+/// policy text itself does not change) remain valid subsets. Because
+/// `IrBlock::dst_cidrs` resolves the WHOLE segment's CIDR list (not just
+/// what a rule references), recompiling against this grown segment table
+/// must change the block's `dst_cidrs` and therefore the fingerprint — a
+/// genuinely new policy version, even though not one rule's text changed.
+const FABRIC_AWS_PROD_CIDR_GROWN: &str = r#"
+segments:
+  - name: proxmox-lab
+    cidrs: ["10.10.0.0/16"]
+  - name: aws-prod
+    cidrs: ["172.16.0.0/12", "172.20.0.0/16"]
+policy:
+  - from: proxmox-lab
+    to: aws-prod
+    rules:
+      - deny:  { ports: [22], proto: tcp }
+      - allow: { dst: 172.16.1.50/32, ports: [5432], proto: tcp }
+      - allow: { dst: 172.16.2.0/24, ports: [443, "8000-8080"], proto: tcp }
+"#;
+
+/// (Task 5) Three segments — `proxmox-lab`/`aws-prod` as before, plus a
+/// THIRD, policy-UNREFERENCED segment `extra-net` — with the identical
+/// `proxmox-lab -> aws-prod` policy from [`FABRIC_WITH_POLICY`]. Used as the
+/// baseline for test (b): growing `extra-net`'s CIDRs must still produce a
+/// CIDR-change delta (it's a real segment mutation), but since no policy
+/// block resolves against `extra-net` at all, recompiling the SAME stored
+/// policy source must yield the SAME fingerprint — no new policy version.
+const FABRIC_3SEG_WITH_POLICY: &str = r#"
+segments:
+  - name: proxmox-lab
+    cidrs: ["10.10.0.0/16"]
+  - name: aws-prod
+    cidrs: ["172.16.0.0/12"]
+  - name: extra-net
+    cidrs: ["10.20.0.0/16"]
+policy:
+  - from: proxmox-lab
+    to: aws-prod
+    rules:
+      - deny:  { ports: [22], proto: tcp }
+      - allow: { dst: 172.16.1.50/32, ports: [5432], proto: tcp }
+      - allow: { dst: 172.16.2.0/24, ports: [443, "8000-8080"], proto: tcp }
+"#;
+
+/// (Task 5) Same as [`FABRIC_3SEG_WITH_POLICY`], with `extra-net` gaining a
+/// second, disjoint CIDR (`10.21.0.0/16`) — the policy-unrelated CIDR
+/// change test (b) exercises.
+const FABRIC_3SEG_EXTRA_CIDR_GROWN: &str = r#"
+segments:
+  - name: proxmox-lab
+    cidrs: ["10.10.0.0/16"]
+  - name: aws-prod
+    cidrs: ["172.16.0.0/12"]
+  - name: extra-net
+    cidrs: ["10.20.0.0/16", "10.21.0.0/16"]
+policy:
+  - from: proxmox-lab
+    to: aws-prod
+    rules:
+      - deny:  { ports: [22], proto: tcp }
+      - allow: { dst: 172.16.1.50/32, ports: [5432], proto: tcp }
+      - allow: { dst: 172.16.2.0/24, ports: [443, "8000-8080"], proto: tcp }
+"#;
+
+/// (Task 5) Same as [`FABRIC_WITH_POLICY`], but `aws-prod`'s CIDR set is
+/// SHRUNK to `172.16.3.0/24` — a range that contains NEITHER policy rule's
+/// `dst` (`172.16.1.50/32` nor `172.16.2.0/24`). The policy text itself is
+/// unchanged, so recompiling it against this shrunk segment table must fail
+/// validation (`dst` no longer ⊆ the `to`-segment's CIDRs) — the whole
+/// apply must be rejected, leaving both the segment's CIDRs and the
+/// `policy_version` table exactly as they were.
+const FABRIC_AWS_PROD_CIDR_SHRUNK_BELOW_POLICY: &str = r#"
+segments:
+  - name: proxmox-lab
+    cidrs: ["10.10.0.0/16"]
+  - name: aws-prod
+    cidrs: ["172.16.3.0/24"]
+policy:
+  - from: proxmox-lab
+    to: aws-prod
+    rules:
+      - deny:  { ports: [22], proto: tcp }
+      - allow: { dst: 172.16.1.50/32, ports: [5432], proto: tcp }
+      - allow: { dst: 172.16.2.0/24, ports: [443, "8000-8080"], proto: tcp }
 "#;
 
 /// The controller's on-disk SQLite file path — same file
@@ -232,6 +341,52 @@ async fn try_apply(
         })
         .await
         .map(|r| r.into_inner())
+}
+
+/// (Task 5) Every CIDR currently registered to segment `name`, read via a
+/// fresh `rusqlite` connection to the controller's on-disk DB (same pattern
+/// as [`count_policy_versions`]/[`policy_rule_rows`]) — used to prove a
+/// failed apply left a segment's CIDRs completely untouched (rollback
+/// proof for test (c)).
+async fn segment_cidrs(h: &TestController, name: &str) -> Vec<String> {
+    let path = db_path(h);
+    let name = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&path)
+            .expect("opening controller DB for segment_cidrs");
+        conn.busy_timeout(Duration::from_secs(5))
+            .expect("setting busy_timeout on segment_cidrs connection");
+        let mut stmt = conn
+            .prepare(
+                "SELECT c.cidr FROM cidr c JOIN segment s ON s.id = c.segment_id \
+                 WHERE s.name = ?1 ORDER BY c.cidr",
+            )
+            .expect("preparing segment_cidrs query");
+        let rows = stmt
+            .query_map([name], |row| row.get::<_, String>(0))
+            .expect("querying segment_cidrs");
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .expect("collecting segment_cidrs rows")
+    })
+    .await
+    .expect("segment_cidrs blocking task panicked")
+}
+
+/// (Task 5) Reads the next message off `stream`, bounded by
+/// [`WATCH_TIMEOUT`], and asserts it's a `Delta` (not a `StateSnapshot`) —
+/// the common "consume one live delta" step tests (a)/(b) both need,
+/// factored out since (a) must do it twice (peer-upsert + policy update, in
+/// either order).
+async fn recv_delta(stream: &mut tonic::Streaming<wiremesh_proto::v1::SyncMessage>) -> wiremesh_proto::v1::Delta {
+    let msg = tokio::time::timeout(WATCH_TIMEOUT, stream.next())
+        .await
+        .expect("timed out waiting for a live Sync.Watch delta")
+        .expect("Sync.Watch stream ended before delivering a delta")
+        .expect("Sync.Watch stream yielded an error instead of a delta");
+    match msg.body {
+        Some(sync_message::Body::Delta(d)) => d,
+        other => panic!("expected a Delta, got: {other:?}"),
+    }
 }
 
 /// (a) `apply -f` of a fabric declaring 2 segments AND a policy in one call
@@ -535,5 +690,281 @@ async fn policy_rule_rows_are_populated_with_correct_ordinals() {
         ports2_str.contains("8000"),
         "row 2's ports must mention the 8000-8080 range, got: {:?}",
         ports2
+    );
+}
+
+/// (Task 5, brief item a) Growing segment B's (`aws-prod`) declared CIDR set
+/// on an apply must: count as `updated_segments == 1` (not the pure no-op
+/// cycle-2/Task-4 treated an existing segment name as); and fan out to
+/// every OTHER already-connected gateway (here, gateway A on `proxmox-lab`)
+/// TWO live deltas — a peer-upsert carrying B's new `allowed_ips`
+/// (`ChangeEvent::SegmentCidrsChanged`), and a `PolicyUpdated` delta at
+/// `version == 2` whose IR resolves the `proxmox-lab -> aws-prod` block's
+/// `dst_cidrs` to the grown CIDR set (recompiling the SAME stored policy
+/// source against the new segment table changes the block's resolved
+/// CIDRs, hence the fingerprint, even though no rule's text changed).
+/// Order between the two deltas is not guaranteed and not asserted.
+#[tokio::test]
+async fn cidr_change_updates_segment_and_fans_out_peer_and_policy_deltas() {
+    let h = TestController::start().await;
+
+    let d0 = h.apply(FABRIC_WITH_POLICY).await;
+    assert!(
+        d0.policy_updated,
+        "baseline apply must compile version 1, got: {:?}",
+        d0
+    );
+
+    // B: the gateway whose segment's CIDRs are about to grow.
+    let b = enroll_on_existing_segment(&h, "172.16.0.0/12").await;
+    // A: a DIFFERENT segment's gateway, already connected and watching,
+    // whose full-mesh peer view of B must be refreshed live.
+    let a = enroll_on_existing_segment(&h, "10.10.0.0/16").await;
+    let mut a_stream = a.open_sync().await;
+
+    // Consume A's initial snapshot (already lists B as a peer, since B
+    // enrolled first — not itself under test here).
+    let snap_msg = tokio::time::timeout(WATCH_TIMEOUT, a_stream.next())
+        .await
+        .expect("timed out waiting for A's initial Sync.Watch snapshot")
+        .expect("A's Sync.Watch stream ended before delivering the initial snapshot")
+        .expect("A's Sync.Watch stream yielded an error instead of the initial snapshot");
+    match snap_msg.body {
+        Some(sync_message::Body::Snapshot(_)) => {}
+        other => panic!("expected A's first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+    }
+
+    let d1 = h.apply(FABRIC_AWS_PROD_CIDR_GROWN).await;
+    assert_eq!(
+        d1.updated_segments, 1,
+        "growing aws-prod's declared CIDR set must count as an updated segment, got diff: {:?}",
+        d1
+    );
+    assert!(
+        d1.policy_updated,
+        "recompiling the stored policy against aws-prod's grown CIDR set must change its \
+         resolved dst_cidrs (and therefore its fingerprint) into a genuinely new version, \
+         got diff: {:?}",
+        d1
+    );
+
+    let deltas = vec![recv_delta(&mut a_stream).await, recv_delta(&mut a_stream).await];
+
+    let policy_delta = deltas
+        .iter()
+        .find(|d| d.policy_version != 0)
+        .unwrap_or_else(|| panic!("expected one of the two deltas to carry a new policy_version, got: {:?}", deltas));
+    assert_eq!(
+        policy_delta.policy_version, 2,
+        "the CIDR-triggered recompilation must produce version 2, got: {:?}",
+        policy_delta
+    );
+    let ir = PolicyIR::from_json(&policy_delta.policy_ir)
+        .expect("the policy delta's policy_ir must parse as a real PolicyIR");
+    let block = ir
+        .blocks
+        .iter()
+        .find(|b| b.from == "proxmox-lab" && b.to == "aws-prod")
+        .expect("expected the proxmox-lab -> aws-prod block in the recompiled IR");
+    assert!(
+        block.dst_cidrs.contains(&"172.16.0.0/12".to_string())
+            && block.dst_cidrs.contains(&"172.20.0.0/16".to_string()),
+        "the recompiled block's dst_cidrs must resolve to aws-prod's GROWN CIDR set \
+         (both 172.16.0.0/12 and 172.20.0.0/16), got: {:?}",
+        block.dst_cidrs
+    );
+
+    let peer_delta = deltas
+        .iter()
+        .find(|d| !d.upserted_peers.is_empty())
+        .unwrap_or_else(|| panic!("expected one of the two deltas to carry B's peer upsert, got: {:?}", deltas));
+    let peer = &peer_delta.upserted_peers[0];
+    assert_eq!(
+        peer.gateway_id,
+        b.id(),
+        "the peer-upsert delta must be about B (the gateway whose segment's CIDRs changed)"
+    );
+    assert_eq!(peer.segment_name, "aws-prod");
+    assert!(
+        peer.allowed_ips.iter().any(|c| c == "172.16.0.0/12")
+            && peer.allowed_ips.iter().any(|c| c == "172.20.0.0/16"),
+        "the peer-upsert's allowed_ips must reflect aws-prod's GROWN CIDR set, got: {:?}",
+        peer.allowed_ips
+    );
+}
+
+/// (Task 5, brief item b) Growing a segment's CIDRs that the STORED policy
+/// does not reference at all (`extra-net`, not named in any `from`/`to`)
+/// must still count as `updated_segments == 1` and fan out a CIDR-change
+/// delta — but must NOT recompile into a new policy version, since the
+/// recompiled IR (same source, same OTHER segments) is byte-for-byte
+/// identical: same fingerprint.
+#[tokio::test]
+async fn cidr_change_on_a_policy_unrelated_segment_does_not_recompile() {
+    let h = TestController::start().await;
+
+    let d0 = h.apply(FABRIC_3SEG_WITH_POLICY).await;
+    assert_eq!(
+        d0.created_segments, 3,
+        "baseline apply must create all 3 segments, got diff: {:?}",
+        d0
+    );
+    assert!(
+        d0.policy_updated,
+        "baseline apply must compile version 1, got: {:?}",
+        d0
+    );
+
+    // D: the gateway on the policy-unreferenced segment whose CIDRs grow.
+    let d_gw = enroll_on_existing_segment(&h, "10.20.0.0/16").await;
+    // A: a different segment's already-connected gateway, watching for the
+    // CIDR-change delta.
+    let a = enroll_on_existing_segment(&h, "10.10.0.0/16").await;
+    let mut a_stream = a.open_sync().await;
+
+    let snap_msg = tokio::time::timeout(WATCH_TIMEOUT, a_stream.next())
+        .await
+        .expect("timed out waiting for A's initial Sync.Watch snapshot")
+        .expect("A's Sync.Watch stream ended before delivering the initial snapshot")
+        .expect("A's Sync.Watch stream yielded an error instead of the initial snapshot");
+    match snap_msg.body {
+        Some(sync_message::Body::Snapshot(_)) => {}
+        other => panic!("expected A's first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+    }
+
+    let d1 = h.apply(FABRIC_3SEG_EXTRA_CIDR_GROWN).await;
+    assert_eq!(
+        d1.updated_segments, 1,
+        "growing extra-net's declared CIDR set must count as an updated segment even though \
+         no policy block references it, got diff: {:?}",
+        d1
+    );
+    assert!(
+        !d1.policy_updated,
+        "a CIDR change on a segment the stored policy never resolves against must NOT \
+         recompile into a new version (same fingerprint), got diff: {:?}",
+        d1
+    );
+    assert_eq!(
+        count_policy_versions(&h).await,
+        1,
+        "no second policy_version row should exist after a policy-unrelated CIDR change"
+    );
+
+    let delta = recv_delta(&mut a_stream).await;
+    assert_eq!(
+        delta.policy_version, 0,
+        "this delta must be the CIDR-change peer-upsert only, carrying no policy update, got: {:?}",
+        delta
+    );
+    assert_eq!(delta.upserted_peers.len(), 1, "expected exactly one upserted peer, got: {:?}", delta);
+    let peer = &delta.upserted_peers[0];
+    assert_eq!(peer.gateway_id, d_gw.id(), "the upserted peer must be D (extra-net's gateway)");
+    assert_eq!(peer.segment_name, "extra-net");
+    assert!(
+        peer.allowed_ips.iter().any(|c| c == "10.20.0.0/16")
+            && peer.allowed_ips.iter().any(|c| c == "10.21.0.0/16"),
+        "the peer-upsert's allowed_ips must reflect extra-net's GROWN CIDR set, got: {:?}",
+        peer.allowed_ips
+    );
+}
+
+/// (Task 5, brief item c) Shrinking a segment's CIDRs below what the
+/// STORED policy needs (a rule's `dst` no longer ⊆ the segment's CIDRs)
+/// must fail the WHOLE apply — the compile error names the offending CIDR
+/// (which pins the specific rule) — and must roll back completely: the
+/// segment's CIDRs are read back UNCHANGED (not partially replaced), and no
+/// new `policy_version` row exists.
+#[tokio::test]
+async fn cidr_shrink_below_policy_needs_fails_the_whole_apply_and_rolls_back() {
+    let h = TestController::start().await;
+
+    let d0 = h.apply(FABRIC_WITH_POLICY).await;
+    assert!(
+        d0.policy_updated,
+        "baseline apply must compile version 1, got: {:?}",
+        d0
+    );
+
+    let err = try_apply(&h, FABRIC_AWS_PROD_CIDR_SHRUNK_BELOW_POLICY)
+        .await
+        .expect_err(
+            "shrinking aws-prod's CIDRs below what the stored policy's rules need must fail \
+             the whole apply",
+        );
+    assert!(
+        err.message().contains("172.16.1.50/32") || err.message().contains("172.16.2.0/24"),
+        "the compile-error status must name a `dst` CIDR that no longer fits (pinning the \
+         offending rule), got: {}",
+        err.message()
+    );
+    assert!(
+        err.message().contains("subset"),
+        "the compile-error status should describe a subset violation, got: {}",
+        err.message()
+    );
+
+    assert_eq!(
+        segment_cidrs(&h, "aws-prod").await,
+        vec!["172.16.0.0/12".to_string()],
+        "a failed apply must roll back completely — aws-prod's CIDRs must be exactly what \
+         they were before, not shrunk and not partially replaced"
+    );
+    assert_eq!(
+        count_policy_versions(&h).await,
+        1,
+        "a failed recompilation must leave the policy_version table untouched (still just \
+         the baseline version 1)"
+    );
+}
+
+/// (Task 5, brief item d) Re-applying the SAME already-applied CIDR-change
+/// fabric a second time must be a true no-op: `updated_segments == 0`,
+/// `policy_updated == false`, zero new audit rows — mirroring
+/// `tests/apply.rs`'s segments-only idempotence contract and this file's
+/// own `reapplying_identical_policy_is_a_true_no_op`, now for a fabric that
+/// changes a segment's CIDRs rather than only creating segments/policy.
+#[tokio::test]
+async fn reapplying_identical_cidr_change_is_a_true_no_op() {
+    let h = TestController::start().await;
+
+    let d0 = h.apply(FABRIC_WITH_POLICY).await;
+    assert!(
+        d0.policy_updated,
+        "baseline apply must compile version 1, got: {:?}",
+        d0
+    );
+
+    let d1 = h.apply(FABRIC_AWS_PROD_CIDR_GROWN).await;
+    assert_eq!(
+        d1.updated_segments, 1,
+        "growing aws-prod's CIDR set must register as a real change before this test's \
+         idempotence check even makes sense, got diff: {:?}",
+        d1
+    );
+    assert!(
+        d1.policy_updated,
+        "the CIDR growth must also have triggered a real recompilation, got diff: {:?}",
+        d1
+    );
+
+    let audits_after_change = h.count_audit().await;
+
+    let d2 = h.apply(FABRIC_AWS_PROD_CIDR_GROWN).await;
+    assert_eq!(
+        d2.updated_segments, 0,
+        "re-applying the byte-identical (already-changed) fabric must not update any segment \
+         again, got diff: {:?}",
+        d2
+    );
+    assert!(
+        !d2.policy_updated,
+        "re-applying the byte-identical fabric must not create a new policy version, got: {:?}",
+        d2
+    );
+    assert_eq!(
+        h.count_audit().await,
+        audits_after_change,
+        "an idempotent re-apply must not add any audit rows"
     );
 }
