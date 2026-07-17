@@ -9,13 +9,18 @@
 use crate::dsl::{PolicyDoc, PortSpec, RuleBody, RuleSrc};
 use crate::{CompileError, SegmentDef};
 use ipnet::{IpNet, Ipv4Net};
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 /// Validates `doc` against `segments`, returning every compile error found
 /// (empty if the document is valid).
 pub fn validate(doc: &PolicyDoc, segments: &[SegmentDef]) -> Vec<CompileError> {
     let mut errors = Vec::new();
-    let mut seen_pairs: HashSet<(&str, &str)> = HashSet::new();
+    // Maps each `(from, to)` pair to the block index where it was *first*
+    // seen, so a later duplicate can name that original occurrence in its
+    // error message (controller ruling: one `CompileError` per duplicate,
+    // `block == Some(duplicate_idx)`, message names `"block {original_idx}"`
+    // — see `props.rs`'s property (f)).
+    let mut seen_pairs: HashMap<(&str, &str), usize> = HashMap::new();
 
     for (block_idx, block) in doc.policy.iter().enumerate() {
         let ctx = format!("({}\u{2192}{})", block.from, block.to);
@@ -37,15 +42,22 @@ pub fn validate(doc: &PolicyDoc, segments: &[SegmentDef]) -> Vec<CompileError> {
             });
         }
 
-        if !seen_pairs.insert((block.from.as_str(), block.to.as_str())) {
-            errors.push(CompileError {
-                block: Some(block_idx),
-                rule: None,
-                msg: format!(
-                    "{ctx} duplicate block for ordered (from, to) pair '{}' \u{2192} '{}'",
-                    block.from, block.to
-                ),
-            });
+        let pair = (block.from.as_str(), block.to.as_str());
+        match seen_pairs.get(&pair) {
+            Some(&original_idx) => {
+                errors.push(CompileError {
+                    block: Some(block_idx),
+                    rule: None,
+                    msg: format!(
+                        "{ctx} duplicate block for ordered (from, to) pair '{}' \u{2192} '{}' \
+                         (pair first defined at block {original_idx})",
+                        block.from, block.to
+                    ),
+                });
+            }
+            None => {
+                seen_pairs.insert(pair, block_idx);
+            }
         }
 
         for (rule_idx, rule) in block.rules.iter().enumerate() {
