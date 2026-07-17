@@ -148,7 +148,7 @@ policy:
 "#;
 
 /// (Task 5) Same segments/policy as [`FABRIC_WITH_POLICY`], but `aws-prod`'s
-/// declared CIDR set gains a SECOND, disjoint CIDR (`172.20.0.0/16`) — the
+/// declared CIDR set gains a SECOND, disjoint CIDR (`172.32.0.0/16`) — the
 /// original `172.16.0.0/12` stays, so both policy rules' `dst`s (which the
 /// policy text itself does not change) remain valid subsets. Because
 /// `IrBlock::dst_cidrs` resolves the WHOLE segment's CIDR list (not just
@@ -160,7 +160,7 @@ segments:
   - name: proxmox-lab
     cidrs: ["10.10.0.0/16"]
   - name: aws-prod
-    cidrs: ["172.16.0.0/12", "172.20.0.0/16"]
+    cidrs: ["172.16.0.0/12", "172.32.0.0/16"]
 policy:
   - from: proxmox-lab
     to: aws-prod
@@ -768,9 +768,9 @@ async fn cidr_change_updates_segment_and_fans_out_peer_and_policy_deltas() {
         .expect("expected the proxmox-lab -> aws-prod block in the recompiled IR");
     assert!(
         block.dst_cidrs.contains(&"172.16.0.0/12".to_string())
-            && block.dst_cidrs.contains(&"172.20.0.0/16".to_string()),
+            && block.dst_cidrs.contains(&"172.32.0.0/16".to_string()),
         "the recompiled block's dst_cidrs must resolve to aws-prod's GROWN CIDR set \
-         (both 172.16.0.0/12 and 172.20.0.0/16), got: {:?}",
+         (both 172.16.0.0/12 and 172.32.0.0/16), got: {:?}",
         block.dst_cidrs
     );
 
@@ -787,7 +787,7 @@ async fn cidr_change_updates_segment_and_fans_out_peer_and_policy_deltas() {
     assert_eq!(peer.segment_name, "aws-prod");
     assert!(
         peer.allowed_ips.iter().any(|c| c == "172.16.0.0/12")
-            && peer.allowed_ips.iter().any(|c| c == "172.20.0.0/16"),
+            && peer.allowed_ips.iter().any(|c| c == "172.32.0.0/16"),
         "the peer-upsert's allowed_ips must reflect aws-prod's GROWN CIDR set, got: {:?}",
         peer.allowed_ips
     );
