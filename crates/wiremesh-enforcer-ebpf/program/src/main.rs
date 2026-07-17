@@ -29,20 +29,44 @@
 use aya_ebpf::{
     bindings::{TC_ACT_PIPE, TC_ACT_SHOT},
     btf_maps::{lpm_trie::Key as LpmKey, Array as BtfArray, ArrayOfMaps, LpmTrie},
+    helpers::bpf_ktime_get_ns,
     macros::{btf_map, classifier, map},
     maps::{Array, LruHashMap},
     programs::TcContext,
 };
 use wiremesh_enforcer_common::*;
 
-// --- generation-independent maps (Task 7, unchanged) --------------------
+// --- generation-independent maps (Task 7, unchanged; FLOWS's value type
+// and RATE/CONFIG are Task 9 additions) -----------------------------------
 
 #[map]
 static COUNTERS: Array<u64> = Array::with_max_entries(COUNTERS_LEN as u32, 0);
 #[map]
 static ACTIVE: Array<u32> = Array::with_max_entries(1, 0);
+/// `65536` here is only this map's OWN declared default — `ebpf.rs`'s
+/// `EbpfEnforcer::new` overrides the actual loaded `max_entries` from
+/// `EnforcerConfig::flow_max` via `EbpfLoader::map_max_entries("FLOWS", ...)`
+/// before the map is ever created in the kernel (Task 9 brief: "flow_max:
+/// set FLOWS max_entries from EnforcerConfig BEFORE load").
 #[map]
-static FLOWS: LruHashMap<FlowKey, u64> = LruHashMap::with_max_entries(65536, 0);
+static FLOWS: LruHashMap<FlowKey, FlowVal> = LruHashMap::with_max_entries(65536, 0);
+/// Per-source egress rate-cap state (Task 9 brief). Sized independently of
+/// `flow_max` — its cardinality is bounded by distinct SOURCE IPs feeding
+/// this gateway's egress path, not by distinct flows, and the brief doesn't
+/// call for it to be configurable. `4096` is a generous, LRU-backed
+/// implementation choice (an eviction here only resets a source's rate
+/// bookkeeping to a fresh burst-1 window on its next packet — never
+/// incorrect, just momentarily generous), not a hard requirement.
+#[map]
+static RATE: LruHashMap<u32, RateVal> = LruHashMap::with_max_entries(4096, 0);
+/// Per-protocol idle timeouts + the rate cap (Task 9 brief: `CONFIG:
+/// Array<u64>`, indices `CFG_TCP_NS`/`CFG_UDP_NS`/`CFG_ICMP_NS`/
+/// `CFG_RATE_CAP`). Written by `ebpf.rs`'s `write_config` immediately after
+/// load, before either classifier is attached — see `cfg_or_default`'s doc
+/// comment for the defense-in-depth fallback if a slot is ever read as `0`
+/// anyway.
+#[map]
+static CONFIG: Array<u64> = Array::with_max_entries(CONFIG_LEN as u32, 0);
 
 // --- per-generation maps (Task 8) ----------------------------------------
 //
@@ -85,6 +109,124 @@ static GEN_META: ArrayOfMaps<MetaArr, GENERATIONS> = ArrayOfMaps::new();
 fn bump(idx: u32) {
     if let Some(c) = COUNTERS.get_ptr_mut(idx) {
         unsafe { *c += 1 };
+    }
+}
+
+/// Reads `CONFIG[idx]`, falling back to `default` if the slot is exactly
+/// `0` — see `wiremesh_enforcer_common::DEFAULT_TCP_NS`'s doc comment for
+/// why `0` specifically (rather than any other sentinel) means "not yet
+/// configured, use a safe default" here: a real operator-supplied idle
+/// timeout or rate cap of exactly zero would immediately expire every flow
+/// / block every new one, which is never the actual intent, so `0` is safe
+/// to reserve as the "unset" sentinel. `ebpf.rs`'s `write_config` is the
+/// PRIMARY guard (writes real values before either classifier attaches);
+/// this is defense-in-depth on top of that ordering, not instead of it.
+#[inline(always)]
+fn cfg_or_default(idx: u32, default: u64) -> u64 {
+    let v = CONFIG.get(idx).copied().unwrap_or(0);
+    if v == 0 {
+        default
+    } else {
+        v
+    }
+}
+
+/// This flow's protocol's configured idle timeout, in nanoseconds
+/// (`bpf_ktime_get_ns()`-comparable). Any protocol other than tcp/udp/icmp
+/// never reaches a `FLOWS` hit-path call site in practice (`ipv4_at`/
+/// `ports_at` only special-case those three; every other IPv4 protocol gets
+/// `(0, 0)` ports and is still recordable/matchable, so this still needs a
+/// total answer) — falls back to the udp timeout, this design's shortest
+/// non-icmp default, as a conservative (expires sooner rather than later)
+/// choice for that unspecified case.
+#[inline(always)]
+fn timeout_ns(proto: u8) -> u64 {
+    match proto {
+        6 => cfg_or_default(CFG_TCP_NS, DEFAULT_TCP_NS),
+        1 => cfg_or_default(CFG_ICMP_NS, DEFAULT_ICMP_NS),
+        _ => cfg_or_default(CFG_UDP_NS, DEFAULT_UDP_NS),
+    }
+}
+
+fn rate_cap() -> u32 {
+    cfg_or_default(CFG_RATE_CAP, DEFAULT_RATE_CAP) as u32
+}
+
+/// The shared hit-path check for all three of `try_ingress`'s `FLOWS`
+/// lookups (reverse-continuation, forward-continuation, and the ICMP
+/// embedded-error match) — Task 9 brief's "Hit path" contract: absent ->
+/// miss; present but stale (`now - last_seen_ns > timeout_ns(proto)`) ->
+/// evict the entry and miss (falls through to rule evaluation); present and
+/// fresh -> hit, and if `refresh` is set, bump `last_seen_ns` to `now` in
+/// place (both directions of ordinary traffic refresh the idle timer, spec
+/// §5.3).
+///
+/// `refresh = false` is used ONLY by the ICMP embedded-error lookup: an
+/// ICMP error report is not itself forward traffic on the flow it's
+/// reporting about, so observing one must not extend that flow's idle
+/// timer — but the SAME staleness check still applies, so a stale original
+/// flow's embedded-error lookup also correctly misses rather than
+/// fast-pathing a packet that has no business bypassing rule evaluation.
+///
+/// Uses `get_ptr_mut` (like `bump`, above) rather than `get`+`insert`, so a
+/// refresh is a single in-place field write, not a full map re-insert.
+fn flow_hit(key: &FlowKey, proto: u8, now: u64, refresh: bool) -> bool {
+    match FLOWS.get_ptr_mut(key) {
+        None => false,
+        Some(ptr) => {
+            let last_seen = unsafe { (*ptr).last_seen_ns };
+            if now.saturating_sub(last_seen) > timeout_ns(proto) {
+                let _ = FLOWS.remove(key);
+                false
+            } else {
+                if refresh {
+                    unsafe { (*ptr).last_seen_ns = now };
+                }
+                true
+            }
+        }
+    }
+}
+
+/// Per-source (`src`, network-byte-order IPv4) rolling-1s-window new-flow
+/// rate cap (Task 9 brief). Returns `true` (and records this attempt
+/// against the current window) iff `src` may record ONE more new `FLOWS`
+/// entry right now; `false` means this window's cap is already spent — the
+/// caller must skip the `FLOWS` insert, but the packet itself is still
+/// let through either way (egress never blocks traffic, only bookkeeping).
+///
+/// Window arithmetic is overflow-safe: `now.saturating_sub(window_start_ns)`
+/// (both `u64` nanosecond timestamps from the same monotonic clock, `now`
+/// always >= any previously-recorded `window_start_ns`, but saturating
+/// regardless) and `count.saturating_add(1)` (bounded by `cap` in practice,
+/// since the `count < cap` branch is the only place it grows, but
+/// saturating regardless rather than relying on that bound alone).
+fn rate_allows(src: u32, now: u64) -> bool {
+    let cap = rate_cap();
+    match RATE.get_ptr_mut(&src) {
+        None => {
+            let _ = RATE.insert(&src, &RateVal { window_start_ns: now, count: 1, _pad: 0 }, 0);
+            true
+        }
+        Some(ptr) => {
+            let window_start = unsafe { (*ptr).window_start_ns };
+            if now.saturating_sub(window_start) > RATE_WINDOW_NS {
+                // Rolling window elapsed: start a fresh one at `now`.
+                unsafe {
+                    (*ptr).window_start_ns = now;
+                    (*ptr).count = 1;
+                }
+                true
+            } else {
+                let count = unsafe { (*ptr).count };
+                if count < cap {
+                    unsafe { (*ptr).count = count.saturating_add(1) };
+                    true
+                } else {
+                    false
+                }
+            }
+        }
     }
 }
 
@@ -133,16 +275,17 @@ fn ports_at(ctx: &TcContext, off: usize, proto: u8) -> (u16, u16) {
 fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     let (src, dst, proto, ihl) = ipv4_at(ctx)?;
     let (sport, dport) = ports_at(ctx, ihl, proto);
+    let now = unsafe { bpf_ktime_get_ns() };
 
     // 1) reply of an inside-initiated flow? (egress recorded src=inside)
     let rev = FlowKey { src: dst, dst: src, sport: dport, dport: sport, proto, _pad: [0; 3] };
-    if unsafe { FLOWS.get(&rev) }.is_some() {
+    if flow_hit(&rev, proto, now, true) {
         bump(CTR_FLOW_HIT);
         return Ok(TC_ACT_PIPE);
     }
     // 2) continuation of an inbound-allowed flow?
     let fwd = FlowKey { src, dst, sport, dport, proto, _pad: [0; 3] };
-    if unsafe { FLOWS.get(&fwd) }.is_some() {
+    if flow_hit(&fwd, proto, now, true) {
         bump(CTR_FLOW_HIT);
         return Ok(TC_ACT_PIPE);
     }
@@ -150,7 +293,12 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     // (spec §5.3, Cilium approach) — the ICMP error itself is a fresh inbound
     // packet with no flow of its own; instead we look at the original packet
     // it is reporting on, which (being sent from inside this segment) was
-    // recorded as-is at egress.
+    // recorded as-is at egress. `refresh = false`: an ICMP error is not
+    // forward traffic on the original flow (see `flow_hit`'s doc comment) —
+    // it still honors that flow's own staleness check (a stale original
+    // flow's embedded-error lookup also misses), it just must not extend
+    // that flow's idle timer merely because a router somewhere reported an
+    // error about it.
     if proto == 1 {
         let itype: u8 = ctx.load(ihl).map_err(|_| ())?;
         if itype == 3 || itype == 11 || itype == 12 {
@@ -167,7 +315,7 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
                 // original packet was OUTBOUND from this segment => recorded at egress as-is
                 let ekey = FlowKey { src: esrc, dst: edst, sport: esport, dport: edport,
                                      proto: eproto, _pad: [0; 3] };
-                if unsafe { FLOWS.get(&ekey) }.is_some() {
+                if flow_hit(&ekey, eproto, now, false) {
                     bump(CTR_FLOW_HIT);
                     return Ok(TC_ACT_PIPE);
                 }
@@ -176,17 +324,48 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     }
     // 4) rules (default deny)
     if scan_generation(src, dst, proto, dport) == ACT_ALLOW {
-        let _ = FLOWS.insert(&fwd, &1u64, 0);
+        let _ = FLOWS.insert(&fwd, &FlowVal { last_seen_ns: now }, 0);
         return Ok(TC_ACT_PIPE);
     }
     Ok(TC_ACT_SHOT)
 }
 
+/// Records this packet's own 5-tuple in `FLOWS` (egress is recording-only —
+/// it never blocks, per `aeth_egress`). Task 9 adds: (a) an EXISTING,
+/// still-fresh entry is refreshed in place rather than blindly re-inserted;
+/// (b) an existing but STALE entry is evicted and treated exactly like a
+/// brand-new one — a 5-tuple reused after its previous instance idled out is
+/// a new flow in every sense that matters here, not a continuation, so it's
+/// still subject to (c); (c) a genuinely new entry is only recorded if this
+/// source's per-source rolling-window rate cap (`rate_allows`) allows it —
+/// skipping the insert when capped is the entire enforcement mechanism
+/// (Task 9 brief: "egress never blocks packets", only the bookkeeping is
+/// capped, so a capped new flow's REPLIES simply fall through to rule
+/// evaluation instead of fast-pathing).
 fn try_egress(ctx: &TcContext) -> Result<(), ()> {
     let (src, dst, proto, ihl) = ipv4_at(ctx)?;
     let (sport, dport) = ports_at(ctx, ihl, proto);
     let key = FlowKey { src, dst, sport, dport, proto, _pad: [0; 3] };
-    let _ = FLOWS.insert(&key, &1u64, 0);
+    let now = unsafe { bpf_ktime_get_ns() };
+
+    match FLOWS.get_ptr_mut(&key) {
+        None => {
+            if rate_allows(src, now) {
+                let _ = FLOWS.insert(&key, &FlowVal { last_seen_ns: now }, 0);
+            }
+        }
+        Some(ptr) => {
+            let last_seen = unsafe { (*ptr).last_seen_ns };
+            if now.saturating_sub(last_seen) > timeout_ns(proto) {
+                let _ = FLOWS.remove(&key);
+                if rate_allows(src, now) {
+                    let _ = FLOWS.insert(&key, &FlowVal { last_seen_ns: now }, 0);
+                }
+            } else {
+                unsafe { (*ptr).last_seen_ns = now };
+            }
+        }
+    }
     Ok(())
 }
 

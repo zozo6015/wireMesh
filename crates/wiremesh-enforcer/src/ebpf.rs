@@ -18,14 +18,15 @@ use aya::{
         Array, ArrayOfMaps, MapData,
     },
     programs::{tc, SchedClassifier, TcAttachType},
-    Ebpf,
+    Ebpf, EbpfLoader,
 };
 use ipnet::Ipv4Net;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use wiremesh_enforcer_common::{
-    bit_set, FlowKey, RuleBits, RuleMeta, ACT_ALLOW, ACT_DENY, BITSET_WORDS, CTR_DEFAULT_DENY,
-    LPM_MAX_ENTRIES, MAX_RULES,
+    bit_set, FlowKey, FlowVal, RuleBits, RuleMeta, ACT_ALLOW, ACT_DENY, BITSET_WORDS,
+    CFG_ICMP_NS, CFG_RATE_CAP, CFG_TCP_NS, CFG_UDP_NS, CTR_DEFAULT_DENY, LPM_MAX_ENTRIES,
+    MAX_RULES,
 };
 use wiremesh_policy::{IrAction, IrProto, PolicyIR};
 
@@ -50,8 +51,12 @@ const BPF_F_NO_PREALLOC: u32 = 1;
 /// [`apply_generation`]'s "reap-on-next-apply" wait below.
 const REAP_GRACE: Duration = Duration::from_secs(10);
 
-const PINNED_MAPS: [&str; 7] =
-    ["COUNTERS", "ACTIVE", "GEN_SRC", "GEN_DST", "GEN_RULES", "GEN_META", "FLOWS"];
+const PINNED_MAPS: [&str; 9] = [
+    "COUNTERS", "ACTIVE", "GEN_SRC", "GEN_DST", "GEN_RULES", "GEN_META", "FLOWS",
+    // Task 9 additions: the per-protocol-idle-timeout/rate-cap config map
+    // and the per-source rate-cap bookkeeping map.
+    "CONFIG", "RATE",
+];
 
 /// The live eBPF backend: one loaded+attached [`Ebpf`] instance per
 /// `probe()` call, kept alive for the lifetime of the boxed [`Enforcer`].
@@ -82,11 +87,15 @@ const PINNED_MAPS: [&str; 7] =
 /// detach; it does not need an explicit unattach/unload step.
 pub struct EbpfEnforcer {
     ebpf: Ebpf,
-    #[allow(dead_code)] // not yet consumed: idle timeouts/rate caps/log
-    // sampling aren't wired into the eBPF maps in this task (the spike's
-    // FLOWS table is a fixed 65536-entry LruHashMap with no idle-eviction
-    // or rate-limiting logic yet) -- kept here so a later task can read it
-    // back without changing `probe`'s signature again.
+    #[allow(dead_code)] // `flow_max`/`tcp_idle_s`/`udp_idle_s`/`icmp_idle_s`/
+    // `rate_cap_per_src` are now consumed (Task 9: `FLOWS` max_entries via
+    // `EbpfLoader::map_max_entries` + the `CONFIG` map, both in `new` below,
+    // from the LOCAL `cfg` parameter, before this struct is even
+    // constructed) -- but `log_per_rule`/`log_aggregate` (deny-log sampling)
+    // remain unconsumed until Task 10 wires up the deny-event ring buffer,
+    // so the field as a whole is kept (and still needs the allow) purely for
+    // those two, retained here so that later task can read them back without
+    // changing `probe`'s signature again.
     cfg: EnforcerConfig,
     /// Task 8 map-in-map generation bookkeeping (idx→`rule_id` mapping for
     /// `counters()`, and the pending-reap grace-period tracker for
@@ -151,11 +160,28 @@ struct PendingReap {
 
 impl EbpfEnforcer {
     pub(crate) fn new(iface: &str, cfg: EnforcerConfig) -> Result<Self> {
-        let mut ebpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
-            env!("OUT_DIR"),
-            "/wiremesh-enforcer"
-        )))
-        .context("loading embedded eBPF object")?;
+        // Task 9 brief: "flow_max: set FLOWS max_entries from
+        // EnforcerConfig BEFORE load" -- `EbpfLoader::map_max_entries`
+        // overrides the kernel-declared map's default `max_entries` before
+        // the map is actually created in the kernel, unlike the per-
+        // generation LPM/`Array` maps (which are recreated fresh on every
+        // `apply()` via standalone `create` calls, not the loader). Plain
+        // `Ebpf::load` (Task 7/8) has no way to express this override, hence
+        // the switch to the builder API here.
+        let mut ebpf = EbpfLoader::new()
+            .map_max_entries("FLOWS", cfg.flow_max)
+            .load(aya::include_bytes_aligned!(concat!(
+                env!("OUT_DIR"),
+                "/wiremesh-enforcer"
+            )))
+            .context("loading embedded eBPF object")?;
+
+        // Task 9 brief: config must be written BEFORE either classifier
+        // attaches, so no packet is ever classified against an unwritten
+        // (all-zero) `CONFIG` -- see `write_config`'s own doc comment and
+        // `wiremesh_enforcer_common::DEFAULT_TCP_NS`'s doc comment for the
+        // kernel-side defense-in-depth fallback on top of this ordering.
+        write_config(&mut ebpf, &cfg).context("writing CONFIG map")?;
 
         let _ = tc::qdisc_add_clsact(iface); // idempotent-ish: ignore EEXIST (graduated from spike)
         for (prog, at) in [
@@ -235,6 +261,27 @@ fn ensure_bpffs(pin_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Writes `EnforcerConfig`'s idle-timeout/rate-cap fields into the kernel's
+/// `CONFIG: Array<u64>` map (Task 9 brief: indices `CFG_TCP_NS`/
+/// `CFG_UDP_NS`/`CFG_ICMP_NS`/`CFG_RATE_CAP`) — seconds converted to
+/// nanoseconds (`bpf_ktime_get_ns()`-comparable, matching `FlowVal::
+/// last_seen_ns`'s unit). Called from `EbpfEnforcer::new`, strictly BEFORE
+/// either tc classifier is attached, so no packet is ever evaluated against
+/// an unwritten (all-zero) `CONFIG` — this ordering is the primary guard the
+/// Task 9 brief's self-review checklist calls for ("config written before
+/// attach so no packet sees zero timeouts"); the kernel program's own
+/// `cfg_or_default` is a secondary, defense-in-depth fallback on top of it,
+/// not a substitute for it.
+fn write_config(ebpf: &mut Ebpf, cfg: &EnforcerConfig) -> Result<()> {
+    let mut config: Array<&mut MapData, u64> =
+        Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG")?)?;
+    config.set(CFG_TCP_NS, u64::from(cfg.tcp_idle_s) * 1_000_000_000, 0)?;
+    config.set(CFG_UDP_NS, u64::from(cfg.udp_idle_s) * 1_000_000_000, 0)?;
+    config.set(CFG_ICMP_NS, u64::from(cfg.icmp_idle_s) * 1_000_000_000, 0)?;
+    config.set(CFG_RATE_CAP, u64::from(cfg.rate_cap_per_src), 0)?;
+    Ok(())
+}
+
 fn pin_maps(ebpf: &mut Ebpf, pin_dir: &std::path::Path) -> Result<()> {
     ensure_bpffs(pin_dir)?;
     std::fs::create_dir_all(pin_dir)
@@ -297,11 +344,12 @@ impl Enforcer for EbpfEnforcer {
     /// set rather than fast-pathing on a stale recorded flow.
     fn flush_flows(&mut self) -> Result<()> {
         // `FLOWS` is a `BPF_MAP_TYPE_LRU_HASH` (the eBPF program's
-        // `LruHashMap<FlowKey, u64>`); on the userspace side aya represents
+        // `LruHashMap<FlowKey, FlowVal>` as of Task 9 -- was `LruHashMap<
+        // FlowKey, u64>` pre-Task-9); on the userspace side aya represents
         // both plain and LRU hash maps with the same `aya::maps::HashMap`
         // type (`Map::LruHashMap` and `Map::HashMap` both convert into it) —
         // there is no separate `aya::maps::LruHashMap` type to name here.
-        let mut flows: aya::maps::HashMap<&mut MapData, FlowKey, u64> =
+        let mut flows: aya::maps::HashMap<&mut MapData, FlowKey, FlowVal> =
             aya::maps::HashMap::try_from(self.ebpf.map_mut("FLOWS").context("FLOWS")?)?;
         let keys: Vec<FlowKey> = flows.keys().collect::<Result<_, _>>()?;
         for k in keys {
