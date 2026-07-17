@@ -952,3 +952,136 @@ policy:
     }
     drop(lab);
 }
+
+// --- counters for retired rules must be pruned at apply -----------------
+
+/// Task 8 re-review finding (relayed by the coordinator): the fix above
+/// (`fold_and_reset_counters` folding a superseded generation's per-idx
+/// counts into `GenerationState::counter_accum`, keyed by the stable
+/// `rule_id`) makes counters SURVIVE a rule's idx changing across policy
+/// updates -- but that same `counter_accum` map is never pruned, so a rule
+/// that's REMOVED entirely keeps its counter around forever (unbounded
+/// growth over a gateway's whole policy-edit history, and a removed rule's
+/// counter staying visible in `counters().by_rule` indefinitely).
+///
+/// Ruling (relayed by the coordinator): at `apply()`, after folding, any
+/// `counter_accum` entry whose `rule_id` is NOT present in the NEW
+/// generation's idx->rule_id mapping must be pruned. This is consistent
+/// with nft named-counter semantics (a counter tied to a deleted rule
+/// doesn't outlive it) and doesn't conflict with the design's survival
+/// guarantee, which only ever promised counters survive for UNCHANGED
+/// rules across an update, not that a deleted rule's history is kept
+/// forever.
+///
+/// RED today: `counter_accum` has no pruning step at all (see
+/// `fold_and_reset_counters`'s doc comment above -- it only folds and
+/// zeroes `COUNTERS` slots, never removes an accumulator entry), so a
+/// retired rule's `rule_id` remains in `counters().by_rule` after the
+/// policy that dropped it is applied.
+#[test]
+fn counters_for_removed_rules_are_pruned_at_apply() {
+    let (lab, a, b) = wg_lab();
+    join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
+
+    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+        .expect("probe should load + attach eBPF on wg0");
+
+    let segs = segments_exact();
+    let v1_yaml = "
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+          ports: [9300]
+      - allow:
+          proto: tcp
+          ports: [9301]
+";
+    let v1 = compile_with(v1_yaml, &segs, 1);
+    let rule_a_id = v1.blocks[0].rules[0].rule_id.clone();
+    let rule_b_id = v1.blocks[0].rules[1].rule_id.clone();
+    enforcer
+        .apply(&v1)
+        .expect("v1 (two small allow rules, no padding needed) must apply");
+
+    let mut children = vec![
+        spawn_accept_only_listener(&b, 9300),
+        spawn_accept_only_listener(&b, 9301),
+    ];
+    std::thread::sleep(Duration::from_millis(200));
+
+    // A gets k hits; B gets its own, smaller, distinct m hits -- so B's
+    // post-v2 value has a concrete, non-trivial baseline to prove "intact"
+    // against, rather than a vacuous "still absent/0" either way.
+    let k = 2u64;
+    for _ in 0..k {
+        assert!(
+            tcp_connect(&a, "10.10.0.2", 9300, 2),
+            "connection matching rule A (port 9300) should succeed under v1"
+        );
+    }
+    let m = 1u64;
+    for _ in 0..m {
+        assert!(
+            tcp_connect(&a, "10.10.0.2", 9301, 2),
+            "connection matching rule B (port 9301) should succeed under v1"
+        );
+    }
+    let snapshot = enforcer.counters().expect("counters() should succeed after v1 traffic");
+    assert!(
+        snapshot.by_rule.get(&rule_a_id).copied().unwrap_or(0) > 0,
+        "rule A should show a nonzero hit count before v2 removes it: {:?}",
+        snapshot.by_rule
+    );
+    assert_eq!(
+        snapshot.by_rule.get(&rule_b_id).copied().unwrap_or(0),
+        m,
+        "rule B should show exactly m={m} hits before v2: {:?}",
+        snapshot.by_rule
+    );
+
+    // v2: A is REMOVED entirely -- only B remains.
+    let v2_yaml = "
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+          ports: [9301]
+";
+    let v2 = compile_with(v2_yaml, &segs, 2);
+    assert_eq!(
+        v2.blocks[0].rules[0].rule_id, rule_b_id,
+        "rule_id is a content hash independent of position -- B's rule_id must be unchanged \
+         across v1/v2 despite shifting from idx1 to idx0"
+    );
+
+    // apply() may internally block out the remainder of v1's post-flip reap
+    // grace (>=10s total since v1's flip) before returning -- acceptable,
+    // no explicit sleep needed here.
+    enforcer.apply(&v2).expect(
+        "v2 (B only, A removed -- no padding needed, small policies apply fast) must apply",
+    );
+
+    let after_v2 = enforcer.counters().expect("counters() should succeed after v2 apply");
+    assert!(
+        !after_v2.by_rule.contains_key(&rule_a_id),
+        "rule A was removed entirely in v2 -- its counter must be pruned from by_rule, not kept \
+         around forever: {:?}",
+        after_v2.by_rule
+    );
+    assert_eq!(
+        after_v2.by_rule.get(&rule_b_id).copied().unwrap_or(0),
+        m,
+        "rule B's own counter must be intact (unaffected by A's removal/pruning): {:?}",
+        after_v2.by_rule
+    );
+
+    for c in &mut children {
+        let _ = c.kill();
+    }
+    drop(lab);
+}
