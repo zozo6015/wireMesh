@@ -47,90 +47,18 @@
 //! (by_rule == 100) already passes today, while its event-count assertion
 //! (`>= 5`) fails on "got 0 events".
 
-mod lab {
-    use natlab::{Lab, Ns};
-    use std::io::Write;
-
-    fn wg_keypair() -> (String, String) {
-        let priv_out = std::process::Command::new("wg")
-            .arg("genkey")
-            .output()
-            .unwrap();
-        let privkey = String::from_utf8(priv_out.stdout).unwrap().trim().to_string();
-        let pub_out = {
-            let mut c = std::process::Command::new("wg")
-                .arg("pubkey")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            c.stdin.as_mut().unwrap().write_all(privkey.as_bytes()).unwrap();
-            c.wait_with_output().unwrap()
-        };
-        (privkey.clone(), String::from_utf8(pub_out.stdout).unwrap().trim().to_string())
-    }
-
-    /// Returns a running lab: overlay 10.10.0.1 <-> 10.10.0.2 over underlay
-    /// 10.9.1.0/24, `wg0` created via the KERNEL WireGuard implementation
-    /// directly inside each namespace. Verbatim copy of
-    /// `tests/generations.rs`'s/`tests/flow_table.rs`'s identical helper
-    /// (see those files' doc comments for the full rationale) — `#[path]`-
-    /// free per this crate's established per-file self-sufficiency
-    /// convention. Distinct `Lab::new` prefix (`"aeth10"`) so this file's
-    /// netns/veth names never collide with another test binary's lab
-    /// running concurrently.
-    pub fn wg_lab() -> (Lab, Ns, Ns) {
-        let mut lab = Lab::new("aeth10").unwrap();
-        let a = lab.ns("a").unwrap();
-        let b = lab.ns("b").unwrap();
-        lab.veth((&a, "u0", "10.9.1.1/24"), (&b, "u1", "10.9.1.2/24")).unwrap();
-
-        let (apriv, apub) = wg_keypair();
-        let (bpriv, bpub) = wg_keypair();
-
-        for (ns, privkey, peer_pub, my_ip, _peer_ip, peer_ep) in [
-            (&a, &apriv, &bpub, "10.10.0.1/24", "10.10.0.2", "10.9.1.2:51820"),
-            (&b, &bpriv, &apub, "10.10.0.2/24", "10.10.0.1", "10.9.1.1:51820"),
-        ] {
-            ns.exec(&["ip", "link", "add", "wg0", "type", "wireguard"]).unwrap();
-            let kf = format!("/tmp/{}.key", ns.name);
-            std::fs::write(&kf, privkey).unwrap();
-            ns.exec(&[
-                "wg", "set", "wg0", "listen-port", "51820", "private-key", &kf,
-                "peer", peer_pub, "allowed-ips", "10.10.0.0/24",
-                "endpoint", peer_ep,
-            ]).unwrap();
-            ns.exec(&["ip", "addr", "add", my_ip, "dev", "wg0"]).unwrap();
-            ns.exec(&["ip", "link", "set", "wg0", "up", "mtu", "1280"]).unwrap();
-        }
-
-        (lab, a, b)
-    }
-}
-
-use lab::wg_lab;
+// (Task 12) `wg_lab`/`join_netns` graduated into `wiremesh-testkit`'s
+// `netns` module -- see that module's doc comments for the full history
+// (this file's previous inline `mod lab` + `fn join_netns` copies are now
+// that module's single source of truth). `"aeth10"` is this file's distinct
+// `wg_lab` prefix, unchanged from its pre-graduation `Lab::new("aeth10")`
+// call -- kept so this file's netns/veth names still never collide with
+// another test binary's lab running concurrently.
 use std::net::Ipv4Addr;
 use std::time::Duration;
 use wiremesh_enforcer::EnforcerConfig;
 use wiremesh_policy::{compile, parse_policy, PolicyIR, SegmentDef};
-
-/// See `tests/generations.rs`'s identical helper for the full rationale
-/// (safe here for the same reason: libtest gives every `#[test]` fn its own
-/// OS thread, and `setns` is scoped to the calling thread alone).
-fn join_netns(ns_name: &str) -> anyhow::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let path = format!("/var/run/netns/{ns_name}");
-    let file = std::fs::File::open(&path)
-        .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
-    let rc = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
-    if rc != 0 {
-        anyhow::bail!(
-            "setns({path}, CLONE_NEWNET) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
+use wiremesh_testkit::netns::{join_netns, wg_lab, Ns};
 
 /// Exact per-host /32 segments — same as `tests/generations.rs`'s
 /// `segments_exact`, duplicated per this crate's established per-file
@@ -155,7 +83,7 @@ fn compile_with(yaml: &str, segs: &[SegmentDef], version: u64) -> PolicyIR {
 /// why 0.3s guarantees exactly one SYN is ever sent). Exists purely to put
 /// one denied SYN packet on the wire, not to report success/failure back to
 /// the caller.
-fn deny_one_syn(ns: &natlab::Ns, dst_ip: &str, port: u16) {
+fn deny_one_syn(ns: &Ns, dst_ip: &str, port: u16) {
     let script = format!(
         r#"
 import socket
@@ -175,7 +103,7 @@ except Exception:
 /// socket in one tight in-process Python loop (no per-datagram process
 /// spawn) -- comfortably completes in low milliseconds, well inside the
 /// brief's "<1s" scenario window for (c)'s sampling test.
-fn udp_blast(ns: &natlab::Ns, dst_ip: &str, dst_port: u16, count: u32) {
+fn udp_blast(ns: &Ns, dst_ip: &str, dst_port: u16, count: u32) {
     let script = format!(
         r#"
 import socket
@@ -201,7 +129,7 @@ for _ in range({count}):
 /// doc) -- `events.len() == 1` fails with `events.len() == 0`.
 #[test]
 fn one_denied_syn_yields_exactly_one_deny_event_with_matching_rule_id() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth10");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", EnforcerConfig::default())
@@ -255,7 +183,7 @@ policy:
 /// RED today: same stub as (a) -- `events.len() == 1` fails with `0`.
 #[test]
 fn default_deny_yields_deny_event_with_rule_id_none() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth10");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", EnforcerConfig::default())
@@ -312,7 +240,7 @@ fn default_deny_yields_deny_event_with_rule_id_none() {
 /// >= 5` fails with `0`.
 #[test]
 fn sampling_bounds_events_while_counter_still_counts_all_100() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth10");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let cfg = EnforcerConfig { log_per_rule: 5, ..EnforcerConfig::default() };

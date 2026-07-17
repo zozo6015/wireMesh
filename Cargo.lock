@@ -925,13 +925,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
-name = "natlab"
-version = "0.1.0"
-dependencies = [
- "anyhow",
-]
-
-[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2131,9 +2124,9 @@ dependencies = [
  "cargo_metadata",
  "ipnet",
  "libc",
- "natlab",
  "wiremesh-enforcer-common",
  "wiremesh-policy",
+ "wiremesh-testkit",
 ]
 
 [[package]]
@@ -2171,6 +2164,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "hyper-util",
+ "libc",
  "rand 0.8.7",
  "rcgen",
  "tempfile",

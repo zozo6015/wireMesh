@@ -33,3 +33,16 @@ rcgen = { workspace = true }
 # Cargo.lock) — declaring it directly here just makes the dependency
 # explicit rather than relying on an incidental transitive edge.
 x509-parser = "0.16"
+# (Task 12) `netns::join_netns`'s `setns(2)` call — optional, only pulled in
+# by the `netns` feature below, so pure-userspace consumers (e.g.
+# wiremesh-controller's own test suite) never link it.
+libc = { version = "0.2", optional = true }
+
+[features]
+# Gates `src/netns.rs`: the privileged Linux network-namespace test harness
+# (`Lab`/`Ns`/`wg_lab`/`join_netns`), graduated from `spike/natlab` and the
+# enforcer test files' duplicated `wg_lab`/`join_netns` copies (Task 12).
+# Off by default so depending on `wiremesh-testkit` for its userspace
+# `TestController`/`StubGateway` surface never compiles or links `libc`'s
+# netns bits, and never requires a Linux host.
+netns = ["dep:libc"]

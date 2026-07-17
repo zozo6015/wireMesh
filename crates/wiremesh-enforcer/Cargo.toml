@@ -51,7 +51,15 @@ aya-build = { version = "0.2.0", default-features = false }
 cargo_metadata = { version = "0.23.0", default-features = false }
 
 [dev-dependencies]
-# `tests/ebpf_backend.rs`'s inline `wg_lab()` (adapted from
-# `spike/enforcer/enforcer/tests/common/mod.rs`) needs the same two-node
-# veth+netns lab helper the spike tests use.
-natlab = { path = "../../spike/natlab" }
+# (Task 12) The graduated netns test harness (`Lab`/`Ns`/`wg_lab`/
+# `join_netns`) that `tests/{ebpf_backend,generations,flow_table,deny_events,
+# nft_backend}.rs` all drive — replaces the earlier per-file inline `mod lab`
+# copies (themselves adapted from `spike/enforcer/enforcer/tests/common/mod.rs`)
+# and the standalone `natlab` path dependency they used before graduation.
+# `default-features = false` + explicit `netns` feature: this crate only
+# needs the netns harness, never the userspace `TestController`/`StubGateway`
+# surface `wiremesh-testkit` also exposes (that surface has no
+# `wiremesh-enforcer` relevance and pulls in `wiremesh-controller`'s own
+# dependency tree regardless of which features are selected, since Cargo
+# always compiles a crate's non-optional dependencies).
+wiremesh-testkit = { path = "../wiremesh-testkit", default-features = false, features = ["netns"] }

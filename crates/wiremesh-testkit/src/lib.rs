@@ -12,6 +12,14 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+/// Privileged Linux network-namespace test harness (`Lab`/`Ns`/`wg_lab`/
+/// `join_netns`) — graduated (Task 12) from `spike/natlab` and the
+/// `wiremesh-enforcer` test suite's duplicated netns lab helpers. Feature-
+/// gated (see this crate's `Cargo.toml`) so the userspace `TestController`/
+/// `StubGateway` surface above never pulls it in.
+#[cfg(feature = "netns")]
+pub mod netns;
+
 use hyper_util::rt::TokioIo;
 use rand::RngCore;
 use tempfile::TempDir;

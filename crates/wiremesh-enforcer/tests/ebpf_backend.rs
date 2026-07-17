@@ -38,124 +38,19 @@
 //! (after successfully bringing up the lab) until Step 3 (implementer) fills
 //! in the real eBPF loader in `src/ebpf.rs` (not yet created).
 
-// Adapted inline copy of the canonical two-node WireGuard tunnel lab helper
-// (spike/enforcer/enforcer/tests/common/mod.rs, itself adapted from
-// spike/tunnel/tests/common/mod.rs) -- each spike crate (and now this crate,
-// ahead of Task 12's graduated shared testkit harness) is standalone, so
-// this is copied rather than depended on directly. `#[path]`-free per the
-// brief: defined inline as its own module in this same file, not via
-// `#[path = "..."] mod common;` pointing at a separate file. Adapted beyond
-// the spike's literal version (see the module doc above): kernel WireGuard
-// instead of the boringtun `spike-tunnel` binary, so no `SPIKE_TUNNEL_BIN`
-// env var and no spawned processes to track/kill.
-mod lab {
-    use natlab::{Lab, Ns};
-    use std::io::Write;
-
-    fn wg_keypair() -> (String, String) {
-        let priv_out = std::process::Command::new("wg")
-            .arg("genkey")
-            .output()
-            .unwrap();
-        let privkey = String::from_utf8(priv_out.stdout).unwrap().trim().to_string();
-        let pub_out = {
-            let mut c = std::process::Command::new("wg")
-                .arg("pubkey")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            c.stdin.as_mut().unwrap().write_all(privkey.as_bytes()).unwrap();
-            c.wait_with_output().unwrap()
-        };
-        (privkey.clone(), String::from_utf8(pub_out.stdout).unwrap().trim().to_string())
-    }
-
-    /// Returns a running lab: overlay 10.10.0.1 <-> 10.10.0.2 over underlay
-    /// 10.9.1.0/24, `wg0` created via the KERNEL WireGuard implementation
-    /// directly inside each namespace (`ip link add wg0 type wireguard`) --
-    /// no userspace tunnel process involved, so there is nothing for the
-    /// caller to kill afterward (unlike the spike's boringtun-backed
-    /// version).
-    pub fn wg_lab() -> (Lab, Ns, Ns) {
-        let mut lab = Lab::new("aeth").unwrap();
-        let a = lab.ns("a").unwrap();
-        let b = lab.ns("b").unwrap();
-        lab.veth((&a, "u0", "10.9.1.1/24"), (&b, "u1", "10.9.1.2/24")).unwrap();
-
-        let (apriv, apub) = wg_keypair();
-        let (bpriv, bpub) = wg_keypair();
-
-        // `allowed-ips` is WireGuard cryptokey routing's OWN allow-list, fully
-        // independent of (and evaluated before) anything the eBPF enforcer
-        // sees: a packet whose src (outbound) or claimed src (inbound) falls
-        // outside it is silently dropped by the kernel WG implementation
-        // itself, never reaching wg0's tc classifier at all. Widened from the
-        // bare peer host `/32` to the whole overlay `/24` (root-caused via a
-        // bare `ping -I <alias>` repro, zero eBPF involved) so tests that
-        // source traffic from secondary IP aliases on `wg0` (e.g.
-        // `tests/generations.rs`'s LPM tests, which bind to `10.10.0.8`/`.9`
-        // in addition to the primary `10.10.0.1`) actually reach the peer
-        // instead of being dropped before the enforcer ever runs.
-        for (ns, privkey, peer_pub, my_ip, _peer_ip, peer_ep) in [
-            (&a, &apriv, &bpub, "10.10.0.1/24", "10.10.0.2", "10.9.1.2:51820"),
-            (&b, &bpriv, &apub, "10.10.0.2/24", "10.10.0.1", "10.9.1.1:51820"),
-        ] {
-            ns.exec(&["ip", "link", "add", "wg0", "type", "wireguard"]).unwrap();
-            let kf = format!("/tmp/{}.key", ns.name);
-            std::fs::write(&kf, privkey).unwrap();
-            ns.exec(&[
-                "wg", "set", "wg0", "listen-port", "51820", "private-key", &kf,
-                "peer", peer_pub, "allowed-ips", "10.10.0.0/24",
-                "endpoint", peer_ep,
-            ]).unwrap();
-            ns.exec(&["ip", "addr", "add", my_ip, "dev", "wg0"]).unwrap();
-            ns.exec(&["ip", "link", "set", "wg0", "up", "mtu", "1280"]).unwrap();
-        }
-
-        (lab, a, b)
-    }
-}
-
-use lab::wg_lab;
-
-/// Joins the CALLING OS thread to `ns_name`'s network namespace via
-/// `setns(2)`/`CLONE_NEWNET`, so subsequent in-process library calls
-/// (`probe`/`apply`) run as if executing inside that namespace -- the same
-/// effect `ip netns exec` gets a subprocess (what the spike's binary-based
-/// tests use instead), but there is no `wiremesh-enforcer` CLI binary here,
-/// only the library. Safe to do from a test: libtest always runs each
-/// `#[test]` fn on its own freshly spawned OS thread (true even under
-/// `--test-threads=1`, which only bounds how many run *concurrently* -- see
-/// CLAUDE.md's "Network tests are serial" rule), and Linux namespace
-/// membership changed via `setns` is scoped to the calling thread alone, not
-/// the whole process -- so this cannot leak into any other test.
-///
-/// Only joins the NETWORK namespace, not `b`'s private mount namespace
-/// (`natlab::Ns::exec`/`spawn` additionally `nsenter --mount=...` for a
-/// boringtun UAPI-socket collision reason documented in
-/// `spike/natlab/src/lib.rs` -- moot here now that this lab uses kernel
-/// WireGuard, not boringtun, but harmless either way since this test runs
-/// exactly one enforcer instance, no concurrent same-named pins/sockets to
-/// disambiguate).
-fn join_netns(ns_name: &str) -> anyhow::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let path = format!("/var/run/netns/{ns_name}");
-    let file = std::fs::File::open(&path)
-        .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
-    let rc = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
-    if rc != 0 {
-        anyhow::bail!(
-            "setns({path}, CLONE_NEWNET) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
+// (Task 12) `wg_lab`/`join_netns` graduated into `wiremesh-testkit`'s
+// `netns` module -- see that module's doc comments for the full history
+// (this file's previous inline `mod lab` + `fn join_netns` copies, adapted
+// from `spike/enforcer/enforcer/tests/common/mod.rs`, are now that module's
+// single source of truth). `"aeth"` is this file's distinct `wg_lab` prefix,
+// unchanged from its pre-graduation `Lab::new("aeth")` call -- kept so this
+// file's netns/veth names still never collide with another test binary's
+// lab running concurrently.
+use wiremesh_testkit::netns::{join_netns, wg_lab};
 
 #[test]
 fn probe_attaches_ebpf_and_applies_empty_policy_on_wg0() {
-    let (lab, _a, b) = wg_lab();
+    let (lab, _a, b) = wg_lab("aeth");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer =
@@ -219,7 +114,7 @@ fn probe_attaches_ebpf_and_applies_empty_policy_on_wg0() {
 /// re-probe-succeeds contract Task 8 needs) ARE hard assertions.
 #[test]
 fn dropping_enforcer_detaches_and_allows_reprobe_on_same_iface() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     // Sanity: the kernel-WG tunnel alone (no enforcer attached yet) passes ICMP.

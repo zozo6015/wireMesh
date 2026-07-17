@@ -26,95 +26,17 @@
 //! second independent RED reason behind (a)'s counter assertions, reached
 //! only once Task 8 lifts the capacity cap.
 
-mod lab {
-    use natlab::{Lab, Ns};
-    use std::io::Write;
-
-    fn wg_keypair() -> (String, String) {
-        let priv_out = std::process::Command::new("wg")
-            .arg("genkey")
-            .output()
-            .unwrap();
-        let privkey = String::from_utf8(priv_out.stdout).unwrap().trim().to_string();
-        let pub_out = {
-            let mut c = std::process::Command::new("wg")
-                .arg("pubkey")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            c.stdin.as_mut().unwrap().write_all(privkey.as_bytes()).unwrap();
-            c.wait_with_output().unwrap()
-        };
-        (privkey.clone(), String::from_utf8(pub_out.stdout).unwrap().trim().to_string())
-    }
-
-    /// Returns a running lab: overlay 10.10.0.1 <-> 10.10.0.2 over underlay
-    /// 10.9.1.0/24, `wg0` created via the KERNEL WireGuard implementation
-    /// directly inside each namespace. See `tests/ebpf_backend.rs`'s
-    /// identical helper for the full rationale.
-    pub fn wg_lab() -> (Lab, Ns, Ns) {
-        let mut lab = Lab::new("aeth8").unwrap();
-        let a = lab.ns("a").unwrap();
-        let b = lab.ns("b").unwrap();
-        lab.veth((&a, "u0", "10.9.1.1/24"), (&b, "u1", "10.9.1.2/24")).unwrap();
-
-        let (apriv, apub) = wg_keypair();
-        let (bpriv, bpub) = wg_keypair();
-
-        // `allowed-ips` is WireGuard cryptokey routing's OWN allow-list, fully
-        // independent of (and evaluated before) anything the eBPF enforcer
-        // sees: a packet whose src (outbound) or claimed src (inbound) falls
-        // outside it is silently dropped by the kernel WG implementation
-        // itself, never reaching wg0's tc classifier at all. Widened from the
-        // bare peer host `/32` to the whole overlay `/24` (root-caused via a
-        // bare `ping -I <alias>` repro, zero eBPF involved) so this file's
-        // LPM tests -- which bind to secondary IP aliases `10.10.0.8`/`.9` on
-        // `a`'s `wg0` in addition to its primary `10.10.0.1` -- actually reach
-        // `b` instead of being dropped before the enforcer ever runs. Keep
-        // this in sync with `tests/ebpf_backend.rs`'s identical copy.
-        for (ns, privkey, peer_pub, my_ip, _peer_ip, peer_ep) in [
-            (&a, &apriv, &bpub, "10.10.0.1/24", "10.10.0.2", "10.9.1.2:51820"),
-            (&b, &bpriv, &apub, "10.10.0.2/24", "10.10.0.1", "10.9.1.1:51820"),
-        ] {
-            ns.exec(&["ip", "link", "add", "wg0", "type", "wireguard"]).unwrap();
-            let kf = format!("/tmp/{}.key", ns.name);
-            std::fs::write(&kf, privkey).unwrap();
-            ns.exec(&[
-                "wg", "set", "wg0", "listen-port", "51820", "private-key", &kf,
-                "peer", peer_pub, "allowed-ips", "10.10.0.0/24",
-                "endpoint", peer_ep,
-            ]).unwrap();
-            ns.exec(&["ip", "addr", "add", my_ip, "dev", "wg0"]).unwrap();
-            ns.exec(&["ip", "link", "set", "wg0", "up", "mtu", "1280"]).unwrap();
-        }
-
-        (lab, a, b)
-    }
-}
-
-use lab::wg_lab;
+// (Task 12) `wg_lab`/`join_netns` graduated into `wiremesh-testkit`'s
+// `netns` module -- see that module's doc comments for the full history
+// (this file's previous inline `mod lab` + `fn join_netns` copies are now
+// that module's single source of truth). `"aeth8"` is this file's distinct
+// `wg_lab` prefix, unchanged from its pre-graduation `Lab::new("aeth8")`
+// call -- kept so this file's netns/veth names still never collide with
+// another test binary's lab running concurrently.
 use std::process::Child;
 use std::time::Duration;
 use wiremesh_policy::{compile, parse_policy, PolicyIR, SegmentDef};
-
-/// See `tests/ebpf_backend.rs`'s identical helper for the full rationale
-/// (safe here for the same reason: libtest gives every `#[test]` fn its own
-/// OS thread, and `setns` is scoped to the calling thread alone).
-fn join_netns(ns_name: &str) -> anyhow::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let path = format!("/var/run/netns/{ns_name}");
-    let file = std::fs::File::open(&path)
-        .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
-    let rc = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
-    if rc != 0 {
-        anyhow::bail!(
-            "setns({path}, CLONE_NEWNET) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
+use wiremesh_testkit::netns::{join_netns, wg_lab, Ns};
 
 // --- policy fixtures --------------------------------------------------
 
@@ -173,7 +95,7 @@ fn pad_rules_yaml(start_port: u16, n: u16) -> String {
 /// Accepts connections in a loop, closing each immediately — enough to make
 /// a plain TCP `connect()` succeed on an otherwise-empty test port. Used by
 /// (a)/(b)/(c), which only care whether `connect()` succeeds or times out.
-fn spawn_accept_only_listener(ns: &natlab::Ns, port: u16) -> Child {
+fn spawn_accept_only_listener(ns: &Ns, port: u16) -> Child {
     let script = format!(
         r#"
 import socket
@@ -197,7 +119,7 @@ while True:
 /// stack), so "succeeds fast" vs. "times out" is a clean allow/deny signal
 /// as long as a real listener is bound on the port either way (see
 /// `spawn_accept_only_listener` above).
-fn tcp_connect_from(ns: &natlab::Ns, bind_addr: &str, dst_addr: &str, port: u16, timeout_s: u32) -> bool {
+fn tcp_connect_from(ns: &Ns, bind_addr: &str, dst_addr: &str, port: u16, timeout_s: u32) -> bool {
     let script = format!(
         r#"
 import socket, sys
@@ -214,14 +136,14 @@ except Exception:
     ns.exec(&["python3", "-c", &script]).is_ok()
 }
 
-fn tcp_connect(ns: &natlab::Ns, dst_addr: &str, port: u16, timeout_s: u32) -> bool {
+fn tcp_connect(ns: &Ns, dst_addr: &str, port: u16, timeout_s: u32) -> bool {
     tcp_connect_from(ns, "0.0.0.0", dst_addr, port, timeout_s)
 }
 
 /// Counts UDP datagrams received on `port` until `idle_timeout_s` elapses
 /// with no new packet, then prints the final count and exits. Used by (d)'s
 /// continuous-stream-under-flip test.
-fn spawn_udp_counting_receiver(ns: &natlab::Ns, port: u16, idle_timeout_s: f64) -> Child {
+fn spawn_udp_counting_receiver(ns: &Ns, port: u16, idle_timeout_s: f64) -> Child {
     let script = format!(
         r#"
 import socket
@@ -243,7 +165,7 @@ print(count)
 
 /// Sends `count` UDP datagrams to `dst_addr:port`, `interval_s` seconds
 /// apart, then prints `count` and exits.
-fn spawn_udp_sender(ns: &natlab::Ns, dst_addr: &str, port: u16, count: u32, interval_s: f64) -> Child {
+fn spawn_udp_sender(ns: &Ns, dst_addr: &str, port: u16, count: u32, interval_s: f64) -> Child {
     let script = format!(
         r#"
 import socket, time
@@ -261,7 +183,7 @@ print(n)
 /// Accepts ONE connection and echoes a fixed `b"ack"` reply for every
 /// message it receives, indefinitely — used by (e) to prove an
 /// already-established flow survives a later generation flip + reap.
-fn spawn_ack_echo_listener(ns: &natlab::Ns, port: u16) -> Child {
+fn spawn_ack_echo_listener(ns: &Ns, port: u16) -> Child {
     let script = format!(
         r#"
 import socket
@@ -287,7 +209,7 @@ except Exception:
 /// (spanning the caller's v2 apply + the >=10s old-generation reap grace),
 /// then exchanges a second request/ack over the SAME still-open socket.
 /// Exits 0 iff both round-trips succeeded.
-fn spawn_persistent_9100_client(ns: &natlab::Ns) -> Child {
+fn spawn_persistent_9100_client(ns: &Ns) -> Child {
     let script = r#"
 import socket, sys, time
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -321,7 +243,7 @@ sys.exit(0 if second == b"ack" else 1)
 /// per-rule counters.
 #[test]
 fn first_match_wins_denies_ssh_carve_out_allows_the_rest_with_correct_rule_counters() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
@@ -400,7 +322,7 @@ policy:
 /// rules.
 #[test]
 fn whole_segment_fallback_enforces_against_block_cidrs_not_a_bare_host_match() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
@@ -469,7 +391,7 @@ policy:
 /// rules.
 #[test]
 fn lpm_first_match_denies_narrow_carve_out_allows_the_wider_covering_cidr() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth8");
     a.exec(&["ip", "addr", "add", "10.10.0.8/32", "dev", "wg0"])
         .expect("add secondary source address .8 on a's wg0");
     a.exec(&["ip", "addr", "add", "10.10.0.9/32", "dev", "wg0"])
@@ -554,7 +476,7 @@ policy:
 #[test]
 fn lpm_cumulative_bitset_first_match_allows_narrow_host_via_earlier_wide_allow_despite_later_deny_carve_out(
 ) {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth8");
     a.exec(&["ip", "addr", "add", "10.10.0.8/32", "dev", "wg0"])
         .expect("add secondary source address .8 on a's wg0");
     a.exec(&["ip", "addr", "add", "10.10.0.9/32", "dev", "wg0"])
@@ -630,7 +552,7 @@ policy:
 /// (before the loop even starts) bails with `Err`.
 #[test]
 fn atomic_generation_flip_under_continuous_udp_traffic_has_zero_deficit() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
@@ -712,7 +634,7 @@ policy:
 /// flip) is ever reached.
 #[test]
 fn old_generation_reap_does_not_break_in_flight_allowed_flow_and_new_gen_matches() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
@@ -826,7 +748,7 @@ policy:
 /// is really A's history).
 #[test]
 fn counters_survive_rule_insertion_keyed_by_rule_id() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
@@ -980,7 +902,7 @@ policy:
 /// policy that dropped it is applied.
 #[test]
 fn counters_for_removed_rules_are_pruned_at_apply() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())

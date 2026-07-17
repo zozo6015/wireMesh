@@ -60,92 +60,18 @@
 //!   as a whole is a genuine RED against Task 8's "nothing ever expires"
 //!   behavior, not merely a regression guard for already-green code.
 
-mod lab {
-    use natlab::{Lab, Ns};
-    use std::io::Write;
-
-    fn wg_keypair() -> (String, String) {
-        let priv_out = std::process::Command::new("wg")
-            .arg("genkey")
-            .output()
-            .unwrap();
-        let privkey = String::from_utf8(priv_out.stdout).unwrap().trim().to_string();
-        let pub_out = {
-            let mut c = std::process::Command::new("wg")
-                .arg("pubkey")
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .spawn()
-                .unwrap();
-            c.stdin.as_mut().unwrap().write_all(privkey.as_bytes()).unwrap();
-            c.wait_with_output().unwrap()
-        };
-        (privkey.clone(), String::from_utf8(pub_out.stdout).unwrap().trim().to_string())
-    }
-
-    /// Returns a running lab: overlay 10.10.0.1 <-> 10.10.0.2 over underlay
-    /// 10.9.1.0/24, `wg0` created via the KERNEL WireGuard implementation
-    /// directly inside each namespace. Verbatim copy of
-    /// `tests/generations.rs`'s identical helper (see that file's doc
-    /// comments for the full rationale) — `#[path]`-free per this crate's
-    /// established per-file self-sufficiency convention.
-    pub fn wg_lab() -> (Lab, Ns, Ns) {
-        let mut lab = Lab::new("aeth9").unwrap();
-        let a = lab.ns("a").unwrap();
-        let b = lab.ns("b").unwrap();
-        lab.veth((&a, "u0", "10.9.1.1/24"), (&b, "u1", "10.9.1.2/24")).unwrap();
-
-        let (apriv, apub) = wg_keypair();
-        let (bpriv, bpub) = wg_keypair();
-
-        // `allowed-ips` widened to the whole overlay /24 (not just the peer
-        // host /32) since d924b39 -- required so alias-sourced traffic (this
-        // file's (d) rate-cap test binds extra IP aliases on `b`'s wg0)
-        // actually reaches the peer instead of being dropped by WireGuard's
-        // own cryptokey routing before the enforcer ever runs.
-        for (ns, privkey, peer_pub, my_ip, _peer_ip, peer_ep) in [
-            (&a, &apriv, &bpub, "10.10.0.1/24", "10.10.0.2", "10.9.1.2:51820"),
-            (&b, &bpriv, &apub, "10.10.0.2/24", "10.10.0.1", "10.9.1.1:51820"),
-        ] {
-            ns.exec(&["ip", "link", "add", "wg0", "type", "wireguard"]).unwrap();
-            let kf = format!("/tmp/{}.key", ns.name);
-            std::fs::write(&kf, privkey).unwrap();
-            ns.exec(&[
-                "wg", "set", "wg0", "listen-port", "51820", "private-key", &kf,
-                "peer", peer_pub, "allowed-ips", "10.10.0.0/24",
-                "endpoint", peer_ep,
-            ]).unwrap();
-            ns.exec(&["ip", "addr", "add", my_ip, "dev", "wg0"]).unwrap();
-            ns.exec(&["ip", "link", "set", "wg0", "up", "mtu", "1280"]).unwrap();
-        }
-
-        (lab, a, b)
-    }
-}
-
-use lab::wg_lab;
+// (Task 12) `wg_lab`/`join_netns` graduated into `wiremesh-testkit`'s
+// `netns` module -- see that module's doc comments for the full history
+// (this file's previous inline `mod lab` + `fn join_netns` copies are now
+// that module's single source of truth). `"aeth9"` is this file's distinct
+// `wg_lab` prefix, unchanged from its pre-graduation `Lab::new("aeth9")`
+// call -- kept so this file's netns/veth names still never collide with
+// another test binary's lab running concurrently.
 use std::process::Child;
 use std::time::Duration;
 use wiremesh_enforcer::EnforcerConfig;
 use wiremesh_policy::{compile, parse_policy, PolicyIR, SegmentDef};
-
-/// See `tests/generations.rs`'s identical helper for the full rationale
-/// (safe here for the same reason: libtest gives every `#[test]` fn its own
-/// OS thread, and `setns` is scoped to the calling thread alone).
-fn join_netns(ns_name: &str) -> anyhow::Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let path = format!("/var/run/netns/{ns_name}");
-    let file = std::fs::File::open(&path)
-        .map_err(|e| anyhow::anyhow!("open {path}: {e}"))?;
-    let rc = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNET) };
-    if rc != 0 {
-        anyhow::bail!(
-            "setns({path}, CLONE_NEWNET) failed: {}",
-            std::io::Error::last_os_error()
-        );
-    }
-    Ok(())
-}
+use wiremesh_testkit::netns::{join_netns, wg_lab, Ns};
 
 /// This task's small config values throughout (brief: "small config values
 /// (udp_idle_s: 2, flow_max: 64, rate_cap_per_src: 8)"). Every other field
@@ -201,7 +127,7 @@ fn empty_ir(version: u64) -> PolicyIR {
 /// completes in well under a second, callers needing precise before/after
 /// timing (idle-expiry / keep-alive tests) can sequence several calls with
 /// explicit `sleep`s in between with no race against a lingering process.
-fn udp_send_from(ns: &natlab::Ns, bind_ip: &str, bind_port: u16, dst_ip: &str, dst_port: u16) {
+fn udp_send_from(ns: &Ns, bind_ip: &str, bind_port: u16, dst_ip: &str, dst_port: u16) {
     let script = format!(
         r#"
 import socket
@@ -218,7 +144,7 @@ s.sendto(b"x", ("{dst_ip}", {dst_port}))
 /// `timeout_s` for a single datagram. Always prints exactly `RECEIVED` or
 /// `TIMEOUT` and exits 0 — never a nonzero exit, so `probe_received` alone
 /// (reading stdout after `wait_with_output`) tells the whole story.
-fn spawn_udp_recv_probe(ns: &natlab::Ns, port: u16, timeout_s: f64) -> Child {
+fn spawn_udp_recv_probe(ns: &Ns, port: u16, timeout_s: f64) -> Child {
     let script = format!(
         r#"
 import socket
@@ -262,7 +188,7 @@ fn probe_received(child: Child) -> bool {
 /// still (incorrectly) received by `b`'s listener.
 #[test]
 fn udp_flow_passes_within_idle_window_then_is_denied_after_expiry() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth9");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", tiny_cfg())
@@ -323,7 +249,7 @@ fn udp_flow_passes_within_idle_window_then_is_denied_after_expiry() {
 /// received).
 #[test]
 fn keepalive_traffic_refreshes_the_idle_timer_but_stopping_lets_it_expire_again() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth9");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", tiny_cfg())
@@ -399,7 +325,7 @@ fn keepalive_traffic_refreshes_the_idle_timer_but_stopping_lets_it_expire_again(
 /// this test must stay green throughout that refactor.
 #[test]
 fn flush_flows_forces_reevaluation_of_an_established_flow_after_its_allow_rule_is_removed() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth9");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", flush_test_cfg())
@@ -505,7 +431,7 @@ policy:
 /// `tiny_cfg` value -- (ii) is what carries this test's genuine RED.
 #[test]
 fn per_source_rate_cap_prevents_one_blasting_source_from_evicting_another_sources_flow() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth9");
     b.exec(&["ip", "addr", "add", "10.10.0.12/32", "dev", "wg0"])
         .expect("add alias1 (the blasting source) on b's wg0");
     b.exec(&["ip", "addr", "add", "10.10.0.22/32", "dev", "wg0"])
@@ -610,7 +536,7 @@ for s in socks:
 /// regression guard alongside (c)'s UDP variant.
 #[test]
 fn live_tcp_flow_survives_apply_removing_its_rule_but_not_a_subsequent_flush() {
-    let (lab, a, b) = wg_lab();
+    let (lab, a, b) = wg_lab("aeth9");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", tiny_cfg())
@@ -678,7 +604,7 @@ policy:
 /// message it receives, indefinitely. Adapted from `tests/generations.rs`'s
 /// identical helper (different port parameter, kept local per this crate's
 /// per-file self-sufficiency convention).
-fn spawn_ack_echo_listener(ns: &natlab::Ns, port: u16) -> Child {
+fn spawn_ack_echo_listener(ns: &Ns, port: u16) -> Child {
     let script = format!(
         r#"
 import socket
@@ -709,7 +635,7 @@ except Exception:
 /// line per stage (`OK`/`FAIL` for r1/r2, `DENIED`/`PASSED` for r3) and
 /// always exits 0, so the whole story is in stdout regardless of where a
 /// stage fails.
-fn spawn_flow_persistence_client(ns: &natlab::Ns, dst_addr: &str, port: u16) -> Child {
+fn spawn_flow_persistence_client(ns: &Ns, dst_addr: &str, port: u16) -> Child {
     let script = format!(
         r#"
 import socket, time
