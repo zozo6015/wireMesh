@@ -16,8 +16,12 @@
 use wiremesh_policy::{parse_policy, CompileError, SegmentDef};
 
 /// The fixed segment table every fixture in this file is validated
-/// against: three non-overlapping /16s, named so `from`/`to` in the
-/// fixtures read naturally.
+/// against: three non-overlapping /16s plus one wider /12, named so
+/// `from`/`to` in the fixtures read naturally. `seg-wide` exists so the
+/// positive subset-containment fixtures have a segment CIDR block visibly
+/// larger than the rule CIDR nested inside it (per review finding: every
+/// other fixture's `src`/`dst` is either omitted or a negative case, so the
+/// containment check's true-path never ran).
 fn segments() -> Vec<SegmentDef> {
     vec![
         SegmentDef {
@@ -31,6 +35,10 @@ fn segments() -> Vec<SegmentDef> {
         SegmentDef {
             name: "seg-c".into(),
             cidrs: vec!["10.2.0.0/16".parse().unwrap()],
+        },
+        SegmentDef {
+            name: "seg-wide".into(),
+            cidrs: vec!["172.16.0.0/12".parse().unwrap()],
         },
     ]
 }
@@ -223,6 +231,42 @@ fn empty_rules_block_parses_ok() {
     assert!(
         result.is_ok(),
         "empty rules: [] block should parse (default-deny that pair), got {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn src_and_dst_strictly_inside_segment_cidrs_parses_ok() {
+    // Review finding (Important): every other fixture's src/dst is either
+    // omitted or a negative case, so the subset-containment check's
+    // true-path (a CIDR that legitimately IS contained) never ran. A
+    // regression that always returns "not a subset", or that swaps the
+    // `contains` call direction to accept supersets instead of subsets,
+    // would still pass all the other tests. This fixture's src (10.0.5.0/24
+    // inside seg-a's 10.0.0.0/16) and dst (172.16.1.50/32 inside
+    // seg-wide's 172.16.0.0/12) are both strictly-contained, list-form
+    // CIDRs that must validate successfully.
+    let yaml = include_str!("fixtures/positive_subset_containment.yaml");
+    let result = parse_policy(yaml, &segments());
+    assert!(
+        result.is_ok(),
+        "src/dst strictly inside their segment's CIDRs should parse, got {:?}",
+        result.err()
+    );
+}
+
+#[test]
+fn bare_string_src_and_dst_parses_ok() {
+    // Review finding (Minor): RuleBody::src/dst accept a bare YAML string
+    // as well as a list (dsl.rs's `string_or_seq`), but no fixture exercised
+    // the bare-string form. Same CIDRs as
+    // `src_and_dst_strictly_inside_segment_cidrs_parses_ok` above, but
+    // written as `src: "..."` / `dst: "..."` instead of `src: ["..."]`.
+    let yaml = include_str!("fixtures/bare_string_src_dst.yaml");
+    let result = parse_policy(yaml, &segments());
+    assert!(
+        result.is_ok(),
+        "bare-string src/dst should parse the same as list-form, got {:?}",
         result.err()
     );
 }

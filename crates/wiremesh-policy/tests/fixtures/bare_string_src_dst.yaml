@@ -1,0 +1,13 @@
+# Valid case (NOT an error): the bare-string form of src/dst (a single YAML
+# string instead of a list) — dsl.rs's `string_or_seq` accepts both, but
+# only the list form had a fixture before this. Same CIDRs as
+# positive_subset_containment.yaml.
+policy:
+  - from: seg-a
+    to: seg-wide
+    rules:
+      - allow:
+          src: "10.0.5.0/24"
+          dst: "172.16.1.50/32"
+          proto: tcp
+          ports: [443]
