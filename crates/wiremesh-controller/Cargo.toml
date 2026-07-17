@@ -56,6 +56,12 @@ tokio = { workspace = true }
 tonic = { workspace = true }
 wiremesh-proto = { path = "../wiremesh-proto" }
 wiremesh-testkit = { path = "../wiremesh-testkit" }
+# (Task 4, cycle 3) `PolicyIR::from_json`/`blocks_fingerprint` — parses the
+# real compiled IR bytes `tests/policy_pipeline.rs` reads back off a
+# Sync.Watch snapshot/delta. Test scaffolding only: the controller's own
+# `src/` does not (yet) depend on this crate until Task 4's implementation
+# step lands.
+wiremesh-policy = { path = "../wiremesh-policy" }
 # StreamExt::next() to consume StubGateway::open_sync()'s Sync.Watch stream.
 tokio-stream = "0.1"
 # Real on-disk DB file path for the persisted-revision reopen test.

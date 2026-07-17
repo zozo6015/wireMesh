@@ -1947,6 +1947,7 @@ dependencies = [
  "tokio-stream",
  "tonic",
  "tower 0.4.13",
+ "wiremesh-policy",
  "wiremesh-proto",
  "wiremesh-testkit",
  "wiremesh-trust",
