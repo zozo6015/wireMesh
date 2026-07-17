@@ -13,14 +13,25 @@
 //! nftables do not work on the host" -- the dev container this always runs
 //! in via `./dev.sh run` is always privileged).
 //!
-//! Requires `SPIKE_TUNNEL_BIN` to point at a built `spike-tunnel` release
-//! binary, same as every spike/enforcer test (see
-//! `docs/research/phase0-results.md`'s canonical command) -- e.g.:
+//! Self-sufficient under the plain canonical command -- NO env var, NO
+//! out-of-band build required:
 //! ```text
-//! ./dev.sh run "cd spike/tunnel && cargo build --release && cd /work && \
-//!   SPIKE_TUNNEL_BIN=/work/spike/tunnel/target/release/spike-tunnel \
-//!   cargo test -p wiremesh-enforcer --test ebpf_backend -- --test-threads=1 --nocapture"
+//! ./dev.sh run "cargo test -p wiremesh-enforcer -- --test-threads=1 --nocapture"
 //! ```
+//! `mod lab` below uses the KERNEL WireGuard implementation directly
+//! (`ip link add wgN type wireguard`) rather than the Phase 0 spike's
+//! boringtun-based `spike-tunnel` userspace binary (which the spike's own
+//! `wg_lab`, `spike/enforcer/enforcer/tests/common/mod.rs`, requires via a
+//! pre-built binary path in `SPIKE_TUNNEL_BIN` -- fine for that spike, since
+//! its own test harness always sets the env var, but not self-sufficient for
+//! a bare `cargo test` here). This container's kernel (6.12.x-linuxkit) has
+//! the `wireguard` netlink link type built in -- confirmed manually (`ip
+//! link add wg-test type wireguard` inside `./dev.sh run`, then a full
+//! two-netns kernel-WG lab that actually pings end to end) -- so no
+//! userspace tunnel process/binary is needed at all: `ip link add wg0 type
+//! wireguard` + `wg set` (same CLI the spike already uses to configure keys/
+//! peers/allowed-ips) is the entire data plane, with nothing to spawn or
+//! kill afterward.
 //!
 //! RED evidence (current skeleton): `probe`'s body is `todo!()` (Task 7 Step
 //! 1's skeleton, `src/lib.rs`) -- the test below panics with that message
@@ -33,12 +44,13 @@
 // ahead of Task 12's graduated shared testkit harness) is standalone, so
 // this is copied rather than depended on directly. `#[path]`-free per the
 // brief: defined inline as its own module in this same file, not via
-// `#[path = "..."] mod common;` pointing at a separate file.
+// `#[path = "..."] mod common;` pointing at a separate file. Adapted beyond
+// the spike's literal version (see the module doc above): kernel WireGuard
+// instead of the boringtun `spike-tunnel` binary, so no `SPIKE_TUNNEL_BIN`
+// env var and no spawned processes to track/kill.
 mod lab {
     use natlab::{Lab, Ns};
     use std::io::Write;
-    use std::process::Child;
-    use std::{thread, time::Duration};
 
     fn wg_keypair() -> (String, String) {
         let priv_out = std::process::Command::new("wg")
@@ -60,15 +72,12 @@ mod lab {
     }
 
     /// Returns a running lab: overlay 10.10.0.1 <-> 10.10.0.2 over underlay
-    /// 10.9.1.0/24, with the spike-tunnel binary running in each namespace.
-    /// Callers are responsible for killing the returned tunnel processes.
-    pub fn wg_lab() -> (Lab, Ns, Ns, Vec<Child>) {
-        let bin = std::env::var("SPIKE_TUNNEL_BIN").expect(
-            "SPIKE_TUNNEL_BIN must be set to the path of the built spike-tunnel binary \
-             (e.g. /work/spike/tunnel/target/release/spike-tunnel) -- this crate cannot use \
-             CARGO_BIN_EXE_spike-tunnel from a different, standalone-workspace crate",
-        );
-        let bin = bin.as_str();
+    /// 10.9.1.0/24, `wg0` created via the KERNEL WireGuard implementation
+    /// directly inside each namespace (`ip link add wg0 type wireguard`) --
+    /// no userspace tunnel process involved, so there is nothing for the
+    /// caller to kill afterward (unlike the spike's boringtun-backed
+    /// version).
+    pub fn wg_lab() -> (Lab, Ns, Ns) {
         let mut lab = Lab::new("aeth").unwrap();
         let a = lab.ns("a").unwrap();
         let b = lab.ns("b").unwrap();
@@ -77,14 +86,11 @@ mod lab {
         let (apriv, apub) = wg_keypair();
         let (bpriv, bpub) = wg_keypair();
 
-        let ta = a.spawn(&[bin, "wg0"]).unwrap();
-        let tb = b.spawn(&[bin, "wg0"]).unwrap();
-        thread::sleep(Duration::from_millis(800)); // device + UAPI socket up
-
         for (ns, privkey, peer_pub, my_ip, peer_ip, peer_ep) in [
             (&a, &apriv, &bpub, "10.10.0.1/24", "10.10.0.2", "10.9.1.2:51820"),
             (&b, &bpriv, &apub, "10.10.0.2/24", "10.10.0.1", "10.9.1.1:51820"),
         ] {
+            ns.exec(&["ip", "link", "add", "wg0", "type", "wireguard"]).unwrap();
             let kf = format!("/tmp/{}.key", ns.name);
             std::fs::write(&kf, privkey).unwrap();
             ns.exec(&[
@@ -96,7 +102,7 @@ mod lab {
             ns.exec(&["ip", "link", "set", "wg0", "up", "mtu", "1280"]).unwrap();
         }
 
-        (lab, a, b, vec![ta, tb])
+        (lab, a, b)
     }
 }
 
@@ -115,10 +121,11 @@ use lab::wg_lab;
 /// the whole process -- so this cannot leak into any other test.
 ///
 /// Only joins the NETWORK namespace, not `b`'s private mount namespace
-/// (`natlab::Ns::exec`/`spawn` additionally `nsenter --mount=...` for the
+/// (`natlab::Ns::exec`/`spawn` additionally `nsenter --mount=...` for a
 /// boringtun UAPI-socket collision reason documented in
-/// `spike/natlab/src/lib.rs` -- irrelevant here since this test runs exactly
-/// one enforcer instance, no concurrent same-named pins/sockets to
+/// `spike/natlab/src/lib.rs` -- moot here now that this lab uses kernel
+/// WireGuard, not boringtun, but harmless either way since this test runs
+/// exactly one enforcer instance, no concurrent same-named pins/sockets to
 /// disambiguate).
 fn join_netns(ns_name: &str) -> anyhow::Result<()> {
     use std::os::unix::io::AsRawFd;
@@ -137,7 +144,7 @@ fn join_netns(ns_name: &str) -> anyhow::Result<()> {
 
 #[test]
 fn probe_attaches_ebpf_and_applies_empty_policy_on_wg0() {
-    let (lab, _a, b, mut children) = wg_lab();
+    let (lab, _a, b) = wg_lab();
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
     let mut enforcer =
@@ -159,8 +166,5 @@ fn probe_attaches_ebpf_and_applies_empty_policy_on_wg0() {
         .apply(&empty_ir)
         .expect("apply of an empty policy IR should succeed");
 
-    for c in &mut children {
-        let _ = c.kill();
-    }
     drop(lab);
 }
