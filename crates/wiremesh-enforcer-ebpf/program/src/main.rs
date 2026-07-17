@@ -1,34 +1,86 @@
 #![no_std]
 #![no_main]
 
-// Graduated verbatim (Task 7 brief) from `spike/enforcer/enforcer-ebpf/src/main.rs`
-// — the tc classifier: ingress enforce + egress flow-record, ICMP
-// embedded-error lookup, A/B rules tables. The spike's A/B mechanism (two
-// fixed 64-entry `Array<Rule>` tables + an `ACTIVE` index flipped
-// atomically) is kept as-is THIS task; map-in-map generations (lifting the
-// 64-entry cap to `wiremesh_enforcer::flatten::MAX_RULES` = 256) are
-// Task 8. Map names kept as-is per the brief.
+// Graduated from `spike/enforcer/enforcer-ebpf/src/main.rs` (Task 7 brief),
+// rewritten for Task 8 (`.superpowers/sdd/task-8-brief.md`): LPM-bitset
+// first-match matching + map-in-map atomic generations. The tc classifier
+// shape (ingress enforce + egress flow-record) and the ICMP embedded-error
+// lookup are unchanged from Task 7; `scan_rules` (renamed `scan_generation`
+// below) and the rule tables themselves are what Task 8 replaces — the
+// fixed 64-entry A/B `Array<Rule>` + `ACTIVE`-index flip (Task 7) is gone,
+// replaced by four `BPF_MAP_TYPE_ARRAY_OF_MAPS` outers (`GEN_SRC`/
+// `GEN_DST`/`GEN_RULES`/`GEN_META`), each with `GENERATIONS` (2) slots,
+// still indexed by the same single-read `ACTIVE`. `MAX_RULES` is now 256
+// (up from 64), `wiremesh_enforcer_common`'s — the same constant
+// `wiremesh-enforcer`'s `flatten()` enforces at the controller/compile-time
+// layer (design §6: "the controller rejects at compile time, not the
+// gateway at load time").
 
+// Generation-independent maps (`COUNTERS`/`ACTIVE`/`FLOWS`) keep the plain
+// `#[map]`/`aya_ebpf::maps` style, unchanged from Task 7 (brief: "unchanged
+// from Task 7"). Only the new per-generation maps below need `#[btf_map]`/
+// `aya_ebpf::btf_maps` — that's the mechanism this crate version's
+// `ArrayOfMaps`/LPM-trie-as-inner-map map-in-map support requires; it isn't
+// available via the old `#[map]` API at all. (Mixing the two styles in one
+// object was investigated as a possible source of a real Task 8 bug and
+// ruled out: an all-`#[btf_map]` object exhibited the identical symptom.
+// The actual root cause was unrelated to map declaration style — see this
+// task's report.)
 use aya_ebpf::{
     bindings::{TC_ACT_PIPE, TC_ACT_SHOT},
-    macros::{classifier, map},
+    btf_maps::{lpm_trie::Key as LpmKey, Array as BtfArray, ArrayOfMaps, LpmTrie},
+    macros::{btf_map, classifier, map},
     maps::{Array, LruHashMap},
     programs::TcContext,
 };
 use wiremesh_enforcer_common::*;
 
+// --- generation-independent maps (Task 7, unchanged) --------------------
+
 #[map]
-static COUNTERS: Array<u64> = Array::with_max_entries(4, 0);
+static COUNTERS: Array<u64> = Array::with_max_entries(COUNTERS_LEN as u32, 0);
 #[map]
 static ACTIVE: Array<u32> = Array::with_max_entries(1, 0);
 #[map]
-static RULES_A: Array<Rule> = Array::with_max_entries(64, 0);
-#[map]
-static RULES_B: Array<Rule> = Array::with_max_entries(64, 0);
-#[map]
-static RULE_LEN: Array<u32> = Array::with_max_entries(2, 0); // len per table
-#[map]
 static FLOWS: LruHashMap<FlowKey, u64> = LruHashMap::with_max_entries(65536, 0);
+
+// --- per-generation maps (Task 8) ----------------------------------------
+//
+// Each of the four outers below has exactly `GENERATIONS` (2) slots,
+// mirrored by the same slot index in every other outer — `ACTIVE` (above)
+// selects which slot is live. `scan_generation` reads `ACTIVE` exactly ONCE
+// per packet, so a packet's SRC lookup, DST lookup, RULES lookups, and META
+// length read all resolve against the SAME generation, never a mix (design
+// §6's atomic-flip guarantee: "reads the active generation index exactly
+// once per packet, so lookups can never straddle generations").
+
+// The trie's raw key data is `u64`, not `u32`, even though only the low 32
+// bits (a zero-extended, big-endian-as-loaded IPv4 address) are ever
+// meaningful (`prefix_len` never exceeds 32): the kernel's LPM trie node
+// layout places `V`'s bytes immediately after `Key<K>`'s raw `data` bytes
+// with no padding, so it requires `size_of::<K>()` to be a multiple of
+// `align_of::<V>()`; `V` = `RuleBits` = `[u64; 4]` has `align_of() == 8`,
+// which a 4-byte `u32` key can't satisfy but an 8-byte `u64` key does. Zero-
+// extending a little-endian-native `u32` (`x as u64`) leaves the meaningful
+// 4 bytes in the trie's first 4 data bytes (this container's host and the
+// bpfel-unknown-none target are both little-endian) — exactly where LPM
+// prefix matching (which only ever examines the first `prefix_len` <= 32
+// bits) needs them, with the upper 4 bytes an always-zero, never-examined
+// pad. See `ebpf.rs`'s `build_trie`/`LpmKey` construction for the userspace
+// side of this same convention.
+type SrcTrie = LpmTrie<u64, RuleBits, LPM_MAX_ENTRIES>;
+type DstTrie = LpmTrie<u64, RuleBits, LPM_MAX_ENTRIES>;
+type RulesArr = BtfArray<RuleMeta, MAX_RULES>;
+type MetaArr = BtfArray<u32, 1>;
+
+#[btf_map]
+static GEN_SRC: ArrayOfMaps<SrcTrie, GENERATIONS> = ArrayOfMaps::new();
+#[btf_map]
+static GEN_DST: ArrayOfMaps<DstTrie, GENERATIONS> = ArrayOfMaps::new();
+#[btf_map]
+static GEN_RULES: ArrayOfMaps<RulesArr, GENERATIONS> = ArrayOfMaps::new();
+#[btf_map]
+static GEN_META: ArrayOfMaps<MetaArr, GENERATIONS> = ArrayOfMaps::new();
 
 fn bump(idx: u32) {
     if let Some(c) = COUNTERS.get_ptr_mut(idx) {
@@ -116,19 +168,17 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
                 let ekey = FlowKey { src: esrc, dst: edst, sport: esport, dport: edport,
                                      proto: eproto, _pad: [0; 3] };
                 if unsafe { FLOWS.get(&ekey) }.is_some() {
-                    bump(CTR_ICMP_ERR);
+                    bump(CTR_FLOW_HIT);
                     return Ok(TC_ACT_PIPE);
                 }
             }
         }
     }
     // 4) rules (default deny)
-    if scan_rules(src, dst, proto, dport) == ACT_ALLOW {
+    if scan_generation(src, dst, proto, dport) == ACT_ALLOW {
         let _ = FLOWS.insert(&fwd, &1u64, 0);
-        bump(CTR_ALLOW);
         return Ok(TC_ACT_PIPE);
     }
-    bump(CTR_DENY);
     Ok(TC_ACT_SHOT)
 }
 
@@ -140,47 +190,78 @@ fn try_egress(ctx: &TcContext) -> Result<(), ()> {
     Ok(())
 }
 
-// First-match linear scan over whichever table ACTIVE currently points at.
-// ACTIVE is read exactly ONCE per packet (`table` below) — the spec's
-// one-generation-read-per-packet rule that the A/B atomic flip depends on:
-// every packet must see either wholly the old ruleset or wholly the new one,
-// never a mix from re-reading ACTIVE mid-scan.
-fn scan_rules(src: u32, dst: u32, proto: u8, dport: u16) -> u32 {
-    let table = ACTIVE.get(0).copied().unwrap_or(0);
-    let len = RULE_LEN.get(table).copied().unwrap_or(0).min(64);
-    // Bounded `for 0..64` (not `while i < len`) so the verifier can see a
-    // fixed iteration count at compile time; the `i >= len` break enforces
-    // the real (runtime) length.
-    for i in 0..64u32 {
+// The single generation-read-per-packet verdict path (design §6). `ACTIVE`
+// is read exactly ONCE (`slot` below); every subsequent lookup (SRC, DST,
+// RULES, META) is keyed by that SAME `slot` — a packet can never straddle
+// two generations, even if `apply()` flips `ACTIVE` concurrently on another
+// CPU mid-scan. `bits = SRC_LPM[src] & DST_LPM[dst]`: LPM lookups return the
+// CUMULATIVE bitset `ebpf.rs`'s userspace `apply()` builds — every prefix's
+// stored bits are the union of every covering rule's bit, not just the
+// rule(s) inserted at that exact prefix (see that file's `build_lpm_entries`
+// doc comment) — so a bounded first-match scan over `RULES[0..len)`, not
+// raw LPM longest-prefix-wins, decides the verdict. A missing LPM entry (no
+// covering CIDR at all) or a missing/uninstalled generation slot (before
+// the first `apply()`) both default to an all-zero bitset via `unwrap_or`,
+// which naturally falls through the scan below to the default-deny bump —
+// no special-casing needed for either case.
+fn scan_generation(src: u32, dst: u32, proto: u8, dport: u16) -> u32 {
+    let slot = ACTIVE.get(0).copied().unwrap_or(0);
+
+    let src_key = LpmKey::new(32, src as u64);
+    let dst_key = LpmKey::new(32, dst as u64);
+
+    let src_bits: RuleBits = GEN_SRC
+        .get(slot)
+        .and_then(|trie| trie.get(&src_key))
+        .copied()
+        .unwrap_or([0u64; BITSET_WORDS]);
+    let dst_bits: RuleBits = GEN_DST
+        .get(slot)
+        .and_then(|trie| trie.get(&dst_key))
+        .copied()
+        .unwrap_or([0u64; BITSET_WORDS]);
+
+    let mut bits: RuleBits = [0u64; BITSET_WORDS];
+    let mut w = 0usize;
+    while w < BITSET_WORDS {
+        bits[w] = src_bits[w] & dst_bits[w];
+        w += 1;
+    }
+
+    let len = GEN_META
+        .get_value(slot, &0u32)
+        .copied()
+        .unwrap_or(0)
+        .min(MAX_RULES as u32);
+
+    // Bounded `for 0..MAX_RULES` (not `while i < len`) so the verifier can
+    // see a fixed iteration count at compile time; the `i >= len` break
+    // enforces the real (runtime) flattened length.
+    for i in 0..MAX_RULES as u32 {
         if i >= len {
             break;
         }
-        let r = match if table == 0 { RULES_A.get(i) } else { RULES_B.get(i) } {
-            Some(r) => r,
+        if !bit_get(&bits, i) {
+            continue;
+        }
+        let meta = match GEN_RULES.get_value(slot, &i) {
+            Some(m) => m,
             None => break,
         };
-        if rule_matches(r, src, dst, proto, dport) {
-            return r.action;
+        if meta_matches(meta, proto, dport) {
+            bump(i);
+            return meta.action;
         }
     }
+    bump(CTR_DEFAULT_DENY);
     ACT_DENY
 }
 
-fn prefix_match(addr: u32, net: u32, plen: u32) -> bool {
-    if plen == 0 {
-        return true;
-    }
-    let mask = u32::MAX << (32 - plen);
-    (u32::from_be(addr) & mask) == (u32::from_be(net) & mask)
-}
-
-fn rule_matches(r: &Rule, src: u32, dst: u32, proto: u8, dport: u16) -> bool {
-    prefix_match(src, r.src, r.src_plen)
-        && prefix_match(dst, r.dst, r.dst_plen)
-        && (r.proto == 0 || r.proto == proto as u32)
-        && (r.port_hi == 0 || {
+fn meta_matches(m: &RuleMeta, proto: u8, dport: u16) -> bool {
+    (m.proto == 0 || m.proto == proto as u32)
+        && (m.port_hi == 0 || {
             let p = u16::from_be(dport);
-            p >= r.port_lo && p <= r.port_hi
+            p >= m.port_lo && p <= m.port_hi
         })
 }
 

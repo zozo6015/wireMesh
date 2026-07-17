@@ -68,7 +68,8 @@ pub trait Enforcer {
     /// Which backend this instance is actually driving.
     fn kind(&self) -> BackendKind;
     /// Installs `ir` as the live rule set. Atomic: in-flight packets must
-    /// never observe a half-applied policy (design §6's atomic A/B flip).
+    /// never observe a half-applied policy (design §6's atomic generation
+    /// flip — Task 8's map-in-map generations in the eBPF backend, `ebpf.rs`).
     fn apply(&mut self, ir: &PolicyIR) -> anyhow::Result<()>;
     /// Reads current per-rule and default-deny counters.
     fn counters(&mut self) -> anyhow::Result<Counters>;
