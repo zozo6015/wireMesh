@@ -15,3 +15,11 @@ serde_yaml = { workspace = true }
 # `SegmentDef::cidrs` and every CIDR the validator parses out of `src`/`dst`
 # are `ipnet::Ipv4Net` (v1 is IPv4-only per design §4).
 ipnet = { workspace = true }
+# `PolicyIR`'s canonical wire form (ir.rs, Task 2, design D-C3-1) is JSON,
+# not YAML — `to_canonical_json`/`from_json`/`blocks_fingerprint` all
+# serialize/deserialize through this.
+serde_json = { workspace = true }
+# `rule_id` (design D-C3-3) and `blocks_fingerprint` (design D-C3-8) are
+# both sha256 content hashes — same crate/version `wiremesh-controller`
+# already uses for its own hashing.
+sha2 = { workspace = true }

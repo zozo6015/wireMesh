@@ -1828,7 +1828,9 @@ dependencies = [
  "anyhow",
  "ipnet",
  "serde",
+ "serde_json",
  "serde_yaml",
+ "sha2",
 ]
 
 [[package]]
