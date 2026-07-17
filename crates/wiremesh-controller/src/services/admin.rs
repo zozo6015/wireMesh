@@ -124,14 +124,25 @@ impl Admin for AdminSvc {
             return Err(Status::invalid_argument("segment name must not be empty"));
         }
 
+        // (Task 5 review finding) `.trunc()` normalizes each declared CIDR to
+        // its network address (host bits zeroed) at THIS parse boundary — so
+        // a caller declaring `172.16.5.9/12` (a host address within, but not
+        // the canonical form of, that /12) stores and compares as
+        // `172.16.0.0/12`, never the non-canonical string. See
+        // `Db::apply_fabric`'s doc comment for why this matters for the
+        // CIDR-update no-op contract; `CreateSegment` gets the same
+        // treatment for consistency (a segment's stored CIDRs are always
+        // canonical, regardless of which RPC created/updated them).
         let cidrs: Vec<Ipv4Net> = req
             .cidrs
             .iter()
             .map(|c| {
                 Ipv4Net::from_str(c)
+                    .map(|net| net.trunc())
                     .map_err(|e| Status::invalid_argument(format!("invalid IPv4 CIDR {c:?}: {e}")))
             })
             .collect::<Result<_, _>>()?;
+        let cidr_strs: Vec<String> = cidrs.iter().map(|c| c.to_string()).collect();
 
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -155,7 +166,11 @@ impl Admin for AdminSvc {
         Ok(Response::new(Segment {
             id: segment_id as u64,
             name: req.name,
-            cidrs: req.cidrs,
+            // Echoes the NORMALIZED (canonical, `.trunc()`'d) form — the
+            // exact strings now stored — not `req.cidrs` verbatim, so a
+            // caller that declared host bits sees back what's actually
+            // persisted.
+            cidrs: cidr_strs,
         }))
     }
 
@@ -739,16 +754,28 @@ impl Admin for AdminSvc {
 
         let mut segments = Vec::with_capacity(spec.segments.len());
         for s in &spec.segments {
+            // (Task 5 review finding) `.trunc()` here — same as
+            // `CreateSegment` — is what makes `Db::apply_fabric`'s declared-
+            // vs-stored CIDR set comparison and storage both canonical: a
+            // fabric.yaml re-declaring a segment's CIDR with host bits set
+            // (e.g. `172.16.5.9/12` restating the already-stored
+            // `172.16.0.0/12`) must diff as identical, not as a spurious
+            // change, and the `cidr` row must never end up holding the
+            // non-canonical string. Without this, `apply_fabric`'s
+            // `BTreeSet<Ipv4Net>` compare treats the raw address bits as
+            // significant and wrongly sees two different values.
             let cidrs: Vec<Ipv4Net> = s
                 .cidrs
                 .iter()
                 .map(|c| {
-                    Ipv4Net::from_str(c).map_err(|e| {
-                        Status::invalid_argument(format!(
-                            "invalid IPv4 CIDR {c:?} in segment {:?}: {e}",
-                            s.name
-                        ))
-                    })
+                    Ipv4Net::from_str(c)
+                        .map(|net| net.trunc())
+                        .map_err(|e| {
+                            Status::invalid_argument(format!(
+                                "invalid IPv4 CIDR {c:?} in segment {:?}: {e}",
+                                s.name
+                            ))
+                        })
                 })
                 .collect::<Result<_, _>>()?;
             segments.push((s.name.clone(), cidrs));

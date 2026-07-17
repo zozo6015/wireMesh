@@ -684,12 +684,18 @@ impl Db {
     /// inserted (same CIDR-overlap invariant as [`Db::insert_segment`],
     /// enforced via the shared [`insert_segment_tx`] helper). A declared
     /// segment whose `name` ALREADY exists has its declared CIDR set
-    /// compared (set-compare on normalized [`Ipv4Net`]) against what's
-    /// stored: identical is a pure no-op (unchanged cycle-2/Task-4
-    /// behavior); DIFFERENT means its `cidr` rows are REPLACED (delete +
-    /// insert, same overlap guard exempting this segment's own rows — see
-    /// [`insert_cidrs_tx`]) and it counts into [`ApplyOutcome::updated_segments`].
-    /// Segment DELETION stays out of this method's scope (unchanged).
+    /// compared (set-compare on [`Ipv4Net`]) against what's stored:
+    /// identical is a pure no-op (unchanged cycle-2/Task-4 behavior);
+    /// DIFFERENT means its `cidr` rows are REPLACED (delete + insert, same
+    /// overlap guard exempting this segment's own rows — see
+    /// [`insert_cidrs_tx`]) and it counts into
+    /// [`ApplyOutcome::updated_segments`]. Segment DELETION stays out of
+    /// this method's scope (unchanged). (Task 5 review finding) This compare
+    /// is exact on address bits, so it depends on every `cidrs` entry
+    /// already being normalized to its network address — the caller
+    /// (`AdminSvc::apply`'s segment CIDR parsing) does this via
+    /// `Ipv4Net::trunc()` at the parse boundary, so a host-bits restatement
+    /// of an unchanged network is a true no-op, not a spurious update.
     ///
     /// **Idempotence is the load-bearing contract:** nothing is written at
     /// all — no `INSERT`/`DELETE`, no audit row, no revision bump — unless at
@@ -761,9 +767,18 @@ impl Db {
         for (name, cidrs) in segments {
             if existing_names.contains(name) {
                 // Already present: diff its declared CIDR set (Task 5)
-                // against what's stored, set-compare on normalized
-                // `Ipv4Net` (order-insensitive, exact — same discipline
+                // against what's stored, set-compare on `Ipv4Net`
+                // (order-insensitive, exact — same discipline
                 // `enroll_gateway`'s `bound_cidrs` comparison already uses).
+                // This compare is exact on the ADDRESS bits, not just the
+                // network — it does NOT itself truncate host bits — so it
+                // relies on every caller (`AdminSvc::apply`'s segment CIDR
+                // parsing) having already normalized each declared CIDR to
+                // its network address via `Ipv4Net::trunc()` at the parse
+                // boundary. Without that upstream normalization, a
+                // host-bits restatement of an unchanged network (e.g.
+                // `172.16.5.9/12` vs. the stored `172.16.0.0/12`) would
+                // wrongly compare as different.
                 let segment_id: i64 =
                     tx.query_row("SELECT id FROM segment WHERE name = ?1", params![name], |row| {
                         row.get(0)
