@@ -13,7 +13,7 @@
 
 use ipnet::Ipv4Net;
 use wiremesh_enforcer::flatten;
-use wiremesh_policy::{compile, parse_policy, PolicyIR, SegmentDef};
+use wiremesh_policy::{compile, parse_policy, IrAction, IrBlock, IrProto, IrRule, PolicyIR, SegmentDef};
 
 /// Two non-overlapping /16s, named so `from`/`to` read naturally — mirrors
 /// `wiremesh-policy/tests/golden.rs`'s `segments()` convention (this crate's
@@ -48,15 +48,56 @@ fn cidr(s: &str) -> Ipv4Net {
 
 /// Builds a single-block policy with `n` rules, each `deny: { proto: tcp,
 /// ports: [p] }` for a distinct single port `p` in `1..=n` — used by the
-/// `MAX_RULES` tests below to generate an oversized (or exactly-boundary)
-/// policy programmatically rather than via a giant fixture file (per the
-/// Task 7 brief).
+/// exactly-at-the-boundary test below to generate a 256-rule policy
+/// programmatically rather than via a giant fixture file (per the Task 7
+/// brief). NOT used for the >256 (overflow) case any more — see
+/// `oversized_ir` below.
 fn policy_yaml_with_n_single_port_rules(n: u16) -> String {
     let mut yaml = String::from("policy:\n  - from: seg-a\n    to: seg-b\n    rules:\n");
     for p in 1..=n {
         yaml.push_str(&format!("      - deny: {{ proto: tcp, ports: [{p}] }}\n"));
     }
     yaml
+}
+
+/// Builds a single-block [`PolicyIR`] with `n` single-port rules DIRECTLY
+/// (struct literals — `IrBlock`/`IrRule`'s fields are public), bypassing
+/// `parse_policy`/`compile` entirely.
+///
+/// Why: `wiremesh-policy` now has its OWN `MAX_RULES` compile-time guard
+/// (design §6 — the controller rejects an oversized policy before it ever
+/// reaches a gateway), so `compile()` on a >256-flattened-rule DSL source
+/// correctly returns `Err` — there is no longer any way to reach `flatten()`
+/// with an oversized `PolicyIR` by going through `compile()`. But `flatten`'s
+/// OWN guard is still wanted as defense in depth: the enforcer consumes IR
+/// straight off the wire (design §5's canonical JSON) and must not trust
+/// that whatever compiled it upstream actually enforced the limit. Building
+/// the oversized `PolicyIR` directly is exactly how a real gateway would end
+/// up calling `flatten()` on bad input — e.g. a future/buggy controller
+/// version, or IR replayed from disk — so this is the right shape for the
+/// test, not a workaround.
+fn oversized_ir(n: u16) -> PolicyIR {
+    let rules = (1..=n)
+        .map(|p| IrRule {
+            rule_id: format!("r{p}"),
+            action: IrAction::Deny,
+            proto: IrProto::Tcp,
+            src: vec![],
+            dst: vec![],
+            ports: vec![(p, p)],
+        })
+        .collect();
+    PolicyIR {
+        schema: 1,
+        version: 1,
+        blocks: vec![IrBlock {
+            from: "seg-a".into(),
+            to: "seg-b".into(),
+            src_cidrs: vec!["10.0.0.0/16".into()],
+            dst_cidrs: vec!["10.1.0.0/16".into()],
+            rules,
+        }],
+    }
 }
 
 /// Blocks (and each block's rules) flatten in `(block_ord, rule_ord)` source
@@ -182,12 +223,17 @@ fn flatten_succeeds_at_exactly_max_rules_boundary() {
 
 /// One more flattened rule than [`wiremesh_enforcer::MAX_RULES`] (257) is an
 /// `Err` naming the limit (design §6: the eBPF verifier-budget mitigation's
-/// "documented max-rules-per-block constant").
+/// "documented max-rules-per-block constant"). Constructs the oversized
+/// `PolicyIR` directly via [`oversized_ir`] rather than through
+/// `parse_policy`/`compile` — `wiremesh-policy`'s OWN `MAX_RULES` guard now
+/// correctly rejects this shape at compile time, so `compile()` can never
+/// hand `flatten()` a >256-rule `PolicyIR` any more. Both checks are wanted
+/// (defense in depth), so `flatten`'s own guard needs an input that reaches
+/// it directly, the way IR arriving off the wire would.
 #[test]
 fn flatten_errs_when_flattened_count_exceeds_max_rules() {
     let n = wiremesh_enforcer::MAX_RULES as u16 + 1;
-    let yaml = policy_yaml_with_n_single_port_rules(n);
-    let ir = compile_ok(&yaml, 1);
+    let ir = oversized_ir(n);
     let err = flatten(&ir).expect_err("257 flattened rules (MAX_RULES=256) must be Err");
     let msg = err.to_string();
     assert!(
