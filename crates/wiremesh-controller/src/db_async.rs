@@ -358,4 +358,10 @@ impl DbHandle {
         })
         .await?
     }
+
+    /// See [`Db::latest_policy`].
+    pub async fn latest_policy(&self) -> Result<Option<(u64, String)>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.latest_policy()).await?
+    }
 }

@@ -4,9 +4,13 @@ use ipnet::Ipv4Net; use std::str::FromStr;
 #[test]
 fn migration_is_idempotent_and_sets_user_version() {
     let db = Db::open_memory().unwrap();
-    assert_eq!(db.user_version().unwrap(), 1);
+    // Cycle-3 Task 4 adds migration v2 (`policy_version.fingerprint`) via
+    // the same `PRAGMA user_version` mechanism as v1 — `Db::open`/
+    // `open_memory` already runs every migration up to the latest, so a
+    // fresh DB lands on 2, not 1.
+    assert_eq!(db.user_version().unwrap(), 2);
     db.run_migrations().unwrap(); // second run is a no-op
-    assert_eq!(db.user_version().unwrap(), 1);
+    assert_eq!(db.user_version().unwrap(), 2);
 }
 
 #[test]

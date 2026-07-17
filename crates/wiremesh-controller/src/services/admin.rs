@@ -707,13 +707,23 @@ impl Admin for AdminSvc {
         Ok(Response::new(RevokeCertResponse {}))
     }
 
-    /// (Task 14) Declarative `fabricctl apply -f fabric.yaml`: parses the
+    /// (Task 14; cycle-3 Task 4 wires real DSL compilation + live fan-out
+    /// behind it) Declarative `fabricctl apply -f fabric.yaml`: parses the
     /// YAML (`crate::apply::parse_fabric`), validates every segment's CIDRs
     /// as IPv4 (mirrors `create_segment`), and hands the whole thing to
-    /// [`crate::db_async::DbHandle::apply_fabric`] to diff-and-apply in one
-    /// transaction. See that method's doc comment for the idempotence
-    /// contract this RPC is entirely riding on: a second, identical apply
-    /// must come back with every `ApplyDiff` field zero/false.
+    /// [`crate::db_async::DbHandle::apply_fabric`] to diff-and-apply
+    /// (segments, THEN policy compile/versioning) in one transaction. See
+    /// that method's doc comment for the idempotence contract this RPC is
+    /// entirely riding on: a second, identical (or merely
+    /// fingerprint-identical) apply must come back with every `ApplyDiff`
+    /// field zero/false. A compile error surfaces as `Status::internal`
+    /// (mirroring every other `apply_fabric` error) naming the offending
+    /// segment/rule — nothing is stored in that case. When the apply DID
+    /// mint a new policy version, re-reads it and the post-commit revision
+    /// to publish a [`ChangeEvent::PolicyUpdated`] — same "mutate durably
+    /// first, then notify" order `RotateKey`/`Drain`/`RevokeCert` use — so
+    /// every ALREADY-connected gateway's open `Sync.Watch` stream gets the
+    /// new IR without waiting for a reconnect.
     async fn apply(&self, request: Request<ApplyRequest>) -> Result<Response<ApplyDiff>, Status> {
         let actor = actor_of(&request);
         let req = request.into_inner();
@@ -749,6 +759,34 @@ impl Admin for AdminSvc {
             .apply_fabric(segments, policy_yaml, actor, now)
             .await
             .map_err(|e| Status::internal(format!("applying fabric: {e}")))?;
+
+        if outcome.policy_updated {
+            // Re-read rather than thread the freshly-compiled IR back out of
+            // `apply_fabric`: `Db::latest_policy` is the single "what's the
+            // current policy" read path every other caller (`build_snapshot`,
+            // a restarted controller) also uses, so this broadcasts exactly
+            // the same bytes a reconnecting gateway would see — no separate
+            // code path that could drift from it.
+            if let Some((version, compiled_ir_json)) = self
+                .db
+                .latest_policy()
+                .await
+                .map_err(|e| Status::internal(format!("reading latest policy after apply: {e}")))?
+            {
+                let revision = self.db.current_revision().await.map_err(|e| {
+                    Status::internal(format!("reading revision after policy apply: {e}"))
+                })?;
+                // `send` errors only when there are currently no `Sync.Watch`
+                // subscribers — nobody to notify, which is not a failure
+                // (mirrors `RotateKey`/`Drain`/`RevokeCert`'s identical
+                // `let _ =`).
+                let _ = self.change_tx.send(ChangeEvent::PolicyUpdated {
+                    version,
+                    ir: compiled_ir_json.into_bytes(),
+                    revision,
+                });
+            }
+        }
 
         let total_changes = outcome.created_segments
             + outcome.updated_segments

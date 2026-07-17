@@ -196,6 +196,18 @@ CREATE TABLE state_revision (
 INSERT INTO state_revision (id, revision) VALUES (0, 0);
 "#;
 
+/// Schema migration to `user_version = 2` (cycle-3 Task 4, design D-C3-8):
+/// adds `policy_version.fingerprint`, the version-independent
+/// `PolicyIR::blocks_fingerprint()` equality key `apply_fabric` compares
+/// against a compile candidate's own fingerprint to decide whether a
+/// semantically-unchanged re-apply (even with different source TEXT, e.g.
+/// reordered YAML keys) should mint a new version at all. `DEFAULT ''`
+/// satisfies `NOT NULL` for any pre-migration row (none exist pre-release,
+/// but the migration mechanism itself is exercised regardless).
+const SCHEMA_V2: &str = r#"
+ALTER TABLE policy_version ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';
+"#;
+
 /// Returned (wrapped in [`anyhow::Error`]) when [`Db::insert_segment`]'s CIDR
 /// overlap check finds a conflicting, already-registered CIDR. Names the
 /// existing segment so callers/operators can resolve it (master-spec §4.1,
@@ -279,6 +291,59 @@ fn insert_segment_tx(tx: &Transaction<'_>, name: &str, cidrs: &[Ipv4Net]) -> Res
     }
 
     Ok(segment_id)
+}
+
+/// Reads the FULL current `segment`/`cidr` table (every segment, any
+/// segments just inserted by this same transaction included) as
+/// `wiremesh_policy::SegmentDef`s — what [`Db::apply_fabric`] hands to
+/// `wiremesh_policy::{parse_policy, compile}` so a policy block can resolve
+/// against a segment declared earlier in the SAME `fabric.yaml` apply, not
+/// just whatever existed before this call started.
+fn read_all_segment_defs_tx(tx: &Transaction<'_>) -> Result<Vec<wiremesh_policy::SegmentDef>> {
+    let segments: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare("SELECT id, name FROM segment ORDER BY id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+
+    let mut out = Vec::with_capacity(segments.len());
+    for (id, name) in segments {
+        let cidr_strs: Vec<String> = {
+            let mut stmt = tx.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
+            let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let cidrs: Vec<Ipv4Net> = cidr_strs
+            .iter()
+            .map(|c| c.parse())
+            .collect::<Result<_, _>>()
+            .map_err(|e| anyhow::anyhow!("stored cidr for segment {name:?} is not valid IPv4: {e}"))?;
+        out.push(wiremesh_policy::SegmentDef { name, cidrs });
+    }
+    Ok(out)
+}
+
+/// Lowercase wire encoding for a compiled rule's `action` — matches
+/// `wiremesh_policy::ir::IrAction`'s own `#[serde(rename_all = "lowercase")]`
+/// tag, used here for the `policy_rule.action` TEXT column (`db.rs` has no
+/// direct dependency on `serde_json::Value` for this, so a small local match
+/// is simpler than round-tripping through serde just to unquote a string).
+fn ir_action_str(action: &wiremesh_policy::IrAction) -> &'static str {
+    match action {
+        wiremesh_policy::IrAction::Allow => "allow",
+        wiremesh_policy::IrAction::Deny => "deny",
+    }
+}
+
+/// Lowercase wire encoding for a compiled rule's `proto` — see
+/// [`ir_action_str`]'s doc comment for the same rationale.
+fn ir_proto_str(proto: &wiremesh_policy::IrProto) -> &'static str {
+    match proto {
+        wiremesh_policy::IrProto::Tcp => "tcp",
+        wiremesh_policy::IrProto::Udp => "udp",
+        wiremesh_policy::IrProto::Icmp => "icmp",
+        wiremesh_policy::IrProto::Any => "any",
+    }
 }
 
 /// Result of a successful [`Db::apply_fabric`] call — the mirror of
@@ -479,11 +544,14 @@ impl Db {
         Ok(v)
     }
 
-    /// Applies the full schema DDL in a single transaction if `user_version`
-    /// is below 1, then sets `user_version = 1`. Idempotent: running it again
-    /// once at version 1 is a no-op.
+    /// Applies every schema migration the current `PRAGMA user_version` is
+    /// behind, each in its own transaction with the version bump. Idempotent:
+    /// running it again once at the latest version is a no-op. v1 is the
+    /// full initial schema; v2 (cycle-3 Task 4) adds
+    /// `policy_version.fingerprint` — see [`SCHEMA_V2`]'s doc comment.
     pub fn run_migrations(&self) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
+
         let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         if version < 1 {
             let tx = conn.transaction()?;
@@ -496,6 +564,15 @@ impl Db {
             tx.execute_batch("PRAGMA user_version = 1")?;
             tx.commit()?;
         }
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 2 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V2)?;
+            tx.execute_batch("PRAGMA user_version = 2")?;
+            tx.commit()?;
+        }
+
         Ok(())
     }
 
@@ -595,12 +672,29 @@ impl Db {
     /// what makes "zero new audit rows" true rather than merely arranged to
     /// look true.
     ///
-    /// `policy_yaml`, if `Some`, is stored as `policy_version.source_yaml`
-    /// and compiled via the STUB [`crate::apply::compile_policy`] (always
-    /// `"[]"`, empty IR v0) — but only as a NEW `policy_version` row (version
-    /// = previous max + 1, or 1 if none exist yet) when `policy_yaml` differs
-    /// from the latest stored `source_yaml`. `None`/identical-to-latest never
-    /// touches the `policy_version` table at all.
+    /// `policy_yaml`, if `Some`, is parsed and compiled for REAL (cycle-3
+    /// Task 4): `wiremesh_policy::parse_policy` + `compile`, run INSIDE this
+    /// transaction, AFTER every segment insert above — against the segment
+    /// table (queried fresh via [`read_all_segment_defs_tx`]) as it stands
+    /// at that point, so a fabric.yaml that declares a brand-new segment AND
+    /// a policy block referencing it applies atomically (a compile error
+    /// rolls back the segment inserts too — see below). A compile error
+    /// (unknown segment, non-subset CIDR, malformed ports, etc.) fails the
+    /// WHOLE call: the transaction is rolled back, nothing is stored (not
+    /// even the segments), and `Err`'s message is every collected
+    /// [`wiremesh_policy::CompileError`]'s `Display` joined with `\n`.
+    ///
+    /// New-version rule (design D-C3-8): the candidate IR is compiled at
+    /// `version = latest + 1` (or `1` if none exists yet) and its
+    /// `blocks_fingerprint()` is compared against the latest STORED
+    /// fingerprint — a version-independent structural equality key, not a
+    /// raw-source-text comparison. Identical fingerprint means NO new
+    /// version (`policy_updated: false`), even if `source_yaml`'s TEXT
+    /// differs (e.g. reordered YAML keys within a rule). Only on a genuine
+    /// new version are `policy_version` (with its `fingerprint`) and every
+    /// `policy_rule` row (`(version, block_ord, rule_ord, action, src, dst,
+    /// proto, ports)`, action/proto lowercase, src/dst/ports as
+    /// human-readable comma-joined text) written.
     pub fn apply_fabric(
         &self,
         segments: &[(String, Vec<Ipv4Net>)],
@@ -644,34 +738,105 @@ impl Db {
             ));
         }
 
-        // Policy stub seam: only touched when a `policy:` stanza was
-        // actually declared AND its source text differs from whatever is
-        // currently the latest `policy_version.source_yaml` (a fresh DB has
-        // none, which counts as "differs").
+        // Real DSL->IR compilation (cycle-3 Task 4), run against the segment
+        // table AS OF THIS POINT (after every segment insert above) — see
+        // this method's doc comment for the atomicity/idempotence contract.
         let mut policy_updated = false;
         if let Some(source_yaml) = policy_yaml {
+            let segment_defs = read_all_segment_defs_tx(&tx)?;
+
+            let compile_errors_to_err = |errors: Vec<wiremesh_policy::CompileError>| {
+                anyhow::anyhow!(
+                    "{}",
+                    errors
+                        .iter()
+                        .map(|e| e.to_string())
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                )
+            };
+
+            let parsed = match wiremesh_policy::parse_policy(source_yaml, &segment_defs) {
+                Ok(parsed) => parsed,
+                Err(errors) => {
+                    tx.rollback()?;
+                    return Err(compile_errors_to_err(errors));
+                }
+            };
+
             let latest: Option<(i64, String)> = tx
                 .query_row(
-                    "SELECT version, source_yaml FROM policy_version \
+                    "SELECT version, fingerprint FROM policy_version \
                      ORDER BY version DESC LIMIT 1",
                     [],
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
+            let candidate_version = latest.as_ref().map(|(v, _)| v + 1).unwrap_or(1);
+
+            let candidate_ir =
+                match wiremesh_policy::compile(&parsed, &segment_defs, candidate_version as u64) {
+                    Ok(ir) => ir,
+                    Err(errors) => {
+                        tx.rollback()?;
+                        return Err(compile_errors_to_err(errors));
+                    }
+                };
+            let candidate_fingerprint = candidate_ir.blocks_fingerprint();
 
             let changed = match &latest {
-                Some((_, existing_source)) => existing_source != source_yaml,
+                Some((_, existing_fingerprint)) => existing_fingerprint != &candidate_fingerprint,
                 None => true,
             };
 
             if changed {
-                let new_version = latest.map(|(v, _)| v + 1).unwrap_or(1);
-                let compiled_ir = crate::apply::compile_policy(source_yaml);
+                let new_version = candidate_version;
+                let compiled_ir_json = candidate_ir.to_canonical_json();
                 tx.execute(
-                    "INSERT INTO policy_version (version, source_yaml, compiled_ir, created_by, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![new_version, source_yaml, compiled_ir, actor, now],
+                    "INSERT INTO policy_version \
+                     (version, source_yaml, compiled_ir, fingerprint, created_by, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        new_version,
+                        source_yaml,
+                        compiled_ir_json,
+                        candidate_fingerprint,
+                        actor,
+                        now
+                    ],
                 )?;
+
+                for (block_ord, block) in candidate_ir.blocks.iter().enumerate() {
+                    for (rule_ord, rule) in block.rules.iter().enumerate() {
+                        let ports = if rule.ports.is_empty() {
+                            None
+                        } else {
+                            Some(
+                                rule.ports
+                                    .iter()
+                                    .map(|(lo, hi)| format!("{lo}-{hi}"))
+                                    .collect::<Vec<_>>()
+                                    .join(","),
+                            )
+                        };
+                        tx.execute(
+                            "INSERT INTO policy_rule \
+                             (version, block_ord, rule_ord, action, src, dst, proto, ports) \
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                            params![
+                                new_version,
+                                block_ord as i64,
+                                rule_ord as i64,
+                                ir_action_str(&rule.action),
+                                rule.src.join(","),
+                                rule.dst.join(","),
+                                ir_proto_str(&rule.proto),
+                                ports,
+                            ],
+                        )?;
+                    }
+                }
+
                 policy_updated = true;
                 audit_rows.push((
                     "apply-policy",
@@ -731,6 +896,25 @@ impl Db {
             |row| row.get(0),
         )?;
         Ok(rev as u64)
+    }
+
+    /// (Cycle-3 Task 4) The latest compiled policy, if any has ever been
+    /// applied: `(version, compiled_ir)` where `compiled_ir` is the exact
+    /// canonical-JSON TEXT [`Db::apply_fabric`] stored — never recompiled
+    /// here, so a caller (`crate::projection::build_snapshot`, the Admin
+    /// `Apply` handler's post-commit broadcast) always serves the same bytes
+    /// that were validated and versioned at apply time. `None` on a fresh DB
+    /// that has never had a policy applied.
+    pub fn latest_policy(&self) -> Result<Option<(u64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let row: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT version, compiled_ir FROM policy_version ORDER BY version DESC LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        Ok(row.map(|(version, ir)| (version as u64, ir)))
     }
 
     /// Appends one row to `audit_log` (master-spec §4.5, C-8).
