@@ -36,6 +36,26 @@ const PINNED_MAPS: [&str; 6] = ["COUNTERS", "ACTIVE", "RULES_A", "RULES_B", "RUL
 /// handle — map pinning (below) is therefore best-effort, for external
 /// tooling (a later `fabricctl`/stats path), not required for this type's
 /// own correctness.
+///
+/// **Verified teardown-on-drop contract** (Task 7 review finding,
+/// empirically resolved by
+/// `tests/ebpf_backend.rs`'s `dropping_enforcer_detaches_and_allows_reprobe_on_same_iface`):
+/// `EbpfEnforcer` has no `Drop` impl of its own and discards the `LinkId`s
+/// its two tc-classifier `.attach()` calls return, relying entirely on
+/// `aya::Ebpf`'s own `Drop` to tear things down when this struct's `ebpf`
+/// field is dropped. On this kernel (6.12.x, TCX `bpf_link` attach
+/// semantics — design §6), that locking test confirms dropping an
+/// `EbpfEnforcer` DOES cleanly detach both tc classifiers: enforcement
+/// observably stops (a previously-blocked ping starts succeeding again)
+/// once the value goes out of scope, and a subsequent `probe()` on the
+/// SAME still-live iface succeeds and re-enforces from scratch. bpffs map
+/// pins (if `pin_maps` succeeded) are NOT torn down by this — they persist
+/// independently in the kernel until explicitly unpinned or the bpffs
+/// mount goes away, which is exactly why `pin_maps`'s own best-effort/
+/// non-fatal framing above already treats pin survival as orthogonal to
+/// this type's lifetime. Task 8's reload path (drop the current
+/// `Enforcer`, `probe()` again) can rely on plain `Drop`/scope-exit for
+/// detach; it does not need an explicit unattach/unload step.
 pub struct EbpfEnforcer {
     ebpf: Ebpf,
     #[allow(dead_code)] // not yet consumed: idle timeouts/rate caps/log
