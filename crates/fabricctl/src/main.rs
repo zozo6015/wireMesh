@@ -20,14 +20,14 @@ use clap::{Parser, Subcommand};
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
 use tonic::transport::{Channel, Endpoint, Uri};
-use tonic::{Request, Status};
+use tonic::{Code, Request, Status};
 use tower::service_fn;
 
 use wiremesh_proto::v1::admin_client::AdminClient;
 use wiremesh_proto::v1::{
     ApplyRequest, AuditQueryRequest, CreateSegmentRequest, DeleteSegmentRequest, DrainRequest,
-    ListGatewaysRequest, ListRelaysRequest, ListSegmentsRequest, MintApiTokenRequest,
-    RegisterRelayRequest, RevokeApiTokenRequest,
+    GetPolicyRequest, ListGatewaysRequest, ListRelaysRequest, ListSegmentsRequest,
+    MintApiTokenRequest, RegisterRelayRequest, RevokeApiTokenRequest,
 };
 
 #[derive(Parser)]
@@ -83,6 +83,12 @@ enum Command {
     Apply {
         #[arg(short = 'f', long = "file")]
         file: PathBuf,
+    },
+    /// (Task 6) Compiled-policy inspection: the source/IR of a specific (or
+    /// the latest) version, and per-gateway applied-vs-latest status.
+    Policy {
+        #[command(subcommand)]
+        cmd: PolicyCmd,
     },
 }
 
@@ -165,6 +171,22 @@ enum AuditCmd {
         #[arg(long, default_value_t = String::new())]
         action: String,
     },
+}
+
+#[derive(Subcommand)]
+enum PolicyCmd {
+    /// Prints a policy version's raw source YAML followed by its
+    /// pretty-printed compiled IR (JSON). Omit `--version` (or pass `0`) for
+    /// the latest.
+    Show {
+        #[arg(long, default_value_t = 0)]
+        version: u64,
+    },
+    /// Per-gateway `name / applied_version / latest_version` — `applied_version`
+    /// is the last version that gateway's `Sync.Report` acked (`0` if it has
+    /// never reported one); `latest_version` is the controller's current
+    /// latest compiled policy (`0` if none has ever been applied).
+    Status,
 }
 
 /// One `audit export` JSON line's shape — field names match `AuditEntry`'s
@@ -253,6 +275,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Token { cmd } => run_token(&mut client, cmd).await,
         Command::Audit { cmd } => run_audit(&mut client, cmd).await,
         Command::Apply { file } => run_apply(&mut client, file).await,
+        Command::Policy { cmd } => run_policy(&mut client, cmd).await,
     }
 }
 
@@ -378,6 +401,54 @@ async fn run_apply(client: &mut AdminAuthClient, file: PathBuf) -> anyhow::Resul
         diff.policy_updated,
         diff.total_changes,
     );
+    Ok(())
+}
+
+/// (Task 6) `policy show` prints the raw source YAML, then the compiled IR
+/// pretty-printed as JSON (parsed from `PolicyVersionMsg.compiled_ir`'s
+/// verbatim bytes, then re-serialized with `serde_json::to_string_pretty`
+/// for readability — the wire bytes themselves are already valid,
+/// canonical-but-compact JSON, see `PolicyIR::from_json`'s doc comment).
+/// `policy status` prints, per gateway (off `Admin.ListGateways`), its
+/// name, its last-`Sync.Report`-acked `applied_version`, and the
+/// controller's current `latest_version` (off `Admin.GetPolicy{version: 0}`
+/// — `0` if no policy has ever been applied, rather than failing the whole
+/// command).
+async fn run_policy(client: &mut AdminAuthClient, cmd: PolicyCmd) -> anyhow::Result<()> {
+    match cmd {
+        PolicyCmd::Show { version } => {
+            let resp = client
+                .get_policy(GetPolicyRequest { version })
+                .await?
+                .into_inner();
+            println!("{}", resp.source_yaml);
+            let ir: serde_json::Value = serde_json::from_slice(&resp.compiled_ir)
+                .map_err(|e| anyhow::anyhow!("parsing compiled_ir as JSON: {e}"))?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&ir)
+                    .map_err(|e| anyhow::anyhow!("pretty-printing compiled_ir as JSON: {e}"))?
+            );
+        }
+        PolicyCmd::Status => {
+            let gateways = client
+                .list_gateways(ListGatewaysRequest {})
+                .await?
+                .into_inner()
+                .gateways;
+            let latest_version = match client.get_policy(GetPolicyRequest { version: 0 }).await {
+                Ok(resp) => resp.into_inner().version,
+                Err(status) if status.code() == Code::NotFound => 0,
+                Err(status) => return Err(status.into()),
+            };
+            for gw in gateways {
+                println!(
+                    "{}\tapplied_version={}\tlatest_version={}",
+                    gw.name, gw.applied_version, latest_version
+                );
+            }
+        }
+    }
     Ok(())
 }
 

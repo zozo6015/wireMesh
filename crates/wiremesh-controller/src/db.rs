@@ -515,6 +515,19 @@ pub struct DrainOutcome {
     pub revoked_serials: Vec<String>,
 }
 
+/// (Task 6) A full `policy_version` row — every column [`Admin::get_policy`]
+/// needs to fill a `PolicyVersionMsg`, as opposed to [`Db::latest_policy`]'s
+/// narrower `(version, compiled_ir)` (the only two columns its two callers,
+/// `projection::build_snapshot` and `AdminSvc::apply`'s post-commit
+/// broadcast, ever needed before this task).
+pub struct PolicyVersionRow {
+    pub version: u64,
+    pub source_yaml: String,
+    pub compiled_ir: String,
+    pub created_by: String,
+    pub created_at: String,
+}
+
 /// The controller's embedded SQLite store.
 ///
 /// The connection is held behind a `Mutex` purely for interior mutability
@@ -1042,15 +1055,66 @@ impl Db {
     /// that were validated and versioned at apply time. `None` on a fresh DB
     /// that has never had a policy applied.
     pub fn latest_policy(&self) -> Result<Option<(u64, String)>> {
+        Ok(self
+            .policy_version(None)?
+            .map(|row| (row.version, row.compiled_ir)))
+    }
+
+    /// (Task 6) A specific `policy_version` row's full contents (every
+    /// column [`services::admin::AdminSvc::get_policy`] needs), or the
+    /// LATEST one when `version` is `None` — the DB-layer expression of
+    /// `GetPolicyRequest`'s "`version = 0` means latest" wire contract,
+    /// translated to `Option` here so that sentinel doesn't leak into the DB
+    /// layer. `None` (the `Result`'s `Option`, not the argument) if no
+    /// policy has ever been applied (`version: None`) or the requested
+    /// version number doesn't exist (`version: Some(v)`) — the caller turns
+    /// that into `Status::not_found`. [`Db::latest_policy`] delegates to this
+    /// (with `version: None`) rather than duplicating the "latest" query.
+    pub fn policy_version(&self, version: Option<u64>) -> Result<Option<PolicyVersionRow>> {
         let conn = self.conn.lock().unwrap();
-        let row: Option<(i64, String)> = conn
-            .query_row(
-                "SELECT version, compiled_ir FROM policy_version ORDER BY version DESC LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        Ok(row.map(|(version, ir)| (version as u64, ir)))
+        let row: Option<(i64, String, String, String, String)> = match version {
+            None => conn
+                .query_row(
+                    "SELECT version, source_yaml, compiled_ir, created_by, created_at \
+                     FROM policy_version ORDER BY version DESC LIMIT 1",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?,
+            Some(v) => conn
+                .query_row(
+                    "SELECT version, source_yaml, compiled_ir, created_by, created_at \
+                     FROM policy_version WHERE version = ?1",
+                    params![v as i64],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .optional()?,
+        };
+        Ok(row.map(
+            |(version, source_yaml, compiled_ir, created_by, created_at)| PolicyVersionRow {
+                version: version as u64,
+                source_yaml,
+                compiled_ir,
+                created_by,
+                created_at,
+            },
+        ))
     }
 
     /// Appends one row to `audit_log` (master-spec §4.5, C-8).

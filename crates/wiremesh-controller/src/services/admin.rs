@@ -874,15 +874,47 @@ impl Admin for AdminSvc {
         }))
     }
 
-    /// (Task 6) Not yet implemented — Step 3 (implementer) wires this to
-    /// `Db`'s version lookup (0 = latest, else exact match, NotFound
-    /// otherwise). This stub exists only so the wire contract compiles
-    /// against RED tests written in Step 1.
+    /// (Task 6) A specific compiled policy version's full record — backs
+    /// `fabricctl policy show`/`status`. `version: 0` means "latest"
+    /// ([`GetPolicyRequest`]'s documented wire contract); any other value is
+    /// looked up exactly. `NotFound` when no policy has ever been applied
+    /// (`version: 0` with an empty `policy_version` table) OR the requested
+    /// version number was never compiled — [`crate::db::Db::policy_version`]
+    /// collapses both into the same `Ok(None)`, which becomes `NotFound`
+    /// here, matching `tests/get_policy.rs`'s
+    /// `get_policy_unknown_version_is_not_found`. Read-only (listed in
+    /// `crate::auth::READONLY_METHODS`, same tier as `ListSegments`): this
+    /// never mutates anything, so no audit row is appended (consistent with
+    /// every other list/read RPC in this file).
     async fn get_policy(
         &self,
-        _request: Request<GetPolicyRequest>,
+        request: Request<GetPolicyRequest>,
     ) -> Result<Response<PolicyVersionMsg>, Status> {
-        Err(Status::unimplemented("Task 6"))
+        let req = request.into_inner();
+        let version = (req.version != 0).then_some(req.version);
+
+        let row = self
+            .db
+            .policy_version(version)
+            .await
+            .map_err(|e| Status::internal(format!("reading policy version: {e}")))?
+            .ok_or_else(|| {
+                Status::not_found(match version {
+                    Some(v) => format!("no policy_version row for version {v}"),
+                    None => "no policy has ever been applied".to_string(),
+                })
+            })?;
+
+        Ok(Response::new(PolicyVersionMsg {
+            version: row.version,
+            source_yaml: row.source_yaml,
+            // Stored `compiled_ir` is canonical-JSON TEXT (never binary) —
+            // its bytes verbatim, same discipline `Apply`'s
+            // `ChangeEvent::PolicyUpdated` uses (`compiled_ir_json.into_bytes()`).
+            compiled_ir: row.compiled_ir.into_bytes(),
+            created_by: row.created_by,
+            created_at: row.created_at,
+        }))
     }
 }
 

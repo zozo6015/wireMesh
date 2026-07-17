@@ -12,7 +12,7 @@ use ipnet::Ipv4Net;
 use crate::db::Db;
 pub use crate::db::{
     ApplyOutcome, DrainOutcome, EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow,
-    GatewayRow, RotateKeyOutcome,
+    GatewayRow, PolicyVersionRow, RotateKeyOutcome,
 };
 
 /// Cheaply cloneable async handle to a [`Db`]. `Db` already serializes access
@@ -369,5 +369,11 @@ impl DbHandle {
     pub async fn latest_policy(&self) -> Result<Option<(u64, String)>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.latest_policy()).await?
+    }
+
+    /// See [`Db::policy_version`]. Backs `Admin.GetPolicy`.
+    pub async fn policy_version(&self, version: Option<u64>) -> Result<Option<PolicyVersionRow>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.policy_version(version)).await?
     }
 }

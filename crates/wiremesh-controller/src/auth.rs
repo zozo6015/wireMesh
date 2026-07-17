@@ -75,6 +75,7 @@ const READONLY_METHODS: &[&str] = &[
     "ListRelays",
     "AuditQuery",
     "DebugKeyStates",
+    "GetPolicy",
 ];
 
 /// The authenticated caller's identity, stamped into the request's
