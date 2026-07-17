@@ -2,7 +2,12 @@
 //! `spike/enforcer/enforcer/src/main.rs`'s `run()`/`apply_rules()` (Task 7
 //! brief), then upgraded in Task 8
 //! (`.superpowers/sdd/task-8-brief.md`) to LPM-bitset first-match matching
-//! + map-in-map atomic generations. Loads the embedded object built by
+//! + map-in-map atomic generations, then in Task 9
+//! (`.superpowers/sdd/task-9-brief.md`) with a real flow-table idle timeout/
+//! per-source rate cap, and in Task 10
+//! (`.superpowers/sdd/task-10-brief.md`) with real, sampled
+//! [`crate::DenyEvent`] draining (`deny_events`, below) off the kernel
+//! program's `DENY_RB` ring buffer. Loads the embedded object built by
 //! `build.rs` (from the sibling standalone `wiremesh-enforcer-ebpf`
 //! workspace's `program` package), attaches the tc classifier ingress
 //! (enforce) + egress (flow-record) on `iface`, then drives
@@ -15,18 +20,19 @@ use anyhow::{bail, Context, Result};
 use aya::{
     maps::{
         lpm_trie::{Key as LpmKey, LpmTrie},
-        Array, ArrayOfMaps, MapData,
+        Array, ArrayOfMaps, MapData, RingBuf,
     },
     programs::{tc, SchedClassifier, TcAttachType},
     Ebpf, EbpfLoader,
 };
 use ipnet::Ipv4Net;
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 use wiremesh_enforcer_common::{
-    bit_set, FlowKey, FlowVal, RuleBits, RuleMeta, ACT_ALLOW, ACT_DENY, BITSET_WORDS,
-    CFG_ICMP_NS, CFG_RATE_CAP, CFG_TCP_NS, CFG_UDP_NS, CTR_DEFAULT_DENY, LPM_MAX_ENTRIES,
-    MAX_RULES,
+    bit_set, DenyEventRaw, FlowKey, FlowVal, RuleBits, RuleMeta, ACT_ALLOW, ACT_DENY,
+    BITSET_WORDS, CFG_ICMP_NS, CFG_LOG_AGGREGATE, CFG_LOG_PER_RULE, CFG_RATE_CAP, CFG_TCP_NS,
+    CFG_UDP_NS, CTR_DEFAULT_DENY, LPM_MAX_ENTRIES, MAX_RULES,
 };
 use wiremesh_policy::{IrAction, IrProto, PolicyIR};
 
@@ -51,11 +57,14 @@ const BPF_F_NO_PREALLOC: u32 = 1;
 /// [`apply_generation`]'s "reap-on-next-apply" wait below.
 const REAP_GRACE: Duration = Duration::from_secs(10);
 
-const PINNED_MAPS: [&str; 9] = [
+const PINNED_MAPS: [&str; 12] = [
     "COUNTERS", "ACTIVE", "GEN_SRC", "GEN_DST", "GEN_RULES", "GEN_META", "FLOWS",
     // Task 9 additions: the per-protocol-idle-timeout/rate-cap config map
     // and the per-source rate-cap bookkeeping map.
     "CONFIG", "RATE",
+    // Task 10 additions: the deny-event ring buffer and its two log
+    // sampling token-bucket maps.
+    "DENY_RB", "LOG_RULE_BUDGET", "LOG_AGG_BUDGET",
 ];
 
 /// The live eBPF backend: one loaded+attached [`Ebpf`] instance per
@@ -87,15 +96,14 @@ const PINNED_MAPS: [&str; 9] = [
 /// detach; it does not need an explicit unattach/unload step.
 pub struct EbpfEnforcer {
     ebpf: Ebpf,
-    #[allow(dead_code)] // `flow_max`/`tcp_idle_s`/`udp_idle_s`/`icmp_idle_s`/
-    // `rate_cap_per_src` are now consumed (Task 9: `FLOWS` max_entries via
-    // `EbpfLoader::map_max_entries` + the `CONFIG` map, both in `new` below,
-    // from the LOCAL `cfg` parameter, before this struct is even
-    // constructed) -- but `log_per_rule`/`log_aggregate` (deny-log sampling)
-    // remain unconsumed until Task 10 wires up the deny-event ring buffer,
-    // so the field as a whole is kept (and still needs the allow) purely for
-    // those two, retained here so that later task can read them back without
-    // changing `probe`'s signature again.
+    #[allow(dead_code)] // every field is now consumed (Task 9: `flow_max`/
+    // `tcp_idle_s`/`udp_idle_s`/`icmp_idle_s`/`rate_cap_per_src`; Task 10:
+    // `log_per_rule`/`log_aggregate`), but all of that consumption happens
+    // in `new` below, from the LOCAL `cfg` parameter, strictly BEFORE this
+    // struct is ever constructed -- `self.cfg` itself is never read again
+    // afterwards. Kept (with the allow) so a later task can read the
+    // effective config back off a live `EbpfEnforcer` without another
+    // `probe`/`new` signature change.
     cfg: EnforcerConfig,
     /// Task 8 map-in-map generation bookkeeping (idx→`rule_id` mapping for
     /// `counters()`, and the pending-reap grace-period tracker for
@@ -261,17 +269,20 @@ fn ensure_bpffs(pin_dir: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Writes `EnforcerConfig`'s idle-timeout/rate-cap fields into the kernel's
-/// `CONFIG: Array<u64>` map (Task 9 brief: indices `CFG_TCP_NS`/
-/// `CFG_UDP_NS`/`CFG_ICMP_NS`/`CFG_RATE_CAP`) — seconds converted to
-/// nanoseconds (`bpf_ktime_get_ns()`-comparable, matching `FlowVal::
-/// last_seen_ns`'s unit). Called from `EbpfEnforcer::new`, strictly BEFORE
-/// either tc classifier is attached, so no packet is ever evaluated against
-/// an unwritten (all-zero) `CONFIG` — this ordering is the primary guard the
-/// Task 9 brief's self-review checklist calls for ("config written before
-/// attach so no packet sees zero timeouts"); the kernel program's own
-/// `cfg_or_default` is a secondary, defense-in-depth fallback on top of it,
-/// not a substitute for it.
+/// Writes `EnforcerConfig`'s idle-timeout/rate-cap/log-sampling fields into
+/// the kernel's `CONFIG: Array<u64>` map (Task 9 brief: indices `CFG_TCP_NS`/
+/// `CFG_UDP_NS`/`CFG_ICMP_NS`/`CFG_RATE_CAP`; Task 10 adds `CFG_LOG_PER_RULE`/
+/// `CFG_LOG_AGGREGATE`) — the first three seconds converted to nanoseconds
+/// (`bpf_ktime_get_ns()`-comparable, matching `FlowVal::last_seen_ns`'s
+/// unit); the rate cap and the two log sampling budgets are already plain
+/// per-second counts, written as-is. Called from `EbpfEnforcer::new`,
+/// strictly BEFORE either tc classifier is attached, so no packet is ever
+/// evaluated (or logged) against an unwritten (all-zero) `CONFIG` — this
+/// ordering is the primary guard the Task 9 brief's self-review checklist
+/// calls for ("config written before attach so no packet sees zero
+/// timeouts"), unchanged in Task 10 for the two new slots; the kernel
+/// program's own `cfg_or_default` is a secondary, defense-in-depth fallback
+/// on top of it, not a substitute for it.
 fn write_config(ebpf: &mut Ebpf, cfg: &EnforcerConfig) -> Result<()> {
     let mut config: Array<&mut MapData, u64> =
         Array::try_from(ebpf.map_mut("CONFIG").context("CONFIG")?)?;
@@ -279,6 +290,8 @@ fn write_config(ebpf: &mut Ebpf, cfg: &EnforcerConfig) -> Result<()> {
     config.set(CFG_UDP_NS, u64::from(cfg.udp_idle_s) * 1_000_000_000, 0)?;
     config.set(CFG_ICMP_NS, u64::from(cfg.icmp_idle_s) * 1_000_000_000, 0)?;
     config.set(CFG_RATE_CAP, u64::from(cfg.rate_cap_per_src), 0)?;
+    config.set(CFG_LOG_PER_RULE, u64::from(cfg.log_per_rule), 0)?;
+    config.set(CFG_LOG_AGGREGATE, u64::from(cfg.log_aggregate), 0)?;
     Ok(())
 }
 
@@ -358,12 +371,86 @@ impl Enforcer for EbpfEnforcer {
         Ok(())
     }
 
-    /// Honest stub (Task 7 brief): the eBPF program doesn't yet emit a
-    /// deny-event ring/perf buffer -- that's Task 10's addition. Draining
-    /// real sampled deny events (design §6) needs that buffer wired up
-    /// first.
+    /// Real (Task 10): non-blockingly drains every `DenyEventRaw` currently
+    /// sitting in `DENY_RB` (`program/src/main.rs`'s sampled deny-event ring
+    /// buffer, populated by `maybe_emit_deny` on the deny verdict path,
+    /// AFTER that path's counter bump — design §5.3) into the public
+    /// [`DenyEvent`] shape.
+    ///
+    /// **Generation-boundary rule_id mapping (self-review, documented per
+    /// the brief's explicit prompt to pick one):** `rule_idx` -> `rule_id`
+    /// is resolved via `self.gen.idx_to_rule_id`, i.e. whatever generation
+    /// is CURRENT at the moment `deny_events()` is called — not whatever
+    /// generation was active at the moment the event was actually emitted
+    /// in the kernel. Unlike `counters()` (which Task 8's post-review fix
+    /// makes fold history across `apply()` calls specifically so a rule's
+    /// count is never lost or misattributed), a `DenyEvent` is a point-in-
+    /// time sample, not an accumulating total, and the design's own
+    /// sampling philosophy already accepts dropped/imprecise volume as a
+    /// trade-off for bounded cost. So the accepted, documented race here is
+    /// narrower and cheaper to reason about than an event-tagging scheme
+    /// would be: an event emitted by the OLD generation but drained after a
+    /// later `apply()` has already flipped and overwritten
+    /// `idx_to_rule_id` can report the WRONG `rule_id` (either `None`, if
+    /// the new generation has fewer rules than `rule_idx`, or -- rarely --
+    /// a different rule's `id`, if the new generation happens to reuse that
+    /// same idx for an unrelated rule) rather than the rule that actually
+    /// matched at emission time. This is deliberately not "fixed" the way
+    /// `counters()` was: doing so would require either tagging every event
+    /// with its own generation number (a `DenyEventRaw` field this task's
+    /// binding design doesn't call for) or snapshotting/retaining every past
+    /// generation's mapping indefinitely (unbounded memory, the same
+    /// problem `prune_retired_counters` exists to avoid for `counter_accum`).
+    /// In practice this window is both rare (bounded by how long events can
+    /// sit undrained across an `apply()`) and low-stakes (deny events are a
+    /// monitoring/alerting aid, not a security-relevant total), so it is
+    /// accepted and documented rather than engineered away, consistent with
+    /// this design's other small, bounded, well-understood races (e.g.
+    /// `fold_and_reset_counters`'s own accepted undercount window).
     fn deny_events(&mut self) -> Result<Vec<DenyEvent>> {
-        Ok(Vec::new())
+        let mut rb: RingBuf<&mut MapData> =
+            RingBuf::try_from(self.ebpf.map_mut("DENY_RB").context("DENY_RB")?)?;
+
+        let mut events = Vec::new();
+        while let Some(item) = rb.next() {
+            if item.len() != std::mem::size_of::<DenyEventRaw>() {
+                // Malformed/mis-sized entry (shouldn't happen -- the kernel
+                // program only ever writes exactly-sized `DenyEventRaw`
+                // records via `RingBuf::output`) -- skip rather than panic
+                // or misinterpret adjacent bytes.
+                continue;
+            }
+            // SAFETY: length checked above; `DenyEventRaw` is `#[repr(C)]`,
+            // `Copy`, and has no invalid bit patterns for any of its plain
+            // integer fields, so reading an unaligned copy out of the ring
+            // buffer's byte slice (which the kernel guarantees contains
+            // exactly one `DenyEventRaw`'s worth of bytes, written via
+            // `RingBuf::output(&ev, 0)` on the kernel side) is sound.
+            let raw: DenyEventRaw =
+                unsafe { std::ptr::read_unaligned(item.as_ptr().cast::<DenyEventRaw>()) };
+
+            let rule_id = if raw.rule_idx == CTR_DEFAULT_DENY {
+                None
+            } else {
+                self.gen.idx_to_rule_id.get(raw.rule_idx as usize).cloned()
+            };
+
+            events.push(DenyEvent {
+                // `raw.src`/`raw.dst` are the same raw, as-loaded
+                // representation `FlowKey`'s identically-documented fields
+                // use (network byte order, not host-order-correct as a bare
+                // integer) -- `u32::from_be` undoes the same transformation
+                // `build_trie`'s userspace side already applies in the
+                // other direction (`u32::from(net.network()).to_be()`) for
+                // this exact raw wire format.
+                src: Ipv4Addr::from(u32::from_be(raw.src)),
+                dst: Ipv4Addr::from(u32::from_be(raw.dst)),
+                proto: raw.proto,
+                dport: u16::from_be(raw.dport),
+                rule_id,
+            });
+        }
+        Ok(events)
     }
 }
 

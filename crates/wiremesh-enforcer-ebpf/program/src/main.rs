@@ -15,6 +15,15 @@
 // `wiremesh-enforcer`'s `flatten()` enforces at the controller/compile-time
 // layer (design §6: "the controller rejects at compile time, not the
 // gateway at load time").
+//
+// Task 10 (`.superpowers/sdd/task-10-brief.md`) adds sampled deny-event
+// emission on top of the above: `scan_generation`'s two deny verdict sites
+// (an explicit `deny` rule match, and the default-deny fallback after the
+// bounded scan) each call `maybe_emit_deny` immediately after their existing
+// `bump(...)` counter call, subject to the new `LOG_RULE_BUDGET`/
+// `LOG_AGG_BUDGET` per-second token-bucket sampling budgets (`CONFIG`
+// indices `CFG_LOG_PER_RULE`/`CFG_LOG_AGGREGATE`) -- see `log_allows`/
+// `maybe_emit_deny`'s doc comments below.
 
 // Generation-independent maps (`COUNTERS`/`ACTIVE`/`FLOWS`) keep the plain
 // `#[map]`/`aya_ebpf::maps` style, unchanged from Task 7 (brief: "unchanged
@@ -31,7 +40,7 @@ use aya_ebpf::{
     btf_maps::{lpm_trie::Key as LpmKey, Array as BtfArray, ArrayOfMaps, LpmTrie},
     helpers::bpf_ktime_get_ns,
     macros::{btf_map, classifier, map},
-    maps::{Array, LruHashMap},
+    maps::{Array, LruHashMap, RingBuf},
     programs::TcContext,
 };
 use wiremesh_enforcer_common::*;
@@ -67,6 +76,23 @@ static RATE: LruHashMap<u32, RateVal> = LruHashMap::with_max_entries(4096, 0);
 /// anyway.
 #[map]
 static CONFIG: Array<u64> = Array::with_max_entries(CONFIG_LEN as u32, 0);
+/// Deny-event ring buffer (Task 10) — sampled `DenyEventRaw` records,
+/// drained non-blockingly by userspace (`ebpf.rs`'s `deny_events`). See
+/// `DenyEventRaw`/`DENY_RB_BYTES`'s doc comments (`common/src/lib.rs`) for
+/// the wire representation and buffer-size rationale.
+#[map]
+static DENY_RB: RingBuf = RingBuf::with_byte_size(DENY_RB_BYTES, 0);
+/// Per-rule (`0..MAX_RULES`, plus [`CTR_DEFAULT_DENY`] (256) for the
+/// default-deny fallback) deny-event log sampling token buckets (Task 10
+/// brief: "per-rule Array<{window_start_ns, count}>, size MAX_RULES+1
+/// covering default-deny"). Reuses [`RateVal`]'s shape — see that type's
+/// doc comment for why a distinct type wasn't introduced.
+#[map]
+static LOG_RULE_BUDGET: Array<RateVal> = Array::with_max_entries((MAX_RULES + 1) as u32, 0);
+/// The single aggregate (across every rule) deny-event log sampling token
+/// bucket (Task 10 brief: "+ one aggregate slot").
+#[map]
+static LOG_AGG_BUDGET: Array<RateVal> = Array::with_max_entries(1, 0);
 
 // --- per-generation maps (Task 8) ----------------------------------------
 //
@@ -230,6 +256,114 @@ fn rate_allows(src: u32, now: u64) -> bool {
     }
 }
 
+/// The shared token-bucket check behind both deny-event log sampling
+/// budgets (`LOG_RULE_BUDGET`/`LOG_AGG_BUDGET`, Task 10) — the exact same
+/// rolling-1s-window shape as [`rate_allows`]'s `Some` arm above, generalized
+/// over an `Array<RateVal>` keyed by a plain `u32` idx instead of
+/// `rate_allows`'s `LruHashMap<u32, RateVal>` keyed by source IP (an `Array`
+/// slot always exists once declared with enough entries — there is no
+/// `LruHashMap`-style "never seen this key before" case to special-case;
+/// a zero-initialized slot's `window_start_ns == 0` already falls into the
+/// "window elapsed" branch below on the very first real call, since `now`
+/// is always far more than `RATE_WINDOW_NS` past the kernel boot epoch in
+/// any test/production scenario this design targets — no separate
+/// first-touch branch needed).
+///
+/// Same non-atomic-RMW caveat as `rate_allows`/`bump`: `get_ptr_mut` +
+/// plain reads/writes, not a CAS loop. Two CPUs racing on the SAME idx
+/// (same rule denying concurrently on multiple cores) could each observe
+/// `count < cap` and both increment, momentarily over-admitting by a small,
+/// bounded amount within one window — consistent with this design's
+/// existing precedent (`bump`'s counter increments and `rate_allows`'s rate
+/// cap are both the same non-atomic shape) and acceptable here for the same
+/// reason: sampling is a best-effort volume bound, not a hard security
+/// guarantee, so a rare, small over-admission under real concurrency is a
+/// documented, accepted trade-off rather than a bug.
+///
+/// Returns `true` (and records this attempt against the current window)
+/// iff `idx`'s budget has room for one more emission right now; `false`
+/// means this window's cap for `idx` is already spent. `idx` out of the
+/// array's declared range (never expected from this file's own call sites)
+/// conservatively returns `false` (skip emission) rather than panicking.
+fn budget_allows(arr: &Array<RateVal>, idx: u32, cap: u32, now: u64) -> bool {
+    match arr.get_ptr_mut(idx) {
+        None => false,
+        Some(ptr) => {
+            let window_start = unsafe { (*ptr).window_start_ns };
+            if now.saturating_sub(window_start) > RATE_WINDOW_NS {
+                // Window elapsed (or never started -- a zero-initialized
+                // slot's `window_start_ns == 0` takes this same branch on
+                // its very first real call): start a fresh one at `now`.
+                unsafe {
+                    (*ptr).window_start_ns = now;
+                    (*ptr).count = 1;
+                }
+                true
+            } else {
+                let count = unsafe { (*ptr).count };
+                if count < cap {
+                    unsafe { (*ptr).count = count.saturating_add(1) };
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+}
+
+/// Task 10 brief: deny-event emission is gated by BOTH the per-rule AND the
+/// aggregate sampling budget -- an over-budget deny still counts (`bump`
+/// already ran in every caller before this is reached), it just doesn't
+/// emit. Per-rule is checked first: a rule already over its OWN budget
+/// never touches the shared aggregate slot at all, a minor fairness
+/// kindness to other rules' aggregate headroom, though not load-bearing for
+/// this task's own tests (which only ever exercise a single denying rule at
+/// a time).
+fn log_allows(rule_idx: u32, now: u64) -> bool {
+    let per_rule_cap = cfg_or_default(CFG_LOG_PER_RULE, DEFAULT_LOG_PER_RULE) as u32;
+    if !budget_allows(&LOG_RULE_BUDGET, rule_idx, per_rule_cap, now) {
+        return false;
+    }
+    let agg_cap = cfg_or_default(CFG_LOG_AGGREGATE, DEFAULT_LOG_AGGREGATE) as u32;
+    budget_allows(&LOG_AGG_BUDGET, 0, agg_cap, now)
+}
+
+/// Emits one sampled `DenyEventRaw` into `DENY_RB` for a just-denied packet
+/// -- called from `scan_generation` at BOTH deny verdict sites (an explicit
+/// `deny` rule match and the default-deny fallback), in both cases strictly
+/// AFTER that site's own `bump(...)` call (design §5.3: "counters always
+/// count" -- sampling only ever affects whether an EVENT goes out, never
+/// whether the counter increments). `ev.rule_idx` is `CTR_DEFAULT_DENY`
+/// (256) for the default-deny fallback, exactly the marker
+/// `wiremesh_enforcer::ebpf::deny_events` (userspace) checks for to report
+/// `rule_id: None`.
+///
+/// Takes the already-built `&DenyEventRaw` (rather than its five individual
+/// fields) purely for the eBPF calling convention: BPF only has 5 argument
+/// registers, and `rule_idx`/`src`/`dst`/`proto`/`_pad`/`dport`/`now` as
+/// separate scalar params is 6 -- `bpf-linker` rejects that outright
+/// ("stack arguments are not supported", no eBPF ISA support for spilling
+/// call args to the stack). One pointer + `now` is 2 registers, comfortably
+/// under the limit.
+///
+/// `RingBuf::output`'s `Err` (buffer full) is intentionally ignored: a
+/// dropped sample under overflow is an accepted, documented trade-off (see
+/// `DENY_RB_BYTES`'s doc comment) -- sampling already bounds steady-state
+/// volume well under the buffer's size, so overflow should only ever be a
+/// rare burst artifact, never a routine occurrence.
+fn maybe_emit_deny(ev: &DenyEventRaw, now: u64) {
+    if !log_allows(ev.rule_idx, now) {
+        return;
+    }
+    // Explicit turbofish: `&DenyEventRaw` satisfies both the blanket
+    // `impl<T> Borrow<T> for T` (with `T = &DenyEventRaw`) and
+    // `impl<T> Borrow<T> for &T` (with `T = DenyEventRaw`) `output` accepts,
+    // so the compiler can't infer which `T` (the ring buffer ENTRY type) is
+    // intended without help.
+    let _ = DENY_RB.output::<DenyEventRaw>(ev, 0);
+}
+
 #[classifier]
 pub fn aeth_ingress(ctx: TcContext) -> i32 {
     match try_ingress(&ctx) {
@@ -323,7 +457,7 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
         }
     }
     // 4) rules (default deny)
-    if scan_generation(src, dst, proto, dport) == ACT_ALLOW {
+    if scan_generation(src, dst, proto, dport, now) == ACT_ALLOW {
         let _ = FLOWS.insert(&fwd, &FlowVal { last_seen_ns: now }, 0);
         return Ok(TC_ACT_PIPE);
     }
@@ -383,7 +517,7 @@ fn try_egress(ctx: &TcContext) -> Result<(), ()> {
 // the first `apply()`) both default to an all-zero bitset via `unwrap_or`,
 // which naturally falls through the scan below to the default-deny bump —
 // no special-casing needed for either case.
-fn scan_generation(src: u32, dst: u32, proto: u8, dport: u16) -> u32 {
+fn scan_generation(src: u32, dst: u32, proto: u8, dport: u16, now: u64) -> u32 {
     let slot = ACTIVE.get(0).copied().unwrap_or(0);
 
     let src_key = LpmKey::new(32, src as u64);
@@ -429,10 +563,16 @@ fn scan_generation(src: u32, dst: u32, proto: u8, dport: u16) -> u32 {
         };
         if meta_matches(meta, proto, dport) {
             bump(i);
+            if meta.action == ACT_DENY {
+                let ev = DenyEventRaw { src, dst, proto, _pad: [0], dport, rule_idx: i };
+                maybe_emit_deny(&ev, now);
+            }
             return meta.action;
         }
     }
     bump(CTR_DEFAULT_DENY);
+    let ev = DenyEventRaw { src, dst, proto, _pad: [0], dport, rule_idx: CTR_DEFAULT_DENY };
+    maybe_emit_deny(&ev, now);
     ACT_DENY
 }
 

@@ -139,6 +139,14 @@ pub struct FlowVal {
 /// has recorded within it. Egress-side only (ingress-allow entry creation is
 /// uncapped, per the brief) and never blocks the packet itself — only
 /// whether its `FLOWS` insert happens.
+///
+/// Reused as-is (Task 10, not renamed/duplicated) as the token-bucket value
+/// type for `LOG_RULE_BUDGET`/`LOG_AGG_BUDGET` (`program/src/main.rs`) — the
+/// deny-event log sampling budgets are the exact same "N tokens per rolling
+/// 1s window" shape as this rate cap, just `Array`-indexed by rule idx (or a
+/// single aggregate slot) instead of `LruHashMap`-indexed by source IP. See
+/// `program/src/main.rs`'s `budget_allows`, which generalizes this same
+/// read-check-write pattern over that different backing map type.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RateVal {
@@ -152,22 +160,80 @@ pub struct RateVal {
     pub _pad: u32,
 }
 
+/// One sampled deny event (Task 10), emitted into `DENY_RB` (a `RingBuf`,
+/// `program/src/main.rs`) on the deny verdict path — both an explicit
+/// `deny` rule match AND the default-deny fallback — AFTER that path's
+/// counter bump (design §5.3: "counters always count"; see
+/// `program/src/main.rs`'s `maybe_emit_deny`, called only from a spot that
+/// already ran `bump(...)`), and only if the in-kernel per-rule/aggregate
+/// sampling budgets (`log_allows`) haven't already been spent this rolling
+/// window — over-budget denies still count, they just don't emit.
+///
+/// `src`/`dst`/`dport` are kept in the SAME raw, as-loaded representation
+/// `ipv4_at`/`ports_at` produce (see those functions' doc comments: the
+/// underlying bytes are preserved in wire/network order, but the numeric
+/// value of the integer holding them is not host-order-correct as-is) —
+/// consistent with `FlowKey`'s identical convention for the same fields.
+/// Userspace (`ebpf.rs`'s `deny_events`) does the one-time conversion back
+/// to `std::net::Ipv4Addr`/host-order `u16` when building the public
+/// `wiremesh_enforcer::DenyEvent`, exactly as `build_trie`/`meta_matches`
+/// already do for the same raw representation elsewhere in this design.
+///
+/// `rule_idx` is the flattened rule idx that matched (`0..MAX_RULES`), or
+/// [`CTR_DEFAULT_DENY`] (256) for the default-deny fallback — the exact
+/// same idx space `COUNTERS`/`bump` already use, reused here rather than
+/// inventing a second numbering.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DenyEventRaw {
+    pub src: u32,
+    pub dst: u32,
+    pub proto: u8,
+    pub _pad: [u8; 1],
+    pub dport: u16,
+    pub rule_idx: u32,
+}
+
+/// `DENY_RB`'s declared ring buffer size (Task 10) — the kernel requires a
+/// power-of-two multiple of the page size (4 KiB on this container's
+/// kernel); 256 KiB (`64 * 4096`, and itself a power of two) is generous
+/// headroom for this design's sampled (not raw-firehose) event volume:
+/// sampling already bounds steady-state emission to (per-rule cap +
+/// aggregate cap) events/s, so this buffer only needs to absorb bursts
+/// between `deny_events()` drains, not sustained full-rate deny traffic.
+/// Drops under overflow (a `RingBuf::output` failure, ignored by
+/// `maybe_emit_deny`) are acceptable — sampling already bounds volume, an
+/// occasional additional drop under a burst just means a slightly smaller
+/// sample, not a correctness issue (design §6: "deny log sampling").
+pub const DENY_RB_BYTES: u32 = 256 * 1024;
+
 /// `CONFIG[CFG_TCP_NS]`/`CONFIG[CFG_UDP_NS]`/`CONFIG[CFG_ICMP_NS]`: per-
 /// protocol `FlowVal` idle timeouts in nanoseconds; `CONFIG[CFG_RATE_CAP]`:
 /// the per-source rate cap (`RateVal::count` ceiling per rolling window,
 /// stored as `u64` for uniformity with the other three slots even though
-/// it's logically a `u32` count). Written by userspace (`ebpf.rs`'s
-/// `write_config`) into the generation-independent `CONFIG: Array<u64>` map
-/// BEFORE either tc classifier is attached (Task 9 brief) — see
-/// `DEFAULT_*_NS`/`DEFAULT_RATE_CAP` below for the belt-and-suspenders
-/// fallback the kernel program itself applies if a slot is ever read as
-/// exactly `0` anyway.
+/// it's logically a `u32` count). `CONFIG[CFG_LOG_PER_RULE]`/
+/// `CONFIG[CFG_LOG_AGGREGATE]` (Task 10): the deny-event log sampling
+/// budgets — max sampled `DenyEvent`s per second, per matching rule
+/// (including the shared default-deny "rule") / in aggregate across every
+/// rule, respectively (design §6's "deny log sampling"). Written by
+/// userspace (`ebpf.rs`'s `write_config`) into the generation-independent
+/// `CONFIG: Array<u64>` map BEFORE either tc classifier is attached (Task 9
+/// brief, extended unchanged in Task 10 for the two new slots) — see
+/// `DEFAULT_*_NS`/`DEFAULT_RATE_CAP`/`DEFAULT_LOG_PER_RULE`/
+/// `DEFAULT_LOG_AGGREGATE` below for the belt-and-suspenders fallback the
+/// kernel program itself applies if a slot is ever read as exactly `0`
+/// anyway.
 pub const CFG_TCP_NS: u32 = 0;
 pub const CFG_UDP_NS: u32 = 1;
 pub const CFG_ICMP_NS: u32 = 2;
 pub const CFG_RATE_CAP: u32 = 3;
+/// Task 10: per-rule deny-event log sampling budget (events/s).
+pub const CFG_LOG_PER_RULE: u32 = 4;
+/// Task 10: aggregate (across all rules) deny-event log sampling budget
+/// (events/s).
+pub const CFG_LOG_AGGREGATE: u32 = 5;
 /// Total `CONFIG` entries.
-pub const CONFIG_LEN: usize = 4;
+pub const CONFIG_LEN: usize = 6;
 
 /// Fallback per-protocol idle timeouts (ns) / rate cap the kernel program
 /// uses if `CONFIG[idx]` is ever read as exactly `0` (`program/src/main.rs`'s
@@ -186,9 +252,20 @@ pub const DEFAULT_TCP_NS: u64 = 7_200 * 1_000_000_000;
 pub const DEFAULT_UDP_NS: u64 = 60 * 1_000_000_000;
 pub const DEFAULT_ICMP_NS: u64 = 30 * 1_000_000_000;
 pub const DEFAULT_RATE_CAP: u64 = 256;
+/// Fallback deny-event log sampling budgets (Task 10), same "0 means
+/// unset" convention as the four constants above. Mirrors
+/// `wiremesh_enforcer::EnforcerConfig::default()`'s `log_per_rule: 10`/
+/// `log_aggregate: 100` exactly.
+pub const DEFAULT_LOG_PER_RULE: u64 = 10;
+pub const DEFAULT_LOG_AGGREGATE: u64 = 100;
 
 /// The rate cap's rolling window width (Task 9 brief: "per rolling 1s
 /// window") — one second, in nanoseconds, `bpf_ktime_get_ns()`-comparable.
+/// Reused as-is (Task 10) for both deny-event log sampling budgets' own
+/// rolling windows — all three (`RATE`, `LOG_RULE_BUDGET`, `LOG_AGG_BUDGET`)
+/// are the same "N tokens per rolling 1s window" abstraction, just applied
+/// to different keys/caps, so they share one window-width constant rather
+/// than three copies of the same literal.
 pub const RATE_WINDOW_NS: u64 = 1_000_000_000;
 
 #[cfg(feature = "user")]
@@ -199,3 +276,5 @@ unsafe impl aya::Pod for FlowKey {}
 unsafe impl aya::Pod for FlowVal {}
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for RateVal {}
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for DenyEventRaw {}
