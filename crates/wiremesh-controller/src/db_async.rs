@@ -141,6 +141,12 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.cidrs_for_segment(segment_id)).await?
     }
 
+    /// See [`Db::active_gateway_for_segment`].
+    pub async fn active_gateway_for_segment(&self, segment_id: i64) -> Result<Option<i64>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.active_gateway_for_segment(segment_id)).await?
+    }
+
     /// See [`Db::active_keys_for_gateway`].
     pub async fn active_keys_for_gateway(&self, gateway_id: i64) -> Result<Vec<GatewayKeyRow>> {
         let db = self.inner.clone();

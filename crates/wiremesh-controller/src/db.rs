@@ -242,10 +242,18 @@ impl std::error::Error for OverlapError {}
 /// transaction — this function only returns `Err`, it never rolls back
 /// itself, since a caller batching multiple calls (`apply_fabric`) needs to
 /// roll back the WHOLE transaction, not just this segment's partial writes.
-fn insert_segment_tx(tx: &Transaction<'_>, name: &str, cidrs: &[Ipv4Net]) -> Result<i64> {
-    tx.execute("INSERT INTO segment (name) VALUES (?1)", params![name])?;
-    let segment_id = tx.last_insert_rowid();
-
+/// Inserts `cidrs` as `cidr` rows belonging to `segment_id`, enforcing the
+/// CIDR-overlap invariant against every OTHER already-registered segment's
+/// CIDRs (`c.segment_id != ?1` — so this works both for a brand-new
+/// `segment_id` that owns zero rows yet, per [`insert_segment_tx`], AND for
+/// [`Db::apply_fabric`]'s CIDR-REPLACE path (Task 5), which deletes
+/// `segment_id`'s own old rows in the SAME transaction just before calling
+/// this — either way, this segment's own rows never self-conflict), and
+/// against siblings within this same incoming `cidrs` slice (so a single
+/// declaration can't nest two overlapping CIDRs of its own undetected). Does
+/// NOT roll back on error — see [`insert_segment_tx`]'s doc comment for why
+/// that's the caller's job.
+fn insert_cidrs_tx(tx: &Transaction<'_>, segment_id: i64, name: &str, cidrs: &[Ipv4Net]) -> Result<()> {
     let mut accepted: Vec<Ipv4Net> = Vec::with_capacity(cidrs.len());
 
     for cidr in cidrs {
@@ -290,6 +298,13 @@ fn insert_segment_tx(tx: &Transaction<'_>, name: &str, cidrs: &[Ipv4Net]) -> Res
         accepted.push(*cidr);
     }
 
+    Ok(())
+}
+
+fn insert_segment_tx(tx: &Transaction<'_>, name: &str, cidrs: &[Ipv4Net]) -> Result<i64> {
+    tx.execute("INSERT INTO segment (name) VALUES (?1)", params![name])?;
+    let segment_id = tx.last_insert_rowid();
+    insert_cidrs_tx(tx, segment_id, name, cidrs)?;
     Ok(segment_id)
 }
 
@@ -348,17 +363,27 @@ fn ir_proto_str(proto: &wiremesh_policy::IrProto) -> &'static str {
 
 /// Result of a successful [`Db::apply_fabric`] call — the mirror of
 /// `wiremesh_proto::v1::ApplyDiff` on the DB layer (kept as a separate type
-/// so `crate::db` doesn't depend on the proto crate). `updated_segments` and
-/// `deleted_segments` are always `0` in cycle-2 (create-only scope — see
-/// `apply_fabric`'s doc comment); kept as fields now (rather than added
-/// later) so the proto shape and `AdminSvc::apply`'s mapping don't need to
-/// change again once update/delete diffing lands.
-#[derive(Debug, Clone, Copy, Default)]
+/// so `crate::db` doesn't depend on the proto crate). `deleted_segments` is
+/// always `0` (segment deletion stays out of `apply_fabric`'s scope — see
+/// that method's doc comment); kept as a field now (rather than added later)
+/// so the proto shape and `AdminSvc::apply`'s mapping don't need to change
+/// again once delete diffing lands. (Task 5) `updated_segments` counts a
+/// segment whose declared CIDR set differed from what was stored and was
+/// therefore replaced; `changed_segment_cidrs` names exactly which ones (and
+/// their new CIDRs), crate-internal detail `AdminSvc::apply` needs to look up
+/// each one's gateway (if any) and publish a
+/// [`crate::projection::ChangeEvent::SegmentCidrsChanged`] for it — not part
+/// of the wire `ApplyDiff` shape, which only carries the count.
+#[derive(Debug, Clone, Default)]
 pub struct ApplyOutcome {
     pub created_segments: u32,
     pub updated_segments: u32,
     pub deleted_segments: u32,
     pub policy_updated: bool,
+    /// (Task 5) `(segment_id, segment_name, new_cidrs)` for every segment
+    /// whose CIDR set was actually replaced by this apply, in the order
+    /// they were processed.
+    pub changed_segment_cidrs: Vec<(i64, String, Vec<String>)>,
 }
 
 /// Distinguishes *why* [`Db::enroll_gateway`] failed, so the gRPC layer
@@ -650,39 +675,49 @@ impl Db {
         Ok(segment_id)
     }
 
-    /// (Task 14) Diffs a parsed `fabric.yaml`'s `segments:` list (and,
-    /// separately, its optional `policy:` source) against current DB state
-    /// and applies every ACTUAL change in one transaction — this is the
-    /// engine behind `Admin.Apply`.
+    /// (Task 14; Task 5 (cycle 3) adds CIDR-update diffing) Diffs a parsed
+    /// `fabric.yaml`'s `segments:` list (and, separately, its optional
+    /// `policy:` source) against current DB state and applies every ACTUAL
+    /// change in one transaction — this is the engine behind `Admin.Apply`.
     ///
-    /// **Scope (cycle-2 / this task):** CREATE-only for segments — a
-    /// declared segment whose `name` doesn't already exist is inserted (same
-    /// CIDR-overlap invariant as [`Db::insert_segment`], enforced via the
-    /// shared [`insert_segment_tx`] helper); a declared segment whose `name`
-    /// ALREADY exists is treated as a no-op (its CIDRs are not diffed/
-    /// updated, and it is never deleted). Update/delete diffing is
-    /// deliberately partial — see the task report for what's deferred.
+    /// **Scope:** a declared segment whose `name` doesn't already exist is
+    /// inserted (same CIDR-overlap invariant as [`Db::insert_segment`],
+    /// enforced via the shared [`insert_segment_tx`] helper). A declared
+    /// segment whose `name` ALREADY exists has its declared CIDR set
+    /// compared (set-compare on normalized [`Ipv4Net`]) against what's
+    /// stored: identical is a pure no-op (unchanged cycle-2/Task-4
+    /// behavior); DIFFERENT means its `cidr` rows are REPLACED (delete +
+    /// insert, same overlap guard exempting this segment's own rows — see
+    /// [`insert_cidrs_tx`]) and it counts into [`ApplyOutcome::updated_segments`].
+    /// Segment DELETION stays out of this method's scope (unchanged).
     ///
     /// **Idempotence is the load-bearing contract:** nothing is written at
-    /// all — no `INSERT`, no audit row, no revision bump — unless at least
-    /// one segment was actually created or the policy source actually
-    /// changed. That's why every existing-name check and the policy
-    /// source-comparison happen BEFORE any mutation: a second, identical
-    /// apply must produce a transaction with zero writes in it, which is
-    /// what makes "zero new audit rows" true rather than merely arranged to
-    /// look true.
+    /// all — no `INSERT`/`DELETE`, no audit row, no revision bump — unless at
+    /// least one segment was actually created/updated or the policy source
+    /// actually changed. That's why every existing-name/CIDR-set check and
+    /// the policy fingerprint comparison happen BEFORE any mutation: a
+    /// second, identical apply must produce a transaction with zero writes
+    /// in it, which is what makes "zero new audit rows" true rather than
+    /// merely arranged to look true.
     ///
     /// `policy_yaml`, if `Some`, is parsed and compiled for REAL (cycle-3
     /// Task 4): `wiremesh_policy::parse_policy` + `compile`, run INSIDE this
-    /// transaction, AFTER every segment insert above — against the segment
-    /// table (queried fresh via [`read_all_segment_defs_tx`]) as it stands
-    /// at that point, so a fabric.yaml that declares a brand-new segment AND
-    /// a policy block referencing it applies atomically (a compile error
-    /// rolls back the segment inserts too — see below). A compile error
-    /// (unknown segment, non-subset CIDR, malformed ports, etc.) fails the
-    /// WHOLE call: the transaction is rolled back, nothing is stored (not
-    /// even the segments), and `Err`'s message is every collected
-    /// [`wiremesh_policy::CompileError`]'s `Display` joined with `\n`.
+    /// transaction, AFTER every segment create/CIDR-update above — against
+    /// the segment table (queried fresh via [`read_all_segment_defs_tx`]) as
+    /// it stands at that point, so a fabric.yaml that declares a brand-new
+    /// segment (or grows/shrinks an existing one's CIDRs) AND a policy block
+    /// referencing it applies atomically (a compile error rolls back the
+    /// segment mutations too — see below). (Task 5) If `policy_yaml` is
+    /// `None` but at least one segment's CIDRs just changed AND a policy has
+    /// previously been stored, the latest STORED `source_yaml` is used as
+    /// the recompile source instead — a CIDR change can change a stored
+    /// policy's resolved IR (and therefore its fingerprint) even when this
+    /// particular apply carries no `policy:` stanza of its own. A compile
+    /// error (unknown segment, non-subset CIDR, malformed ports, etc.) fails
+    /// the WHOLE call: the transaction is rolled back — segments AND policy
+    /// both left exactly as they were — nothing is stored, and `Err`'s
+    /// message is every collected [`wiremesh_policy::CompileError`]'s
+    /// `Display` joined with `\n`.
     ///
     /// New-version rule (design D-C3-8): the candidate IR is compiled at
     /// `version = latest + 1` (or `1` if none exists yet) and its
@@ -690,8 +725,9 @@ impl Db {
     /// fingerprint — a version-independent structural equality key, not a
     /// raw-source-text comparison. Identical fingerprint means NO new
     /// version (`policy_updated: false`), even if `source_yaml`'s TEXT
-    /// differs (e.g. reordered YAML keys within a rule). Only on a genuine
-    /// new version are `policy_version` (with its `fingerprint`) and every
+    /// differs (e.g. reordered YAML keys within a rule, or a CIDR change on
+    /// a segment no policy block resolves against). Only on a genuine new
+    /// version are `policy_version` (with its `fingerprint`) and every
     /// `policy_rule` row (`(version, block_ord, rule_ord, action, src, dst,
     /// proto, ports)`, action/proto lowercase, src/dst/ports as
     /// human-readable comma-joined text) written.
@@ -714,12 +750,72 @@ impl Db {
         // (entity, diff_json) pairs, accumulated so audit rows are only
         // actually written once we know the apply as a whole isn't empty.
         let mut created_segments = 0u32;
+        let mut updated_segments = 0u32;
         let mut audit_rows: Vec<(&'static str, String, String)> = Vec::new();
+        // (Task 5) `(segment_id, segment_name, new_cidrs)` for every segment
+        // whose CIDR set was actually replaced — surfaced on `ApplyOutcome`
+        // so `AdminSvc::apply` can publish a `SegmentCidrsChanged` event per
+        // changed segment's gateway (if it has one) after commit.
+        let mut changed_segment_cidrs: Vec<(i64, String, Vec<String>)> = Vec::new();
 
         for (name, cidrs) in segments {
             if existing_names.contains(name) {
-                // Already present: cycle-2 scope is create + no-op-on-match
-                // (see the doc comment above) — not an update, not an error.
+                // Already present: diff its declared CIDR set (Task 5)
+                // against what's stored, set-compare on normalized
+                // `Ipv4Net` (order-insensitive, exact — same discipline
+                // `enroll_gateway`'s `bound_cidrs` comparison already uses).
+                let segment_id: i64 =
+                    tx.query_row("SELECT id FROM segment WHERE name = ?1", params![name], |row| {
+                        row.get(0)
+                    })?;
+                let existing_cidr_strs: Vec<String> = {
+                    let mut stmt = tx.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
+                    let rows = stmt.query_map(params![segment_id], |row| row.get::<_, String>(0))?;
+                    rows.collect::<rusqlite::Result<_>>()?
+                };
+                let existing_set: std::collections::BTreeSet<Ipv4Net> = existing_cidr_strs
+                    .iter()
+                    .map(|s| s.parse::<Ipv4Net>())
+                    .collect::<std::result::Result<_, _>>()
+                    .map_err(|e| {
+                        anyhow::anyhow!("stored cidr for segment {name:?} is not valid IPv4: {e}")
+                    })?;
+                let declared_set: std::collections::BTreeSet<Ipv4Net> =
+                    cidrs.iter().copied().collect();
+
+                if existing_set == declared_set {
+                    // True no-op for this segment: identical CIDR set.
+                    continue;
+                }
+
+                // REPLACE: delete this segment's own cidr rows, then
+                // re-insert the declared set. `insert_cidrs_tx`'s overlap
+                // guard already exempts `segment_id`'s own rows
+                // (`c.segment_id != ?1`), and since they're deleted first
+                // here, a segment growing its own CIDR range never
+                // self-conflicts.
+                tx.execute("DELETE FROM cidr WHERE segment_id = ?1", params![segment_id])?;
+                match insert_cidrs_tx(&tx, segment_id, name, cidrs) {
+                    Ok(()) => {}
+                    Err(e) => {
+                        tx.rollback()?;
+                        return Err(e);
+                    }
+                }
+
+                updated_segments += 1;
+                let new_cidr_strs: Vec<String> = cidrs.iter().map(|c| c.to_string()).collect();
+                audit_rows.push((
+                    "apply-update-segment-cidrs",
+                    format!("segment/{name}"),
+                    serde_json::json!({
+                        "name": name,
+                        "old_cidrs": existing_cidr_strs,
+                        "new_cidrs": new_cidr_strs,
+                    })
+                    .to_string(),
+                ));
+                changed_segment_cidrs.push((segment_id, name.clone(), new_cidr_strs));
                 continue;
             }
             match insert_segment_tx(&tx, name, cidrs) {
@@ -738,11 +834,33 @@ impl Db {
             ));
         }
 
+        // (Task 5) The source to (re)compile: the apply's own `policy:`
+        // stanza if it has one; otherwise, if at least one segment's CIDRs
+        // just changed and a policy has previously been stored, the latest
+        // STORED source — recompiling it against the just-updated segment
+        // table may resolve to different CIDRs (and therefore a different
+        // fingerprint) even though this apply's YAML carries no `policy:`
+        // stanza of its own. Neither condition holding means no compile at
+        // all (unchanged cycle-2/Task-4 behavior).
+        let effective_policy_source: Option<String> = match policy_yaml {
+            Some(source) => Some(source.to_string()),
+            None if !changed_segment_cidrs.is_empty() => tx
+                .query_row(
+                    "SELECT source_yaml FROM policy_version ORDER BY version DESC LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?,
+            None => None,
+        };
+
         // Real DSL->IR compilation (cycle-3 Task 4), run against the segment
-        // table AS OF THIS POINT (after every segment insert above) — see
-        // this method's doc comment for the atomicity/idempotence contract.
+        // table AS OF THIS POINT (after every segment create/CIDR-update
+        // above) — see this method's doc comment for the atomicity/
+        // idempotence contract.
         let mut policy_updated = false;
-        if let Some(source_yaml) = policy_yaml {
+        if let Some(source_yaml) = effective_policy_source {
+            let source_yaml = source_yaml.as_str();
             let segment_defs = read_all_segment_defs_tx(&tx)?;
 
             let compile_errors_to_err = |errors: Vec<wiremesh_policy::CompileError>| {
@@ -846,7 +964,7 @@ impl Db {
             }
         }
 
-        if created_segments == 0 && !policy_updated {
+        if created_segments == 0 && updated_segments == 0 && !policy_updated {
             // True no-op: nothing was written above (every branch that
             // writes also increments one of these), so there is nothing to
             // audit and no revision to bump — roll back the (empty, but
@@ -857,6 +975,7 @@ impl Db {
                 updated_segments: 0,
                 deleted_segments: 0,
                 policy_updated: false,
+                changed_segment_cidrs: Vec::new(),
             });
         }
 
@@ -867,18 +986,20 @@ impl Db {
             )?;
         }
 
-        // Projection-affecting mutation (new segment(s)/policy change both
-        // qualify), so bump the persisted revision in this same transaction
-        // — see `bump_revision_tx`'s doc comment. Only reached when at least
-        // one real change happened, per the early return above.
+        // Projection-affecting mutation (new/updated segment(s), policy
+        // change all qualify), so bump the persisted revision in this same
+        // transaction — see `bump_revision_tx`'s doc comment. Only reached
+        // when at least one real change happened, per the early return
+        // above.
         bump_revision_tx(&tx)?;
 
         tx.commit()?;
         Ok(ApplyOutcome {
             created_segments,
-            updated_segments: 0,
+            updated_segments,
             deleted_segments: 0,
             policy_updated,
+            changed_segment_cidrs,
         })
     }
 
@@ -1315,6 +1436,25 @@ impl Db {
             .query_map(params![segment_id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
+    }
+
+    /// (Task 5) The single ACTIVE `gateway.id` enrolled on `segment_id`, if
+    /// any (the one-gateway-per-segment invariant — see `enroll_gateway`'s
+    /// doc comment — means there's at most one). Used after
+    /// [`Db::apply_fabric`] replaces a segment's CIDRs to look up which
+    /// gateway (if it has one yet) `AdminSvc::apply` should publish a
+    /// [`crate::projection::ChangeEvent::SegmentCidrsChanged`] delta for —
+    /// `None` when the segment has no enrolled gateway at all (nothing to
+    /// notify).
+    pub fn active_gateway_for_segment(&self, segment_id: i64) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM gateway WHERE segment_id = ?1 AND status = 'active'",
+            params![segment_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
     }
 
     /// `gateway_key` rows with `state = 'active'` for `gateway_id`, as

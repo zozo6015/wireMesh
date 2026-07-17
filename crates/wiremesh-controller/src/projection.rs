@@ -30,8 +30,7 @@ use crate::routes;
 /// and re-fetch a full snapshot.
 ///
 /// Cycle-2 scope: `GatewayEnrolled` (Task 8) and `KeyRotated` (Task 11).
-/// Segment CIDR changes and revocation are later tasks' events, added as
-/// further variants once they exist.
+/// Cycle-3 adds `PolicyUpdated` (Task 4) and `SegmentCidrsChanged` (Task 5).
 #[derive(Clone, Debug)]
 pub enum ChangeEvent {
     /// A new gateway enrolled — a full-mesh peer every OTHER
@@ -111,6 +110,26 @@ pub enum ChangeEvent {
     /// the fact (those get it via `build_snapshot`). `ir` is the exact
     /// canonical-JSON bytes stored in `policy_version.compiled_ir`.
     PolicyUpdated { version: u64, ir: Vec<u8>, revision: u64 },
+    /// (Cycle-3 Task 5) `Admin.Apply` REPLACED an existing segment's `cidr`
+    /// rows (its declared CIDR set changed) — every OTHER already-connected
+    /// gateway's peer view of `gateway_id` (the segment's own enrolled
+    /// gateway) must be upserted with its FULL current state (keys +
+    /// GROWN/SHRUNK `allowed_ips`), mirroring [`ChangeEvent::KeyRotated`]'s
+    /// full-peer-refresh pattern — an open `Sync.Watch` stream stays
+    /// consistent with what a fresh snapshot would show without waiting for
+    /// a reconnect. Only published for a segment that actually has an
+    /// enrolled gateway (`Db::active_gateway_for_segment` returned `Some`) —
+    /// a CIDR change on a segment with no gateway yet has no peer to upsert.
+    SegmentCidrsChanged {
+        gateway_id: i64,
+        segment_name: String,
+        allowed_ips: Vec<String>,
+        /// `(epoch, pubkey, state)` for every `gateway_key` row of
+        /// `gateway_id`, straight off [`crate::db::Db::all_keys_for_gateway`]
+        /// — same full-key-set rationale as `KeyRotated`.
+        keys: Vec<(i64, String, String)>,
+        revision: u64,
+    },
 }
 
 impl ChangeEvent {
@@ -140,6 +159,7 @@ impl ChangeEvent {
             // newly compiled policy, mirroring `CertRevoked`'s rationale
             // above.
             ChangeEvent::PolicyUpdated { .. } => 0,
+            ChangeEvent::SegmentCidrsChanged { gateway_id, .. } => *gateway_id,
         }
     }
 }
@@ -267,6 +287,34 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             relays: Vec::new(),
             policy_ir: ir,
             policy_version: version,
+            revoked_serials: Vec::new(),
+        },
+        ChangeEvent::SegmentCidrsChanged {
+            gateway_id,
+            segment_name,
+            allowed_ips,
+            keys,
+            revision,
+        } => Delta {
+            revision,
+            upserted_peers: vec![Peer {
+                gateway_id: gateway_id as u64,
+                segment_name,
+                keys: keys
+                    .into_iter()
+                    .map(|(epoch, pubkey, state)| PeerKey {
+                        epoch: epoch as u32,
+                        pubkey,
+                        state,
+                    })
+                    .collect(),
+                candidate_endpoints: Vec::new(),
+                allowed_ips,
+            }],
+            removed_peer_ids: Vec::new(),
+            relays: Vec::new(),
+            policy_ir: Vec::new(),
+            policy_version: 0,
             revoked_serials: Vec::new(),
         },
     }

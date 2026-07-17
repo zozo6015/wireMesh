@@ -708,22 +708,28 @@ impl Admin for AdminSvc {
     }
 
     /// (Task 14; cycle-3 Task 4 wires real DSL compilation + live fan-out
-    /// behind it) Declarative `fabricctl apply -f fabric.yaml`: parses the
+    /// behind it; Task 5 adds segment CIDR-update diffing + its own live
+    /// fan-out) Declarative `fabricctl apply -f fabric.yaml`: parses the
     /// YAML (`crate::apply::parse_fabric`), validates every segment's CIDRs
     /// as IPv4 (mirrors `create_segment`), and hands the whole thing to
     /// [`crate::db_async::DbHandle::apply_fabric`] to diff-and-apply
-    /// (segments, THEN policy compile/versioning) in one transaction. See
-    /// that method's doc comment for the idempotence contract this RPC is
-    /// entirely riding on: a second, identical (or merely
-    /// fingerprint-identical) apply must come back with every `ApplyDiff`
-    /// field zero/false. A compile error surfaces as `Status::internal`
-    /// (mirroring every other `apply_fabric` error) naming the offending
-    /// segment/rule — nothing is stored in that case. When the apply DID
-    /// mint a new policy version, re-reads it and the post-commit revision
-    /// to publish a [`ChangeEvent::PolicyUpdated`] — same "mutate durably
-    /// first, then notify" order `RotateKey`/`Drain`/`RevokeCert` use — so
-    /// every ALREADY-connected gateway's open `Sync.Watch` stream gets the
-    /// new IR without waiting for a reconnect.
+    /// (segments — create OR CIDR-replace — THEN policy compile/versioning)
+    /// in one transaction. See that method's doc comment for the idempotence
+    /// contract this RPC is entirely riding on: a second, identical (or
+    /// merely fingerprint-identical) apply must come back with every
+    /// `ApplyDiff` field zero/false. A compile error surfaces as
+    /// `Status::internal` (mirroring every other `apply_fabric` error)
+    /// naming the offending segment/rule — nothing is stored in that case
+    /// (segments AND policy both rolled back together). For every segment
+    /// whose CIDRs were just replaced, looks up its enrolled gateway (if
+    /// any) and publishes a [`ChangeEvent::SegmentCidrsChanged`] for it.
+    /// When the apply DID mint a new policy version (which a CIDR change
+    /// alone can trigger — see `apply_fabric`'s doc comment), re-reads it and
+    /// the post-commit revision to publish a [`ChangeEvent::PolicyUpdated`]
+    /// — same "mutate durably first, then notify" order
+    /// `RotateKey`/`Drain`/`RevokeCert` use — so every ALREADY-connected
+    /// gateway's open `Sync.Watch` stream gets the new IR / CIDR refresh
+    /// without waiting for a reconnect.
     async fn apply(&self, request: Request<ApplyRequest>) -> Result<Response<ApplyDiff>, Status> {
         let actor = actor_of(&request);
         let req = request.into_inner();
@@ -759,6 +765,45 @@ impl Admin for AdminSvc {
             .apply_fabric(segments, policy_yaml, actor, now)
             .await
             .map_err(|e| Status::internal(format!("applying fabric: {e}")))?;
+
+        // (Task 5) For every segment whose CIDR set was just replaced, look
+        // up whether it has an enrolled gateway (a CIDR change on a segment
+        // with no gateway yet has nobody to notify) and, if so, publish a
+        // `SegmentCidrsChanged` event with its FULL current key set — same
+        // "mutate durably first, then notify" order every other publish in
+        // this handler/module uses.
+        for (segment_id, segment_name, allowed_ips) in &outcome.changed_segment_cidrs {
+            if let Some(gateway_id) = self
+                .db
+                .active_gateway_for_segment(*segment_id)
+                .await
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "looking up gateway for CIDR-changed segment {segment_id}: {e}"
+                    ))
+                })?
+            {
+                let keys = self.db.all_keys_for_gateway(gateway_id).await.map_err(|e| {
+                    Status::internal(format!(
+                        "reading gateway keys after CIDR change: {e}"
+                    ))
+                })?;
+                let revision = self.db.current_revision().await.map_err(|e| {
+                    Status::internal(format!("reading revision after CIDR change: {e}"))
+                })?;
+                // `send` errors only when there are currently no `Sync.Watch`
+                // subscribers — nobody to notify, which is not a failure
+                // (mirrors `RotateKey`/`Drain`/`RevokeCert`'s identical
+                // `let _ =`).
+                let _ = self.change_tx.send(ChangeEvent::SegmentCidrsChanged {
+                    gateway_id,
+                    segment_name: segment_name.clone(),
+                    allowed_ips: allowed_ips.clone(),
+                    keys,
+                    revision,
+                });
+            }
+        }
 
         if outcome.policy_updated {
             // Re-read rather than thread the freshly-compiled IR back out of
