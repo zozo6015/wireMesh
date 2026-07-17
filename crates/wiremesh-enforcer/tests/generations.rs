@@ -62,7 +62,18 @@ mod lab {
         let (apriv, apub) = wg_keypair();
         let (bpriv, bpub) = wg_keypair();
 
-        for (ns, privkey, peer_pub, my_ip, peer_ip, peer_ep) in [
+        // `allowed-ips` is WireGuard cryptokey routing's OWN allow-list, fully
+        // independent of (and evaluated before) anything the eBPF enforcer
+        // sees: a packet whose src (outbound) or claimed src (inbound) falls
+        // outside it is silently dropped by the kernel WG implementation
+        // itself, never reaching wg0's tc classifier at all. Widened from the
+        // bare peer host `/32` to the whole overlay `/24` (root-caused via a
+        // bare `ping -I <alias>` repro, zero eBPF involved) so this file's
+        // LPM tests -- which bind to secondary IP aliases `10.10.0.8`/`.9` on
+        // `a`'s `wg0` in addition to its primary `10.10.0.1` -- actually reach
+        // `b` instead of being dropped before the enforcer ever runs. Keep
+        // this in sync with `tests/ebpf_backend.rs`'s identical copy.
+        for (ns, privkey, peer_pub, my_ip, _peer_ip, peer_ep) in [
             (&a, &apriv, &bpub, "10.10.0.1/24", "10.10.0.2", "10.9.1.2:51820"),
             (&b, &bpriv, &apub, "10.10.0.2/24", "10.10.0.1", "10.9.1.1:51820"),
         ] {
@@ -71,7 +82,7 @@ mod lab {
             std::fs::write(&kf, privkey).unwrap();
             ns.exec(&[
                 "wg", "set", "wg0", "listen-port", "51820", "private-key", &kf,
-                "peer", peer_pub, "allowed-ips", &format!("{peer_ip}/32"),
+                "peer", peer_pub, "allowed-ips", "10.10.0.0/24",
                 "endpoint", peer_ep,
             ]).unwrap();
             ns.exec(&["ip", "addr", "add", my_ip, "dev", "wg0"]).unwrap();
