@@ -1,0 +1,15 @@
+[package]
+name = "wiremesh-policy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# `PolicyDoc`/`BlockSrc`/`RuleSrc`/`RuleBody` (dsl.rs, Task 1 Step 3) derive
+# `Deserialize` off this.
+serde = { workspace = true }
+# The DSL's on-disk format (design §4) is YAML, not JSON — same crate
+# `wiremesh-controller` already uses for `fabric.yaml`/policy stanzas.
+serde_yaml = { workspace = true }
+# `SegmentDef::cidrs` and every CIDR the validator parses out of `src`/`dst`
+# are `ipnet::Ipv4Net` (v1 is IPv4-only per design §4).
+ipnet = { workspace = true }

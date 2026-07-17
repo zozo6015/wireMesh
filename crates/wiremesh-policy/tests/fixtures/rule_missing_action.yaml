@@ -1,0 +1,6 @@
+# Error class: a rule with neither `allow:` nor `deny:` key.
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - {}

@@ -1,0 +1,10 @@
+# Error class: `ports` with `proto` omitted (design §4 — omitted proto
+# defaults to tcp+udp+icmp, and ports is forbidden whenever icmp is in
+# scope, so an omitted proto with ports set is the same violation as
+# proto: icmp with ports set).
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          ports: [443]

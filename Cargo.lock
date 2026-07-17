@@ -1822,6 +1822,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "wiremesh-policy"
+version = "0.1.0"
+dependencies = [
+ "ipnet",
+ "serde",
+ "serde_yaml",
+]
+
+[[package]]
 name = "wiremesh-proto"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,10 @@
+# Error class: `src` not a subset of the from-segment's CIDRs (design §4).
+# seg-a's only CIDR is 10.0.0.0/16; 192.168.0.0/24 isn't contained in it.
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          src: ["192.168.0.0/24"]
+          proto: tcp
+          ports: [443]

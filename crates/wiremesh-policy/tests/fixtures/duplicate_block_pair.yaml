@@ -1,0 +1,16 @@
+# Error class: more than one block per ordered (from, to) pair (design §4).
+# Two blocks both have from: seg-a, to: seg-b. The error names the second
+# (duplicate) occurrence, block index 1.
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+          ports: [443]
+  - from: seg-a
+    to: seg-b
+    rules:
+      - deny:
+          proto: tcp
+          ports: [80]

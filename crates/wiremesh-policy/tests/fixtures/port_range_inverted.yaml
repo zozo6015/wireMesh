@@ -1,0 +1,8 @@
+# Error class: port range lo > hi (design §4 — malformed ranges).
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+          ports: ["8080-8000"]

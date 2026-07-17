@@ -1,0 +1,9 @@
+# Error class: non-IPv4 CIDR (design §4 — v1 is IPv4-only).
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          src: ["::/0"]
+          proto: tcp
+          ports: [443]

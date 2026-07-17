@@ -1,0 +1,10 @@
+# Error class: unknown segment name in `from`/`to` (design §4).
+# `to: seg-nonexistent` doesn't resolve against the segment table the test
+# passes to parse_policy (seg-a, seg-b, seg-c only).
+policy:
+  - from: seg-a
+    to: seg-nonexistent
+    rules:
+      - allow:
+          proto: tcp
+          ports: [443]

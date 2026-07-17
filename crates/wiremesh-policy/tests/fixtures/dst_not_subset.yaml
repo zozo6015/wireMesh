@@ -1,0 +1,10 @@
+# Error class: `dst` not a subset of the to-segment's CIDRs (design §4).
+# seg-b's only CIDR is 10.1.0.0/16; 192.168.1.0/24 isn't contained in it.
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          dst: ["192.168.1.0/24"]
+          proto: tcp
+          ports: [443]
