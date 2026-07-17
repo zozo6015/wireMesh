@@ -471,9 +471,18 @@ proptest! {
     }
 
     /// (f) Injecting a duplicate ordered `(from, to)` pair (a copy of an
-    /// existing block, appended at the end) always yields a
-    /// `CompileError` referencing both the original and the duplicate
-    /// block's index.
+    /// existing block, appended at the end) always yields **exactly one**
+    /// `CompileError` for the duplicate occurrence, whose message both
+    /// says "duplicate" and names the *original* occurrence's block index
+    /// as the substring `"block {original_idx}"` (e.g. "first defined at
+    /// block 0"). This is the controller's binding-contract ruling on the
+    /// original FINDING below: the plan's "mentioning both block indices"
+    /// means one error mentioning both — `block == Some(duplicate_idx)`
+    /// plus the original index in text — not two separate `CompileError`s
+    /// (one per occurrence). The Task 1 golden test
+    /// (`duplicate_ordered_from_to_pair_is_a_compile_error`, `errors.len()
+    /// == 1`, `block == Some(1)`) is unaffected and stays green under this
+    /// contract.
     #[test]
     fn duplicate_ordered_pair_is_always_a_compile_error(policy in gen_policy_strategy()) {
         prop_assume!(!policy.blocks.is_empty());
@@ -502,11 +511,21 @@ proptest! {
             Ok(_) => unreachable!("checked is_err() above"),
         };
 
-        let mentions_original = errors.iter().any(|e| e.block == Some(original_idx));
-        let mentions_duplicate = errors.iter().any(|e| e.block == Some(duplicate_idx));
+        prop_assert_eq!(
+            errors.len(), 1,
+            "expected exactly one CompileError for the duplicate pair occurrence, got: {:?}", errors
+        );
+        prop_assert_eq!(errors[0].block, Some(duplicate_idx));
+        prop_assert_eq!(errors[0].rule, None);
         prop_assert!(
-            mentions_original && mentions_duplicate,
-            "expected a CompileError referencing both block {original_idx} and block {duplicate_idx}, got: {errors:?}"
+            errors[0].msg.to_lowercase().contains("duplicate"),
+            "msg should contain 'duplicate', got: {}", errors[0].msg
+        );
+        let original_marker = format!("block {original_idx}");
+        prop_assert!(
+            errors[0].msg.contains(&original_marker),
+            "msg should name the original occurrence as '{}', got: {}",
+            original_marker, errors[0].msg
         );
     }
 
