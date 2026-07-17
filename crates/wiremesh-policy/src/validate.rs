@@ -149,10 +149,15 @@ fn validate_cidrs(
     }
 }
 
-/// Checks `ports`/`proto` on one rule body: `ports` requires an explicit
-/// `proto: tcp|udp` (design §4 — omitted proto defaults to tcp+udp+icmp,
-/// and icmp has no ports); each port/range must be in `1..=65535` with
-/// `lo <= hi`.
+/// Checks `ports`/`proto` on one rule body: `proto`, if present, must be
+/// one of `tcp`/`udp`/`icmp` (design §4 — those plus "absent" are the only
+/// valid values); this is checked unconditionally, regardless of whether
+/// `ports` is present — an invalid `proto` with no `ports` used to slip
+/// through `validate_ports`'s ports-only checks below and reach `compile()`
+/// unrejected (Task 2 finding: it hit `compile()`'s `unreachable!()`).
+/// `ports` additionally requires an explicit `proto: tcp|udp` (omitted
+/// proto defaults to tcp+udp+icmp, and icmp has no ports); each port/range
+/// must be in `1..=65535` with `lo <= hi`.
 fn validate_ports(
     block_idx: usize,
     rule_idx: usize,
@@ -160,6 +165,20 @@ fn validate_ports(
     body: &RuleBody,
     errors: &mut Vec<CompileError>,
 ) {
+    match body.proto.as_deref() {
+        None | Some("tcp") | Some("udp") | Some("icmp") => {}
+        Some(other) => {
+            errors.push(CompileError {
+                block: Some(block_idx),
+                rule: Some(rule_idx),
+                msg: format!(
+                    "{ctx} invalid proto '{other}' (must be tcp, udp, icmp, or omitted)"
+                ),
+            });
+            return;
+        }
+    }
+
     if body.ports.is_empty() {
         return;
     }
