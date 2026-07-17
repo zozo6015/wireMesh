@@ -7,16 +7,16 @@
 //! surface that later cycle-3 tasks (IR codegen, controller integration —
 //! design §7's `apply::compile_policy`) depend on by these exact names.
 //!
-//! Task 1 Step 1 (this commit): signatures only, `todo!()`/`unimplemented!()`
-//! bodies — the RED half of the golden tests in `tests/golden.rs`. The real
-//! DSL model (`dsl.rs`) and validation (`validate.rs`) land in Step 3.
-//!
-//! Deviation from the Task 1 brief's literal `Interfaces` snippet, resolved
-//! here (see `.superpowers/sdd/task-1-tests-report.md` for the full note):
-//! the brief shows `parse_policy(yaml: &str)` with no segment table, but
-//! design §4's subset/unknown-segment checks and §7's "invoked with the
-//! current segment table" both require one. `parse_policy` below therefore
-//! takes `segments: &[SegmentDef]` as a second argument.
+//! Deviation from the Task 1 brief's literal `Interfaces` snippet, accepted
+//! by the controller (see `.superpowers/sdd/task-1-tests-report.md` for the
+//! full note): the brief shows `parse_policy(yaml: &str)` with no segment
+//! table, but design §4's subset/unknown-segment checks and §7's "invoked
+//! with the current segment table" both require one. `parse_policy` below
+//! therefore takes `segments: &[SegmentDef]` as a second argument, and does
+//! parsing (`dsl.rs`) and validation (`validate.rs`) in one pure call.
+
+mod dsl;
+mod validate;
 
 use std::fmt;
 
@@ -32,7 +32,7 @@ pub struct SegmentDef {
 /// An opaque, successfully parsed-and-validated policy document. A later
 /// cycle-3 task turns this into the compiled IR (design §5); Task 1 only
 /// proves the source parses and validates against a segment table.
-pub struct PolicySource(#[allow(dead_code)] ());
+pub struct PolicySource(#[allow(dead_code)] dsl::PolicyDoc);
 
 /// Parses `yaml` as a WireMesh policy DSL document (design §4) and
 /// validates it against `segments` — the controller's current segment
@@ -47,8 +47,20 @@ pub fn parse_policy(
     yaml: &str,
     segments: &[SegmentDef],
 ) -> Result<PolicySource, Vec<CompileError>> {
-    let _ = (yaml, segments);
-    todo!("Task 1 Step 3: DSL parse (dsl.rs) + validation (validate.rs)")
+    let doc: dsl::PolicyDoc = serde_yaml::from_str(yaml).map_err(|e| {
+        vec![CompileError {
+            block: None,
+            rule: None,
+            msg: format!("YAML parse error: {e}"),
+        }]
+    })?;
+
+    let errors = validate::validate(&doc, segments);
+    if errors.is_empty() {
+        Ok(PolicySource(doc))
+    } else {
+        Err(errors)
+    }
 }
 
 /// A single compile error, named by its location. `block` is the
@@ -64,13 +76,18 @@ pub struct CompileError {
 }
 
 impl fmt::Display for CompileError {
-    /// Renders as `"block {n} ({from}→{to}) rule {n}: {msg}"`, degrading
-    /// gracefully when `block`/`rule` are `None`. Task 1 Step 3 fills this
-    /// in; block-level errors need the `from`/`to` segment names, which
-    /// this type doesn't carry today, so the real implementation may need
-    /// to thread that through some other way (see Step 3 implementer).
+    /// Renders as `"block {n} rule {n}: {msg}"`, degrading gracefully when
+    /// `block`/`rule` are `None` (a document-level error has neither; a
+    /// block-level error has no `rule`). The brief's example format also
+    /// shows a `({from}→{to})` segment-pair parenthetical, but this type
+    /// intentionally carries only `block`/`rule`/`msg` (the exact fields
+    /// later cycle-3 tasks depend on) — `validate.rs` bakes the `(from→to)`
+    /// context directly into `msg` instead of adding fields here.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let _ = f;
-        todo!("Task 1 Step 3: \"block {{n}} ({{from}}\u{2192}{{to}}) rule {{n}}: {{msg}}\" rendering")
+        match (self.block, self.rule) {
+            (Some(b), Some(r)) => write!(f, "block {b} rule {r}: {}", self.msg),
+            (Some(b), None) => write!(f, "block {b}: {}", self.msg),
+            (None, _) => write!(f, "{}", self.msg),
+        }
     }
 }
