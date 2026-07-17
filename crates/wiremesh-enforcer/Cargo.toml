@@ -1,0 +1,30 @@
+[package]
+name = "wiremesh-enforcer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# `flatten()`'s input (`PolicyIR`) and the `Enforcer::apply` trait method's
+# argument (Task 7 brief) are both `wiremesh_policy::PolicyIR`.
+wiremesh-policy = { path = "../wiremesh-policy" }
+# `Enforcer` trait methods, `probe`, and `flatten` all return
+# `anyhow::Result` (Task 7 brief's exact `Interfaces` snippet).
+anyhow = { workspace = true }
+# `FlatRule::src_cidrs`/`dst_cidrs` are `Vec<ipnet::Ipv4Net>` (Task 7 brief;
+# v1 is IPv4-only per design §4, same crate `wiremesh-policy` already uses).
+ipnet = { workspace = true }
+# Deliberately excluded here (Step 3/implementer's concern, per the Task 7
+# brief's skeleton boundary): any `aya`/`aya-build` dependency, and no
+# `build.rs` — those belong to the real eBPF loader (`src/ebpf.rs`) and its
+# sibling `wiremesh-enforcer-ebpf` workspace, neither of which exists yet.
+
+[dev-dependencies]
+# `tests/ebpf_backend.rs`'s inline `wg_lab()` (adapted from
+# `spike/enforcer/enforcer/tests/common/mod.rs`) needs the same two-node
+# veth+netns lab helper the spike tests use.
+natlab = { path = "../../spike/natlab" }
+# `tests/ebpf_backend.rs`'s `join_netns` helper: `libc::setns`/`CLONE_NEWNET`
+# to move the test's (dedicated, per-`#[test]`-fn) OS thread into the lab's
+# `b` network namespace before calling library code in-process — there is no
+# `wiremesh-enforcer` CLI binary the way the spike had one to `ip netns exec`.
+libc = "0.2"

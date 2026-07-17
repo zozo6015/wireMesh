@@ -498,3 +498,84 @@ fn blocks_fingerprint_ignores_version_but_reflects_rule_changes() {
         "fingerprint must change when a rule changes"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Task 7 (test author) — the compiler-side `MAX_RULES` guard (design §6:
+// "Mitigation if needed: bounded-loop rule evaluation with a documented
+// max-rules-per-block constant (compile error above it) -- the constant, if
+// introduced, is surfaced in `wiremesh-policy` validation so the controller
+// rejects at compile time, not the gateway at load time"). The limit (256)
+// is the same `wiremesh_enforcer::flatten::MAX_RULES` the enforcer crate
+// duplicates/cross-references (see `crates/wiremesh-enforcer/src/flatten.rs`)
+// -- `wiremesh-policy` cannot depend on `wiremesh-enforcer` (leaf crate, see
+// this crate's module doc), so the number is a deliberate duplication, not a
+// shared constant.
+//
+// RED (no guard exists yet, Task 7 Step 1): today NEITHER `parse_policy` NOR
+// `compile` reject an oversized policy at all -- `expect_flatten_guard_error`
+// below (which tries `parse_policy` then `compile`, and panics with "got Ok"
+// if BOTH succeed) currently panics on the 257-rule case, since compiling
+// 257 trivially-valid single-port rules succeeds today. Step 3 (implementer)
+// adds the guard (either in `validate.rs` or `compile.rs` -- this test
+// doesn't care which, only that ONE of `parse_policy`/`compile` returns a
+// `CompileError` naming "256").
+// ---------------------------------------------------------------------------
+
+/// One block, `n` single-port `deny: { proto: tcp, ports: [p] }` rules for
+/// `p` in `1..=n` -- generated programmatically (per the Task 7 brief)
+/// rather than as a giant fixture file. Each rule has exactly one port
+/// range, so this policy's FLATTENED rule count (post port-explosion, see
+/// `wiremesh-enforcer`'s `flatten`) equals `n` exactly.
+fn policy_yaml_with_n_single_port_rules(n: u16) -> String {
+    let mut yaml = String::from("policy:\n  - from: proxmox-lab\n    to: aws-prod\n    rules:\n");
+    for p in 1..=n {
+        yaml.push_str(&format!("      - deny: {{ proto: tcp, ports: [{p}] }}\n"));
+    }
+    yaml
+}
+
+/// Runs `parse_policy` then (if that succeeds) `compile` against
+/// [`ir_segments`], returning whichever step's errors first reject `yaml`.
+/// Panics if BOTH succeed -- every caller of this helper expects a rejection.
+fn expect_flatten_guard_error(yaml: &str) -> Vec<CompileError> {
+    match parse_policy(yaml, &ir_segments()) {
+        Err(errors) => errors,
+        Ok(src) => match compile(&src, &ir_segments(), 1) {
+            Err(errors) => errors,
+            Ok(ir) => panic!(
+                "expected a compile error for a >256 flattened-rule policy, \
+                 got Ok IR with {} block(s)",
+                ir.blocks.len()
+            ),
+        },
+    }
+}
+
+/// The guard itself: 257 flattened rules (256 is the limit) must be
+/// rejected, and the error must name the limit (256) so a developer reading
+/// it knows exactly what to trim.
+#[test]
+fn more_than_max_rules_flattened_is_a_compile_error() {
+    let yaml = policy_yaml_with_n_single_port_rules(257);
+    let errors = expect_flatten_guard_error(&yaml);
+    assert!(!errors.is_empty(), "expected at least one CompileError");
+    assert!(
+        errors.iter().any(|e| e.msg.contains("256")),
+        "expected an error naming the 256 limit, got: {errors:?}"
+    );
+}
+
+/// Boundary companion (already green today, since no guard exists yet to
+/// reject it -- this pins the *other* side of the fencepost so a Step 3
+/// implementation that's off-by-one in the wrong direction, and starts
+/// rejecting at exactly 256, is caught too): exactly 256 flattened rules
+/// must still compile successfully.
+#[test]
+fn exactly_max_rules_flattened_still_compiles_ok() {
+    let yaml = policy_yaml_with_n_single_port_rules(256);
+    let src = parse_policy(&yaml, &ir_segments())
+        .unwrap_or_else(|errors| panic!("expected valid policy, got errors: {errors:?}"));
+    let ir = compile(&src, &ir_segments(), 1)
+        .unwrap_or_else(|errors| panic!("expected compile to succeed, got errors: {errors:?}"));
+    assert_eq!(ir.blocks[0].rules.len(), 256);
+}
