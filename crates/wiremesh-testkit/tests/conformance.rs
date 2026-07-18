@@ -12,6 +12,19 @@
 //! single `Expect` both backends satisfy identically -- this is not a
 //! precedent for casually branching on `kind` elsewhere.
 //!
+//! **Known, tracked, currently-RED cell (not a ratified divergence, not a
+//! suite bug):** `FLUSH_FLOWS_SCENARIO`'s post-flush step currently FAILS
+//! on `BackendKind::Nftables` -- `NftEnforcer::flush_flows` is a Task 12
+//! no-op deferral, not yet wired to a real conntrack flush, even though
+//! design §8/the master spec promise FlushFlows parity on both backends
+//! (see that scenario's own header comment and
+//! `docs/research/cycle3-policy-notes.md`'s "Task 13" section). This
+//! `#[test]` will therefore currently report an overall FAILED with
+//! exactly that one cell red -- expected, and left that way deliberately
+//! as the red-first marker for the follow-up task that implements the
+//! real nft flush, per CLAUDE.md ("a 'failing' behavior test may be a real
+//! finding ... investigate and record it").
+//!
 //! Deliberately a single `#[test]` fn (not one `#[test]` per scenario):
 //! `SCENARIOS` and [`flip_under_traffic_zero_loss`] both need a fresh
 //! `wg_lab` per run, and this crate's netns tests are already required to
@@ -304,52 +317,101 @@ policy:
     steps: POLICY_UPDATE_LIVE_TRAFFIC_STEPS,
 };
 
-// --- 7. FlushFlows forces re-evaluation -- asserting the END STATE that
-//        holds identically on both backends, not the eBPF-specific
-//        "retroactively denies a stale allow" mechanism (see
+// --- 7. FlushFlows genuinely forces re-evaluation -- NOT a ratified
+//        divergence (unlike scenario #6's one-way-UDP step): design §8 and
+//        the master spec promise FlushFlows parity on BOTH backends, and a
+//        real mechanism (a scoped conntrack flush) is available to
+//        nftables -- `NftEnforcer::flush_flows` just hasn't been wired up
+//        to it yet (a Task 12 deferral, not a decision). This scenario is
+//        therefore EXPECTED, right now, to be green on `BackendKind::Ebpf`
+//        and RED on `BackendKind::Nftables` at its post-flush step (the
+//        no-op flush leaves the flow's conntrack entry untouched, so it
+//        stays Delivered instead of the required Dropped) -- a deliberate
+//        red-first marker for the follow-up task that implements the real
+//        nft flush, not something this suite papers over. See
 //        `conformance.rs`'s module doc comment and
-//        `docs/research/cycle3-policy-notes.md` for the full writeup on
-//        why: nftables' `flush_flows` is an already-documented, accepted
-//        no-op, so asserting THAT specific mechanism here would be a false
-//        parity failure, not a real one). ---------------------------------
+//        `docs/research/cycle3-policy-notes.md`'s "Task 13" section for
+//        the full writeup.
+//
+//        BIDIRECTIONAL flow, deliberately NOT one-way UDP (contrast with
+//        scenario #6's `SendExpectByBackend` step, which is a RATIFIED
+//        divergence specifically because it's one-way): this scenario
+//        needs "the same tuple is still Delivered immediately after v2's
+//        apply(), before any flush" to hold identically on BOTH backends
+//        (steps 3-4 below) -- that's only true on nftables if the flow has
+//        genuinely reached conntrack's `established` state, which requires
+//        a reply to have been observed in the reverse direction. So: `a`
+//        sends first (matches v1's explicit allow rule), THEN `b` replies
+//        on the exact reverse tuple (b's egress is always unfiltered, so
+//        this always succeeds -- but it's what marks the SAME conntrack
+//        entry `seen_reply`, i.e. genuinely `established`, not just `new`).
+//        Only once that's established does "flush is the ONLY thing that
+//        can force re-evaluation" become a fair, apples-to-apples question
+//        for both backends. ------------------------------------------------
 
 const FLUSH_FLOWS_STEPS: &[Step] = &[
-    // Establish a flow under the (only, still-live) allow rule.
+    // 1. `a` establishes the flow under v1's allow rule (matches the
+    //    explicit rule -- not yet relying on any statefulness).
     Step::Send {
-        from: ep(Node::A, 9100),
-        to: ep(Node::B, 8100),
+        from: ep(Node::A, 9200),
+        to: ep(Node::B, 8200),
+        proto: L4::Udp,
+        expect: Expect::Delivered,
+    },
+    // 2. `b` replies on the EXACT reverse tuple. Trivially Delivered
+    //    either way (b's egress is never filtered) -- its real purpose is
+    //    the side effect: this is what makes the SAME conntrack entry
+    //    bidirectionally-`established`, not just `new`, on nftables.
+    Step::Send {
+        from: ep(Node::B, 8200),
+        to: ep(Node::A, 9200),
+        proto: L4::Udp,
+        expect: Expect::Delivered,
+    },
+    // 3. v2 removes udp/8200's allow rule entirely (no block at all).
+    Step::ApplyPolicy { yaml: "policy: []\n" },
+    // 4. SAME tuple as step 1, no flush yet: must still be Delivered on
+    //    BOTH backends -- eBPF's FLOWS entry is untouched by apply(); on
+    //    nftables this flow is now genuinely `ct state established`
+    //    (thanks to step 2's reply), so it passes via the unconditional
+    //    `ct state established,related accept` line regardless of v2
+    //    having no rule for it at all. This is the "live-flow survival"
+    //    guarantee, asserted identically for both backends here (contrast
+    //    with scenario #6, where the flow was deliberately one-way and so
+    //    this exact step is where the ratified divergence lives instead).
+    Step::Send {
+        from: ep(Node::A, 9200),
+        to: ep(Node::B, 8200),
         proto: L4::Udp,
         expect: Expect::Delivered,
     },
     Step::FlushFlows,
-    // Same tuple: still allowed by the CURRENT (unchanged) policy --
-    // flush is safe/non-disruptive; whichever way each backend gets there
-    // (eBPF genuinely re-evaluates via a cleared FLOWS map and lands on
-    // the same ALLOW verdict; nftables' no-op flush leaves its unconditional
-    // `ct state established` fast path untouched) the OBSERVABLE outcome
-    // is identical.
+    // 5. SAME tuple, AFTER flush: must now be Dropped on BOTH backends --
+    //    flush forced re-evaluation against v2 (which has no rule for
+    //    this traffic at all). EXPECTED RED on Nftables right now (see
+    //    this block's header comment): `NftEnforcer::flush_flows` is
+    //    currently a no-op, so the established conntrack entry survives
+    //    untouched and this still comes back Delivered.
     Step::Send {
-        from: ep(Node::A, 9100),
-        to: ep(Node::B, 8100),
+        from: ep(Node::A, 9200),
+        to: ep(Node::B, 8200),
         proto: L4::Udp,
-        expect: Expect::Delivered,
+        expect: Expect::Dropped,
     },
-    // An unrelated, never-established tuple on a DIFFERENT destination port
-    // (not just a different source port -- `ports:` matches destination
-    // port only, so reusing dst 8100 here would trivially be allowed by
-    // the standing rule regardless of any flow/conntrack state, proving
-    // nothing about flush) stays denied post-flush too -- flush doesn't
-    // accidentally open the gate for everything.
+    // Control: an unrelated, never-established tuple (different dest port,
+    // never covered by any rule at any point in this scenario) stays
+    // denied throughout -- flush doesn't accidentally open the gate for
+    // everything.
     Step::Send {
-        from: ep(Node::A, 9101),
-        to: ep(Node::B, 8101),
+        from: ep(Node::A, 9201),
+        to: ep(Node::B, 8201),
         proto: L4::Udp,
         expect: Expect::Dropped,
     },
 ];
 
 const FLUSH_FLOWS_SCENARIO: Scenario = Scenario {
-    name: "flush_flows_is_safe_and_current_policy_still_governs_the_end_state",
+    name: "flush_flows_forces_reevaluation_of_an_established_flow",
     policy_yaml: "
 policy:
   - from: seg-a
@@ -357,7 +419,7 @@ policy:
     rules:
       - allow:
           proto: udp
-          ports: [8100]
+          ports: [8200]
 ",
     segments: SEG_AB,
     steps: FLUSH_FLOWS_STEPS,

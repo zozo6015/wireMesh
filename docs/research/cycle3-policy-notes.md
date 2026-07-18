@@ -231,3 +231,32 @@ security-relevant behavior change for what it would buy). The design doc's
 spec amendment (owner's, not this agent's). The conformance suite now
 encodes this as its one sanctioned per-backend expectation — see the
 "Status" paragraph at the top of this section.
+
+## Task 13 also surfaced: nft `flush_flows` is a no-op (Task 12 deferral) — being IMPLEMENTED, not ratified as a divergence
+
+Distinct from the one-way-UDP finding above, and NOT another ratified
+divergence: reviewing `FLUSH_FLOWS_SCENARIO` found it originally had no
+`ApplyPolicy` step at all, so nothing ever needed re-evaluating — it
+wasn't actually testing "flush forces re-evaluation," just "flush doesn't
+break currently-valid traffic." Rewritten to genuinely test it with a
+bidirectional (conntrack-trackable) flow: established under an allow rule,
+the rule is then removed (`ApplyPolicy` to an empty policy), the same
+tuple is confirmed to still pass with NO flush (live-flow survival, both
+backends — this holds because the flow is bidirectional, unlike the
+ratified one-way-UDP case above), then `FlushFlows` is called and the same
+tuple must now be denied.
+
+This is currently green on `BackendKind::Ebpf` (`flush_flows` genuinely
+clears `FLOWS`) and RED on `BackendKind::Nftables` at the post-flush step
+(`NftEnforcer::flush_flows` is still the Task 12 no-op — the established
+conntrack entry survives untouched, so the post-flush send is still
+Delivered instead of the required Dropped). Unlike the one-way-UDP
+finding, **this is NOT being ratified as a divergence** — flush IS
+implementable on nftables via a scoped conntrack flush, and design §8 and
+the master spec both promise `FlushFlows` parity for both backends. This
+RED cell is being left in place deliberately, as the red-first marker for
+a follow-up task to implement the real nft flush (`docs/research/`
+recording it here per CLAUDE.md, same as any other genuine RED finding)
+— NOT encoded via `Step::SendExpectByBackend`, since that mechanism is
+reserved for ratified, permanent divergences, not temporary implementation
+gaps.

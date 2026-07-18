@@ -27,29 +27,32 @@
 //! [`Endpoint`]/[`Node`] name which of these two fixed peers a `Step::Send`
 //! addresses, not an arbitrary host.
 //!
-//! **`FlushFlows` and nftables' documented no-op (read before writing a
-//! FlushFlows-adjacent scenario):** `NftEnforcer::flush_flows` (Task 12,
-//! `wiremesh-enforcer/src/nft.rs`) is a deliberate, already-accepted no-op —
-//! conntrack has no per-fabric-table flush primitive, and nothing needed
-//! one at the time. `EbpfEnforcer::flush_flows` (Task 9/`flow_table.rs`'s
-//! own dedicated, eBPF-only test) genuinely clears the `FLOWS` fast-path
-//! map, which — combined with a policy update that REMOVED an established
+//! **`FlushFlows` and nftables' `flush_flows` no-op gap (read before writing
+//! a FlushFlows-adjacent scenario) — NOT a ratified divergence, a real gap
+//! being closed:** `NftEnforcer::flush_flows` (Task 12,
+//! `wiremesh-enforcer/src/nft.rs`) is currently a no-op — a Task 12
+//! deferral (conntrack has no per-fabric-table flush primitive readily at
+//! hand; nothing exercised it at the time), NOT a design decision that
+//! nftables should never support it. Design §8 and the master spec both
+//! promise "`FlushFlows` forces re-evaluation" as a capability of BOTH
+//! backends — unlike the ratified one-way-UDP divergence documented on
+//! [`Step::SendExpectByBackend`], there is a real, available mechanism here
+//! (a scoped conntrack flush) that a follow-up task is expected to wire up.
+//! `EbpfEnforcer::flush_flows` (Task 9/`flow_table.rs`'s own dedicated,
+//! eBPF-only test) already genuinely clears the `FLOWS` fast-path map,
+//! which — combined with a policy update that REMOVED an established
 //! flow's allow rule — lets that SAME flow be freshly re-evaluated and
-//! DENIED on its very next packet. nftables has no equivalent mechanism:
-//! `ct state established,related accept` is unconditional and evaluated
-//! before any rule, and nothing here clears a live conntrack entry. That
-//! specific "flush retroactively denies an already-established, now-policy-
-//! violating flow" behavior is therefore backend-DIVERGENT by an
-//! already-documented, already-accepted design choice, not a new bug —
-//! per the Task 13 brief, this suite must not manufacture a false parity
-//! failure out of it. [`SCENARIOS`]'s `flush_forces_reevaluation_scenario`
-//! therefore asserts the OBSERVABLE END STATE that genuinely holds
-//! identically on both backends (flush is safe/non-disruptive: a flow the
-//! CURRENT policy still allows keeps passing, and an unrelated
-//! never-established flow stays denied), not the eBPF-specific
-//! "retroactively denies a stale allow" mechanism — see that scenario's own
-//! doc comment, and `docs/research/cycle3-policy-notes.md`, for the full
-//! writeup.
+//! DENIED on its very next packet.
+//! [`SCENARIOS`]'s `flush_forces_reevaluation_scenario` therefore asserts
+//! the REAL, design-promised behavior identically for both backends (a
+//! bidirectional/conntrack-trackable flow survives the policy update until
+//! `FlushFlows` runs, then is denied) — it is EXPECTED, right now, to be
+//! green on `BackendKind::Ebpf` and RED on `BackendKind::Nftables` at its
+//! post-flush step, as the red-first marker for that follow-up nft-flush
+//! task, not something this suite should paper over. See
+//! `docs/research/cycle3-policy-notes.md`'s "Task 13" section for the full
+//! writeup (including why the scenario deliberately uses a bidirectional
+//! flow here, unlike the ratified one-way-UDP scenario).
 
 use crate::netns::{join_netns, wg_lab, Ns};
 use anyhow::{ensure, Context};
