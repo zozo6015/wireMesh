@@ -101,6 +101,7 @@ Ordered by priority.
 | G-5 | **Transparent to workloads.** No agent on machines behind the gateway; only a route toward the gateway is needed. | Demo: an EC2 instance reaches a Proxmox VM's Postgres with only a VPC route-table entry added, per the allow rule. |
 | G-6 | **Fail-static on controller loss.** Tunnels, routes, and the last-applied policy persist while the controller is unreachable. | Kill the controller for 1 hour: existing allowed flows continue; denied flows stay denied; gateways resync on controller return. |
 | G-7 | **Graceful drain/decommission.** | `fabricctl gateway drain <name>` withdraws routes from peers before teardown; peers stop routing to it within 5s. |
+| G-8 | **MTU & PMTUD correctness.** Fabric-wide tun MTU **1280** (relayed-path worst case; per-peer raise to 1420 on verified direct paths is P1). TCP **MSS clamping** on the tun device for workloads that ignore route MTU. **ICMP error packets (unreachable, fragmentation-needed, TTL-exceeded) are matched against the embedded flow's forward or reverse entry and forwarded when that flow is allowed** — default-deny must never black-hole PMTUD. Behavior identical on both enforcement backends. | Conformance suite includes ICMP-error cases (both backends). Integration test: bulk transfer with DF set over a *relayed* path completes without hangs; transport switch direct↔relay under load loses only in-flight packets. Every platform quickstart documents the MTU story. |
 
 #### Relay
 
@@ -120,7 +121,7 @@ Ordered by priority.
 | X-3 | **Security baseline:** mTLS everywhere on the control plane; WireGuard (Noise) on the data plane; secrets never written to logs; keys stored with 0600 perms; minimal Linux capabilities documented (no blanket root requirement where avoidable). | Threat model document published (see §10). |
 | X-4 | **Docs & quickstart:** end-to-end "two segments in 30 minutes" tutorial (AWS VPC ↔ Proxmox VLAN). | A new user following only the docs completes the tutorial; measured in early-adopter testing. |
 | X-5 | **OSS project hygiene (day one):** chosen license, CONTRIBUTING.md, security policy (SECURITY.md + disclosure contact), versioned releases with changelogs, CI running the NAT-matrix and multi-segment integration tests publicly. No opt-out telemetry — any telemetry is opt-in and documented. | Repo passes these checks at first public release; first external PR can be reviewed and merged without process invention. |
-| X-6 | **Version skew & zero-drama upgrades.** Controller vN supports gateways/relays vN and vN-1 (one-minor skew window); Sync advertises the minimum supported component version and `fabricctl gateway list` flags out-of-window components loudly. Gateway upgrade preserves tunnels (make-before-break, same bar as C-5). | Skew matrix tested in CI (vN controller ↔ vN-1 gateway). Upgrading a gateway under an active iperf flow shows < 1s packet loss. "Fabric upgrade" runbook is part of the docs from the first tagged release. |
+| X-6 | **Version skew & zero-drama upgrades.** Controller vN supports gateways/relays vN and vN-1 (one-minor skew window); Sync advertises the minimum supported component version and `fabricctl gateway list` flags out-of-window components loudly. Gateway upgrade preserves tunnels (make-before-break, same bar as C-5). **The policy IR schema is part of the skew contract:** the Sync handshake advertises each gateway's maximum supported IR schema; the controller serves IR at a schema every enrolled gateway supports, and refuses (with a loud `fabricctl` error naming the lagging gateways) any operation that would require a schema an in-window gateway cannot consume — a supported skew must never leave a gateway unable to apply policy. | Skew matrix tested in CI (vN controller ↔ vN-1 gateway). Upgrading a gateway under an active iperf flow shows < 1s packet loss. Skew CI includes an IR-schema case: a vN controller with one vN-1 gateway enrolled keeps serving schema-compatible IR and flags the constraint in `fabricctl gateway list`. "Fabric upgrade" runbook is part of the docs from the first tagged release. |
 | X-7 | **Release integrity.** Every release artifact (binaries, OCI images) ships SHA-256 checksums and signatures (cosign/minisign); the one-line install script verifies the checksum before executing anything. Build provenance (SLSA-style attestation) is P1. | `curl \| sh` refuses to proceed on checksum mismatch; signature verification is documented in one command per artifact type; CI produces and publishes signatures automatically. |
 
 ### 7.2 Nice-to-Have (P1)
@@ -160,8 +161,8 @@ Example (matches the engineering design’s DSL):
 
 ```yaml
 policy:
-  - from: proxmox-lab        # 192.168.0.0/16
-    to: aws-prod             # 172.16.0.0/16
+  - from: proxmox-lab        # 10.10.0.0/16
+    to: aws-prod             # 172.16.0.0/12
     rules:
       - deny:  { ports: [22], proto: tcp }                          # carve-out — first match wins
       - allow: { dst: 172.16.1.50/32, ports: [5432], proto: tcp }   # Postgres
