@@ -11,13 +11,17 @@
 #
 name: "CodeQL Advanced"
 
+# NOTE: This repository uses CodeQL **default setup** (configured in repo
+# settings; it produces the required `CodeQL` / `Analyze (actions)` checks).
+# Default and advanced setup are mutually exclusive, so this advanced workflow
+# is kept manual-dispatch only — it must NOT auto-run on push/PR/schedule, or
+# it (a) fails with a default-vs-advanced conflict and (b) previously failed
+# outright because its `matrix.include` below was left empty. The file is
+# retained so default setup's `actions` analysis always has a workflow file to
+# scan; to switch to advanced setup, disable default setup first, then restore
+# push/pull_request/schedule triggers here.
 on:
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-  schedule:
-    - cron: '18 19 * * 5'
+  workflow_dispatch:
 
 jobs:
   analyze:
@@ -43,6 +47,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
+        - language: actions
+          build-mode: none
+        - language: rust
+          build-mode: none
         # CodeQL supports the following values keywords for 'language': 'actions', 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'rust', 'swift'
         # Use `c-cpp` to analyze code written in C, C++ or both
         # Use 'java-kotlin' to analyze code written in Java, Kotlin or both
