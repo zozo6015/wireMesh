@@ -416,3 +416,32 @@ kernel-side proto match: proto `0`/`Any` should compare against the
 tcp/udp/icmp allowlist, not short-circuit as "any protocol") — per
 CLAUDE.md, not fixed by this (test-author) agent, and the scenario was
 not weakened or skipped for either backend to make it pass artificially.
+
+## Cycle-4 carries from the CodeRabbit review (PR #6)
+
+Two CodeRabbit findings are real but deliberately deferred (resolved on the PR
+as non-blocking for Cycle 3):
+
+- **IPv4 fragment handling in the tc-BPF path.** Non-initial TCP/UDP fragments
+  carry no transport header at `ihl`, so `ports_at` would read payload bytes as
+  ports and mis-scope a port-matched flow. Not exploitable in v1 as shipped:
+  the fabric uses one conservative tun MTU of 1280 with TCP MSS clamping
+  (engineering design §6.1 / PRD G-8), so post-decrypt IPv4 fragmentation is
+  near-zero. Proper fragment association (follow the first fragment's verdict,
+  or explicitly reject + document fragmented traffic) lands in Cycle 4 with the
+  gateway/MTU work, on both enforcement backends.
+- **Conformance harness-error vs policy-drop distinction.** The packet helpers
+  return a bare "delivered?" bool, so a harness/tooling error is
+  indistinguishable from a policy drop. The suite fails *closed* today — every
+  scenario also has expect-Delivered steps that fail loudly on any harness
+  error, so a harness failure cannot silently pass a scenario; the only residual
+  window is an expect-Dropped step passing on a harness error that spares the
+  same-netns delivered steps. Distinguishing send-failure from delivery-failure
+  across the four helper sites is a done-bar-hardening item for a dedicated pass.
+
+Two further findings are pre-existing/documented trade-offs, not Cycle-4 blockers
+but noted for whoever hardens them: binding every distributed Admin payload to
+its commit's revision (single-tenant controller pattern shared with Cycle 2's
+RotateKey/Drain/RevokeCert), and per-CPU BPF counters replacing the non-atomic
+`*c += 1` (the Phase 0 spike-grade carry — enforcement is unaffected; only the
+observability counter can under-report under cross-CPU contention).
