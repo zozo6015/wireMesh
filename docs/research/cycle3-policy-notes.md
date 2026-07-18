@@ -1,5 +1,41 @@
 # Cycle 3 (Policy Pipeline) — Research Notes
 
+## Cycle summary & measured numbers
+
+14 tasks, 3 phases (compiler → eBPF backend → nftables + conformance). Full
+workspace at completion: **127 tests, 0 failed** (`cargo test --workspace
+--features netns`), every task test-authored / implemented / executed /
+reviewed by separate agents per the CLAUDE.md workflow rules.
+
+**Conformance (the done bar):** the backend-parity packet-suite runs 11
+scenarios × 2 backends = **22/22 cells green**, plus the flip-under-traffic
+zero-loss stress test. Exactly **one** sanctioned per-backend expectation — the
+ratified one-way-UDP live-flow divergence (below). Everything else is proven
+identical eBPF-vs-nftables from the same compiled `PolicyIR`.
+
+**eBPF verifier budget** (tc-BPF ingress program, grew as behaviors were added,
+never needed a tail-call split):
+
+| After task | ingress insns | egress insns |
+|---|---|---|
+| 8 (LPM-bitset + map-in-map generations) | ~561 | ~114 |
+| 9 (flow idle timeouts + rate cap) | ~798 | ~312 |
+| 10 (sampled deny ring buffer) | ~935 → ~991 (peek/commit fix) | ~312 |
+
+**Atomic policy flip:** map-in-map generation flip proven zero-loss under 20
+concurrent `apply()` calls during a continuous UDP stream (`generations.rs`);
+nftables `nft -f` atomic replace proven equivalently gap-free
+(`nft_backend.rs`, and the conformance flip test on both backends).
+
+**Two accepted design outcomes** (details in the sections below): (1) the
+ratified one-way-UDP divergence — owner decision 2026-07-18, accept & document;
+(2) the nftables `flush_flows` implementation via whole-netns `conntrack -F`
+(broader blast radius than eBPF's fabric-scoped flush; narrower mechanisms
+investigated and ruled out). **Deployment dependency:** the nftables backend
+requires `conntrack-tools` on the gateway host.
+
+---
+
 ## Task 12: nft named counters do NOT reset on `flush table` + redeclare
 
 **Context:** the Task 12 brief (`.superpowers/sdd/task-12-brief.md`)

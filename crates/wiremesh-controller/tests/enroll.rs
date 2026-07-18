@@ -4,10 +4,7 @@
 //! cert): a CSR presented with that token must come back with a signed leaf
 //! cert + CA bundle, and a *second* enroll attempt with the same (now spent)
 //! token must be rejected as `PermissionDenied` — the token is single-use.
-use wiremesh_proto::v1::{
-    admin_client::AdminClient, enrollment_client::EnrollmentClient, CreateSegmentRequest,
-    EnrollRequest, MintTokenRequest,
-};
+use wiremesh_proto::v1::{CreateSegmentRequest, EnrollRequest, MintTokenRequest};
 
 #[tokio::test]
 async fn enroll_issues_cert_then_token_is_single_use() {
