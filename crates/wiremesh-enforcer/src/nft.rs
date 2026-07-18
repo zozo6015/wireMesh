@@ -76,6 +76,16 @@ pub fn ruleset(ir: &PolicyIR, iface: &str) -> anyhow::Result<String> {
     let _ = writeln!(out, "  counter default_deny {{}}");
 
     let _ = writeln!(out, "  chain from_fabric {{");
+    // Statefulness via conntrack. `established,related` — NOT `new` — is
+    // deliberate: adding `new` would let every not-yet-established flow bypass
+    // rule evaluation, breaking new-connection enforcement across a policy
+    // update. The accepted consequence (ratified Cycle 3 conformance finding,
+    // owner decision 2026-07-18) is that a purely one-way UDP flow — one whose
+    // destination never replies — never leaves conntrack `new`, so unlike the
+    // eBPF backend's FLOWS map it does NOT survive a rule-removing update; it
+    // is re-evaluated (and dropped) on the next packet. All TCP and all
+    // bidirectional flows are unaffected. See docs/research/cycle3-policy-notes.md
+    // and the Cycle 3 design §1.
     let _ = writeln!(out, "    ct state established,related counter accept");
     for f in &flat {
         write_rule_lines(&mut out, f);
