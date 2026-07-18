@@ -505,16 +505,36 @@ policy:
     steps: PORTS_RANGE_EDGE_STEPS,
 };
 
-// --- 10. proto `any` matches tcp+udp+icmp -----------------------------------
+// --- 10. proto `any` matches EXACTLY tcp+udp+icmp -- not literally every IP
+//         protocol (design §4: proto-any = "tcp+udp+icmp", a closed set,
+//         not "no protocol restriction at the IP layer"). The positive half
+//         (tcp/udp/icmp all Delivered) was already covered; the negative
+//         half -- a non-{tcp,udp,icmp} IP protocol (GRE, 47, chosen as the
+//         natural example) must still fall through to default-deny even
+//         under a proto-any allow rule covering the same CIDRs -- was NOT,
+//         and that gap hid a real cross-backend bug: nftables' codegen
+//         explodes `any` into exactly {tcp, udp, icmp} (correct), but the
+//         eBPF backend's flattened rule stores `proto == 0`, and the
+//         kernel-side `meta_matches` treats a stored proto of `0` as
+//         "match every IP protocol" (an eBPF-only over-match, not a shared
+//         IR/compiler bug -- `wiremesh_policy::compile` produces the same
+//         `IrProto::Any` either way). This is a genuine parity requirement
+//         (GRE must be Dropped on BOTH backends) -- NOT expressed via
+//         `Step::SendExpectByBackend`, unlike the ratified one-way-UDP
+//         case. See `docs/research/cycle3-policy-notes.md`'s "Task 13"
+//         section for the root-cause writeup. ------------------------------
 
 const PROTO_ANY_STEPS: &[Step] = &[
     Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 5000), proto: L4::Tcp, expect: Expect::Delivered },
     Step::Send { from: ep(Node::A, 5001), to: ep(Node::B, 5002), proto: L4::Udp, expect: Expect::Delivered },
     Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 0), proto: L4::Icmp, expect: Expect::Delivered },
+    // GRE (IP protocol 47): proto-any means tcp+udp+icmp ONLY -- this must
+    // be denied on BOTH backends, falling through to default-deny.
+    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 0), proto: L4::RawIpProto(47), expect: Expect::Dropped },
 ];
 
 const PROTO_ANY_SCENARIO: Scenario = Scenario {
-    name: "proto_any_matches_tcp_udp_and_icmp",
+    name: "proto_any_matches_tcp_udp_icmp_only_not_every_ip_protocol",
     // No `proto:`/`ports:` at all -- compiles to IrProto::Any, unrestricted
     // ports (design §4: omitted proto defaults to tcp+udp+icmp).
     policy_yaml: "

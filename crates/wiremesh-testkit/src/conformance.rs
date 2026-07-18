@@ -124,6 +124,17 @@ pub enum L4 {
         embedded_src_port: u16,
         embedded_dst_port: u16,
     },
+    /// A bare IPv4 packet carrying an arbitrary, non-{tcp,udp,icmp} IP
+    /// protocol number (e.g. `47` = GRE) with a minimal/empty payload — no
+    /// L4 semantics at all, just the IP header's protocol field set to
+    /// `proto_num`. Exists to distinguish a proto-`any` DSL rule (design
+    /// §4: "tcp+udp+icmp", NOT "every IP protocol") from a truly
+    /// protocol-unrestricted allow: a proto-any rule must still DENY this,
+    /// falling through to default-deny. `port`/direction conventions are
+    /// the same as every other `L4` variant (`to` is where the enforcer's
+    /// ingress hook is exercised); `Endpoint::port` is ignored (raw IP has
+    /// no port concept).
+    RawIpProto(u8),
 }
 
 /// A `Step::Send`'s expected outcome.
@@ -387,6 +398,7 @@ fn send_and_observe(a: &Ns, b: &Ns, from: Endpoint, to: Endpoint, proto: L4) -> 
             embedded_src_port,
             embedded_dst_port,
         ),
+        L4::RawIpProto(proto_num) => check_raw_ip_proto(from_ns, to_ns, to_addr, proto_num),
     }
 }
 
@@ -584,6 +596,68 @@ fn check_icmp_frag_needed(
         embedded_dst_port,
     );
     icmp_probe_got(probe, 3)
+}
+
+/// Spawns a background raw-IP listener bound to protocol `proto_num` on
+/// `ns` -- a `SOCK_RAW` socket created with a NON-zero protocol number is
+/// only delivered packets whose IP header's protocol field matches it
+/// (the kernel's own raw-socket protocol hash), so this is already
+/// filtered to exactly `proto_num`, unlike [`spawn_icmp_type_probe`] (all
+/// ICMP, further filtered by hand on `icmp[0]`). Same
+/// after-netfilter-input-hook delivery property as every other raw-socket
+/// probe in this module: a `drop` verdict at the enforcer's ingress hook
+/// means this listener never sees the packet at all.
+fn spawn_raw_ip_proto_probe(ns: &Ns, proto_num: u8, timeout_s: f64) -> Child {
+    let script = format!(
+        r#"
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, {proto_num})
+s.settimeout({timeout_s})
+try:
+    s.recvfrom(2048)
+    print("RECEIVED")
+except socket.timeout:
+    print("TIMEOUT")
+"#
+    );
+    ns.spawn(&["python3", "-c", &script]).expect("spawn raw ip proto probe")
+}
+
+fn raw_probe_received(child: Child) -> bool {
+    let out = child.wait_with_output().expect("raw ip proto probe should exit");
+    String::from_utf8_lossy(&out.stdout).trim() == "RECEIVED"
+}
+
+/// Sends one bare IPv4 packet from `ns` to `dst_ip` with its protocol
+/// field set to `proto_num` and a minimal, semantically-empty payload --
+/// no L4 header of any kind, just enough bytes to be a non-empty packet.
+/// No `IP_HDRINCL`: the kernel builds the IP header itself (protocol =
+/// `proto_num`, source = whatever route/interface selection picks, which
+/// for an overlay-addressed `dst_ip` is `wg0`) -- the same
+/// kernel-builds-the-IP-header pattern [`send_icmp_dest_unreachable`]
+/// already relies on for crafted ICMP.
+fn send_raw_ip_proto_packet(ns: &Ns, dst_ip: &str, proto_num: u8) {
+    let script = format!(
+        r#"
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_RAW, {proto_num})
+s.sendto(b"\x00" * 8, ("{dst_ip}", 0))
+"#
+    );
+    ns.exec(&["python3", "-c", &script])
+        .expect("sending raw ip proto packet");
+}
+
+/// See [`L4::RawIpProto`]'s doc comment: proves a proto-`any` DSL rule
+/// (design §4: "tcp+udp+icmp") does NOT accidentally allow every IP
+/// protocol -- `proto_num` (e.g. `47` = GRE) must fall through to
+/// default-deny even under a proto-any allow rule covering the same
+/// CIDRs.
+fn check_raw_ip_proto(from_ns: &Ns, to_ns: &Ns, to_addr: &str, proto_num: u8) -> bool {
+    let probe = spawn_raw_ip_proto_probe(to_ns, proto_num, 2.0);
+    std::thread::sleep(Duration::from_millis(150));
+    send_raw_ip_proto_packet(from_ns, to_addr, proto_num);
+    raw_probe_received(probe)
 }
 
 /// Standalone continuous-traffic conformance check (design §8/D-C3-7's

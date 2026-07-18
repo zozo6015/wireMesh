@@ -369,3 +369,50 @@ per the review instruction that the coarser blast radius must be
 documented, not hidden. Behavior parity (flush forces re-evaluation) is
 achieved and verified end-to-end; blast-radius parity is not, and isn't
 required.
+
+## Task 13 (whole-branch review pass): REAL bug — eBPF's proto-`any` over-matches every IP protocol, not just tcp+udp+icmp
+
+**Status: genuine cross-backend bug, coverage gap closed here (test author
+scope) — NOT fixed in the enforcer, scenario NOT weakened, NEITHER
+backend skipped.**
+
+`PROTO_ANY_SCENARIO`'s existing coverage only asserted that a proto-`any`
+allow rule (design §4: omitted `proto:` compiles to `IrProto::Any`,
+defined as "tcp+udp+icmp") DOES match tcp/udp/icmp traffic — it never
+asserted `any` does NOT also match protocols outside that set, so a real
+divergence hid behind a coverage gap, not a design ambiguity:
+
+- `NftEnforcer`'s ruleset codegen explodes an `Any`-proto rule into
+  exactly three protocol-specific match clauses (tcp, udp, icmp) — GRE,
+  ESP, or any other IP protocol number falls through to default-deny,
+  correctly.
+- The eBPF backend's flattened rule representation stores a bare `proto`
+  byte, and an `Any`-proto DSL rule flattens to `proto == 0`. The kernel
+  program's `meta_matches` (or equivalent match helper) treats a stored
+  `proto` of `0` as a wildcard — "match every IP protocol" — rather than
+  "match exactly tcp, udp, or icmp". This is an eBPF-backend-only
+  over-match: `wiremesh_policy::compile` produces the identical
+  `IrProto::Any` for both backends: the divergence is entirely in how
+  each backend's codegen/kernel-side matcher interprets that one shared
+  IR value.
+- Net effect: under a proto-any allow rule, eBPF wrongly ALLOWS traffic
+  using IP protocols the DSL never intended to permit (GRE/47, ESP/50,
+  etc.), while nftables correctly denies them.
+
+**Coverage added** (this commit): `PROTO_ANY_STEPS` gets a fourth step —
+a bare IPv4 packet with protocol 47 (GRE), no L4 payload, driven via a new
+`L4::RawIpProto(u8)` `Step::Send` variant (raw-socket send/receive,
+same technique as `L4::IcmpFragNeeded`'s crafted-ICMP helpers) —
+asserting `Expect::Dropped` on **both** backends. This is a genuine parity
+requirement, not encoded via `Step::SendExpectByBackend`: the CORRECT
+behavior (GRE denied) is identical on both backends; only the CURRENT
+eBPF implementation disagrees with it.
+
+**Result: PASSES on `BackendKind::Nftables` (already correct), FAILS on
+`BackendKind::Ebpf`** (`.superpowers/sdd/task-13-tests-report.md` has the
+raw run). Left red deliberately — the red-first marker for the enforcer
+implementer's fix (expected to be a narrow, one-line change to the
+kernel-side proto match: proto `0`/`Any` should compare against the
+tcp/udp/icmp allowlist, not short-circuit as "any protocol") — per
+CLAUDE.md, not fixed by this (test-author) agent, and the scenario was
+not weakened or skipped for either backend to make it pass artificially.
