@@ -2173,6 +2173,8 @@ dependencies = [
  "tonic",
  "tower 0.4.13",
  "wiremesh-controller",
+ "wiremesh-enforcer",
+ "wiremesh-policy",
  "wiremesh-proto",
  "x509-parser",
 ]

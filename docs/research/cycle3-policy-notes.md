@@ -114,3 +114,93 @@ probe() succeeded, kind = Nftables
 `probe`'s implementation (`src/lib.rs`) is expressed in terms of
 `probe_with`'s two arms exactly as the test author's own doc comment on the
 pre-Task-12 `probe_with` scaffold suggested.
+
+## Task 13: REAL parity bug — nftables does not preserve a one-way (never-replied) UDP flow across a policy update that removes its rule; eBPF does
+
+**Status: genuine backend divergence, reported per CLAUDE.md/the Task 13
+brief — NOT fixed here (test author scope), scenario NOT weakened, NEITHER
+backend skipped.**
+
+`crates/wiremesh-testkit/tests/conformance.rs`'s
+`policy_update_under_live_traffic_flow_survives_new_conns_follow_new_policy`
+scenario: `a` sends one UDP datagram to `b:8000` under a policy that allows
+udp/8000 (delivered — matches the rule). The policy is then updated to a v2
+that allows *only* tcp/8000 (the udp/8000 allow rule is gone). The SAME
+5-tuple is sent again, with no `FlushFlows` in between, and is expected to
+still be **Delivered** — "live-flow survival across an update, absent an
+explicit flush" (design §8/§1's done bar: "atomic policy update under live
+traffic with no enforcement gap and live-flow survival"). A third Send on a
+*different* 5-tuple (same dest port) is expected **Dropped**, proving the
+new policy genuinely governs fresh connections.
+
+This exact shape — a one-directional UDP flow (sender never receives a
+reply) surviving a policy update that removes its allow rule, absent a
+flush — is not a new invention of this task: it is *verbatim* the pattern
+already established and merged in Task 9's own eBPF-only
+`tests/flow_table.rs::flush_flows_forces_reevaluation_of_an_established_flow_after_its_allow_rule_is_removed`
+(`a` sends udp/9600 to `b`, no reply ever sent back; v2 removes the rule;
+the same 5-tuple must still pass until an explicit `flush_flows()` call).
+That test is already green and treated as an accepted regression guard for
+exactly this behavior on eBPF. The Task 13 conformance scenario just
+restates the same, already-accepted expectation as a backend-parameterized
+scenario per D-C3-7.
+
+**Result: PASSES on `BackendKind::Ebpf`, FAILS on `BackendKind::Nftables`**
+(`docs/superpowers/sdd/task-13-tests-report.md` has the raw run). Root
+cause, traced (not guessed):
+
+- `NftEnforcer`'s generated ruleset (`nft.rs::ruleset`) hard-codes exactly
+  one unconditional survival line: `ct state established,related counter
+  accept`. It does **not** include `new`.
+- Linux conntrack only classifies a UDP flow's `ct state` as `established`
+  once a reply packet has been observed in the *reverse* direction (i.e.
+  `seen_reply` is set on the conntrack entry). A purely one-way UDP
+  flow — sender only, destination never replies, exactly what this
+  scenario (and Task 9's own eBPF precedent) sends — stays in conntrack
+  state `new` for every packet it ever sends, indefinitely. It never
+  becomes `established`, so it never matches nft's unconditional accept
+  line at all.
+- Consequently, on nftables, *every* packet of a one-way UDP flow is
+  re-evaluated against the explicit rule list on *every* packet (not just
+  the first) — there is no fast path independent of the live rule set.
+  When v2 removes the udp/8000 allow rule, the very next packet of the
+  already-"established" (from the scenario's perspective) flow is
+  re-evaluated fresh and denied.
+- eBPF's `FLOWS` map has no such bidirectionality requirement:
+  `try_ingress` inserts a `FLOWS` entry on *any* packet that matched an
+  explicit `ACT_ALLOW` verdict (`program/src/main.rs`, the
+  `if scan_generation(..) == ACT_ALLOW { FLOWS.insert(..) }` call site,
+  unconditional on reply direction), and a later packet on the same
+  5-tuple hits that entry as a fast path *before* rule evaluation runs at
+  all, regardless of whether the destination ever sent anything back.
+  `apply()` never touches `FLOWS` (Task 7/8 design), so the entry — and
+  the flow's continued passage — survives the v2 apply untouched, exactly
+  as Task 9's test already demonstrated.
+
+**Why this is reported, not "fixed" or worked around here:** this agent's
+brief is test-author-only for Task 13 (neutral scenario infrastructure); a
+divergence discovered by a scenario built from an already-accepted,
+already-merged precedent (Task 9's own test) is a real product finding, not
+a scenario bug — unlike the FlushFlows scenario's own negative-control step
+(caught and fixed *before* this report), which was testing a mechanically
+different fact (`ports:` matches destination port only, so varying only the
+source port on the *same* covered destination port was never going to be
+denied by anything, flow-table or not — a genuine test-authoring mistake,
+corrected in the same commit as this suite). This one is not that: the
+scenario's expectation is exactly what design §8/§1 promises ("live-flow
+survival") and exactly what Task 9's own accepted eBPF test already
+encodes for the identical one-way-UDP shape; nftables' behavior for it
+is what's actually inconsistent with that promise.
+
+**Candidate fix directions (for whoever picks this up — not decided or
+implemented here):** (a) broaden nft's survival line to `ct state new,
+established,related accept` — but that changes nft's semantics much more
+broadly than just this scenario, since it would let *every* subsequent
+packet of *any* not-yet-established flow bypass rule evaluation too
+(including ones that should still be freshly re-checked against a
+just-changed policy — a security-relevant behavior change, not a narrow
+one); or (b) accept the divergence as a documented, bounded exception
+specific to one-way UDP flows without a rule matching `related`, and adjust
+the design doc's "live-flow survival" language to scope it to flows nft can
+actually track statefully (bidirectional, or TCP). Either way this needs a
+design-level decision, not a silent backend patch.

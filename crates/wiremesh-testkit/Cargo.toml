@@ -37,6 +37,14 @@ x509-parser = "0.16"
 # by the `netns` feature below, so pure-userspace consumers (e.g.
 # wiremesh-controller's own test suite) never link it.
 libc = { version = "0.2", optional = true }
+# (Task 13) `src/conformance.rs`'s `run_scenario`: compiles each scenario's
+# `policy_yaml` with the SAME compiler the controller uses, and drives it
+# through `probe_with`/`Enforcer::{apply,counters,flush_flows}`. Both
+# optional, gated by the `netns` feature below alongside `libc` — a plain
+# (non-netns) consumer of this crate's userspace `TestController`/
+# `StubGateway` surface has no use for either and shouldn't link them.
+wiremesh-policy = { path = "../wiremesh-policy", optional = true }
+wiremesh-enforcer = { path = "../wiremesh-enforcer", optional = true }
 
 [features]
 # Gates `src/netns.rs`: the privileged Linux network-namespace test harness
@@ -45,4 +53,18 @@ libc = { version = "0.2", optional = true }
 # Off by default so depending on `wiremesh-testkit` for its userspace
 # `TestController`/`StubGateway` surface never compiles or links `libc`'s
 # netns bits, and never requires a Linux host.
-netns = ["dep:libc"]
+#
+# (Task 13) Also gates `src/conformance.rs`, which is built on top of
+# `netns.rs`'s `Lab`/`Ns`/`wg_lab` and additionally needs `wiremesh-policy`/
+# `wiremesh-enforcer` — hence `dep:wiremesh-policy`/`dep:wiremesh-enforcer`
+# alongside `dep:libc` here rather than a separate feature. NOTE:
+# `wiremesh-enforcer`'s own dev-dependency on THIS crate (for its own
+# `tests/*.rs`, with `default-features = false, features = ["netns"]`) is a
+# Cargo dev-dependency cycle, not a real one — Cargo permits a crate's
+# dev-dependencies to depend back on that same crate because dev-deps are
+# only linked when building this crate's own tests/benches/examples, never
+# when another crate depends on it as an ordinary library — so
+# `wiremesh-testkit` depending on `wiremesh-enforcer` as a normal
+# (non-dev) dependency here does not create a real cycle in the workspace's
+# build graph.
+netns = ["dep:libc", "dep:wiremesh-policy", "dep:wiremesh-enforcer"]
