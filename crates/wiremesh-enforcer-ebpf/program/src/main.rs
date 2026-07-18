@@ -618,8 +618,26 @@ fn scan_generation(src: u32, dst: u32, proto: u8, dport: u16, now: u64) -> u32 {
     ACT_DENY
 }
 
+/// `m.proto == 0` is the "proto omitted"/`IrProto::Any` sentinel — per spec
+/// §4 (and `wiremesh-enforcer`'s nftables backend, `nft.rs`'s
+/// `IrProto::Any => &["tcp", "udp", "icmp"]`, which explodes `Any` into
+/// EXACTLY those three protocols at codegen time), the policy DSL has no
+/// way to express "match every IP protocol" — `Any`/omitted always means
+/// "tcp, udp, or icmp", never e.g. GRE/ESP/other raw IP protocols. This
+/// function previously treated `m.proto == 0` as "match anything", which
+/// let a proto-any `allow` rule wrongly pass GRE/ESP/etc. (a real
+/// cross-backend divergence from `nft.rs`, RED-locked by
+/// `wiremesh-testkit`'s conformance suite's `PROTO_ANY_SCENARIO`, which
+/// sends a raw GRE packet under a proto-any allow rule and expects
+/// `Dropped` on both backends). A concrete `m.proto` (1/6/17) still
+/// matches exactly that protocol, unchanged.
 fn meta_matches(m: &RuleMeta, proto: u8, dport: u16) -> bool {
-    (m.proto == 0 || m.proto == proto as u32)
+    let proto_matches = if m.proto == 0 {
+        proto == 1 || proto == 6 || proto == 17 // icmp | tcp | udp
+    } else {
+        m.proto == proto as u32
+    };
+    proto_matches
         && (m.port_hi == 0 || {
             let p = u16::from_be(dport);
             p >= m.port_lo && p <= m.port_hi
