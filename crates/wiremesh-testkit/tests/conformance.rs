@@ -12,18 +12,17 @@
 //! single `Expect` both backends satisfy identically -- this is not a
 //! precedent for casually branching on `kind` elsewhere.
 //!
-//! **Known, tracked, currently-RED cell (not a ratified divergence, not a
-//! suite bug):** `FLUSH_FLOWS_SCENARIO`'s post-flush step currently FAILS
-//! on `BackendKind::Nftables` -- `NftEnforcer::flush_flows` is a Task 12
-//! no-op deferral, not yet wired to a real conntrack flush, even though
-//! design §8/the master spec promise FlushFlows parity on both backends
-//! (see that scenario's own header comment and
-//! `docs/research/cycle3-policy-notes.md`'s "Task 13" section). This
-//! `#[test]` will therefore currently report an overall FAILED with
-//! exactly that one cell red -- expected, and left that way deliberately
-//! as the red-first marker for the follow-up task that implements the
-//! real nft flush, per CLAUDE.md ("a 'failing' behavior test may be a real
-//! finding ... investigate and record it").
+//! **`FLUSH_FLOWS_SCENARIO` (design §8/the master spec's "FlushFlows forces
+//! re-evaluation" promise) is a regular, both-backends-must-agree
+//! scenario** -- NOT a `SendExpectByBackend` exception. It was briefly
+//! RED on `BackendKind::Nftables` (`NftEnforcer::flush_flows` was a Task
+//! 12 no-op deferral, left as a deliberate red-first marker), and is now
+//! green on both: `NftEnforcer::flush_flows` runs `conntrack -F`, forcing
+//! every established fabric flow back to `ct state new` so it's
+//! re-evaluated against the live ruleset on its next packet, matching
+//! eBPF's `FLOWS`-clearing behavior. See that scenario's own header
+//! comment and `docs/research/cycle3-policy-notes.md`'s "Task 13" section
+//! for the fix's history.
 //!
 //! Deliberately a single `#[test]` fn (not one `#[test]` per scenario):
 //! `SCENARIOS` and [`flip_under_traffic_zero_loss`] both need a fresh
@@ -319,19 +318,19 @@ policy:
 
 // --- 7. FlushFlows genuinely forces re-evaluation -- NOT a ratified
 //        divergence (unlike scenario #6's one-way-UDP step): design §8 and
-//        the master spec promise FlushFlows parity on BOTH backends, and a
-//        real mechanism (a scoped conntrack flush) is available to
-//        nftables -- `NftEnforcer::flush_flows` just hasn't been wired up
-//        to it yet (a Task 12 deferral, not a decision). This scenario is
-//        therefore EXPECTED, right now, to be green on `BackendKind::Ebpf`
-//        and RED on `BackendKind::Nftables` at its post-flush step (the
-//        no-op flush leaves the flow's conntrack entry untouched, so it
-//        stays Delivered instead of the required Dropped) -- a deliberate
-//        red-first marker for the follow-up task that implements the real
-//        nft flush, not something this suite papers over. See
-//        `conformance.rs`'s module doc comment and
+//        the master spec promise FlushFlows parity on BOTH backends, and
+//        that promise is now met -- `NftEnforcer::flush_flows` runs
+//        `conntrack -F`, forcing every established fabric flow back to
+//        `ct state new` so it's re-evaluated against the live ruleset on
+//        its next packet, matching eBPF's `FLOWS`-clearing behavior. This
+//        scenario is a regular, both-backends-must-agree scenario -- it
+//        was briefly RED on `BackendKind::Nftables` at its post-flush step
+//        (the no-op flush left the flow's conntrack entry untouched) as a
+//        deliberate red-first marker before the real nft flush was wired
+//        up; that gap is now closed and both backends pass identically.
+//        See `conformance.rs`'s module doc comment and
 //        `docs/research/cycle3-policy-notes.md`'s "Task 13" section for
-//        the full writeup.
+//        the fix's history.
 //
 //        BIDIRECTIONAL flow, deliberately NOT one-way UDP (contrast with
 //        scenario #6's `SendExpectByBackend` step, which is a RATIFIED
@@ -387,11 +386,11 @@ const FLUSH_FLOWS_STEPS: &[Step] = &[
     },
     Step::FlushFlows,
     // 5. SAME tuple, AFTER flush: must now be Dropped on BOTH backends --
-    //    flush forced re-evaluation against v2 (which has no rule for
-    //    this traffic at all). EXPECTED RED on Nftables right now (see
-    //    this block's header comment): `NftEnforcer::flush_flows` is
-    //    currently a no-op, so the established conntrack entry survives
-    //    untouched and this still comes back Delivered.
+    //    flush forced re-evaluation against v2 (which has no rule for this
+    //    traffic at all). Nftables: `NftEnforcer::flush_flows`'s
+    //    `conntrack -F` drops the flow's `ct state` back to `new`, so it's
+    //    re-evaluated against v2 and denied. Ebpf: `flush_flows` clears
+    //    the `FLOWS` fast-path entry, forcing the same re-evaluation.
     Step::Send {
         from: ep(Node::A, 9200),
         to: ep(Node::B, 8200),
