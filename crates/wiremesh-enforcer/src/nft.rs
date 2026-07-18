@@ -324,23 +324,44 @@ fn apply_script(script: &str) -> anyhow::Result<()> {
 /// counters the new policy still uses, would be a correctness bug, not just
 /// an ordering nicety.
 ///
-/// Best-effort: a failure here (e.g. a counter deleted by a concurrent
+/// **Entirely best-effort, start to finish — including the read.** This is
+/// cleanup called AFTER `apply()`'s `apply_script()` has already committed
+/// the new ruleset (the part that actually matters for enforcement); by the
+/// time this runs, the spec guarantee "a failed apply keeps the previous
+/// ruleset" no longer applies, because the apply in question already
+/// succeeded. So NEITHER the counter read NOR the delete may propagate an
+/// `Err` out of this function — doing so from `apply()`'s caller's point of
+/// view would be indistinguishable from "the replace itself failed and the
+/// old ruleset is still live," which would be false: the new ruleset IS
+/// live, only bookkeeping cleanup didn't complete. (Review finding,
+/// coordinator-relayed: the read half of this function originally used `?`
+/// and leaked exactly that ambiguity — fixed here to match the delete
+/// half's already-correct log-and-swallow shape.) A failure here (e.g. a
+/// transient `nft -j` read fault, or a counter deleted by a concurrent
 /// caller between the read and the delete — this crate's `Enforcer`s are
 /// not documented as safe to drive concurrently from multiple threads
-/// against the same `iface`, so this is a defensive fallback, not an
-/// expected path) is logged to stderr rather than failing the whole
-/// `apply()`, since the policy replace itself — the part that actually
-/// matters for enforcement — has already succeeded by the time this runs.
-fn prune_retired_counters(iface: &str, flat: &[FlatRule]) -> anyhow::Result<()> {
+/// against the same `iface`, so that's a defensive fallback, not an
+/// expected path) is logged to stderr and otherwise ignored.
+fn prune_retired_counters(iface: &str, flat: &[FlatRule]) {
+    let live = match read_live_counters(iface) {
+        Ok(live) => live,
+        Err(e) => {
+            eprintln!(
+                "wiremesh-enforcer: reading live counters on {iface} to prune retired ones \
+                 failed (non-fatal -- the policy replace itself already succeeded): {e:#}"
+            );
+            return;
+        }
+    };
+
     let active: HashSet<&str> = flat.iter().map(|f| f.rule_id.as_str()).collect();
-    let live = read_live_counters(iface)?;
     let stale: Vec<&String> = live
         .by_rule
         .keys()
         .filter(|id| !active.contains(id.as_str()))
         .collect();
     if stale.is_empty() {
-        return Ok(());
+        return;
     }
 
     // Unquoted identifier form -- unlike a `counter r_<id> {}` *declaration*
@@ -362,7 +383,6 @@ fn prune_retired_counters(iface: &str, flat: &[FlatRule]) -> anyhow::Result<()> 
             stale.len()
         );
     }
-    Ok(())
 }
 
 impl Enforcer for NftEnforcer {
@@ -376,11 +396,22 @@ impl Enforcer for NftEnforcer {
     /// re-apply on their own, so there is nothing to fold here — the only
     /// thing THIS code must actively do is clean up counters for rules the
     /// new policy no longer has, which `flush table` alone does not do).
+    ///
+    /// **Error contract:** once `apply_script` returns `Ok` here, THIS
+    /// method returns `Ok` regardless of what `prune_retired_counters` finds
+    /// — that call is post-commit cleanup, never a condition on whether the
+    /// new ruleset is live. Only `flatten`'s or `apply_script`'s own `Err`
+    /// (i.e. a failure BEFORE or DURING the replace, when the previous
+    /// ruleset is still guaranteed live per nft's transactional semantics)
+    /// propagates out of `apply()`; see `prune_retired_counters`'s doc
+    /// comment for why conflating the two would break the "a failed apply
+    /// keeps the previous ruleset" contract callers rely on.
     fn apply(&mut self, ir: &PolicyIR) -> anyhow::Result<()> {
         let flat = flatten(ir)?;
         let script = ruleset(ir, &self.iface)?;
         apply_script(&script)?;
-        prune_retired_counters(&self.iface, &flat)
+        prune_retired_counters(&self.iface, &flat);
+        Ok(())
     }
 
     /// A direct, unmodified read of `nft -j list counters table ip
