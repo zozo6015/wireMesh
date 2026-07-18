@@ -6,7 +6,11 @@ WireMesh connects network *segments* — VPCs, VNets, VLANs, bare-metal subnets 
 
 Think *"AWS Transit Gateway + Twingate, but open-source, self-hosted, and cloud-agnostic."*
 
-> **Status: pre-1.0, under active development.** The design is complete and the riskiest data-plane bets have been de-risked with a working spike; the control plane is being built cycle by cycle. It is **not yet a shippable end-to-end fabric** — see [Project status](#project-status). WireMesh ships **binaries and documentation only — never hosted infrastructure.** Apache-2.0, no monetization, no project-hosted components.
+> **Status: pre-1.0, under active development.** The design is complete and the riskiest data-plane bets have been de-risked with a working spike; the control plane is being built cycle by cycle. It is **not yet a shippable end-to-end fabric** — see [Project status](#project-status). WireMesh is and will remain **fully open source under Apache-2.0**, built on three commitments:
+>
+> 1. **No feature gating.** The self-hosted version is the complete product, forever — no enterprise edition, no held-back features.
+> 2. **No rug pull.** The license stays Apache-2.0. No relicensing, no source-available switch.
+> 3. **Hosted offerings are downstream consumers, not the project.** A managed WireMesh controller — operated by the maintainer or by anyone else — runs the same public binaries everyone gets, and the data plane always stays customer-owned. The project itself ships binaries and documentation.
 
 ## Why
 
@@ -30,26 +34,25 @@ Think *"AWS Transit Gateway + Twingate, but open-source, self-hosted, and cloud-
 
 Three single-binary components, all in Rust:
 
-```
-        ┌──────────────────────────────────────────────┐
-        │  Controller  (control plane, single-tenant)   │
-        │  embedded CA · SQLite · mTLS gRPC             │
-        │  enrollment · Sync (desired state) · Admin    │
-        └───────────────┬───────────────┬──────────────┘
-              mTLS gRPC  │               │  mTLS gRPC
-             (Sync/Admin)│               │
-            ┌────────────▼───┐       ┌───▼────────────┐
-            │    Gateway     │◄─────►│    Gateway     │   ... one per segment
-            │ boringtun/WG   │  WG   │ boringtun/WG   │
-            │ eBPF L4 policy │ (UDP  │ eBPF L4 policy │
-            └───────┬────────┘  or   └────────┬───────┘
-                    │           relayed)       │
-              segment A                   segment B
-                                │
-                        ┌───────▼───────┐
-                        │     Relay     │   stateless QUIC-datagram forwarder
-                        │  (mutual TLS) │   guaranteed path when NAT defeats
-                        └───────────────┘   direct hole-punching
+```mermaid
+flowchart TB
+    C["Controller — control plane, single-tenant<br/>embedded CA · SQLite · mTLS gRPC<br/>Enrollment · Sync (desired state) · Admin"]
+
+    subgraph SA["Segment A"]
+        GA["Gateway<br/>boringtun / WireGuard<br/>eBPF L4 policy (nftables fallback)"]
+    end
+
+    subgraph SB["Segment B &nbsp;·&nbsp; … one gateway per segment"]
+        GB["Gateway<br/>boringtun / WireGuard<br/>eBPF L4 policy (nftables fallback)"]
+    end
+
+    R["Relay<br/>stateless QUIC-datagram forwarder (mutual TLS)<br/>guaranteed path when NAT defeats direct hole-punching"]
+
+    C -->|"mTLS gRPC (Sync / Admin)"| GA
+    C -->|"mTLS gRPC (Sync / Admin)"| GB
+    GA <-->|"WireGuard (direct UDP)"| GB
+    GA -.->|"same WG ciphertext<br/>over QUIC datagrams"| R
+    R -.->|relayed fallback| GB
 ```
 
 - **Controller** — the single-tenant control plane. Embedded fabric CA, embedded SQLite, three mTLS gRPC services (Enrollment, Sync, Admin) plus a UDP endpoint for NAT-traversal address discovery. Computes the full-mesh topology and streams per-gateway desired state (peer keys, routes, compiled policy, revoked-cert denylist). Driven by the `fabricctl` CLI. Pluggable `SecretStore` / `CertificateIssuer` seams let an external PKI/secrets manager (Vault/OpenBao, and later AWS/GCP/Azure) own key material and rotation.
@@ -130,4 +133,4 @@ WireMesh is developed with a strict, review-first workflow (see [`CLAUDE.md`](CL
 
 ## License
 
-[Apache-2.0](LICENSE). WireMesh is an independent open-source project — it ships artifacts and documentation, and never hosts infrastructure or components on your behalf.
+[Apache-2.0](LICENSE). WireMesh is an independent open-source project. The license permits anyone — including the maintainer — to offer commercial hosting, support, or services around it; none of that changes what you get here: the complete product, self-hostable, with no gated features and no relicensing, ever.
