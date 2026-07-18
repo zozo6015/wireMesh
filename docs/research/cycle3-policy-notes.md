@@ -115,11 +115,26 @@ probe() succeeded, kind = Nftables
 `probe_with`'s two arms exactly as the test author's own doc comment on the
 pre-Task-12 `probe_with` scaffold suggested.
 
-## Task 13: REAL parity bug — nftables does not preserve a one-way (never-replied) UDP flow across a policy update that removes its rule; eBPF does
+## Task 13: RATIFIED divergence — nftables does not preserve a one-way (never-replied) UDP flow across a policy update that removes its rule; eBPF does
 
-**Status: genuine backend divergence, reported per CLAUDE.md/the Task 13
-brief — NOT fixed here (test author scope), scenario NOT weakened, NEITHER
-backend skipped.**
+**Status: RATIFIED (owner decision: ACCEPT & DOCUMENT).** Originally
+reported here as a genuine backend divergence found by the Task 13
+conformance suite (per CLAUDE.md/the Task 13 brief — NOT fixed by the test
+author, scenario NOT weakened, NEITHER backend skipped). The project owner
+has since reviewed the root-cause writeup below and ruled: this is an
+**accepted, understood boundary of the nftables fallback backend**, not a
+bug to fix. It is now encoded as the conformance suite's one sanctioned,
+documented per-backend expectation (`Step::SendExpectByBackend` in
+`wiremesh-testkit/src/conformance.rs`; used exactly once, in
+`crates/wiremesh-testkit/tests/conformance.rs`'s
+`policy_update_under_live_traffic_flow_survives_new_conns_follow_new_policy`
+scenario's middle step) rather than a suite-level failure — the suite is
+22/22 green with this divergence asserted explicitly, backend-by-backend,
+rather than silently ignored or papered over. The design-doc language
+around "live-flow survival" (design §8/§1's done bar) is being scoped
+accordingly by the owner in a separate spec amendment — this note is not
+itself that amendment, just the record of the finding and its ratified
+disposition.
 
 `crates/wiremesh-testkit/tests/conformance.rs`'s
 `policy_update_under_live_traffic_flow_survives_new_conns_follow_new_policy`
@@ -145,9 +160,13 @@ exactly this behavior on eBPF. The Task 13 conformance scenario just
 restates the same, already-accepted expectation as a backend-parameterized
 scenario per D-C3-7.
 
-**Result: PASSES on `BackendKind::Ebpf`, FAILS on `BackendKind::Nftables`**
-(`docs/superpowers/sdd/task-13-tests-report.md` has the raw run). Root
-cause, traced (not guessed):
+**Original result (before ratification/encoding): PASSES on
+`BackendKind::Ebpf`, FAILS on `BackendKind::Nftables`**
+(`.superpowers/sdd/task-13-tests-report.md` has the raw run that surfaced
+this). After ratification, the SAME divergence is now asserted explicitly
+per backend via `Step::SendExpectByBackend` (Delivered on Ebpf, Dropped on
+Nftables) and both backends PASS their respective, documented expectation
+— the suite is 22/22 green. Root cause, traced (not guessed):
 
 - `NftEnforcer`'s generated ruleset (`nft.rs::ruleset`) hard-codes exactly
   one unconditional survival line: `ct state established,related counter
@@ -192,15 +211,23 @@ survival") and exactly what Task 9's own accepted eBPF test already
 encodes for the identical one-way-UDP shape; nftables' behavior for it
 is what's actually inconsistent with that promise.
 
-**Candidate fix directions (for whoever picks this up — not decided or
-implemented here):** (a) broaden nft's survival line to `ct state new,
-established,related accept` — but that changes nft's semantics much more
-broadly than just this scenario, since it would let *every* subsequent
-packet of *any* not-yet-established flow bypass rule evaluation too
-(including ones that should still be freshly re-checked against a
-just-changed policy — a security-relevant behavior change, not a narrow
-one); or (b) accept the divergence as a documented, bounded exception
-specific to one-way UDP flows without a rule matching `related`, and adjust
-the design doc's "live-flow survival" language to scope it to flows nft can
-actually track statefully (bidirectional, or TCP). Either way this needs a
-design-level decision, not a silent backend patch.
+**Candidate fix directions considered, before ratification:** (a) broaden
+nft's survival line to `ct state new,established,related accept` — but
+that changes nft's semantics much more broadly than just this scenario,
+since it would let *every* subsequent packet of *any* not-yet-established
+flow bypass rule evaluation too (including ones that should still be
+freshly re-checked against a just-changed policy — a security-relevant
+behavior change, not a narrow one); or (b) accept the divergence as a
+documented, bounded exception specific to one-way UDP flows without a rule
+matching `related`, and scope the design doc's "live-flow survival"
+language to flows nft can actually track statefully (bidirectional, or
+TCP).
+
+**Ratified decision: (b).** The project owner reviewed this writeup and
+chose to accept & document the divergence rather than change nft's
+survival semantics (option (a) was explicitly rejected as too broad a
+security-relevant behavior change for what it would buy). The design doc's
+"live-flow survival" language is being scoped accordingly in a separate
+spec amendment (owner's, not this agent's). The conformance suite now
+encodes this as its one sanctioned per-backend expectation — see the
+"Status" paragraph at the top of this section.

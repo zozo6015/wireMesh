@@ -1,7 +1,16 @@
 //! Task 13: the backend-parity conformance suite -- THIS CYCLE'S DONE BAR
 //! (design §8/D-C3-7, `.superpowers/sdd/task-13-brief.md`). One scenario
 //! table, executed against BOTH backends in an identical netns topology; a
-//! scenario passes only if BOTH backends agree with its expectation.
+//! scenario passes only if BOTH backends agree with its expectation --
+//! with exactly ONE sanctioned, ratified exception (owner decision: ACCEPT
+//! & DOCUMENT), in `POLICY_UPDATE_LIVE_TRAFFIC_STEPS` below, via
+//! `Step::SendExpectByBackend`. See that step's own comment,
+//! `Step::SendExpectByBackend`'s doc comment
+//! (`wiremesh-testkit/src/conformance.rs`), and
+//! `docs/research/cycle3-policy-notes.md`'s "Task 13" section for the full
+//! writeup. Every OTHER scenario/step in `SCENARIOS` must keep asserting a
+//! single `Expect` both backends satisfy identically -- this is not a
+//! precedent for casually branching on `kind` elsewhere.
 //!
 //! Deliberately a single `#[test]` fn (not one `#[test]` per scenario):
 //! `SCENARIOS` and [`flip_under_traffic_zero_loss`] both need a fresh
@@ -210,9 +219,29 @@ policy:
 };
 
 // --- 6. policy update under live allowed traffic: the established flow
-//        survives (no flush!); a NEW 4-tuple immediately follows the new
-//        (now-denying) policy ------------------------------------------
-
+//        survives (no flush!) on eBPF; a NEW 4-tuple immediately follows
+//        the new (now-denying) policy on BOTH backends -----------------
+//
+// RATIFIED divergence (owner decision: ACCEPT & DOCUMENT -- see
+// `docs/research/cycle3-policy-notes.md`'s "Task 13" section, and
+// `Step::SendExpectByBackend`'s own doc comment in
+// `wiremesh-testkit/src/conformance.rs`): the middle Send below is a
+// ONE-WAY UDP flow (b/A never receives any reply from b/B) -- exactly the
+// shape already established and merged, eBPF-only, in Task 9's
+// `tests/flow_table.rs::flush_flows_forces_reevaluation_of_an_established_flow_after_its_allow_rule_is_removed`.
+// Linux conntrack only classifies a UDP flow `established` after it has
+// seen a REPLY in the reverse direction; a purely one-way flow stays
+// `new` forever, so nftables' unconditional `ct state established,related
+// accept` line never covers it -- every packet of a one-way flow is
+// re-evaluated against the LIVE rule set on nftables, while eBPF's
+// `FLOWS` fast-path map records ANY previously-allowed packet
+// (direction-agnostic) and is untouched by `apply()`. This is therefore
+// the ONE step in this whole suite with a per-backend expectation
+// (`Step::SendExpectByBackend`) -- both the first Send (Delivered on
+// both) and the third Send (a genuinely different 4-tuple, Dropped on
+// both) keep asserting one shared `Expect`, because "new connections
+// follow new policy" holds identically on both backends and must stay
+// asserted for both.
 const POLICY_UPDATE_LIVE_TRAFFIC_STEPS: &[Step] = &[
     // Establish a flow under v1 (allow udp/8000).
     Step::Send {
@@ -233,19 +262,25 @@ policy:
           ports: [8000]
 ",
     },
-    // SAME 4-tuple as the first Send: the already-established flow must
-    // still be delivered -- apply() alone (no FlushFlows) must not disturb
-    // a live flow, on EITHER backend (eBPF: FLOWS fast-path untouched by
-    // apply(); nftables: conntrack's `ct state established` is unconditional).
-    Step::Send {
+    // SAME 4-tuple as the first Send, no FlushFlows in between. eBPF:
+    // FLOWS fast-path untouched by apply() -- still Delivered. Nftables:
+    // this one-way flow never reached conntrack's `established` state (no
+    // reply was ever sent back), so it's re-evaluated against v2 (which no
+    // longer allows udp/8000) and Dropped. See this block's comment above
+    // and `docs/research/cycle3-policy-notes.md` for the full, ratified
+    // writeup -- this is the suite's single sanctioned per-backend step.
+    Step::SendExpectByBackend {
         from: ep(Node::A, 9000),
         to: ep(Node::B, 8000),
         proto: L4::Udp,
-        expect: Expect::Delivered,
+        ebpf: Expect::Delivered,
+        nftables: Expect::Dropped,
     },
     // A DIFFERENT 4-tuple (new source port) on the SAME dest port has no
-    // established state to fall back on -- it's freshly evaluated against
-    // v2, which now denies udp/8000 entirely.
+    // established state to fall back on for EITHER backend -- it's freshly
+    // evaluated against v2, which now denies udp/8000 entirely. Both
+    // backends must agree here: this is what actually proves "new
+    // connections follow new policy".
     Step::Send {
         from: ep(Node::A, 9001),
         to: ep(Node::B, 8000),

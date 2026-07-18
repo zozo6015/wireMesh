@@ -5,7 +5,13 @@
 //! backend (`BackendKind::{Ebpf,Nftables}`) in an identical netns topology.
 //! `crates/wiremesh-testkit/tests/conformance.rs` iterates `[Ebpf,
 //! Nftables] × SCENARIOS`; per D-C3-7 a scenario passes only if it passes
-//! on BOTH backends.
+//! on BOTH backends — with exactly ONE ratified, documented exception:
+//! [`Step::SendExpectByBackend`] (see that variant's own doc comment and
+//! `docs/research/cycle3-policy-notes.md`'s "Task 13" section). Every other
+//! `Step` in every other scenario asserts a single [`Expect`] both backends
+//! must satisfy identically — a scenario reaching for
+//! `SendExpectByBackend` a second time, without an equally traced and
+//! equally ratified `docs/research/` writeup, is doing it wrong.
 //!
 //! **Fixed two-node topology, matching every prior enforcer test suite's
 //! convention** (`tests/{ebpf_backend,generations,flow_table,deny_events,
@@ -139,6 +145,35 @@ pub enum Step {
         proto: L4,
         expect: Expect,
     },
+    /// **The single sanctioned per-backend exception to "one Step, one
+    /// Expect, both backends must agree."** Identical to [`Step::Send`]
+    /// except the expected outcome is chosen by `kind` at run time
+    /// (`ebpf` on [`BackendKind::Ebpf`], `nftables` on
+    /// [`BackendKind::Nftables`]) rather than being one shared [`Expect`].
+    ///
+    /// Exists for exactly one ratified, documented divergence (owner
+    /// decision: ACCEPT & DOCUMENT — see
+    /// `docs/research/cycle3-policy-notes.md`'s "Task 13" section): a
+    /// one-way (never-replied) UDP flow survives a policy update that
+    /// removes its allow rule on eBPF (the `FLOWS` fast-path map records
+    /// any previously-allowed packet, direction-agnostic, and `apply()`
+    /// never touches it) but NOT on nftables (`ct state
+    /// established,related` requires conntrack to have seen a REPLY in
+    /// the reverse direction before it calls a UDP flow `established`; a
+    /// purely one-way flow stays `new` forever and is re-evaluated
+    /// against the live rule set on every packet). This is a real,
+    /// bounded, understood boundary of the nftables fallback backend, not
+    /// a bug — do not add another `SendExpectByBackend` without an
+    /// equally traced, equally ratified finding recorded in
+    /// `docs/research/`; every other scenario/step in this suite must
+    /// keep asserting ONE `Expect` that both backends satisfy identically.
+    SendExpectByBackend {
+        from: Endpoint,
+        to: Endpoint,
+        proto: L4,
+        ebpf: Expect,
+        nftables: Expect,
+    },
     /// Recompiles `yaml` against the scenario's `segments` (a fresh
     /// `wiremesh_policy::compile` call, incrementing the running policy
     /// version) and `Enforcer::apply`s it — a mid-scenario policy update.
@@ -244,6 +279,25 @@ pub fn run_scenario(s: &Scenario, kind: BackendKind) -> anyhow::Result<()> {
                 ensure!(
                     delivered == want,
                     "scenario {:?} step {i} (Send {:?} {:?}->{:?}): expected {:?}, got {}",
+                    s.name,
+                    proto,
+                    from,
+                    to,
+                    expect,
+                    if delivered { "Delivered" } else { "Dropped" }
+                );
+            }
+            Step::SendExpectByBackend { from, to, proto, ebpf, nftables } => {
+                let delivered = send_and_observe(&a, &b, *from, *to, *proto);
+                let expect = match kind {
+                    BackendKind::Ebpf => *ebpf,
+                    BackendKind::Nftables => *nftables,
+                };
+                let want = expect == Expect::Delivered;
+                ensure!(
+                    delivered == want,
+                    "scenario {:?} step {i} (SendExpectByBackend {:?} {:?}->{:?}, kind={kind:?}): \
+                     expected {:?} (the ratified per-backend expectation for this kind), got {}",
                     s.name,
                     proto,
                     from,
