@@ -17,8 +17,24 @@ The project ships binaries and docs, never hosted infrastructure.
 
 ## Project state
 
-Pre-code: docs only. Next action is Phase 0 Task 1 (dev container). Update this
-section as phases complete.
+Phase 0 spike, Cycle 2 (controller core), and Cycle 3 (policy pipeline) are
+complete. Cycle 3 delivered the DSL → canonical-JSON IR compiler
+(`wiremesh-policy`), the controller wiring that compiles/versions policy and
+streams real `policy_ir` over Sync (+ `fabricctl policy show|status`), and the
+`wiremesh-enforcer` library with **both** enforcement backends — eBPF
+(tc-BPF, LPM-bitset first-match, map-in-map atomic generations, stateful flow
+table, sampled deny ring buffer) and the nftables fallback — proven
+behaviorally equivalent by a netns conformance packet-suite
+(`wiremesh-testkit`, `--features netns`). One ratified backend divergence is
+documented (one-way UDP live-flow survival; owner decision 2026-07-18, see
+`docs/research/cycle3-policy-notes.md`). **Deployment note:** the nftables
+backend requires `conntrack-tools` on the gateway host (`flush_flows` uses
+`conntrack -F`).
+
+Next action is Cycle 4 (gateway transport + relay: real `wiremesh-gateway`
+binary consuming `wiremesh-enforcer`, NAT traversal, relay path). Also pending:
+Cycle 2b fast-follow (OpenBao provider driver). Update this section as phases
+complete.
 
 ## Agent workflow rules
 
