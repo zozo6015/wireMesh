@@ -435,20 +435,76 @@ impl Enforcer for NftEnforcer {
         read_live_counters(&self.iface)
     }
 
-    /// Documented no-op (brief's explicit allowance): conntrack has no
-    /// per-fabric ("just this `wiremesh_<iface>` table's flows") flush
-    /// primitive -- `conntrack -F` flushes the WHOLE netns's conntrack
-    /// table, including flows entirely unrelated to this fabric/table
-    /// (Linux's conntrack table is per-network-namespace, not per-nftables-
-    /// table), which is a much blunter instrument than what
-    /// `Enforcer::flush_flows`'s doc comment asks for ("forces re-evaluation
-    /// of already-live flows against the current rule set"). None of Task
-    /// 12's tests call this method (confirmed against
-    /// `tests/nft_backend.rs`), so rather than reach for that blunt,
-    /// over-broad tool speculatively, this stays a documented no-op; a
-    /// later task that actually needs it can add a scoped `conntrack -F`
-    /// call then, informed by whatever real requirement drives it.
+    /// Flushes the kernel's conntrack table via `conntrack -F`, forcing
+    /// every already-established fabric flow to be re-evaluated from
+    /// scratch (as `ct state new`) against the CURRENT ruleset on its next
+    /// packet — design §8/the master spec's `FlushFlows` parity promise for
+    /// both backends. This was a documented no-op through Task 12
+    /// (deferred, since nothing exercised it yet); Task 13's conformance
+    /// suite (`flush_flows_forces_reevaluation_of_an_established_flow`)
+    /// added the first real caller and found the no-op insufficient — see
+    /// `docs/research/cycle3-policy-notes.md`'s Task 13 section for the
+    /// full RED-to-GREEN writeup.
+    ///
+    /// **Known, documented blast-radius limitation — read before assuming
+    /// this is fabric-scoped like the eBPF backend's `flush_flows`:** the
+    /// eBPF backend clears exactly its own `FLOWS` map (every entry in it
+    /// was, by construction, created by THIS fabric's tc-attached `iface`
+    /// traffic and nothing else). nftables has no equivalent "just this
+    /// table's flows" primitive, and three scoping mechanisms that would
+    /// get closer were each ruled out, empirically or by scope:
+    ///  - **conntrack zone:** `conntrack -F` (and `-D`) accept a `-w/--zone`
+    ///    filter, which WOULD scope this precisely — but only if the
+    ///    fabric's own ruleset tags its connections with a dedicated zone
+    ///    via `ct zone set <n>` at `apply()` time. [`ruleset`] (Task 11,
+    ///    golden-fixture-pinned) doesn't do this, and adding it would
+    ///    change every fixture's expected byte-for-byte output — out of
+    ///    this fix's scope, left for whoever next revisits `ruleset`'s
+    ///    codegen with a real need for conntrack zones.
+    ///  - **interface:** verified empirically (`conntrack -L -o extended`)
+    ///    that a conntrack entry carries no ingress/egress-interface field
+    ///    at all in this tool's output — there is nothing to filter
+    ///    `conntrack -D` on by `iface`.
+    ///  - **segment CIDRs (`-s`/`-d` + `--mask-src`/`--mask-dst`):** ruled
+    ///    out on correctness grounds, not just inconvenience — this exact
+    ///    method's own driving scenario re-applies a policy that REMOVES
+    ///    every CIDR/rule for the flow that must be flushed (see the
+    ///    conformance scenario's `ApplyPolicy { yaml: "policy: []\n" }`
+    ///    step), so scoping a delete to "the currently-applied policy's
+    ///    CIDRs" would delete NOTHING — it would silently fail to flush
+    ///    the exact flow the caller needs flushed. Scoping to the UNION of
+    ///    every CIDR ever seen across this `NftEnforcer`'s lifetime would
+    ///    dodge that specific failure but adds unbounded per-instance state
+    ///    for a narrowing that still isn't truly fabric-scoped (a
+    ///    coincidentally-reused address from an unrelated, non-fabric
+    ///    connection sharing the same netns would still be swept).
+    ///
+    /// So this flushes the WHOLE network namespace's conntrack table —
+    /// broader than "just this fabric's flows," matching the design's
+    /// single-purpose-gateway model (§1: "one gateway per segment," no
+    /// other workload traffic expected in that netns) but NOT a guarantee
+    /// if a real deployment ever runs other stateful traffic through the
+    /// same netns as the gateway process. Acceptable for now per explicit
+    /// review sign-off; a future task with a real requirement for narrower
+    /// scoping should revisit `ruleset`'s codegen to add a conntrack zone.
+    ///
+    /// **Error contract:** unlike `prune_retired_counters` (best-effort
+    /// cleanup after an already-committed `apply()`), a `flush_flows()`
+    /// call is itself the caller's explicit, entire request — there is no
+    /// "the important part already succeeded" to fall back on if
+    /// `conntrack -F` fails, so a failure here surfaces as `Err`, not a
+    /// logged-and-swallowed no-op.
     fn flush_flows(&mut self) -> anyhow::Result<()> {
+        let out = Command::new("conntrack")
+            .args(["-F"])
+            .output()
+            .context("spawning conntrack -F")?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "conntrack -F failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
         Ok(())
     }
 

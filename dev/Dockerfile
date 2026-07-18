@@ -1,10 +1,14 @@
 # dev/Dockerfile
 FROM rust:1-bookworm
 
+# `conntrack` (conntrack-tools): NftEnforcer::flush_flows (Task 12 addendum)
+# shells out to it to flush conntrack state and force re-evaluation of
+# already-established fabric flows -- nftables has no built-in ruleset-level
+# primitive for this, unlike the eBPF backend's own FLOWS map.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     iproute2 nftables iperf3 wireguard-tools tcpdump jq \
     pkg-config libssl-dev ca-certificates kmod procps bpftool iputils-ping \
-    protobuf-compiler \
+    protobuf-compiler conntrack \
     && rm -rf /var/lib/apt/lists/*
 
 # eBPF toolchain: nightly rustc (BPF codegen) + bpf-linker + cargo-generate

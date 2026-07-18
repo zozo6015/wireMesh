@@ -260,3 +260,76 @@ recording it here per CLAUDE.md, same as any other genuine RED finding)
 — NOT encoded via `Step::SendExpectByBackend`, since that mechanism is
 reserved for ratified, permanent divergences, not temporary implementation
 gaps.
+
+
+## Task 12 addendum: NftEnforcer::flush_flows implemented via `conntrack -F` -- scoping investigated, whole-netns flush is the only viable mechanism found
+
+Follow-up to the RED cell above, closing the gap: `NftEnforcer::flush_flows`
+(`crates/wiremesh-enforcer/src/nft.rs`) now shells out to `conntrack -F`.
+`conntrack` (the `conntrack-tools` package) was not present in the dev
+container image and was added to `dev/Dockerfile`, then the image was
+rebuilt (`./dev.sh build`).
+
+**Verified empirically before wiring anything up:**
+
+- `conntrack` only starts tracking a flow once the ruleset actually
+  references `ct` somewhere in the packet's path (confirmed with a bare
+  veth pair + minimal nft table: zero conntrack entries with no `ct`-
+  referencing rule present; one entry, correctly bidirectional, once a
+  `ct state established,related ...` line -- exactly what
+  `nft.rs::ruleset` always emits -- was added). This is expected/standard
+  nftables lazy-hook-registration behavior, not a container-specific
+  quirk, and confirms `NftEnforcer`'s existing `ct state
+  established,related counter accept` line (Task 11, unchanged) is what
+  makes flows conntrack-trackable at all.
+- `conntrack -F` exits 0 and reports "connection tracking table has been
+  emptied" both when entries exist and when the table is already empty --
+  no special-casing needed for the empty case.
+- End-to-end: the real `flush_flows_forces_reevaluation_of_an_established_flow`
+  conformance scenario (`crates/wiremesh-testkit/tests/conformance.rs`)
+  now passes on `BackendKind::Nftables` -- full 22/22 conformance matrix
+  green on both backends (`./dev.sh run "cargo test -p wiremesh-testkit
+  --features netns --test conformance -- --test-threads=1 --nocapture"`).
+
+**Scoping investigated and ruled out, in order of how close each got to
+"just this fabric's flows" (the eBPF backend's actual scope):**
+
+1. **Conntrack zone** (`ct zone set <n>` in the ruleset, then `conntrack -F
+   -w <n>`): the RIGHT mechanism in principle -- a zone genuinely
+   partitions the conntrack table so a zoned flush only touches that
+   zone's entries. Requires `nft.rs::ruleset` (Task 11) to emit a `ct zone
+   set` statement, which would change every byte-for-byte-pinned golden
+   fixture under `tests/fixtures/*.nft` -- out of scope for this fix (a
+   test-owned artifact), left for a future task that owns a real
+   requirement to revisit that codegen.
+2. **Interface:** ruled out empirically, not by scope -- `conntrack -L -o
+   extended` was checked directly against a live flow and carries no
+   ingress/egress-interface field at all in this tool's output. There is
+   nothing to filter `conntrack -D` on by `iface`.
+3. **Segment CIDRs** (`conntrack -D -s <cidr> --mask-src <mask> ...`):
+   ruled out on CORRECTNESS grounds, not convenience. The exact scenario
+   this fix targets re-applies a policy that removes every CIDR/rule for
+   the flow that must be flushed (`ApplyPolicy { yaml: "policy: []\n" }`)
+   before `FlushFlows` runs -- scoping the delete to "the CURRENTLY applied
+   policy's CIDRs" would scope it to nothing, silently failing to flush
+   the very flow the caller needs flushed. An enforcer-lifetime UNION of
+   every CIDR ever applied would dodge that specific failure but adds
+   unbounded per-instance state for a narrowing that still isn't really
+   fabric-scoped (a coincidentally-reused address from unrelated,
+   non-fabric traffic sharing the same netns would still be swept) --
+   assessed as not worth the added complexity/state for a partial win.
+
+**Conclusion, per explicit review sign-off:** `conntrack -F` (whole
+network-namespace conntrack table) is the mechanism implemented. This is
+broader than the eBPF backend's `FLOWS`-map-only scope -- it flushes ANY
+conntrack entry visible in the netns the gateway process is running in,
+not just entries created by fabric (`wg0`) traffic. This lines up with the
+design's single-purpose-gateway model (Sec 1: "one gateway per segment," no
+other workload traffic expected to share that netns) but is not a
+guarantee if a real deployment ever runs other stateful traffic in the
+same netns as the gateway process. Documented on
+`NftEnforcer::flush_flows`'s own doc comment (`nft.rs`) as well as here,
+per the review instruction that the coarser blast radius must be
+documented, not hidden. Behavior parity (flush forces re-evaluation) is
+achieved and verified end-to-end; blast-radius parity is not, and isn't
+required.
