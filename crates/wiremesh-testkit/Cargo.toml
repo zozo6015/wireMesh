@@ -68,3 +68,11 @@ wiremesh-enforcer = { path = "../wiremesh-enforcer", optional = true }
 # (non-dev) dependency here does not create a real cycle in the workspace's
 # build graph.
 netns = ["dep:libc", "dep:wiremesh-policy", "dep:wiremesh-enforcer"]
+
+[dev-dependencies]
+# (Task 14) `tests/end_to_end_policy.rs` drives a raw `tonic::Streaming<SyncMessage>`
+# (`StubGateway::open_sync`'s return type) directly, the same way
+# `wiremesh-controller`'s own `tests/{policy_pipeline,sync_snapshot,sync_delta}.rs`
+# do — `StreamExt::next()` needs this crate in scope. Test-only: this
+# crate's own `src/` never streams a `Sync.Watch` response itself.
+tokio-stream = "0.1"

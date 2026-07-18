@@ -2170,6 +2170,7 @@ dependencies = [
  "rcgen",
  "tempfile",
  "tokio",
+ "tokio-stream",
  "tonic",
  "tower 0.4.13",
  "wiremesh-controller",
