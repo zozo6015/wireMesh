@@ -61,14 +61,31 @@ fn main() -> anyhow::Result<()> {
         ..
     } = program_package;
     println!("cargo:rerun-if-changed={manifest_path}");
+    let program_root_dir = manifest_path
+        .parent()
+        .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
+        .to_owned();
     let program_package = aya_build::Package {
         name: name.as_str(),
-        root_dir: manifest_path
-            .parent()
-            .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
-            .as_str(),
+        root_dir: program_root_dir.as_str(),
         ..Default::default()
     };
+
+    // (Review finding) `aya_build::build_ebpf` tracks `program_root_dir`
+    // (`program/src`) via its own `root_dir`, but the sibling `common/`
+    // crate -- shared `#[repr(C)]` types (FlowKey/RuleMeta/...) the program
+    // and this host crate both depend on -- is NOT under that root_dir, so
+    // editing it alone wouldn't trigger a rebuild here and this crate would
+    // link a stale BPF object. Track both explicitly, relative to the
+    // sibling workspace root this build script already resolved above.
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace_root.join("common/src").as_str()
+    );
+    println!(
+        "cargo:rerun-if-changed={}",
+        workspace_root.join("program/src").as_str()
+    );
 
     // Adaptation 2 (see module doc): run the nested cargo invocation from
     // the sibling standalone workspace's own root, not this crate's.

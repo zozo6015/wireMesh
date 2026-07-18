@@ -815,6 +815,20 @@ impl Admin for AdminSvc {
                         "reading gateway keys after CIDR change: {e}"
                     ))
                 })?;
+                // (Review finding) Same lookup `build_snapshot`/
+                // `routes::peers_of` use for a peer's `candidate_endpoints` —
+                // without it this delta would erase an already-known
+                // endpoint from every open `Sync.Watch` stream's view of
+                // this peer.
+                let candidate_endpoint = self
+                    .db
+                    .candidate_endpoint_for_gateway(gateway_id)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!(
+                            "reading candidate endpoint after CIDR change: {e}"
+                        ))
+                    })?;
                 let revision = self.db.current_revision().await.map_err(|e| {
                     Status::internal(format!("reading revision after CIDR change: {e}"))
                 })?;
@@ -827,6 +841,7 @@ impl Admin for AdminSvc {
                     segment_name: segment_name.clone(),
                     allowed_ips: allowed_ips.clone(),
                     keys,
+                    candidate_endpoint,
                     revision,
                 });
             }

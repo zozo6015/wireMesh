@@ -340,6 +340,15 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.gateway_observe_key(gateway_id)).await?
     }
 
+    /// See [`Db::candidate_endpoint_for_gateway`].
+    pub async fn candidate_endpoint_for_gateway(
+        &self,
+        gateway_id: i64,
+    ) -> Result<Option<String>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.candidate_endpoint_for_gateway(gateway_id)).await?
+    }
+
     /// See [`Db::set_candidate_endpoint`].
     pub async fn set_candidate_endpoint(
         &self,

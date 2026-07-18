@@ -555,8 +555,19 @@ fn atomic_generation_flip_under_continuous_udp_traffic_has_zero_deficit() {
     let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
-        .expect("probe should load + attach eBPF on wg0");
+    // (Review finding) The default `reap_grace` (10s) would make each
+    // non-first `apply()` below block for up to 10s, so this test's 20
+    // flips -- meant to happen concurrently with the ~3.5s UDP traffic
+    // window -- would badly overrun it and only the first couple would
+    // actually overlap live traffic. Shrink `reap_grace` so all 20 flips
+    // genuinely land inside the sender's active window, matching this
+    // test's "under continuous traffic" intent.
+    let cfg = wiremesh_enforcer::EnforcerConfig {
+        reap_grace: Duration::from_millis(50),
+        ..wiremesh_enforcer::EnforcerConfig::default()
+    };
+    let mut enforcer =
+        wiremesh_enforcer::probe("wg0", cfg).expect("probe should load + attach eBPF on wg0");
 
     let segs = segments_exact();
     let mut yaml = String::from(

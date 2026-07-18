@@ -114,12 +114,13 @@ pub enum ChangeEvent {
     /// rows (its declared CIDR set changed) — every OTHER already-connected
     /// gateway's peer view of `gateway_id` (the segment's own enrolled
     /// gateway) must be upserted with its FULL current state (keys +
-    /// GROWN/SHRUNK `allowed_ips`), mirroring [`ChangeEvent::KeyRotated`]'s
-    /// full-peer-refresh pattern — an open `Sync.Watch` stream stays
-    /// consistent with what a fresh snapshot would show without waiting for
-    /// a reconnect. Only published for a segment that actually has an
-    /// enrolled gateway (`Db::active_gateway_for_segment` returned `Some`) —
-    /// a CIDR change on a segment with no gateway yet has no peer to upsert.
+    /// GROWN/SHRUNK `allowed_ips` + its current candidate endpoint, if any),
+    /// mirroring [`ChangeEvent::KeyRotated`]'s full-peer-refresh pattern — an
+    /// open `Sync.Watch` stream stays consistent with what a fresh snapshot
+    /// would show without waiting for a reconnect. Only published for a
+    /// segment that actually has an enrolled gateway
+    /// (`Db::active_gateway_for_segment` returned `Some`) — a CIDR change on
+    /// a segment with no gateway yet has no peer to upsert.
     SegmentCidrsChanged {
         gateway_id: i64,
         segment_name: String,
@@ -128,6 +129,12 @@ pub enum ChangeEvent {
         /// `gateway_id`, straight off [`crate::db::Db::all_keys_for_gateway`]
         /// — same full-key-set rationale as `KeyRotated`.
         keys: Vec<(i64, String, String)>,
+        /// `gateway_id`'s most recently observed candidate endpoint, if the
+        /// controller's UDP observation endpoint has ever recorded one for
+        /// it (same lookup `build_snapshot`/`routes::peers_of` use) — a CIDR
+        /// refresh must not erase a known endpoint from an already-open
+        /// `Sync.Watch` stream's view of this peer.
+        candidate_endpoint: Option<String>,
         revision: u64,
     },
 }
@@ -294,6 +301,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             segment_name,
             allowed_ips,
             keys,
+            candidate_endpoint,
             revision,
         } => Delta {
             revision,
@@ -308,7 +316,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
                         state,
                     })
                     .collect(),
-                candidate_endpoints: Vec::new(),
+                candidate_endpoints: candidate_endpoint.into_iter().collect(),
                 allowed_ips,
             }],
             removed_peer_ids: Vec::new(),

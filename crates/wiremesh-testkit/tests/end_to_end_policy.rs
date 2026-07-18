@@ -185,8 +185,31 @@ fn design_lab(prefix: &str) -> (Lab, Ns, Ns) {
     ] {
         ns.exec(&["ip", "link", "add", "wg0", "type", "wireguard"])
             .expect("ip link add wg0");
-        let kf = format!("/tmp/{}.key", ns.name);
-        std::fs::write(&kf, privkey).expect("write wg private key");
+        // (Review finding) A WireGuard private key is sensitive: write it to
+        // a unique, non-predictable path with 0600 perms (not
+        // `std::fs::write`'s default umask-derived, world-readable mode) and
+        // delete it as soon as `wg set` has consumed it, rather than leaving
+        // it sitting in `/tmp` under a name any other local user could guess
+        // (`<ns.name>.key`) for the rest of the test run.
+        let kf = std::env::temp_dir().join(format!(
+            "wiremesh-e2e-{}-{}-{}.key",
+            ns.name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock before UNIX_EPOCH")
+                .as_nanos()
+        ));
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&kf)
+                .expect("create wg private key file with 0600 perms");
+            f.write_all(privkey.as_bytes()).expect("write wg private key");
+        }
         ns.exec(&[
             "wg",
             "set",
@@ -194,7 +217,7 @@ fn design_lab(prefix: &str) -> (Lab, Ns, Ns) {
             "listen-port",
             "51820",
             "private-key",
-            &kf,
+            kf.to_str().expect("temp key path must be valid UTF-8"),
             "peer",
             peer_pub,
             "allowed-ips",
@@ -203,6 +226,7 @@ fn design_lab(prefix: &str) -> (Lab, Ns, Ns) {
             peer_ep,
         ])
         .expect("wg set wg0");
+        let _ = std::fs::remove_file(&kf);
         ns.exec(&["ip", "addr", "add", my_addr, "dev", "wg0"])
             .expect("ip addr add on wg0");
         ns.exec(&["ip", "link", "set", "wg0", "up", "mtu", "1280"])
@@ -393,10 +417,23 @@ async fn full_pipeline_apply_sync_enforce_report() {
     //    nftables (cheap to also exercise, same lab/apply/probe machinery).
     for (kind, prefix) in [(BackendKind::Ebpf, "aeth14e"), (BackendKind::Nftables, "aeth14n")] {
         let ir_for_backend = ir.clone();
-        let (delivered_5432, delivered_22) =
-            tokio::task::spawn_blocking(move || enforce_and_probe(&ir_for_backend, kind, prefix))
-                .await
-                .unwrap_or_else(|e| panic!("{kind:?} enforcement blocking task panicked: {e}"));
+        // (Review finding) `enforce_and_probe` -> `join_netns` calls
+        // `setns(2)`, which mutates the CALLING OS thread's network
+        // namespace for the rest of that thread's lifetime.
+        // `tokio::task::spawn_blocking` runs closures on a SHARED blocking-
+        // pool thread that tokio reuses for later, unrelated blocking work
+        // -- that would leak this test's netns onto whatever runs next on
+        // the same pool thread. Do the actual `setns`/enforce/probe work on
+        // a dedicated `std::thread` instead (never returned to any pool,
+        // torn down after `.join()`), and only bridge the blocking
+        // `.join()` call itself onto `spawn_blocking` -- joining a thread
+        // doesn't touch namespaces, so that part is safe to share.
+        let handle =
+            std::thread::spawn(move || enforce_and_probe(&ir_for_backend, kind, prefix));
+        let (delivered_5432, delivered_22) = tokio::task::spawn_blocking(move || handle.join())
+            .await
+            .unwrap_or_else(|e| panic!("{kind:?} enforcement join-bridging task panicked: {e}"))
+            .unwrap_or_else(|e| std::panic::resume_unwind(e));
 
         assert!(
             delivered_5432,

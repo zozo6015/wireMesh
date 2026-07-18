@@ -55,7 +55,7 @@ const BPF_F_NO_PREALLOC: u32 = 1;
 /// "grace period: 10s after flip, then the old generation's maps are
 /// deleted"). See [`GenerationState::pending_reap`] and
 /// [`apply_generation`]'s "reap-on-next-apply" wait below.
-const REAP_GRACE: Duration = Duration::from_secs(10);
+pub(crate) const REAP_GRACE: Duration = Duration::from_secs(10);
 
 const PINNED_MAPS: [&str; 12] = [
     "COUNTERS", "ACTIVE", "GEN_SRC", "GEN_DST", "GEN_RULES", "GEN_META", "FLOWS",
@@ -315,7 +315,7 @@ impl Enforcer for EbpfEnforcer {
 
     fn apply(&mut self, ir: &PolicyIR) -> Result<()> {
         let flat = flatten(ir)?;
-        apply_generation(&mut self.ebpf, &flat, &mut self.gen)
+        apply_generation(&mut self.ebpf, &flat, &mut self.gen, self.cfg.reap_grace)
     }
 
     /// Real (Task 8, fixed post-review): reads the 258-entry `COUNTERS`
@@ -339,12 +339,19 @@ impl Enforcer for EbpfEnforcer {
     fn counters(&mut self) -> Result<Counters> {
         let counters: Array<&MapData, u64> =
             Array::try_from(self.ebpf.map("COUNTERS").context("COUNTERS")?)?;
-        let live_default_deny = counters.get(&CTR_DEFAULT_DENY, 0).unwrap_or(0);
+        // (Review finding) Propagate a real map-read error instead of
+        // swallowing it as `0` — "counters always count" means a read
+        // failure here must surface, not silently under-report.
+        let live_default_deny = counters
+            .get(&CTR_DEFAULT_DENY, 0)
+            .context("reading CTR_DEFAULT_DENY from COUNTERS")?;
         let default_deny = self.gen.default_deny_accum + live_default_deny;
 
         let mut by_rule: BTreeMap<String, u64> = self.gen.counter_accum.clone();
         for (idx, rule_id) in self.gen.idx_to_rule_id.iter().enumerate() {
-            let c = counters.get(&(idx as u32), 0).unwrap_or(0);
+            let c = counters
+                .get(&(idx as u32), 0)
+                .with_context(|| format!("reading COUNTERS[{idx}] for rule {rule_id}"))?;
             if c > 0 {
                 *by_rule.entry(rule_id.clone()).or_insert(0) += c;
             }
@@ -366,7 +373,21 @@ impl Enforcer for EbpfEnforcer {
             aya::maps::HashMap::try_from(self.ebpf.map_mut("FLOWS").context("FLOWS")?)?;
         let keys: Vec<FlowKey> = flows.keys().collect::<Result<_, _>>()?;
         for k in keys {
-            let _ = flows.remove(&k);
+            match flows.remove(&k) {
+                Ok(()) => {}
+                // Benign: `FLOWS` is `BPF_MAP_TYPE_LRU_HASH`, so the kernel
+                // can concurrently evict this exact entry between the
+                // `keys()` snapshot above and this `remove` -- that surfaces
+                // as `bpf_map_delete_elem` failing ENOENT, not a real flush
+                // failure (the entry is gone either way, which is the goal).
+                Err(aya::maps::MapError::SyscallError(aya::sys::SyscallError {
+                    io_error,
+                    ..
+                })) if io_error.raw_os_error() == Some(libc::ENOENT) => {}
+                Err(e) => {
+                    return Err(e).context("removing FLOWS entry during flush_flows");
+                }
+            }
         }
         Ok(())
     }
@@ -758,13 +779,20 @@ fn prune_retired_counters(gen: &mut GenerationState, new_idx_to_rule_id: &[Strin
 /// PREVIOUS `apply()` flipped away from (our two slots strictly alternate
 /// under our own sole control, so there's only ever one "pending reap" at a
 /// time) — before overwriting it with the new generation's fresh maps, wait
-/// out whatever remains of the 10s grace since that flip. In production use
-/// (`apply()` calls spaced more than 10s apart) this is a no-op; back-to-back
-/// rapid re-applies (exercised deliberately by
-/// `tests/generations.rs`'s `atomic_generation_flip_under_continuous_udp_traffic_has_zero_deficit`)
-/// serialize on this wait instead of ever installing/flipping to a
+/// out whatever remains of `reap_grace` (design default 10s, via
+/// [`crate::EnforcerConfig::reap_grace`]) since that flip. In production use
+/// (`apply()` calls spaced more than `reap_grace` apart) this is a no-op;
+/// back-to-back rapid re-applies (exercised deliberately by
+/// `tests/generations.rs`'s `atomic_generation_flip_under_continuous_udp_traffic_has_zero_deficit`,
+/// which shrinks `reap_grace` so its flips genuinely land inside its traffic
+/// window) serialize on this wait instead of ever installing/flipping to a
 /// still-possibly-in-use generation's slot.
-fn apply_generation(ebpf: &mut Ebpf, flat: &[FlatRule], gen: &mut GenerationState) -> Result<()> {
+fn apply_generation(
+    ebpf: &mut Ebpf,
+    flat: &[FlatRule],
+    gen: &mut GenerationState,
+    reap_grace: Duration,
+) -> Result<()> {
     let active_now: u32 = {
         let a: Array<&MapData, u32> = Array::try_from(ebpf.map("ACTIVE").context("ACTIVE")?)?;
         a.get(&0, 0)?
@@ -777,8 +805,8 @@ fn apply_generation(ebpf: &mut Ebpf, flat: &[FlatRule], gen: &mut GenerationStat
             "outer-array slots must strictly alternate under apply()'s own sole control"
         );
         let elapsed = pending.flipped_at.elapsed();
-        if elapsed < REAP_GRACE {
-            std::thread::sleep(REAP_GRACE - elapsed);
+        if elapsed < reap_grace {
+            std::thread::sleep(reap_grace - elapsed);
         }
     }
 

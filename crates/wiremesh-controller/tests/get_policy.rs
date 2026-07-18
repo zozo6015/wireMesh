@@ -1,4 +1,4 @@
-//! Task 6 (cycle 3): failing tests for the new `Admin.GetPolicy` RPC —
+//! Task 6 (cycle 3): tests for the `Admin.GetPolicy` RPC —
 //! `.superpowers/sdd/task-6-brief.md`. Placed in its own file rather than
 //! folded into `tests/policy_pipeline.rs` (already 1000+ lines covering the
 //! compile/CIDR-diffing pipeline behind `Apply`) because `GetPolicy` is a
@@ -7,16 +7,13 @@
 //! own file (`admin_auth.rs`, `drain.rs`, `keys.rs`, `revoke_audit.rs`,
 //! `sync_delta.rs`, `sync_snapshot.rs`).
 //!
-//! Today `AdminSvc::get_policy` is a `Status::unimplemented("Task 6")` stub
-//! (Step 1 of this task only scaffolds the wire contract — see that
-//! method's doc comment) — every test below is expected to FAIL at runtime
-//! for that reason, except `read_only_token_can_call_get_policy`, whose RED
-//! cause is one layer further out: `GetPolicy` isn't in
-//! `wiremesh_controller::auth::READONLY_METHODS` yet, so a `read-only`
-//! bearer token gets `PermissionDenied` from the auth middleware before ever
-//! reaching the stub. Both are exactly what Step 3 (implementer) must fix:
-//! wire `Db`'s version lookup behind `get_policy` AND add `"GetPolicy"` to
-//! `READONLY_METHODS`.
+//! `AdminSvc::get_policy` is implemented: `version: 0` resolves to the
+//! latest compiled policy, an explicit version looks that version up
+//! exactly, and an unknown version fails `NotFound`. `GetPolicy` is also in
+//! `wiremesh_controller::auth::READONLY_METHODS`, so a `read-only` bearer
+//! token can call it like any other read. The tests below verify all three:
+//! latest-version lookup with a parseable IR, `NotFound` on an unknown
+//! version, and the read-only auth tier.
 use wiremesh_policy::PolicyIR;
 use wiremesh_proto::v1::GetPolicyRequest;
 use wiremesh_testkit::TestController;
@@ -80,10 +77,8 @@ async fn get_policy_latest_returns_version_1_with_parseable_ir() {
         resp.source_yaml
     );
 
-    let ir = PolicyIR::from_json(&resp.compiled_ir).expect(
-        "GetPolicy's compiled_ir must parse as a real PolicyIR — the unimplemented stub \
-         never returns any bytes at all, which is the RED signal for this test",
-    );
+    let ir = PolicyIR::from_json(&resp.compiled_ir)
+        .expect("GetPolicy's compiled_ir must parse as a real PolicyIR");
     assert_eq!(
         ir.version, 1,
         "the parsed IR's version must match the returned version, got {}",
@@ -134,14 +129,12 @@ async fn get_policy_unknown_version_is_not_found() {
     );
 }
 
-/// (3) `GetPolicy` must sit in the same auth tier as `ListSegments`: a
+/// (3) `GetPolicy` sits in the same auth tier as `ListSegments`: a
 /// `read-only`-role bearer token (over the TCP Admin listener) must be
 /// allowed to call it — same positive-control pattern as
-/// `tests/admin_auth.rs`'s `read_only_token_can_list`, just for this new
-/// RPC. RED today for a DIFFERENT reason than tests (1)/(2): `GetPolicy`
-/// isn't yet in `wiremesh_controller::auth::READONLY_METHODS`, so this call
-/// currently fails `PermissionDenied` at the auth middleware, before ever
-/// reaching the (also still-unimplemented) handler.
+/// `tests/admin_auth.rs`'s `read_only_token_can_list`, just for this RPC,
+/// verifying `GetPolicy` is present in
+/// `wiremesh_controller::auth::READONLY_METHODS`.
 #[tokio::test]
 async fn read_only_token_can_call_get_policy() {
     let h = TestController::start().await;

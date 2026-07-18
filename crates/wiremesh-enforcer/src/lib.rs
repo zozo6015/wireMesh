@@ -46,6 +46,18 @@ pub struct EnforcerConfig {
     pub rate_cap_per_src: u32,
     pub log_per_rule: u32,
     pub log_aggregate: u32,
+    /// (Review finding) The eBPF backend's "reap-on-next-apply + minimum
+    /// N since flip" wait (design §6's "grace period: 10s after flip, then
+    /// the old generation's maps are deleted" — see `ebpf::apply_generation`)
+    /// as an injectable duration, defaulting to the design's 10s. Exists so
+    /// tests that deliberately flip generations back-to-back (e.g.
+    /// `tests/generations.rs`'s
+    /// `atomic_generation_flip_under_continuous_udp_traffic_has_zero_deficit`,
+    /// `wiremesh-testkit`'s `flip_under_traffic_zero_loss`) can shrink it to
+    /// a few milliseconds so all their flips genuinely land inside a short
+    /// traffic window, instead of each non-first `apply()` blocking ~10s.
+    /// Production callers get the real 10s via `Default`.
+    pub reap_grace: std::time::Duration,
 }
 
 impl Default for EnforcerConfig {
@@ -58,6 +70,7 @@ impl Default for EnforcerConfig {
             rate_cap_per_src: 256,
             log_per_rule: 10,
             log_aggregate: 100,
+            reap_grace: ebpf::REAP_GRACE,
         }
     }
 }

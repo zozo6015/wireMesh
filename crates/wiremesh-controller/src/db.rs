@@ -2228,6 +2228,27 @@ impl Db {
         .map_err(Into::into)
     }
 
+    /// (Cycle-3 Task 5 review finding) `gateway_id`'s most recently observed
+    /// candidate endpoint, if the controller's UDP observation endpoint has
+    /// ever recorded one for it — the same last-observed-wins value
+    /// `list_other_gateways`/`build_snapshot`/`routes::peers_of` surface to
+    /// peers, exposed here as a single-gateway lookup for
+    /// `AdminSvc::apply`'s `SegmentCidrsChanged` publish (which already knows
+    /// exactly one `gateway_id`, not the full peer set). `None` for an
+    /// unknown/non-active gateway_id or one that's never had an endpoint
+    /// observed (mirrors `gateway_observe_key`'s active-only posture).
+    pub fn candidate_endpoint_for_gateway(&self, gateway_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT candidate_endpoint FROM gateway WHERE id = ?1 AND status = 'active'",
+            params![gateway_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map(|opt| opt.flatten())
+        .map_err(Into::into)
+    }
+
     /// (Task 15) Records `addr` (a UDP `ip:port` string, as observed on the
     /// wire by `crate::observe`) as `gateway_id`'s candidate endpoint —
     /// last-observed-wins (cycle-2 keeps exactly one candidate per gateway;

@@ -674,7 +674,15 @@ pub fn flip_under_traffic_zero_loss(kind: BackendKind) -> anyhow::Result<()> {
     let (lab, a, b) = wg_lab("aeth13");
     join_netns(&b.name).context("join b's netns before probing wg0 in-process")?;
 
-    let mut enforcer = wiremesh_enforcer::probe_with(kind, "wg0", EnforcerConfig::default())
+    // (Review finding) With the default `reap_grace` (10s) each non-first
+    // `apply()` below would block ~10s waiting out the prior flip's reap
+    // grace -- 20 flips would take ~190s, running long after the ~3.5s
+    // sender/1.5s receiver-idle-timeout traffic window has already closed,
+    // defeating the "concurrent with live traffic" point of this scenario.
+    // Shrink it so all 20 flips genuinely complete while traffic is still
+    // flowing.
+    let cfg = EnforcerConfig { reap_grace: Duration::from_millis(50), ..EnforcerConfig::default() };
+    let mut enforcer = wiremesh_enforcer::probe_with(kind, "wg0", cfg)
         .with_context(|| format!("flip_under_traffic_zero_loss({kind:?}): probe_with"))?;
 
     let segs = vec![
@@ -702,8 +710,9 @@ policy:
 
     // 20 flips of the SAME allow policy, back-to-back, concurrent with the
     // live traffic. eBPF's apply() may internally block out the remainder
-    // of a prior flip's >=10s reap grace before returning (design §6) --
-    // acceptable per the graduated pattern this mirrors, no explicit sleep
+    // of a prior flip's reap grace before returning (design §6) -- shrunk to
+    // 50ms above so that wait, summed over 20 flips, stays well inside the
+    // traffic window instead of the design's 10s default; no explicit sleep
     // needed either way; nft's apply() has no such grace (one atomic `nft
     // -f -` transaction) and returns immediately.
     for i in 0..20 {

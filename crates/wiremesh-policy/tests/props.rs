@@ -438,13 +438,36 @@ proptest! {
 
         let mut mutated = policy.clone();
         let old_ports = mutated.blocks[target_block].rules[target_rule].ports.clone();
-        let candidate = vec![PortLit::Single(12345)];
-        let new_ports = if old_ports == candidate {
-            vec![PortLit::Single(54321)]
+        // (Review finding) Comparing raw `PortLit` values (as the previous
+        // `old_ports == candidate` check did) isn't enough: a different
+        // `PortLit` representation can normalize to the SAME range (e.g.
+        // `Range(12345, 12345)` vs `Single(12345)` both normalize to
+        // `(12345, 12345)`) -- picking a "new" port that merely LOOKS
+        // different but normalizes identically leaves `rule_id` unchanged,
+        // spuriously failing this property. Normalize the old rule's ports
+        // first (mirroring `compile.rs::normalize_port`) and pick a single
+        // port whose own normalized range isn't already present in that
+        // list, guaranteeing the compiled rule's normalized range actually
+        // changes.
+        let old_normalized: Vec<(u16, u16)> = old_ports
+            .iter()
+            .map(|p| match p {
+                PortLit::Single(n) => (*n, *n),
+                PortLit::Range(lo, hi) => (*lo, *hi),
+            })
+            .collect();
+        let candidate_port = 12345u16;
+        let new_port = if old_normalized.contains(&(candidate_port, candidate_port)) {
+            54321u16
         } else {
-            candidate
+            candidate_port
         };
-        mutated.blocks[target_block].rules[target_rule].ports = new_ports;
+        prop_assert!(
+            !old_normalized.contains(&(new_port, new_port)),
+            "12345 and 54321 can't both already be a degenerate single-port range in old_ports: {:?}",
+            old_normalized
+        );
+        mutated.blocks[target_block].rules[target_rule].ports = vec![PortLit::Single(new_port)];
 
         let yaml_after = render_yaml(&mutated);
         let src_after = parse_policy(&yaml_after, &segments)
