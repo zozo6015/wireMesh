@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| **Status** | Draft v0.1 |
+| **Status** | Draft v0.4 |
 | **Author** | Peter |
-| **Working name** | *TBD* (referred to as "the fabric" throughout; CLI examples use `fabricctl`) |
-| **Last updated** | 2026-07-07 |
+| **Name** | **WireMesh** (CLI: `fabricctl`) |
+| **Last updated** | 2026-07-18 |
 | **Target audience** | Platform/DevOps engineers, infrastructure teams, homelab operators, managed-platform operators |
 
 ---
@@ -22,10 +22,12 @@ A standalone, cloud-agnostic, zero-trust L3/L4 network fabric written in Rust. I
 
 **Positioning in one line:** AWS Transit Gateway + Twingate — open source, self-hosted, works across any combination of clouds and on-prem.
 
+**Project model:** WireMesh is a fully open-source project (Apache-2.0), built on three commitments: **(1) no feature gating** — the self-hosted version is the complete product, forever; **(2) no rug pull** — the license stays Apache-2.0; **(3) hosted offerings are downstream consumers, not the project** — any managed controller (maintainer-operated or third-party) runs the same public binaries, and the data plane always stays customer-owned. Managed platforms (e.g., Aether) and commercial services (hosting, support, sponsored development that lands upstream) are compatible with — and funded by — this model; gated features and relicensing are not.
+
 ### Architecture (3 components, Twingate-style)
 
 1. **Controller** — control plane. Manages topology, CIDR registry, gateway peers; distributes routing tables and ACL policy; handles key exchange and rotation. Communicates with gateways over mTLS gRPC. Deployable anywhere: VPS, Kubernetes, or a managed platform.
-2. **Gateway** — data plane. Single Rust binary on any Linux VM/LXC. One per network segment. Owns a CIDR block, advertises it to the controller, builds WireGuard tunnels (boringtun) to peer gateways, and enforces L4 ACLs locally via nftables (eBPF/XDP later). Transparent to workloads behind it.
+2. **Gateway** — data plane. Single Rust binary on any Linux VM/LXC. One per network segment. Owns a CIDR block, advertises it to the controller, builds WireGuard tunnels (boringtun) to peer gateways, and enforces L4 ACLs locally in-kernel via eBPF (tc-BPF on the tunnel device), with an nftables fallback where BPF privileges are unavailable. Transparent to workloads behind it.
 3. **Relay** — stateless QUIC forwarder for NAT traversal fallback when direct UDP between gateways is blocked. Runs on any VM with a public IP. Zero payload visibility (end-to-end encrypted).
 
 ## 3. Goals
@@ -85,18 +87,21 @@ Ordered by priority.
 | C-6 | **Declarative API + CLI.** All state (segments, gateways, policies, relays) manageable via gRPC/HTTP API and `fabricctl`; config expressible as files for GitOps. | `fabricctl apply -f fabric.yaml` is idempotent: applying the same file twice yields zero changes. |
 | C-7 | **State persistence.** Controller state survives restart (embedded store, e.g., SQLite/sled, with documented backup path). | Kill and restart the controller: all gateways reconnect and no re-enrollment is required. |
 | C-8 | **Audit log.** Every mutating operation (policy change, gateway add/remove, key rotation) is logged with actor, timestamp, and diff. | Audit entries are queryable via API and exportable as JSON lines. |
+| C-9 | **Certificate revocation.** `fabricctl gateway revoke <name>` revokes a gateway's cert; the revoked-serial denylist is pushed to all gateways/relays via Sync and enforced locally (offline-verifiable — no CRL/OCSP dependency at verification time). Sync connections from revoked certs are rejected at handshake. | After revocation: the revoked gateway's Sync stream is terminated and re-connect rejected; all peers drop its tunnels and stop routing to it within 5s p99 of the denylist push; enforcement continues while the controller is unreachable (denylist is local state, consistent with G-6). |
+| C-10 | **CA lifecycle & disaster recovery.** Embedded CA cert valid 10y; documented rotation runbook (new CA → cross-sign → push dual-root trust bundle via Sync → leaves re-issue at normal renewal → retire old root). CA-key compromise recovery = new CA + fleet re-enrollment via rebind tokens. Backup unit: SQLite + key directory (embedded mode) or SQLite alone (external SecretStore mode), with documented restore ordering. | A controller restored from backup on a fresh host: all gateways reconnect with no re-enrollment (extends C-7). The CA-rotation runbook and the compromise/rekey runbook are both executed as integration tests, not just documented. |
 
 #### Gateway
 
 | ID | Requirement | Acceptance criteria |
 |---|---|---|
-| G-1 | **Single static Rust binary**, x86-64 and arm64, no runtime deps beyond a modern kernel and nftables. | Runs on Ubuntu 22.04+/Debian 12+ VM and Proxmox LXC (documented required capabilities/privileges for LXC). |
-| G-2 | **WireGuard data plane via boringtun** (userspace), with kernel WireGuard as an optional accelerated mode where available. | Sustains ≥ 1 Gbps single-tunnel throughput on a 4-vCPU cloud VM (userspace); kernel mode documented with measured delta. |
+| G-1 | **Single static Rust binary**, x86-64 and arm64, no runtime deps beyond a modern kernel (BPF-capable; nftables required only for the fallback enforcement path). | Runs on Ubuntu 22.04+/Debian 12+ VM and Proxmox LXC (documented required capabilities/privileges for LXC). |
+| G-2 | **WireGuard data plane via boringtun** (userspace), with kernel WireGuard as an optional accelerated mode where available. | Defined benchmark (the Phase 0 `bench.sh` harness): iperf3, TCP, tun MTU 1280, on a 4-vCPU x86-64 cloud VM (c6i.xlarge-class, performance governor), measured in both directions. Targets: **≥ 1 Gbps single flow** and **≥ 1 Gbps aggregate across 8 concurrent peer tunnels** (full-mesh realism). Kernel-WG mode measured on the same harness with the delta published. **Carried Phase 0 gate:** the in-container ~7.7 Mbit/s receive-side cap must be shown to be environmental on the first cloud run (`iperf3 -u -b 0` loss check per the Phase 0 report) — if the cap reproduces on cloud, Bet 1 reopens before any Cycle 4 gateway work. |
 | G-3 | **Full-mesh tunnel establishment** to all peer gateways, with per-pair automatic relay fallback. | With UDP blocked between two gateways, the pair converges to relay transport within 30s without operator action, and reverts to direct when possible. |
-| G-4 | **L4 ACL enforcement via nftables.** Default-deny between segments; rules support src/dst CIDR, port ranges, protocol (TCP/UDP/ICMP). | Traffic matching no allow rule is dropped and counted. Rule updates are applied atomically (no enforcement gap, no transient allow-all/deny-all). |
+| G-4 | **L4 ACL enforcement via eBPF (primary) with nftables fallback.** Both backends compile from the same policy IR and must be behaviorally identical (conformance suite). Default-deny between segments; rules support src/dst CIDR, port ranges, protocol (TCP/UDP/ICMP). Fallback engages automatically where BPF privileges are withheld (e.g., restricted LXC). | Traffic matching no allow rule is dropped and counted. Rule updates are applied atomically on both backends (no enforcement gap, no transient allow-all/deny-all). Conformance suite proves eBPF/nftables parity for every rule construct. |
 | G-5 | **Transparent to workloads.** No agent on machines behind the gateway; only a route toward the gateway is needed. | Demo: an EC2 instance reaches a Proxmox VM's Postgres with only a VPC route-table entry added, per the allow rule. |
 | G-6 | **Fail-static on controller loss.** Tunnels, routes, and the last-applied policy persist while the controller is unreachable. | Kill the controller for 1 hour: existing allowed flows continue; denied flows stay denied; gateways resync on controller return. |
 | G-7 | **Graceful drain/decommission.** | `fabricctl gateway drain <name>` withdraws routes from peers before teardown; peers stop routing to it within 5s. |
+| G-8 | **MTU & PMTUD correctness.** Fabric-wide tun MTU **1280** (relayed-path worst case; per-peer raise to 1420 on verified direct paths is P1). TCP **MSS clamping** on the tun device for workloads that ignore route MTU. **ICMP error packets (unreachable, fragmentation-needed, TTL-exceeded) are matched against the embedded flow's forward or reverse entry and forwarded when that flow is allowed** — default-deny must never black-hole PMTUD. Behavior identical on both enforcement backends. | Conformance suite includes ICMP-error cases (both backends). Integration test: bulk transfer with DF set over a *relayed* path completes without hangs; transport switch direct↔relay under load loses only in-flight packets. Every platform quickstart documents the MTU story. |
 
 #### Relay
 
@@ -116,6 +121,8 @@ Ordered by priority.
 | X-3 | **Security baseline:** mTLS everywhere on the control plane; WireGuard (Noise) on the data plane; secrets never written to logs; keys stored with 0600 perms; minimal Linux capabilities documented (no blanket root requirement where avoidable). | Threat model document published (see §10). |
 | X-4 | **Docs & quickstart:** end-to-end "two segments in 30 minutes" tutorial (AWS VPC ↔ Proxmox VLAN). | A new user following only the docs completes the tutorial; measured in early-adopter testing. |
 | X-5 | **OSS project hygiene (day one):** chosen license, CONTRIBUTING.md, security policy (SECURITY.md + disclosure contact), versioned releases with changelogs, CI running the NAT-matrix and multi-segment integration tests publicly. No opt-out telemetry — any telemetry is opt-in and documented. | Repo passes these checks at first public release; first external PR can be reviewed and merged without process invention. |
+| X-6 | **Version skew & zero-drama upgrades.** Controller vN supports gateways/relays vN and vN-1 (one-minor skew window); Sync advertises the minimum supported component version and `fabricctl gateway list` flags out-of-window components loudly. Gateway upgrade preserves tunnels (make-before-break, same bar as C-5). **The policy IR schema is part of the skew contract:** the Sync handshake advertises each gateway's maximum supported IR schema; the controller serves IR at a schema every enrolled gateway supports, and refuses (with a loud `fabricctl` error naming the lagging gateways) any operation that would require a schema an in-window gateway cannot consume — a supported skew must never leave a gateway unable to apply policy. | Skew matrix tested in CI (vN controller ↔ vN-1 gateway). Upgrading a gateway under an active iperf flow shows < 1s packet loss. Skew CI includes an IR-schema case: a vN controller with one vN-1 gateway enrolled keeps serving schema-compatible IR and flags the constraint in `fabricctl gateway list`. "Fabric upgrade" runbook is part of the docs from the first tagged release. |
+| X-7 | **Release integrity.** Every release artifact (binaries, OCI images) ships SHA-256 checksums and signatures (cosign/minisign); the one-line install script verifies the checksum before executing anything. Build provenance (SLSA-style attestation) is P1. | `curl \| sh` refuses to proceed on checksum mismatch; signature verification is documented in one command per artifact type; CI produces and publishes signatures automatically. |
 
 ### 7.2 Nice-to-Have (P1)
 
@@ -131,11 +138,11 @@ Ordered by priority.
 
 ### 7.3 Future Considerations (P2)
 
-- **eBPF/XDP enforcement path** replacing nftables for ACLs on high-throughput gateways. *(Design constraint now: keep the policy model compiler-agnostic — an intermediate representation that can target nftables today and eBPF later.)*
+- **XDP fast path** for high-throughput gateways, building on the P0 tc-BPF enforcement. *(The compiler-agnostic policy IR (G-4) already keeps this open.)*
 - **User/device access layer** — optional client for user-to-segment access, converging on the full Twingate use case.
-- **SaaS controller offering** — hosted control plane (data plane always stays customer-owned). *(Design constraint now: multi-tenancy boundaries in the controller data model from day one.)*
-- **IPv6 segments** and dual-stack tunnels.
+- **IPv6 segments** and dual-stack tunnels. *(The address-family-agnostic registry/IR/wire-protocol constraint in §8 is what keeps this additive.)*
 - **1:1 NAT for overlapping CIDRs** (brownfield escape hatch).
+- **Maintainer-operated hosted controller** — a paid convenience offering, run as a downstream consumer per the §2 project model: **single-tenant** (one controller instance per customer, sidestepping multi-tenancy in the data model entirely), same public binaries, data plane always customer-owned. Zero code divergence from self-hosted is a hard constraint.
 - **BGP integration** — advertise fabric routes to on-prem routers instead of static routes.
 - **Policy identity extensions** — tags/labels on segments so rules can reference `env=prod` instead of raw CIDRs.
 
@@ -143,20 +150,23 @@ Ordered by priority.
 
 - **L3 subnet routing**, segment-level. One gateway owns one or more CIDRs.
 - **Data plane:** WireGuard (boringtun). **Control plane:** mTLS gRPC. **Fallback:** QUIC relay, per gateway pair.
+- **Enforcement:** eBPF (tc-BPF) primary, nftables fallback; single policy IR, provably identical behavior.
 - **Topology:** full mesh of direct tunnels; relay only where direct fails.
+- **Scale envelope (v1):** designed and soak-tested for up to **50 segments** (≈1,225 tunnel pairs, 49 peers per gateway). Larger fabrics are out of scope for v1 — full mesh is the only topology, and O(n²) pair growth is the deliberate trade for its simplicity.
+- **Address family:** IPv4-only in v1. **Design constraint now:** the CIDR registry, policy IR, and wire protocol are address-family-agnostic so IPv6/dual-stack (P2) is additive, not a rework.
 - **No overlapping CIDRs**, enforced at onboarding (C-2).
-- **Policy:** default deny; explicit allow rules scoped to (source CIDR, destination CIDR, port range(s), protocol). Deny rules supported for carve-outs within an allow. Evaluation order and tie-breaking must be deterministic and documented.
+- **Policy evaluation (normative, per the engineering design):** default deny — a flow matching no rule, or with no block for its (src segment, dst segment) pair, is dropped. Blocks are **directional** (`from: A, to: B` governs A→B initiation only; replies are stateful via the flow table). **First match wins** within a block, rules in written order — deny carve-outs go above the allows they carve. At most one block per ordered segment pair (compile error otherwise), so cross-block ordering cannot arise. `src`/`dst` CIDRs must be subsets of their segments' registered CIDRs (compile error otherwise).
 
-Example (illustrative syntax, final schema TBD — see Open Questions):
+Example (matches the engineering design’s DSL):
 
 ```yaml
 policy:
-  - from: proxmox-lab        # 192.168.0.0/16
-    to: aws-prod             # 172.16.0.0/16
+  - from: proxmox-lab        # 10.10.0.0/16
+    to: aws-prod             # 172.16.0.0/12
     rules:
+      - deny:  { ports: [22], proto: tcp }                          # carve-out — first match wins
       - allow: { dst: 172.16.1.50/32, ports: [5432], proto: tcp }   # Postgres
       - allow: { dst: 172.16.2.0/24, ports: [443], proto: tcp }
-      - deny:  { ports: [22], proto: tcp }
 ```
 
 ## 9. Success Metrics
@@ -168,45 +178,46 @@ policy:
 - GitHub traction as an OSS proxy: **500 stars / 20 external issues** in 60 days (signal, not vanity — issues indicate real deployment attempts).
 
 **Lagging (2 quarters):**
-- **≥ 25 distinct production-ish deployments** self-reported (telemetry is opt-in only; count via discussions/issues/adopters file).
+- **≥ 25 entries in `ADOPTERS.md`** (plus a pinned "who is running WireMesh" discussion) — the concrete mechanism, since telemetry is opt-in only and cannot be the counting method.
 - **≥ 3 managed-platform tenants** using the fabric integration once P1 ships.
 - Soak stability: a 3-segment reference fabric runs **30 days** with zero unplanned data-plane interruptions.
-- Zero critical CVEs in the enforcement or key-handling paths post external review.
+- **External security review of the enforcement and key-handling paths completed before 1.0** — commissioned via an OSS audit program (OSTIF / Sovereign Tech Fund application as soon as Cycle 3 lands, since queues are long); metric: review report published, all critical/high findings fixed before the 1.0 tag.
 
 ## 10. Security & Threat Model (must be published with v1)
 
 Minimum coverage:
 - **Compromised relay** — must yield ciphertext only; no key material, no metadata beyond src/dst gateway endpoints and volume.
 - **Compromised controller** — can rewrite topology/policy (accepted risk of centralized control plane); cannot silently read data-plane traffic. Mitigations: audit log (C-8), gateway-side logging of applied policy versions, future policy signing (P2 candidate).
-- **Compromised gateway** — blast radius is its own segment plus flows allowed to/from it; peers' keys are per-pair so lateral decryption is not possible.
+- **Compromised gateway** — blast radius is its own segment plus flows allowed to/from it. Keys are one static keypair **per gateway per epoch** (not per-pair); Noise IK's ephemeral DH already prevents a compromised gateway from decrypting other pairs' traffic, so lateral decryption is not possible.
 - **Enrollment token theft** — tokens are single-use and expiring; enrollment binds to expected CIDR.
+- **Fabric CA key loss or compromise** — covered by C-10: loss is a restore-from-backup event (no re-enrollment); compromise is a new CA + fleet re-enrollment via rebind tokens, with the runbook exercised as an integration test.
 - **Fail posture** — explicitly fail-static (G-6); document why not fail-closed (a controller outage must not become a network outage).
 
 ## 11. Open Questions
 
 | # | Question | Owner | Blocking? |
 |---|---|---|---|
-| 1 | Policy schema: custom YAML DSL vs. something interoperable (e.g., a subset of Cilium/K8s NetworkPolicy semantics)? Affects G-4 IR design. | Eng (Peter) | Yes — before G-4 |
-| 2 | Controller store: SQLite vs. sled vs. Postgres-optional? Impacts HA path (P1). | Eng | Yes — before C-7 |
+| 1 | ~~Policy schema~~ — **Resolved: custom YAML DSL** (segment-to-segment, first-match-wins, directional blocks), compiled to a backend-agnostic IR. K8s NetworkPolicy semantics rejected: pod/identity model doesn't map to segment routing. See §8 and the engineering design §5. | Eng (Peter) | Resolved |
+| 2 | ~~Controller store~~ — **Resolved: embedded SQLite** (Cycle 2). HA path (P1) will build on snapshot/replication of the SQLite store. | Eng | Resolved |
 | 3 | Key rotation cadence and trigger model: time-based, on-demand only, or both? | Eng/Security | No |
-| 4 | How are routes injected on the workload side per platform — documented manual route-table entries only (v1), or cloud-API automation (route table writes need cloud credentials on the gateway — trust implication)? | Eng | Yes — scoping X-1 |
-| 5 | Does a gateway support multiple owned CIDRs in v1, or exactly one? (Multiple is likely cheap and avoids awkward workarounds.) | Eng | Yes — data model |
-| 6 | Conntrack strategy for stateful TCP/UDP allow rules in nftables — per-direction rules or connection tracking with implicit return traffic? | Eng | Yes — before G-4 |
-| 7 | Project name + license (Apache-2.0 vs. AGPL given future SaaS ambitions). OSS-first positioning makes this **blocking before the repo goes public** — relicensing later is painful once external contributions land (or requires a CLA from day one). | Peter | Yes — before public repo |
+| 4 | ~~Route injection~~ — **Resolved: manual documented routes + published Terraform modules per cloud. No cloud credentials on gateways, ever** — a deliberate trust boundary, not a limitation: target users already drive route tables via IaC, and creds on the data plane would explode the threat model. Cloud-API automation revisited only as a separately-credentialed helper (P2 at best). | Eng | Resolved |
+| 5 | ~~Multiple CIDRs~~ — **Resolved: multiple CIDRs per segment in v1** — already implemented in the Cycle 2 data model (`cidr` 1:N `segment`; `repeated string cidrs` on the wire). | Eng | Resolved |
+| 6 | ~~Conntrack strategy~~ — **Resolved: stateful with implicit return traffic.** eBPF: BPF LRU flow table keyed on the 5-tuple, new-flow = direction of first packet, ICMP errors matched via the embedded flow (G-8); nftables: kernel conntrack (`established,related`). Conformance suite proves the two identical. | Eng | Resolved |
+| 7 | ~~Project name + license~~ — **Resolved: WireMesh, Apache-2.0.** Fully open source under the §2 three-commitment model; a future maintainer-operated hosted controller (P2) runs the same Apache-2.0 binaries, so there is no AGPL pressure and no relicensing path. | Peter | Resolved |
 | 8 | Relay abuse prevention for public relays — auth tokens per fabric? Rate limits? | Eng/Security | No (relays are self-hosted in v1) |
-| 9 | Kubernetes gateway mode specifics: hostNetwork pod advertising the node/pod/service CIDR? How does it coexist with the CNI (e.g., Cilium) — route injection vs. CNI-native routes? Does it need a NetworkPolicy exemption? | Eng (Peter) | Yes — before the k8s quickstart (X-1) |
+| 9 | ~~Kubernetes gateway mode~~ — **Resolved: node-network only in v1.** Single-replica hostNetwork Deployment advertising the node subnet; pods/services reached via NodePort/LoadBalancer like any external client. No CNI interaction, no pod/service CIDR advertisement in v1. | Eng (Peter) | Resolved |
 
 ## 12. Phasing & Timeline Considerations
 
 No hard external deadlines. Suggested phases, each independently shippable:
 
-- **Phase 0 — Spike (2–3 weeks):** boringtun tunnel between two gateways with static config; nftables rule application; QUIC relay prototype. De-risks the three riskiest technical bets before any controller work.
+- **Phase 0 — Spike (2–3 weeks):** boringtun tunnel between two gateways with static config; tc-BPF ACL on the tunnel device; QUIC relay prototype; NAT-traversal harness. De-risks the riskiest technical bets before any controller work. *(Complete — see `docs/research/phase0-report.md`.)*
 - **Phase 1 — MVP (P0 core):** controller with enrollment, CIDR registry, route/policy distribution; 2–3 segment mesh; relay fallback; CLI; AWS + Proxmox + generic Linux quickstarts. *Exit criterion: the 30-minute tutorial passes with an external tester.*
 - **Phase 2 — Hardening:** key rotation, drain/decommission, full observability, audit log, GCP/Azure docs, threat model publication, soak testing.
 - **Phase 3 — P1 wave:** managed-platform integration, policy plan/dry-run, web UI (read-only), Terraform provider, controller HA.
-- **Phase 4 — P2 exploration:** eBPF enforcement path, user-access layer, SaaS controller.
+- **Phase 4 — P2 exploration:** XDP fast path, user-access layer.
 
-**Dependency callouts:** managed-platform integration (Phase 3) depends on the target platform's tenant/network APIs being stable; eBPF path depends on the policy IR decision (Open Question #1) being made *now* even though implementation is deferred.
+**Dependency callouts:** managed-platform integration (Phase 3) depends on the target platform's tenant/network APIs being stable; both enforcement backends (eBPF primary, nftables fallback) depend on the policy IR decision (Open Question #1) being made before Cycle 3.
 
 ## 13. Risks
 
@@ -214,7 +225,7 @@ No hard external deadlines. Suggested phases, each independently shippable:
 |---|---|---|---|
 | NAT traversal edge cases (symmetric NAT, CGNAT) burn disproportionate effort | High | Medium | Relay-first mentality: relay is the guaranteed path, direct is the optimization. Ship with an honest NAT compatibility matrix. |
 | boringtun throughput insufficient for real workloads | Medium | High | Benchmark in Phase 0; kernel-WG mode as escape hatch (P1). |
-| nftables atomic-update semantics harder than expected under churn | Medium | Medium | Use nft's native atomic ruleset replacement; policy IR keeps eBPF exit open. |
+| Atomic policy swap harder than expected under churn (eBPF map replacement / nftables ruleset replacement) | Medium | Medium | eBPF: versioned map-in-map swap; nftables: native atomic ruleset replacement. Single IR + conformance suite keeps both honest. |
 | Scope gravity toward device-level access ("just add a client") | High | High | Non-goal #1 is explicit; revisit only as P2 after segment routing is proven. |
 | Single-node controller perceived as SPOF and blocks adoption | Medium | Medium | Fail-static gateways + loud documentation of the outage story; HA in P1. |
 

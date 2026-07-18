@@ -253,7 +253,7 @@
     <p class="eyebrow">WireMesh &middot; Build Progress</p>
     <h1>Zero-trust network fabric &mdash; cycle-by-cycle build tracker</h1>
     <p class="lede">Open-source (Apache-2.0), self-hosted, cloud-agnostic L3/L4 network fabric in Rust: WireGuard data plane, default-deny eBPF policy, one gateway per segment, no agents on workloads. The engineering design ships as four plan cycles; this page tracks what's done, in flight, and next.</p>
-    <p class="stamp">Last updated <b>2026-07-18</b> &middot; Phase 0 + Cycle 2 + Cycle 3 complete &middot; Cycle 3 on branch <code>worktree-cycle3-policy-pipeline</code>, ready for PR &middot; Cycle 4 up next</p>
+    <p class="stamp">Last updated <b>2026-07-18</b> &middot; Phase 0 + Cycle 2 + Cycle 3 complete &middot; PRD reconciled to v0.4 &middot; Cycle 3 on branch <code>worktree-cycle3-policy-pipeline</code> (PR #6) &middot; Cycle 4 up next</p>
   </header>
 
   <div class="metrics">
@@ -332,7 +332,7 @@
           <span class="pill done"><span>Complete &middot; 2026-07-18</span></span>
         </div>
         <p>The YAML DSL &rarr; canonical-JSON versioned IR (<code>wiremesh-policy</code>) &rarr; both enforcement backends: eBPF primary (tc-BPF, LPM-bitset first-match, map-in-map atomic generations, stateful flow table with idle timeouts + per-source rate cap, sampled deny ring buffer) and the nftables fallback (atomic <code>nft&nbsp;-f</code> replace, conntrack statefulness, conntrack-flush re-evaluation). Controller compiles/versions policy and streams real <code>policy_ir</code> over Sync; <code>fabricctl policy show|status</code> lands. A netns conformance packet-suite proves behavioral parity across both backends (22/22 cells), ICMP-error semantics included, with one <em>ratified</em> divergence documented (one-way UDP live-flow survival). End-to-end capstone (controller apply &rarr; Sync IR &rarr; enforcer verdicts &rarr; report) green on both backends.</p>
-        <p class="dep"><b>14/14 tasks</b> &middot; workspace 127 tests green &middot; every task test-authored / implemented / executed / reviewed by separate agents. <b>Depends on:</b> Cycle 2 (IR over Sync; data model). <b>Reused &amp; graduated:</b> Phase 0 <code>enforcer</code> program + <code>natlab</code> harness into <code>wiremesh-enforcer{,-ebpf}</code> and <code>wiremesh-testkit</code>. <b>Note:</b> nft backend needs <code>conntrack-tools</code> on the gateway host.</p>
+        <p class="dep"><b>14/14 tasks</b> &middot; workspace 127 tests green &middot; every task test-authored / implemented / executed / reviewed by separate agents. <b>Depends on:</b> Cycle 2 (IR over Sync; data model). <b>Reused &amp; graduated:</b> Phase 0 <code>enforcer</code> program + <code>natlab</code> harness into <code>wiremesh-enforcer{,-ebpf}</code> and <code>wiremesh-testkit</code>. <b>PRD v0.4 gates &mdash; both met:</b> G-8 ICMP-error semantics in the conformance suite (done, both backends); fail-open proto parse is now a hard error (invalid proto = compile error; omitted proto matches only tcp/udp/icmp on both backends). <b>Notes:</b> nft backend needs <code>conntrack-tools</code> on the gateway host; <b>triggers on merge:</b> submit the OSTIF / Sovereign Tech Fund audit application (PRD &sect;9).</p>
       </article>
 
       <article class="cycle" data-status="pending">
@@ -342,7 +342,7 @@
           <span class="pill pending"><span>Pending</span></span>
         </div>
         <p>The gateway and relay binaries: tunnel manager (embedded boringtun, per-epoch keys), NAT traversal + brokered hole punch, relay failover, and the full NAT-matrix integration harness. Where the pending G-2 throughput gate is resolved.</p>
-        <p class="dep"><b>Next up.</b> <b>Depends on:</b> Cycle 2 (Sync client, enrollment) + Cycle 3 (<code>wiremesh-enforcer</code> — consumed by the gateway; state bundle carries the compiled IR). <b>Reuses:</b> <code>relay</code>, <code>punch</code>, <code>natlab</code>, <code>udpshim</code> logic.</p>
+        <p class="dep"><b>Next up.</b> <b>Depends on:</b> Cycle 2 (Sync client, enrollment) + Cycle 3 (<code>wiremesh-enforcer</code> — consumed by the gateway; state bundle carries the compiled IR). <b>Reuses:</b> <code>relay</code>, <code>punch</code>, <code>natlab</code>, <code>udpshim</code> logic. <b>Blockers carried in (PRD v0.4):</b> Sync-handshake rejection for revoked certs (C-9 &mdash; the tracked Cycle 2 seam); Sync <em>version-negotiation field</em> incl. the <b>IR-schema skew contract</b> before the first tagged release (X-6 &mdash; Cycle 3 built the <code>schema</code> field; the handshake negotiation is Cycle 4); CA rotation + compromise runbooks executed as integration tests (C-10). <b>Carried from the Cycle 3 whole-branch review:</b> a compile-time bound on distinct CIDRs (eBPF LPM capacity vs the PRD v0.4 50-segment envelope); <code>iface</code>-escaping guard at the enforcer boundary; the ~10s eBPF reap-grace vs the 5s-p99 propagation target (consider <code>GENERATIONS=3</code>).</p>
       </article>
 
     </div>
@@ -400,6 +400,18 @@
         <div class="rt"><b>Sync go-skew constraint (new hard requirement).</b><span class="rd">Phase 0 Bet 4 found the broker's "go" must arrive within one one-way path latency, or NAT mappings self-poison. The controller's Sync brokering (Cycle 2) must honor it; spec &sect;6.1 to be amended.</span></div>
       </div>
       <div class="risk-item">
+        <span class="chip sec">Cycle-4 blocker</span>
+        <div class="rt"><b>Revoked/drained gateway can still open Sync (C-9).</b><span class="rd">Elevated by the Cycle 2 whole-branch review; now a formal PRD requirement. Handshake-time rejection of revoked certs lands in Cycle 4 &mdash; no traffic-authz consequence until a data plane exists, but it gates the first end-to-end fabric.</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip sec">Cycle-4 blocker</span>
+        <div class="rt"><b>Sync version negotiation before first tagged release (X-6).</b><span class="rd">The one-minor skew window (controller vN &harr; gateway vN-1) needs a min-supported-version field in the Sync handshake. Adding it in Cycle 4 is a field; adding it after a tagged release is a protocol migration.</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip note">Calendar-critical</span>
+        <div class="rt"><b>External audit application fires when Cycle 3 lands.</b><span class="rd">PRD &sect;9 (v0.4): the OSTIF / Sovereign Tech Fund application goes out as soon as the policy pipeline merges &mdash; review queues run months, and the review must complete before 1.0.</span></div>
+      </div>
+      <div class="risk-item">
         <span class="chip note">Tracked fix</span>
         <div class="rt"><b>ICMP-echo reverse-key asymmetry.</b><span class="rd">Egress records echo as {id,0}; ingress reverse lookup swaps to {0,id}, so inside-initiated echo replies don't match. ICMP <em>errors</em> work. Dedicated fix in Cycle 3/4.</span></div>
       </div>
@@ -413,6 +425,26 @@
   <section>
     <h2>Session log</h2>
     <div class="log">
+      <div class="entry">
+        <div class="date">2026-07-18 &middot; later</div>
+        <h4>Cycle 3 complete &mdash; policy pipeline shipped as PR #6</h4>
+        <ul>
+          <li>All 14 tasks done subagent-driven (separate test-author / implementer / dedicated executor / reviewer each); full workspace green (<code>--features netns</code>), 0 warnings; conformance <b>22/22 cells on both backends</b>; end-to-end capstone green.</li>
+          <li><b>Two PRD v0.4 Cycle-3 gates met:</b> G-8 ICMP-error semantics in the conformance suite (both backends); fail-open proto parse is now a hard error (invalid proto = compile error, and omitted proto matches only tcp/udp/icmp &mdash; the latter a real over-match bug the whole-branch review caught: eBPF had been allowing GRE/ESP under a proto-any rule).</li>
+          <li><b>Ratified divergence</b> (owner decision): one-way UDP live-flow survival differs across backends (conntrack can't mark an unreplied UDP flow established) &mdash; accepted &amp; documented, encoded as the suite's single sanctioned per-backend expectation; master spec &sect;5.4 + Cycle-3 design amended. A second surfaced gap (nft <code>flush_flows</code> was a no-op) was <em>fixed</em> to real parity, not ratified.</li>
+          <li><b>Carried to Cycle 4</b> (whole-branch review, all fail-safe): compile-time distinct-CIDR bound vs the new 50-segment envelope; <code>iface</code>-escaping guard; the ~10s reap-grace vs 5s-p99 (<code>GENERATIONS=3</code> proposal, owner signoff). Deployment: nft backend needs <code>conntrack-tools</code>.</li>
+        </ul>
+      </div>
+      <div class="entry">
+        <div class="date">2026-07-18</div>
+        <h4>PRD reconciled to reality &mdash; v0.2 &rarr; v0.4 &mdash; project model settled</h4>
+        <ul>
+          <li><b>v0.2:</b> eBPF-primary / nftables-fallback flip backfilled from the design (was still nftables-P0); SaaS item and multi-tenancy constraint removed; name/license/store questions marked resolved.</li>
+          <li><b>v0.3:</b> new requirements C-9 (revocation), C-10 (CA lifecycle/DR with runbooks-as-tests), G-8 (MTU/PMTUD + ICMP-error semantics), X-6 (version skew), X-7 (signed releases); G-2 acceptance rewritten with the bench.sh methodology + 8-tunnel aggregate target + the carried Phase 0 gate; 50-segment v1 scale envelope; first-match-wins policy semantics made normative; all blocking open questions (1, 4, 5, 6, 9) marked resolved from the design.</li>
+          <li><b>v0.4:</b> project model rewritten to the three-commitment form (no feature gating, no rug pull, hosted offerings are downstream consumers) in both PRD &sect;2 and the README &mdash; opening the door to a future maintainer-operated <em>single-tenant</em> hosted controller (new P2 item, zero code divergence as a hard constraint) without ever needing to walk back a "never".</li>
+          <li>README architecture diagram converted from ASCII to Mermaid (parse-validated against mermaid 9 and 10); this tracker updated with the new Cycle 3/4 gates below.</li>
+        </ul>
+      </div>
       <div class="entry">
         <div class="date">2026-07-17</div>
         <h4>Cycle 2 merged to <code>main</code> &mdash; review fixes, CI green, local cleanup</h4>
