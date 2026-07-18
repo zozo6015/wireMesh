@@ -28,6 +28,9 @@ wiremesh-enforcer-common = { path = "../wiremesh-enforcer-ebpf/common", features
 # `ensure_bpffs` (graduated verbatim from `spike/enforcer/enforcer/src/main.rs:49`):
 # `libc::statfs`/`libc::mount` to detect/mount bpffs at `/sys/fs/bpf`.
 libc = "0.2"
+# (Task 12) `NftEnforcer::counters`/`apply`'s offset accumulator: parses
+# `nft -j list counters table ip wiremesh_<iface>`'s JSON output.
+serde_json = { workspace = true }
 
 [build-dependencies]
 # `build.rs`: `aya_build::build_ebpf` via `cargo_metadata` pointed at the

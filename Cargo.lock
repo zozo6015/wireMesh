@@ -2124,6 +2124,7 @@ dependencies = [
  "cargo_metadata",
  "ipnet",
  "libc",
+ "serde_json",
  "wiremesh-enforcer-common",
  "wiremesh-policy",
  "wiremesh-testkit",

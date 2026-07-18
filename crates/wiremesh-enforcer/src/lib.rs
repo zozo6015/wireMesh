@@ -110,40 +110,49 @@ pub struct DenyEvent {
 /// if needed"). Returns whichever one actually succeeded, boxed behind the
 /// shared [`Enforcer`] trait.
 ///
-/// Task 7 (this task) implements the eBPF half only (`src/ebpf.rs`) — an
-/// eBPF load/attach failure is currently returned as-is (with added
-/// context), not silently swallowed into a fallback: the nftables backend
-/// doesn't exist yet. The nftables fallback (Task 12) will change this
-/// function's `Err` path into a second attempt instead of a final one; the
-/// signature (`Result<Box<dyn Enforcer>>`) already accommodates that
-/// without another breaking change.
+/// Task 12: the eBPF `Err` path (which Task 7 originally returned as-is, as
+/// a final answer — the nftables backend didn't exist yet) is now a second
+/// *attempt* rather than the end of the line: the eBPF failure's context is
+/// logged to stderr (so an operator/CI log can see WHY it fell back — a
+/// silent, undiagnosable fallback would be worse than the eBPF-only
+/// behavior it replaces) and [`probe_with`]'s `Nftables` arm is tried next.
+/// If nftables ALSO fails, that (not the original eBPF error) is what's
+/// returned — the caller only cares about the last, most-relevant failure
+/// once every backend has been tried.
 pub fn probe(iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforcer>> {
-    match ebpf::EbpfEnforcer::new(iface, cfg) {
-        Ok(enforcer) => Ok(Box::new(enforcer)),
-        Err(e) => Err(e.context(format!(
-            "eBPF backend failed to load/attach on {iface}; no nftables fallback available yet \
-             (design §6/D-C3-4 — that lands in Task 12)"
-        ))),
+    match probe_with(BackendKind::Ebpf, iface, cfg) {
+        Ok(enforcer) => Ok(enforcer),
+        Err(e) => {
+            eprintln!(
+                "wiremesh-enforcer: eBPF backend failed to load/attach on {iface} ({e:#}); \
+                 falling back to the nftables backend (design §6/D-C3-4)"
+            );
+            probe_with(BackendKind::Nftables, iface, cfg)
+        }
     }
 }
 
-/// Task 12, Step 1 (test author) scaffold: a forced-choice counterpart to
-/// [`probe`], used ONLY by `tests/nft_backend.rs` to drive the nftables
-/// backend deterministically without depending on `probe`'s real "eBPF
-/// attempt, then nftables fallback" branching (which Step 3, the
-/// implementer, still owns) or on any env var / knob to defeat eBPF's
-/// availability in the privileged dev container (where eBPF always
-/// succeeds). Per `.superpowers/sdd/task-12-brief.md`'s Interfaces section:
-/// "an env/knob-free forced choice for tests: `probe_with(BackendKind, ...)`".
+/// Forced-choice counterpart to [`probe`]: loads exactly the requested
+/// backend, with no eBPF-attempt-first fallback logic in the way. `probe`
+/// itself is expressed in terms of this function's two arms (see `probe`'s
+/// doc comment) — this is the one place either backend's constructor is
+/// actually invoked.
 ///
-/// `todo!()` body is allowed scaffold (not implementation) — Step 3 fills
-/// this in for real (`Ebpf => probe`'s existing eBPF-only path;
-/// `Nftables => NftEnforcer::new(iface, cfg)`, once that type exists) and
-/// most likely re-expresses `probe` itself in terms of this function's
-/// `Nftables` arm for its fallback branch. Every test in
-/// `tests/nft_backend.rs` calls `probe_with(BackendKind::Nftables, ..)`
-/// and panics here (RED) until then.
+/// Used directly by `tests/nft_backend.rs` to drive the nftables backend
+/// deterministically in the privileged dev container, where a plain
+/// `probe()` call would always pick `BackendKind::Ebpf` (eBPF always
+/// succeeds there) and never exercise the nftables path at all — per
+/// `.superpowers/sdd/task-12-brief.md`'s Interfaces section: "an env/knob-
+/// free forced choice for tests: `probe_with(BackendKind, ...)`".
 pub fn probe_with(kind: BackendKind, iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforcer>> {
-    let _ = (kind, iface, cfg);
-    todo!("Task 12 Step 3: BackendKind::Ebpf -> probe's existing path; BackendKind::Nftables -> NftEnforcer::new")
+    match kind {
+        BackendKind::Ebpf => {
+            let enforcer = ebpf::EbpfEnforcer::new(iface, cfg)?;
+            Ok(Box::new(enforcer))
+        }
+        BackendKind::Nftables => {
+            let enforcer = nft::NftEnforcer::new(iface, cfg)?;
+            Ok(Box::new(enforcer))
+        }
+    }
 }
