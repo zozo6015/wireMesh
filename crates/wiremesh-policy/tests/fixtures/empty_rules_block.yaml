@@ -1,0 +1,7 @@
+# Valid case (NOT an error): an empty `rules:` list in a block. A block of
+# zero rules just default-denies that (from, to) pair — this must parse
+# successfully.
+policy:
+  - from: seg-a
+    to: seg-b
+    rules: []

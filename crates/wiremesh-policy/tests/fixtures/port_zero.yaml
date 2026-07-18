@@ -1,0 +1,8 @@
+# Error class: port 0 (design §4 — malformed ports).
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+          ports: [0]

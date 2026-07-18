@@ -1,0 +1,9 @@
+# Error class: `ports` with `proto: icmp` (design §4 — `ports` requires an
+# explicit `proto: tcp|udp`; icmp doesn't have ports).
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: icmp
+          ports: [443]

@@ -1,0 +1,18 @@
+[package]
+name = "wiremesh-enforcer-common"
+version = "0.1.0"
+edition.workspace = true
+
+license.workspace = true
+
+[features]
+default = []
+# The `aya::Pod` unsafe impls below are only meaningful (and only compile)
+# on the userspace side — the eBPF `program` crate never enables this.
+user = ["aya"]
+
+[dependencies]
+aya = { workspace = true, optional = true }
+
+[lib]
+path = "src/lib.rs"

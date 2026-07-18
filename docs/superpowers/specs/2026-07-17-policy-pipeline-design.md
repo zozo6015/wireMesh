@@ -29,6 +29,23 @@ rule), stateful replies in both directions, ICMP echo and embedded-error
 gap and live-flow survival, and per-`rule_id` counters that survive a policy
 update when the rule text is unchanged.
 
+**Ratified backend divergence (one-way UDP live-flow survival).** "Live-flow
+survival across a policy update" holds for both backends for any flow the
+backend can track statefully — all TCP flows and any bidirectional (replied)
+UDP/ICMP flow. It does **not** hold identically for a purely *one-way* UDP
+flow (sender never receives a reply): the eBPF backend's `FLOWS` map fast-paths
+it and it survives a rule-removing update until `flush_flows`, whereas the
+nftables backend relies on conntrack, which never promotes an unreplied UDP
+flow past `ct state new`, so such a flow is re-evaluated against the live
+ruleset on every packet and is dropped as soon as its rule is removed. This is
+an accepted, documented limitation of the nftables *fallback* backend (owner
+decision, 2026-07-18): the naive fix (`ct state new` in the accept line) is
+rejected because it would let every not-yet-established flow bypass rule
+evaluation, breaking the "new connections follow new policy" guarantee. The
+conformance suite (§8) encodes this as its single sanctioned per-backend
+expectation; every other scenario proves identical behavior. Full analysis:
+`docs/research/cycle3-policy-notes.md` ("Task 13").
+
 **Out of scope (cycle 4):** the real `wiremesh-gateway` binary and its Sync
 client (the conformance suite drives the enforcer library directly); relay and
 transport; CLI wiring of `fabricctl gateway flush-flows` (the library exposes
@@ -198,7 +215,11 @@ for observability (`fabricctl`, logs) but backends key only off CIDRs.
   embedded-error (PMTUD) forward and reverse, policy flip under live iperf/UDP
   flood (no gap: zero spurious verdicts during flip), live-flow survival across
   update + `flush_flows` forcing re-evaluation, counter stability across
-  versions, rate-cap behavior, LRU-eviction metric visibility.
+  versions, rate-cap behavior, LRU-eviction metric visibility. Every scenario
+  asserts identical behavior on both backends except the single ratified
+  one-way-UDP divergence (§1): that scenario's mid-step carries a per-backend
+  expectation (eBPF survives, nftables re-evaluates), the suite's only
+  sanctioned backend-conditional assertion.
 - **Controller integration** (`wiremesh-controller` tests): `apply -f` with a
   real policy → stub gateway receives IR bytes + version over Sync; CIDR add →
   new version fans out; compile error → nothing stored, error names the rule.

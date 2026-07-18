@@ -1,0 +1,8 @@
+# Error class: port > 65535 (design §4 — malformed ports).
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+          ports: [70000]

@@ -1,0 +1,10 @@
+# Same as rule_id_stable_base.yaml except the *second* rule's port changes
+# (5432 -> 5433) — an edit unrelated to the first (deny ports 22) rule.
+# rule_id for block[0].rules[0] must be unchanged; rule_id for
+# block[0].rules[1] must differ.
+policy:
+  - from: proxmox-lab
+    to: aws-prod
+    rules:
+      - deny:  { ports: [22], proto: tcp }
+      - allow: { dst: 172.16.1.50/32, ports: [5433], proto: tcp }

@@ -1,0 +1,12 @@
+# Error class: `proto` is an unrecognized value (design §4: valid values are
+# tcp | udp | icmp | absent). Deliberately has NO `ports:` — Task 1's
+# validate.rs only checked `proto` inside the ports-present branch, so an
+# invalid proto with no ports slipped through parse_policy and only blew up
+# later, in compile()'s unreachable!(). This must be rejected unconditionally
+# by parse_policy, regardless of whether `ports` is present.
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: sctp

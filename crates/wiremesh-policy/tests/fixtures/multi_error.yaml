@@ -1,0 +1,26 @@
+# Multi-error collection: 3 independent errors across 3 distinct blocks,
+# each block a distinct (from, to) pair so none of them trip the
+# duplicate-block-pair check. All 3 must come back from a single
+# parse_policy call:
+#   block 0: unknown segment ("seg-nonexistent") in `to`
+#   block 1 rule 0: port 0
+#   block 2 rule 0: ports with proto: icmp
+policy:
+  - from: seg-a
+    to: seg-nonexistent
+    rules:
+      - allow:
+          proto: tcp
+          ports: [443]
+  - from: seg-b
+    to: seg-a
+    rules:
+      - allow:
+          proto: tcp
+          ports: [0]
+  - from: seg-a
+    to: seg-c
+    rules:
+      - allow:
+          proto: icmp
+          ports: [443]

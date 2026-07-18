@@ -1,0 +1,13 @@
+# Error class: a rule with both `allow:` and `deny:` keys (same class as
+# rule_missing_action.yaml — "exactly one of allow/deny" — covering the
+# other half of the "(or both)" case from the Task 1 brief).
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+          ports: [443]
+        deny:
+          proto: tcp
+          ports: [80]

@@ -23,11 +23,11 @@ use wiremesh_proto::v1::{
     ApplyDiff, ApplyRequest, AuditEntry, AuditQueryRequest, AuditQueryResponse,
     CreateSegmentRequest, DebugKeyStatesRequest, DebugKeyStatesResponse, DeleteSegmentRequest,
     DeleteSegmentResponse, DrainRequest, DrainResponse, GatewayInfo, GatewayKeyState,
-    ListGatewaysRequest, ListGatewaysResponse, ListRelaysRequest, ListRelaysResponse,
-    ListSegmentsRequest, ListSegmentsResponse, MintApiTokenRequest, MintApiTokenResponse,
-    MintTokenRequest, MintTokenResponse, RegisterRelayRequest, Relay, RevokeApiTokenRequest,
-    RevokeApiTokenResponse, RevokeCertRequest, RevokeCertResponse, RotateKeyRequest,
-    RotateKeyResponse, Segment,
+    GetPolicyRequest, ListGatewaysRequest, ListGatewaysResponse, ListRelaysRequest,
+    ListRelaysResponse, ListSegmentsRequest, ListSegmentsResponse, MintApiTokenRequest,
+    MintApiTokenResponse, MintTokenRequest, MintTokenResponse, PolicyVersionMsg,
+    RegisterRelayRequest, Relay, RevokeApiTokenRequest, RevokeApiTokenResponse, RevokeCertRequest,
+    RevokeCertResponse, RotateKeyRequest, RotateKeyResponse, Segment,
 };
 
 use crate::db_async::DbHandle;
@@ -124,14 +124,25 @@ impl Admin for AdminSvc {
             return Err(Status::invalid_argument("segment name must not be empty"));
         }
 
+        // (Task 5 review finding) `.trunc()` normalizes each declared CIDR to
+        // its network address (host bits zeroed) at THIS parse boundary — so
+        // a caller declaring `172.16.5.9/12` (a host address within, but not
+        // the canonical form of, that /12) stores and compares as
+        // `172.16.0.0/12`, never the non-canonical string. See
+        // `Db::apply_fabric`'s doc comment for why this matters for the
+        // CIDR-update no-op contract; `CreateSegment` gets the same
+        // treatment for consistency (a segment's stored CIDRs are always
+        // canonical, regardless of which RPC created/updated them).
         let cidrs: Vec<Ipv4Net> = req
             .cidrs
             .iter()
             .map(|c| {
                 Ipv4Net::from_str(c)
+                    .map(|net| net.trunc())
                     .map_err(|e| Status::invalid_argument(format!("invalid IPv4 CIDR {c:?}: {e}")))
             })
             .collect::<Result<_, _>>()?;
+        let cidr_strs: Vec<String> = cidrs.iter().map(|c| c.to_string()).collect();
 
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -155,7 +166,11 @@ impl Admin for AdminSvc {
         Ok(Response::new(Segment {
             id: segment_id as u64,
             name: req.name,
-            cidrs: req.cidrs,
+            // Echoes the NORMALIZED (canonical, `.trunc()`'d) form — the
+            // exact strings now stored — not `req.cidrs` verbatim, so a
+            // caller that declared host bits sees back what's actually
+            // persisted.
+            cidrs: cidr_strs,
         }))
     }
 
@@ -707,13 +722,29 @@ impl Admin for AdminSvc {
         Ok(Response::new(RevokeCertResponse {}))
     }
 
-    /// (Task 14) Declarative `fabricctl apply -f fabric.yaml`: parses the
+    /// (Task 14; cycle-3 Task 4 wires real DSL compilation + live fan-out
+    /// behind it; Task 5 adds segment CIDR-update diffing + its own live
+    /// fan-out) Declarative `fabricctl apply -f fabric.yaml`: parses the
     /// YAML (`crate::apply::parse_fabric`), validates every segment's CIDRs
     /// as IPv4 (mirrors `create_segment`), and hands the whole thing to
-    /// [`crate::db_async::DbHandle::apply_fabric`] to diff-and-apply in one
-    /// transaction. See that method's doc comment for the idempotence
-    /// contract this RPC is entirely riding on: a second, identical apply
-    /// must come back with every `ApplyDiff` field zero/false.
+    /// [`crate::db_async::DbHandle::apply_fabric`] to diff-and-apply
+    /// (segments — create OR CIDR-replace — THEN policy compile/versioning)
+    /// in one transaction. See that method's doc comment for the idempotence
+    /// contract this RPC is entirely riding on: a second, identical (or
+    /// merely fingerprint-identical) apply must come back with every
+    /// `ApplyDiff` field zero/false. A compile error surfaces as
+    /// `Status::internal` (mirroring every other `apply_fabric` error)
+    /// naming the offending segment/rule — nothing is stored in that case
+    /// (segments AND policy both rolled back together). For every segment
+    /// whose CIDRs were just replaced, looks up its enrolled gateway (if
+    /// any) and publishes a [`ChangeEvent::SegmentCidrsChanged`] for it.
+    /// When the apply DID mint a new policy version (which a CIDR change
+    /// alone can trigger — see `apply_fabric`'s doc comment), re-reads it and
+    /// the post-commit revision to publish a [`ChangeEvent::PolicyUpdated`]
+    /// — same "mutate durably first, then notify" order
+    /// `RotateKey`/`Drain`/`RevokeCert` use — so every ALREADY-connected
+    /// gateway's open `Sync.Watch` stream gets the new IR / CIDR refresh
+    /// without waiting for a reconnect.
     async fn apply(&self, request: Request<ApplyRequest>) -> Result<Response<ApplyDiff>, Status> {
         let actor = actor_of(&request);
         let req = request.into_inner();
@@ -723,16 +754,28 @@ impl Admin for AdminSvc {
 
         let mut segments = Vec::with_capacity(spec.segments.len());
         for s in &spec.segments {
+            // (Task 5 review finding) `.trunc()` here — same as
+            // `CreateSegment` — is what makes `Db::apply_fabric`'s declared-
+            // vs-stored CIDR set comparison and storage both canonical: a
+            // fabric.yaml re-declaring a segment's CIDR with host bits set
+            // (e.g. `172.16.5.9/12` restating the already-stored
+            // `172.16.0.0/12`) must diff as identical, not as a spurious
+            // change, and the `cidr` row must never end up holding the
+            // non-canonical string. Without this, `apply_fabric`'s
+            // `BTreeSet<Ipv4Net>` compare treats the raw address bits as
+            // significant and wrongly sees two different values.
             let cidrs: Vec<Ipv4Net> = s
                 .cidrs
                 .iter()
                 .map(|c| {
-                    Ipv4Net::from_str(c).map_err(|e| {
-                        Status::invalid_argument(format!(
-                            "invalid IPv4 CIDR {c:?} in segment {:?}: {e}",
-                            s.name
-                        ))
-                    })
+                    Ipv4Net::from_str(c)
+                        .map(|net| net.trunc())
+                        .map_err(|e| {
+                            Status::invalid_argument(format!(
+                                "invalid IPv4 CIDR {c:?} in segment {:?}: {e}",
+                                s.name
+                            ))
+                        })
                 })
                 .collect::<Result<_, _>>()?;
             segments.push((s.name.clone(), cidrs));
@@ -750,6 +793,88 @@ impl Admin for AdminSvc {
             .await
             .map_err(|e| Status::internal(format!("applying fabric: {e}")))?;
 
+        // (Task 5) For every segment whose CIDR set was just replaced, look
+        // up whether it has an enrolled gateway (a CIDR change on a segment
+        // with no gateway yet has nobody to notify) and, if so, publish a
+        // `SegmentCidrsChanged` event with its FULL current key set — same
+        // "mutate durably first, then notify" order every other publish in
+        // this handler/module uses.
+        for (segment_id, segment_name, allowed_ips) in &outcome.changed_segment_cidrs {
+            if let Some(gateway_id) = self
+                .db
+                .active_gateway_for_segment(*segment_id)
+                .await
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "looking up gateway for CIDR-changed segment {segment_id}: {e}"
+                    ))
+                })?
+            {
+                let keys = self.db.all_keys_for_gateway(gateway_id).await.map_err(|e| {
+                    Status::internal(format!(
+                        "reading gateway keys after CIDR change: {e}"
+                    ))
+                })?;
+                // (Review finding) Same lookup `build_snapshot`/
+                // `routes::peers_of` use for a peer's `candidate_endpoints` —
+                // without it this delta would erase an already-known
+                // endpoint from every open `Sync.Watch` stream's view of
+                // this peer.
+                let candidate_endpoint = self
+                    .db
+                    .candidate_endpoint_for_gateway(gateway_id)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!(
+                            "reading candidate endpoint after CIDR change: {e}"
+                        ))
+                    })?;
+                let revision = self.db.current_revision().await.map_err(|e| {
+                    Status::internal(format!("reading revision after CIDR change: {e}"))
+                })?;
+                // `send` errors only when there are currently no `Sync.Watch`
+                // subscribers — nobody to notify, which is not a failure
+                // (mirrors `RotateKey`/`Drain`/`RevokeCert`'s identical
+                // `let _ =`).
+                let _ = self.change_tx.send(ChangeEvent::SegmentCidrsChanged {
+                    gateway_id,
+                    segment_name: segment_name.clone(),
+                    allowed_ips: allowed_ips.clone(),
+                    keys,
+                    candidate_endpoint,
+                    revision,
+                });
+            }
+        }
+
+        if outcome.policy_updated {
+            // Re-read rather than thread the freshly-compiled IR back out of
+            // `apply_fabric`: `Db::latest_policy` is the single "what's the
+            // current policy" read path every other caller (`build_snapshot`,
+            // a restarted controller) also uses, so this broadcasts exactly
+            // the same bytes a reconnecting gateway would see — no separate
+            // code path that could drift from it.
+            if let Some((version, compiled_ir_json)) = self
+                .db
+                .latest_policy()
+                .await
+                .map_err(|e| Status::internal(format!("reading latest policy after apply: {e}")))?
+            {
+                let revision = self.db.current_revision().await.map_err(|e| {
+                    Status::internal(format!("reading revision after policy apply: {e}"))
+                })?;
+                // `send` errors only when there are currently no `Sync.Watch`
+                // subscribers — nobody to notify, which is not a failure
+                // (mirrors `RotateKey`/`Drain`/`RevokeCert`'s identical
+                // `let _ =`).
+                let _ = self.change_tx.send(ChangeEvent::PolicyUpdated {
+                    version,
+                    ir: compiled_ir_json.into_bytes(),
+                    revision,
+                });
+            }
+        }
+
         let total_changes = outcome.created_segments
             + outcome.updated_segments
             + outcome.deleted_segments
@@ -761,6 +886,49 @@ impl Admin for AdminSvc {
             deleted_segments: outcome.deleted_segments,
             policy_updated: outcome.policy_updated,
             total_changes,
+        }))
+    }
+
+    /// (Task 6) A specific compiled policy version's full record — backs
+    /// `fabricctl policy show`/`status`. `version: 0` means "latest"
+    /// ([`GetPolicyRequest`]'s documented wire contract); any other value is
+    /// looked up exactly. `NotFound` when no policy has ever been applied
+    /// (`version: 0` with an empty `policy_version` table) OR the requested
+    /// version number was never compiled — [`crate::db::Db::policy_version`]
+    /// collapses both into the same `Ok(None)`, which becomes `NotFound`
+    /// here, matching `tests/get_policy.rs`'s
+    /// `get_policy_unknown_version_is_not_found`. Read-only (listed in
+    /// `crate::auth::READONLY_METHODS`, same tier as `ListSegments`): this
+    /// never mutates anything, so no audit row is appended (consistent with
+    /// every other list/read RPC in this file).
+    async fn get_policy(
+        &self,
+        request: Request<GetPolicyRequest>,
+    ) -> Result<Response<PolicyVersionMsg>, Status> {
+        let req = request.into_inner();
+        let version = (req.version != 0).then_some(req.version);
+
+        let row = self
+            .db
+            .policy_version(version)
+            .await
+            .map_err(|e| Status::internal(format!("reading policy version: {e}")))?
+            .ok_or_else(|| {
+                Status::not_found(match version {
+                    Some(v) => format!("no policy_version row for version {v}"),
+                    None => "no policy has ever been applied".to_string(),
+                })
+            })?;
+
+        Ok(Response::new(PolicyVersionMsg {
+            version: row.version,
+            source_yaml: row.source_yaml,
+            // Stored `compiled_ir` is canonical-JSON TEXT (never binary) —
+            // its bytes verbatim, same discipline `Apply`'s
+            // `ChangeEvent::PolicyUpdated` uses (`compiled_ir_json.into_bytes()`).
+            compiled_ir: row.compiled_ir.into_bytes(),
+            created_by: row.created_by,
+            created_at: row.created_at,
         }))
     }
 }

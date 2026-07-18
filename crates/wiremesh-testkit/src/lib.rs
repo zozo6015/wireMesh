@@ -12,6 +12,23 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+/// Privileged Linux network-namespace test harness (`Lab`/`Ns`/`wg_lab`/
+/// `join_netns`) — graduated (Task 12) from `spike/natlab` and the
+/// `wiremesh-enforcer` test suite's duplicated netns lab helpers. Feature-
+/// gated (see this crate's `Cargo.toml`) so the userspace `TestController`/
+/// `StubGateway` surface above never pulls it in.
+#[cfg(feature = "netns")]
+pub mod netns;
+
+/// Backend-parity conformance scenario runner (Task 13; design D-C3-7) —
+/// `Scenario`/`Step`/`run_scenario` drive ONE scenario table against
+/// EITHER backend (`wiremesh_enforcer::BackendKind`) in an identical netns
+/// topology built on top of [`netns::wg_lab`]. Feature-gated alongside
+/// `netns` (see this crate's `Cargo.toml`) since it's built directly on
+/// that module plus `wiremesh-policy`/`wiremesh-enforcer`.
+#[cfg(feature = "netns")]
+pub mod conformance;
+
 use hyper_util::rt::TokioIo;
 use rand::RngCore;
 use tempfile::TempDir;

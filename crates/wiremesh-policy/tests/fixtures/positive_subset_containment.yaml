@@ -1,0 +1,14 @@
+# Valid case (NOT an error): src/dst CIDRs strictly contained within their
+# segment's CIDR (the positive path of the subset-containment check, which
+# every other fixture omits or violates on purpose). List form.
+#   src 10.0.5.0/24    is inside seg-a's    10.0.0.0/16
+#   dst 172.16.1.50/32 is inside seg-wide's 172.16.0.0/12
+policy:
+  - from: seg-a
+    to: seg-wide
+    rules:
+      - allow:
+          src: ["10.0.5.0/24"]
+          dst: ["172.16.1.50/32"]
+          proto: tcp
+          ports: [443]

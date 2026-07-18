@@ -1,0 +1,15 @@
+# Companion to invalid_proto_no_ports.yaml: every *valid* proto value,
+# including omitted, still parses fine with no `ports:` present. Guards
+# against a fix for the invalid-proto gap overcorrecting into rejecting
+# tcp/udp/icmp/absent too.
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          proto: tcp
+      - allow:
+          proto: udp
+      - allow:
+          proto: icmp
+      - allow: {}

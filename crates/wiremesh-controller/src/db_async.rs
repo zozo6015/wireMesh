@@ -12,7 +12,7 @@ use ipnet::Ipv4Net;
 use crate::db::Db;
 pub use crate::db::{
     ApplyOutcome, DrainOutcome, EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow,
-    GatewayRow, RotateKeyOutcome,
+    GatewayRow, PolicyVersionRow, RotateKeyOutcome,
 };
 
 /// Cheaply cloneable async handle to a [`Db`]. `Db` already serializes access
@@ -139,6 +139,12 @@ impl DbHandle {
     pub async fn cidrs_for_segment(&self, segment_id: i64) -> Result<Vec<String>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.cidrs_for_segment(segment_id)).await?
+    }
+
+    /// See [`Db::active_gateway_for_segment`].
+    pub async fn active_gateway_for_segment(&self, segment_id: i64) -> Result<Option<i64>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.active_gateway_for_segment(segment_id)).await?
     }
 
     /// See [`Db::active_keys_for_gateway`].
@@ -334,6 +340,15 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.gateway_observe_key(gateway_id)).await?
     }
 
+    /// See [`Db::candidate_endpoint_for_gateway`].
+    pub async fn candidate_endpoint_for_gateway(
+        &self,
+        gateway_id: i64,
+    ) -> Result<Option<String>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.candidate_endpoint_for_gateway(gateway_id)).await?
+    }
+
     /// See [`Db::set_candidate_endpoint`].
     pub async fn set_candidate_endpoint(
         &self,
@@ -357,5 +372,17 @@ impl DbHandle {
             db.apply_fabric(&segments, policy_yaml.as_deref(), &actor, &now)
         })
         .await?
+    }
+
+    /// See [`Db::latest_policy`].
+    pub async fn latest_policy(&self) -> Result<Option<(u64, String)>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.latest_policy()).await?
+    }
+
+    /// See [`Db::policy_version`]. Backs `Admin.GetPolicy`.
+    pub async fn policy_version(&self, version: Option<u64>) -> Result<Option<PolicyVersionRow>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.policy_version(version)).await?
     }
 }

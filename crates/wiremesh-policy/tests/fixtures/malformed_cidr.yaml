@@ -1,0 +1,10 @@
+# Error class: malformed CIDR (design §4). /40 isn't a valid IPv4 prefix
+# length (max 32).
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow:
+          src: ["10.0.0.0/40"]
+          proto: tcp
+          ports: [443]

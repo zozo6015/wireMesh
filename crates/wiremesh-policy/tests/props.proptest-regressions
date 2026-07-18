@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc e17d5fd6b2b25fbceabb6f1b2cc306fe1b7ce42b49afbcd202471928e8267a70 # shrinks to policy = GenPolicy { segments: [GenSegment { name: "seg0", cidrs: ["10.0.0.0/24"] }], blocks: [GenBlock { from_idx: 0, to_idx: 0, rules: [] }] }

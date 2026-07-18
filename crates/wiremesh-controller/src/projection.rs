@@ -3,10 +3,14 @@
 //! off the DB (`db_async::DbHandle`) plus whatever the mTLS layer already
 //! resolved about the caller (its own identity and cert).
 //!
-//! Cycle-2 scope, per the engineering design's amendments: `policy_ir` is
-//! always an empty v0 IR (`policy_version = 0`) — the policy pipeline is a
-//! later task — and `relays` is always empty (relay support is later too).
-//! `revision` is the persisted `state_revision` counter
+//! `policy_ir`/`policy_version` are sourced from
+//! [`crate::db::Db::latest_policy`] (cycle-3 Task 4): the exact
+//! canonical-JSON bytes `Db::apply_fabric` compiled and stored at apply
+//! time, served VERBATIM — this module never recompiles, so a snapshot can
+//! never drift from what was actually validated and versioned. Still
+//! empty/`0` on a fresh controller that has never had a policy applied.
+//! `relays` is always empty (relay support is a later task). `revision` is
+//! the persisted `state_revision` counter
 //! ([`crate::db::Db::current_revision`]) — a value that survives a
 //! controller restart, so a reconnecting gateway never sees the revision go
 //! backwards (which would break T8 delta comparison / T9 fail-static
@@ -26,8 +30,7 @@ use crate::routes;
 /// and re-fetch a full snapshot.
 ///
 /// Cycle-2 scope: `GatewayEnrolled` (Task 8) and `KeyRotated` (Task 11).
-/// Segment CIDR changes and revocation are later tasks' events, added as
-/// further variants once they exist.
+/// Cycle-3 adds `PolicyUpdated` (Task 4) and `SegmentCidrsChanged` (Task 5).
 #[derive(Clone, Debug)]
 pub enum ChangeEvent {
     /// A new gateway enrolled — a full-mesh peer every OTHER
@@ -100,6 +103,40 @@ pub enum ChangeEvent {
     /// snapshot to see it denylisted, mirroring `GatewayDrained`'s identical
     /// push.
     CertRevoked { serial: String, revision: u64 },
+    /// (Cycle-3 Task 4) `Admin.Apply` compiled and stored a genuinely NEW
+    /// policy version (design D-C3-8: fingerprint-based, not every apply
+    /// that merely re-submits an unchanged policy) — every ALREADY-connected
+    /// gateway must learn the new IR, not just gateways that connect after
+    /// the fact (those get it via `build_snapshot`). `ir` is the exact
+    /// canonical-JSON bytes stored in `policy_version.compiled_ir`.
+    PolicyUpdated { version: u64, ir: Vec<u8>, revision: u64 },
+    /// (Cycle-3 Task 5) `Admin.Apply` REPLACED an existing segment's `cidr`
+    /// rows (its declared CIDR set changed) — every OTHER already-connected
+    /// gateway's peer view of `gateway_id` (the segment's own enrolled
+    /// gateway) must be upserted with its FULL current state (keys +
+    /// GROWN/SHRUNK `allowed_ips` + its current candidate endpoint, if any),
+    /// mirroring [`ChangeEvent::KeyRotated`]'s full-peer-refresh pattern — an
+    /// open `Sync.Watch` stream stays consistent with what a fresh snapshot
+    /// would show without waiting for a reconnect. Only published for a
+    /// segment that actually has an enrolled gateway
+    /// (`Db::active_gateway_for_segment` returned `Some`) — a CIDR change on
+    /// a segment with no gateway yet has no peer to upsert.
+    SegmentCidrsChanged {
+        gateway_id: i64,
+        segment_name: String,
+        allowed_ips: Vec<String>,
+        /// `(epoch, pubkey, state)` for every `gateway_key` row of
+        /// `gateway_id`, straight off [`crate::db::Db::all_keys_for_gateway`]
+        /// — same full-key-set rationale as `KeyRotated`.
+        keys: Vec<(i64, String, String)>,
+        /// `gateway_id`'s most recently observed candidate endpoint, if the
+        /// controller's UDP observation endpoint has ever recorded one for
+        /// it (same lookup `build_snapshot`/`routes::peers_of` use) — a CIDR
+        /// refresh must not erase a known endpoint from an already-open
+        /// `Sync.Watch` stream's view of this peer.
+        candidate_endpoint: Option<String>,
+        revision: u64,
+    },
 }
 
 impl ChangeEvent {
@@ -123,6 +160,13 @@ impl ChangeEvent {
             // connected gateway, including the one whose own cert was just
             // revoked, is meant to learn about a revocation.
             ChangeEvent::CertRevoked { .. } => 0,
+            // Not "about" any single gateway either — every connected
+            // gateway (this task's `already_connected_gateway_receives_
+            // policy_delta_on_live_apply` test included) must receive a
+            // newly compiled policy, mirroring `CertRevoked`'s rationale
+            // above.
+            ChangeEvent::PolicyUpdated { .. } => 0,
+            ChangeEvent::SegmentCidrsChanged { gateway_id, .. } => *gateway_id,
         }
     }
 }
@@ -241,6 +285,46 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             policy_version: 0,
             revoked_serials: vec![serial],
         },
+        ChangeEvent::PolicyUpdated { version, ir, revision } => Delta {
+            revision,
+            // No peer/revocation change — only the policy fields carry
+            // anything, per this variant's doc comment.
+            upserted_peers: Vec::new(),
+            removed_peer_ids: Vec::new(),
+            relays: Vec::new(),
+            policy_ir: ir,
+            policy_version: version,
+            revoked_serials: Vec::new(),
+        },
+        ChangeEvent::SegmentCidrsChanged {
+            gateway_id,
+            segment_name,
+            allowed_ips,
+            keys,
+            candidate_endpoint,
+            revision,
+        } => Delta {
+            revision,
+            upserted_peers: vec![Peer {
+                gateway_id: gateway_id as u64,
+                segment_name,
+                keys: keys
+                    .into_iter()
+                    .map(|(epoch, pubkey, state)| PeerKey {
+                        epoch: epoch as u32,
+                        pubkey,
+                        state,
+                    })
+                    .collect(),
+                candidate_endpoints: candidate_endpoint.into_iter().collect(),
+                allowed_ips,
+            }],
+            removed_peer_ids: Vec::new(),
+            relays: Vec::new(),
+            policy_ir: Vec::new(),
+            policy_version: 0,
+            revoked_serials: Vec::new(),
+        },
     }
 }
 
@@ -286,16 +370,23 @@ pub async fn build_snapshot(
 
     let revoked_serials = db.revoked_serials().await?;
 
+    // (Cycle-3 Task 4) The latest compiled policy's exact stored bytes —
+    // never recompiled here (see this module's doc comment). `None` (fresh
+    // controller, no policy ever applied) maps to the same empty/`0`
+    // placeholder cycle-2 always sent.
+    let (policy_version, policy_ir) = match db.latest_policy().await? {
+        Some((version, compiled_ir_json)) => (version, compiled_ir_json.into_bytes()),
+        None => (0, Vec::new()),
+    };
+
     Ok(StateSnapshot {
         revision,
         self_cert_pem,
         peers,
         // Relay support is a later task — cycle-2 ships a direct-only mesh.
         relays: Vec::new(),
-        // Empty v0 policy IR (engineering design §11): the policy pipeline
-        // compiles real IR starting in a later task.
-        policy_ir: Vec::new(),
-        policy_version: 0,
+        policy_ir,
+        policy_version,
         revoked_serials,
     })
 }

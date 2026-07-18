@@ -1,0 +1,10 @@
+# The worked example from the master spec §5.1 (DSL) / the policy-pipeline
+# design doc §5 (concretized IR): a single (proxmox-lab -> aws-prod) block
+# with a deny carve-out ahead of two allow rules, first-match-wins.
+policy:
+  - from: proxmox-lab
+    to: aws-prod
+    rules:
+      - deny:  { ports: [22], proto: tcp }
+      - allow: { dst: 172.16.1.50/32, ports: [5432], proto: tcp }
+      - allow: { dst: 172.16.2.0/24, ports: [443, "8000-8080"], proto: tcp }

@@ -1,0 +1,8 @@
+# Baseline for the rule_id-stability test: two rules in one block. Compare
+# against rule_id_stable_changed.yaml, which edits only the second rule.
+policy:
+  - from: proxmox-lab
+    to: aws-prod
+    rules:
+      - deny:  { ports: [22], proto: tcp }
+      - allow: { dst: 172.16.1.50/32, ports: [5432], proto: tcp }

@@ -1,0 +1,68 @@
+[package]
+name = "wiremesh-enforcer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# `flatten()`'s input (`PolicyIR`) and the `Enforcer::apply` trait method's
+# argument (Task 7 brief) are both `wiremesh_policy::PolicyIR`.
+wiremesh-policy = { path = "../wiremesh-policy" }
+# `Enforcer` trait methods, `probe`, and `flatten` all return
+# `anyhow::Result` (Task 7 brief's exact `Interfaces` snippet).
+anyhow = { workspace = true }
+# `FlatRule::src_cidrs`/`dst_cidrs` are `Vec<ipnet::Ipv4Net>` (Task 7 brief;
+# v1 is IPv4-only per design §4, same crate `wiremesh-policy` already uses).
+ipnet = { workspace = true }
+# `src/ebpf.rs`'s loader: `Ebpf::load`, `tc::qdisc_add_clsact`,
+# `SchedClassifier`/`TcAttachType`, `Array`/`MapData` -- graduated from
+# `spike/enforcer/enforcer/src/main.rs`. Pinned to the same version as the
+# sibling `wiremesh-enforcer-ebpf` workspace's `aya` (not workspace-inherited
+# from the ROOT workspace's `[workspace.dependencies]`, which has no `aya`
+# entry -- only this one crate needs it).
+aya = { version = "0.14.0", default-features = false }
+# `Rule`/`FlowKey` (the `#[repr(C)]` map value types shared with the eBPF
+# `program` crate) plus their `aya::Pod` impls, gated behind the `user`
+# feature (mirrors `spike/enforcer/enforcer/Cargo.toml`'s identical
+# `enforcer-common = { ..., features = ["user"] }`).
+wiremesh-enforcer-common = { path = "../wiremesh-enforcer-ebpf/common", features = ["user"] }
+# `ensure_bpffs` (graduated verbatim from `spike/enforcer/enforcer/src/main.rs:49`):
+# `libc::statfs`/`libc::mount` to detect/mount bpffs at `/sys/fs/bpf`.
+libc = "0.2"
+# (Task 12) `NftEnforcer::counters`/`apply`'s offset accumulator: parses
+# `nft -j list counters table ip wiremesh_<iface>`'s JSON output.
+serde_json = { workspace = true }
+
+[build-dependencies]
+# `build.rs`: `aya_build::build_ebpf` via `cargo_metadata` pointed at the
+# sibling standalone `wiremesh-enforcer-ebpf` workspace's `program` package
+# (Task 7 brief). Deliberately NOT also a path build-dependency the way
+# `spike/enforcer/enforcer/Cargo.toml`'s `enforcer-ebpf = { path = ... }`
+# is: that crate lived in the SAME workspace as its depender, so declaring
+# it taught cargo's single resolve graph about it. Here, `program` is a
+# member of the SIBLING standalone workspace's OWN `[workspace]` -- `cargo`
+# does not let one workspace pull a package governed by another workspace's
+# `[workspace]` into its own resolve graph as an ordinary dependency (unlike
+# `natlab`, below, which has no `[workspace]` of its own and so is fair game
+# for exactly that). `build.rs` instead changes its own cwd into the sibling
+# workspace's root before invoking `aya_build::build_ebpf`, so its nested
+# `cargo build -p wiremesh-enforcer-program` subprocess resolves the package
+# name (and that workspace's own profile/dependency pins) directly, with no
+# outer dependency declaration needed; `aya_build` emits its own
+# `cargo:rerun-if-changed` for `program`'s directory regardless.
+anyhow = { workspace = true }
+aya-build = { version = "0.2.0", default-features = false }
+cargo_metadata = { version = "0.23.0", default-features = false }
+
+[dev-dependencies]
+# (Task 12) The graduated netns test harness (`Lab`/`Ns`/`wg_lab`/
+# `join_netns`) that `tests/{ebpf_backend,generations,flow_table,deny_events,
+# nft_backend}.rs` all drive — replaces the earlier per-file inline `mod lab`
+# copies (themselves adapted from `spike/enforcer/enforcer/tests/common/mod.rs`)
+# and the standalone `natlab` path dependency they used before graduation.
+# `default-features = false` + explicit `netns` feature: this crate only
+# needs the netns harness, never the userspace `TestController`/`StubGateway`
+# surface `wiremesh-testkit` also exposes (that surface has no
+# `wiremesh-enforcer` relevance and pulls in `wiremesh-controller`'s own
+# dependency tree regardless of which features are selected, since Cargo
+# always compiles a crate's non-optional dependencies).
+wiremesh-testkit = { path = "../wiremesh-testkit", default-features = false, features = ["netns"] }
