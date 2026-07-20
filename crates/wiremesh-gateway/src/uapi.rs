@@ -51,6 +51,16 @@ pub fn encode_set(cfg: &DeviceConfig) -> anyhow::Result<String> {
     Ok(s)
 }
 
+/// Derive the base64 WireGuard public key from a base64 private key.
+pub fn base64_pub_from_priv(priv_b64: &str) -> anyhow::Result<String> {
+    let raw = base64_decode(priv_b64)?;
+    let arr: [u8; 32] = raw.as_slice().try_into()
+        .map_err(|_| anyhow!("private key must be 32 bytes"))?;
+    let secret = boringtun::x25519::StaticSecret::from(arr);
+    let public = boringtun::x25519::PublicKey::from(&secret);
+    Ok(base64_encode(public.as_bytes()))
+}
+
 pub fn apply(ifname: &str, cfg: &DeviceConfig) -> anyhow::Result<()> {
     let path = format!("/var/run/wireguard/{ifname}.sock");
     let mut stream = UnixStream::connect(&path)

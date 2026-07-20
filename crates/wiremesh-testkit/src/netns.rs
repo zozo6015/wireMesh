@@ -321,3 +321,47 @@ pub fn join_netns(ns_name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Joins the calling OS thread to `ns`'s network namespace (as `join_netns`
+/// does) AND its private, persistent mount namespace (pinned at `Lab::ns`
+/// time — see `MOUNTNS_DIR`'s doc comment). `join_netns` alone is sufficient
+/// for every existing in-process caller because they either run a single
+/// enforcer instance per joined namespace (no same-named socket to collide
+/// with) or drive kernel WireGuard (`wg_lab`), which never touches
+/// `/var/run/wireguard` at all.
+///
+/// It is NOT sufficient for two *simultaneous, in-process* boringtun
+/// devices that share an interface name (e.g. two gateways each running
+/// `wg0`): boringtun's UAPI control socket is keyed by the fixed path
+/// `/var/run/wireguard/<ifname>.sock`, and plain `join_netns` only switches
+/// `CLONE_NEWNET` — the mount namespace (and therefore that path) stays the
+/// process's ambient one, so both devices would bind/connect to the exact
+/// same socket file and cross-configure each other. This function additionally
+/// `setns(CLONE_NEWNS)`s into `ns`'s pinned mount namespace, which has its
+/// own private tmpfs at `/var/run/wireguard`, giving each `Ns` a truly
+/// isolated boringtun UAPI socket — the in-process equivalent of what
+/// `Ns::exec`/`spawn`'s `nsenter --mount=...` already does for subprocesses.
+pub fn join_netns_and_mountns(ns: &Ns) -> Result<()> {
+    join_netns(&ns.name)?;
+    use std::os::unix::io::AsRawFd;
+    // setns(CLONE_NEWNS) refuses a thread whose fs_struct (root dir, cwd,
+    // umask) is still shared with sibling threads — true by default for any
+    // Rust thread spawned via std::thread::spawn, which clones with
+    // CLONE_FS like any other pthread (errno EINVAL; see `man 2 setns`).
+    // unshare(CLONE_FS) gives this thread its own private fs_struct first.
+    let rc = unsafe { libc::unshare(libc::CLONE_FS) };
+    if rc != 0 {
+        bail!("unshare(CLONE_FS) failed: {}", std::io::Error::last_os_error());
+    }
+    let file = std::fs::File::open(&ns.mountns)
+        .map_err(|e| anyhow::anyhow!("open {}: {e}", ns.mountns))?;
+    let rc = unsafe { libc::setns(file.as_raw_fd(), libc::CLONE_NEWNS) };
+    if rc != 0 {
+        bail!(
+            "setns({}, CLONE_NEWNS) failed: {}",
+            ns.mountns,
+            std::io::Error::last_os_error()
+        );
+    }
+    Ok(())
+}
