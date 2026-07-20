@@ -6,7 +6,19 @@ service Sync {
   rpc Report(ReportRequest) returns (ReportResponse);
 }
 message WatchRequest {}
-message SyncMessage { oneof body { StateSnapshot snapshot = 1; Delta delta = 2; } }
+message SyncMessage { oneof body { StateSnapshot snapshot = 1; Delta delta = 2; PunchDirective punch = 3; } }
+// Broker-issued NAT-traversal instruction: sent to one gateway of a pair,
+// carrying the *other* gateway's candidate set, so both sides can fire a
+// punch at (approximately) the same instant. Does not use the
+// subject_gateway_id() self-skip routing path — the broker addresses each
+// pair member's Watch stream explicitly (see cycle4b design doc §4).
+message PunchDirective {
+  uint64 peer_gateway_id = 1;      // the peer to punch toward
+  repeated string candidates = 2;  // that peer's candidate set (public + local)
+  uint64 go_unix_ms = 3;           // synchronized fire instant (best-effort corroboration
+                                    // of the broker's back-to-back sends, which are the
+                                    // primary go-skew guarantee)
+}
 message PeerKey { uint32 epoch = 1; string pubkey = 2; string state = 3; } // pending|active|retiring
 message Peer {
   uint64 gateway_id = 1;
@@ -25,5 +37,12 @@ message StateSnapshot {
   repeated string revoked_serials = 7;
 }
 message Delta { uint64 revision = 1; repeated Peer upserted_peers = 2; repeated uint64 removed_peer_ids = 3; repeated string relays = 4; bytes policy_ir = 5; uint64 policy_version = 6; repeated string revoked_serials = 7; }
-message ReportRequest { uint64 applied_version = 1; }
+message ReportRequest {
+  uint64 applied_version = 1;
+  repeated string local_endpoints = 2;  // gateway's own routable local ip:wg_port
+                                         // addresses, offered to the controller as
+                                         // local-source candidates for LAN/hairpin
+                                         // reachability. Additive field; empty = old
+                                         // (pre-4b) client behavior.
+}
 message ReportResponse {}

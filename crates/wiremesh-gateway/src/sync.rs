@@ -29,7 +29,13 @@ pub async fn watch(client: &mut SyncClient<Channel>) -> anyhow::Result<tonic::St
 }
 
 pub async fn report(client: &mut SyncClient<Channel>, applied_version: u64) -> anyhow::Result<()> {
-    client.report(ReportRequest { applied_version }).await.map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
+    // local_endpoints (cycle4b §5) is populated by a later task once the gateway
+    // enumerates its routable local addresses; empty vec is the documented
+    // additive-field default (equivalent to pre-4b client behavior).
+    client
+        .report(ReportRequest { applied_version, local_endpoints: vec![] })
+        .await
+        .map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
     Ok(())
 }
 
@@ -39,19 +45,27 @@ pub async fn next_desired(
     stream: &mut tonic::Streaming<SyncMessage>,
     current: &mut Option<DesiredState>,
 ) -> anyhow::Result<Option<DesiredState>> {
-    let Some(msg) = stream.next().await else { return Ok(None) };
-    let msg = msg.map_err(|s| anyhow!("Sync stream error: {s}"))?;
-    match msg.body {
-        Some(Body::Snapshot(s)) => {
-            let ds = DesiredState::from_snapshot(&s);
-            *current = Some(ds.clone());
-            Ok(Some(ds))
+    loop {
+        let Some(msg) = stream.next().await else { return Ok(None) };
+        let msg = msg.map_err(|s| anyhow!("Sync stream error: {s}"))?;
+        match msg.body {
+            Some(Body::Snapshot(s)) => {
+                let ds = DesiredState::from_snapshot(&s);
+                *current = Some(ds.clone());
+                return Ok(Some(ds));
+            }
+            Some(Body::Delta(d)) => {
+                let cur = current.as_mut().ok_or_else(|| anyhow!("delta before snapshot"))?;
+                cur.apply_delta(&d);
+                return Ok(Some(cur.clone()));
+            }
+            Some(Body::Punch(_)) => {
+                // NAT-traversal punch directives (cycle4b §4) are not a DesiredState
+                // change — they'll be routed to the path/puncher subsystem by a
+                // later cycle4b task. Ignore here and wait for the next message.
+                continue;
+            }
+            None => return Err(anyhow!("empty SyncMessage body")),
         }
-        Some(Body::Delta(d)) => {
-            let cur = current.as_mut().ok_or_else(|| anyhow!("delta before snapshot"))?;
-            cur.apply_delta(&d);
-            Ok(Some(cur.clone()))
-        }
-        None => Err(anyhow!("empty SyncMessage body")),
     }
 }
