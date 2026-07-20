@@ -73,7 +73,7 @@ pub fn report_once(
 /// `netns` integration tests (a separate compilation unit) can reuse this
 /// exact technique instead of duplicating the raw-socket setup — see
 /// `punch.rs` and `tests/punch_netns.rs`.
-pub fn reuseport_udp(port: u16) -> anyhow::Result<UdpSocket> {
+pub(crate) fn reuseport_udp(port: u16) -> anyhow::Result<UdpSocket> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if fd < 0 {

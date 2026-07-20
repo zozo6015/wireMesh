@@ -85,7 +85,12 @@ pub fn punch_candidates(
                 let msg = &buf[..n];
                 if msg.starts_with(b"PING") {
                     let _ = sock.send_to(b"PONG", from);
-                } else if msg.starts_with(b"PONG") {
+                } else if msg.starts_with(b"PONG") && targets.contains(&from) {
+                    // Only accept a PONG from an address we actually punched.
+                    // Without this guard an off-path sender reachable on the WG
+                    // port during the punch window could spoof a PONG and get an
+                    // unintended address "confirmed" — ahead of any WireGuard
+                    // authentication. (Hardens the spike/natpunch original.)
                     confirmed = Some(from);
                     break;
                 }
