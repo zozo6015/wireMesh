@@ -105,6 +105,11 @@ pub struct TestController {
     // panic here).
     server_runtime: Option<tokio::runtime::Runtime>,
     socket_path: PathBuf,
+    // (Cycle 4a Task 12) The IP every controller listener binds to, captured
+    // at `start`/`start_on` so `restart` re-binds the SAME address (the OS
+    // still re-assigns the ports). `127.0.0.1` for `start()` (unchanged);
+    // a routable underlay IP for the mesh-milestone test's `start_on`.
+    bind_ip: std::net::Ipv4Addr,
     // Held only so the directory (and everything the controller wrote under
     // it — DB, CA, secrets, the socket) is cleaned up on drop; never read
     // directly.
@@ -151,6 +156,19 @@ impl TestController {
     /// field's doc comment for why this decoupling is load-bearing, not
     /// cosmetic.
     pub async fn start() -> TestController {
+        Self::start_on(Config::default_bind_ip()).await
+    }
+
+    /// (Cycle 4a Task 12) Additive counterpart to [`Self::start`] that binds
+    /// every controller listener (Enrollment/Sync/Admin TCP + observation
+    /// UDP) to `bind_ip` instead of the default `127.0.0.1`. Used by the
+    /// mesh-milestone netns test to bind a routable underlay address a
+    /// `wiremesh-gateway` process in a separate network namespace can reach —
+    /// `sync_tcp_addr()`/`observe_addr()` then return that routable `IP:port`.
+    /// `start()` delegates here with `127.0.0.1`, so every existing caller is
+    /// byte-for-byte unchanged. The TLS server cert SAN stays `127.0.0.1`
+    /// regardless (see `Config::bind_ip`'s doc comment).
+    pub async fn start_on(bind_ip: std::net::Ipv4Addr) -> TestController {
         let data_dir = tempfile::tempdir().expect("creating temp data dir for TestController");
         let socket_path = data_dir.path().join("controller.sock");
 
@@ -161,6 +179,7 @@ impl TestController {
             socket_path: socket_path.clone(),
             admin_tcp_port: 0,
             observe_udp_port: 0,
+            bind_ip,
         };
 
         let server_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -180,6 +199,7 @@ impl TestController {
             socket_path,
             running: Some(running),
             server_runtime: Some(server_runtime),
+            bind_ip,
         }
     }
 
@@ -219,6 +239,7 @@ impl TestController {
             socket_path: self.socket_path.clone(),
             admin_tcp_port: 0,
             observe_udp_port: 0,
+            bind_ip: self.bind_ip,
         };
 
         // (Task 13) Reuse the SAME `server_runtime` across a restart (rather
@@ -541,6 +562,32 @@ impl StubGateway {
         token: &str,
         cidrs: &[&str],
     ) -> anyhow::Result<StubGateway> {
+        Self::enroll_inner(controller, token, cidrs, "").await
+    }
+
+    /// (Task 11b) Additive counterpart to [`Self::enroll`] that also
+    /// declares a real, caller-supplied base64 WireGuard public key on the
+    /// `EnrollRequest` — this is what lands as the gateway's epoch-0
+    /// baseline `GATEWAY_KEY.pubkey` instead of the cycle-2 placeholder (see
+    /// `wiremesh_controller::db::Db::enroll_gateway`). `enroll` itself is
+    /// left untouched (it delegates to the same private helper with `""`)
+    /// so every existing caller keeps getting the placeholder, unaffected by
+    /// this addition.
+    pub async fn enroll_with_wg_pubkey(
+        controller: &TestController,
+        token: &str,
+        cidrs: &[&str],
+        wg_pubkey: &str,
+    ) -> anyhow::Result<StubGateway> {
+        Self::enroll_inner(controller, token, cidrs, wg_pubkey).await
+    }
+
+    async fn enroll_inner(
+        controller: &TestController,
+        token: &str,
+        cidrs: &[&str],
+        wg_pubkey: &str,
+    ) -> anyhow::Result<StubGateway> {
         let (csr_pem, key_pair) = gen_csr("stub-gw");
         let key_pem = key_pair.serialize_pem();
 
@@ -550,6 +597,7 @@ impl StubGateway {
                 token: token.to_string(),
                 csr_pem,
                 cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
+                wg_pubkey: wg_pubkey.to_string(),
             })
             .await
             .map_err(|status| anyhow::anyhow!("Enrollment.Enroll failed: {status}"))?
@@ -834,6 +882,19 @@ impl StubGateway {
         self.gateway_id as u64
     }
 
+    /// (Task 10) This gateway's `observe_key` — the random per-gateway
+    /// secret the controller returned exactly once in
+    /// `EnrollResponse.observe_key` at enrollment (see the `observe_key`
+    /// field's doc comment). `probe_observe` already reaches this field
+    /// internally to build its own probe; this accessor exposes the same
+    /// value so a caller can build an equivalent probe itself (e.g. the
+    /// gateway crate's own `wiremesh_gateway::observe::report_once`, whose
+    /// cross-process parity with the controller's verifier is exactly what
+    /// `tests/observe_parity.rs` proves).
+    pub fn observe_key(&self) -> String {
+        self.observe_key.clone()
+    }
+
     /// This gateway's leaf certificate's serial number, as a lowercase hex
     /// string (e.g. `"01a2b3"`), parsed back out of `cert_pem`. Used by
     /// later tasks to correlate "the cert this stub is holding" with "the
@@ -984,6 +1045,46 @@ pub async fn enroll_one(h: &TestController, segment_name: &str, cidr: &str) -> S
     // stub, so a caller can later call `gw.segment_id()` (e.g. to mint a
     // `rebind` token bound to this exact segment) without needing a
     // dedicated lookup RPC.
+    gw.set_segment_id(segment.id as i64);
+    gw
+}
+
+/// (Task 11b) Additive counterpart to [`enroll_one`] that redeems the minted
+/// token via [`StubGateway::enroll_with_wg_pubkey`] instead of
+/// [`StubGateway::enroll`], so the resulting gateway's epoch-0 baseline key
+/// is `wg_pubkey` rather than the cycle-2 placeholder. `enroll_one` itself is
+/// untouched — every existing caller is unaffected.
+pub async fn enroll_one_with_wg_pubkey(
+    h: &TestController,
+    segment_name: &str,
+    cidr: &str,
+    wg_pubkey: &str,
+) -> StubGateway {
+    let mut admin = h.admin_client().await;
+
+    let segment = admin
+        .create_segment(CreateSegmentRequest {
+            name: segment_name.to_string(),
+            cidrs: vec![cidr.to_string()],
+        })
+        .await
+        .expect("creating segment for enroll_one_with_wg_pubkey")
+        .into_inner();
+
+    let token = admin
+        .mint_token(MintTokenRequest {
+            kind: "gateway".to_string(),
+            bound_cidrs: vec![cidr.to_string()],
+            rebind_segment_id: 0,
+        })
+        .await
+        .expect("minting gateway token for enroll_one_with_wg_pubkey")
+        .into_inner()
+        .token;
+
+    let mut gw = StubGateway::enroll_with_wg_pubkey(h, &token, &[cidr], wg_pubkey)
+        .await
+        .expect("enrolling stub gateway in enroll_one_with_wg_pubkey");
     gw.set_segment_id(segment.id as i64);
     gw
 }

@@ -151,6 +151,7 @@ impl Enrollment for EnrollmentSvc {
                 secret_hash_hex,
                 cidrs,
                 gateway_name.clone(),
+                req.wg_pubkey.clone(),
                 issued.serial.clone(),
                 issued.handle.clone(),
                 not_after,

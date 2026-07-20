@@ -1232,6 +1232,7 @@ impl Db {
         secret_hash: &str,
         cidrs: &[Ipv4Net],
         gateway_name: &str,
+        wg_pubkey: &str,
         cert_serial: &str,
         issuer_handle: &str,
         cert_not_after: &str,
@@ -1424,13 +1425,22 @@ impl Db {
 
         // (Task 11) Bookkeeping baseline: every enrolled gateway gets an
         // epoch-0 `active` GATEWAY_KEY row so a later `RotateKey` always has
-        // something to rotate FROM. The pubkey here is a placeholder, NOT a
-        // real WireGuard public key — cycle-2 is bookkeeping only (no real
-        // WireGuard/data-plane; see the module doc comment and the Task 11
-        // brief). A real gateway-generated pubkey lands in cycle 4.
+        // something to rotate FROM.
+        // (Task 11b) When the enrolling gateway supplied a real, locally-
+        // generated WireGuard public key (`wg_pubkey`, threaded in from
+        // `EnrollRequest.wg_pubkey`), THAT is what lands here — peers read it
+        // straight out of `GATEWAY_KEY` via Sync's `PeerKey.pubkey`, which is
+        // what lets them actually configure a tunnel. An empty `wg_pubkey`
+        // (e.g. an older caller that never sets the field) falls back to the
+        // cycle-2 placeholder, unchanged from before Task 11b.
+        let baseline_pubkey = if wg_pubkey.is_empty() {
+            format!("placeholder-pubkey-gw{gateway_id}-epoch0")
+        } else {
+            wg_pubkey.to_string()
+        };
         tx.execute(
             "INSERT INTO gateway_key (gateway_id, epoch, pubkey, state) VALUES (?1, 0, ?2, 'active')",
-            params![gateway_id, format!("placeholder-pubkey-gw{gateway_id}-epoch0")],
+            params![gateway_id, baseline_pubkey],
         )?;
 
         // `AND used_at IS NULL` is redundant given the SELECT above already

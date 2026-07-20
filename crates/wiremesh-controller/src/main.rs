@@ -47,6 +47,7 @@ async fn main() -> Result<()> {
         socket_path,
         admin_tcp_port,
         observe_udp_port,
+        bind_ip: Config::default_bind_ip(),
     };
 
     let running = serve(config).await?;

@@ -1,5 +1,43 @@
 # Phase 0 Spike — Measured Results
 
+## Cycle 4a — G-2 throughput (deferred measurement)
+
+**Status: bench built, number still pending a 4-vCPU cloud run.** Cycle 4a
+shipped the real `wiremesh-gateway` binary and its own throughput smoke test,
+`crates/wiremesh-gateway/tests/throughput_bench.rs` (procedure:
+`crates/wiremesh-gateway/bench.md`). Run in the same macOS Docker-Desktop dev
+container as the Phase-0 Bet-1 measurement above:
+
+```sh
+./dev.sh run "cargo test -p wiremesh-gateway --test throughput_bench \
+  --features netns-tests -- --test-threads=1 --nocapture"
+# THROUGHPUT SMOKE (netns, harness-only, NOT the G-2 gate): 6.90 Mbit/s
+```
+
+This reproduces the same order-of-magnitude receive-side cap as Bet 1
+(~6.9 Mbit/s here vs. ~7.5–7.8 Mbit/s there) on a real `wiremesh-gateway`
+tunnel (in-process boringtun via the UAPI writer, `wg0` at MTU 1280) rather
+than the Phase-0 `spike-tunnel` binary — consistent with the container being
+the shared cause, not an artifact specific to the spike code. The smoke test
+intentionally asserts only that iperf3 completed, never a Mbit/s floor.
+
+**The G-2 gate itself (>=1 Gbps on a 4-vCPU, non-oversubscribed cloud VM)
+remains unmeasured** — it needs real hardware, not this container.
+`bench.md` documents the exact procedure (parallel `-P 4` streams matching
+the PRD's aggregate methodology, plus a `-u -b 0` loss-profile check to
+settle whether the receive-cap is environment noise or a real boringtun
+bottleneck). The number is to be recorded in this section, replacing this
+entry, once that cloud run happens.
+
+**4a's correctness does not depend on this number.** The full-mesh netns
+milestone (`crates/wiremesh-gateway/tests/mesh_milestone.rs`) independently
+proves the gateway is functionally correct — real WireGuard tunnel, enforcer
+allow/deny with counters, fail-static boot with no controller running, and
+live policy updates — all four done-bar assertions green with two real
+`wiremesh-gateway` processes. G-2 throughput is a performance gate, tracked
+separately, and does not block Cycle 4a completion per the plan.
+
+
 Environment (all measurements): dev container on Docker Desktop for Mac (linuxkit
 VM, `--privileged`, aarch64), kernel `6.12.76-linuxkit`, `nproc=8`, host CPU Apple
 M2. Per-bet environment specifics are repeated in each section. **These container

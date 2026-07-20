@@ -1,7 +1,14 @@
 syntax = "proto3";
 package wiremesh.v1;
 service Enrollment { rpc Enroll(EnrollRequest) returns (EnrollResponse); }
-message EnrollRequest { string token = 1; string csr_pem = 2; repeated string cidrs = 3; }
+// (Task 11b) `wg_pubkey` is the enrolling gateway's own base64 WireGuard
+// public key, generated locally before enrollment — it is stored as the
+// gateway's epoch-0 baseline `GATEWAY_KEY` row so peers can learn a REAL key
+// to configure their tunnel against (see `wiremesh_controller::db::Db::enroll_gateway`).
+// Empty means "no key supplied yet": the controller falls back to the
+// cycle-2 placeholder (`placeholder-pubkey-gw{id}-epoch0`), so older callers
+// that don't set this field are unaffected.
+message EnrollRequest { string token = 1; string csr_pem = 2; repeated string cidrs = 3; string wg_pubkey = 4; }
 // (Task 11) `gateway_id` is the DB row id the controller assigned this
 // enrollment — lets a caller (e.g. `wiremesh-testkit::StubGateway::id`)
 // address itself in later Admin ops (e.g. `RotateKey`) without a dedicated

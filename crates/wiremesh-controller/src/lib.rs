@@ -102,6 +102,34 @@ pub struct Config {
     /// for. `0` = OS-assigned, same convention as every other port in this
     /// struct.
     pub observe_udp_port: u16,
+    /// (Cycle 4a Task 12) IP address every TLS/mTLS/authenticated TCP/UDP
+    /// listener above binds to — the Enrollment TCP, Sync TCP, and
+    /// observation UDP sockets. Defaults to `127.0.0.1` via
+    /// [`Config::default_bind_ip`] for every existing test/dev deployment
+    /// (loopback-only, unchanged behavior); the mesh-milestone netns test
+    /// overrides it to a routable underlay address so a `wiremesh-gateway`
+    /// process in a SEPARATE network namespace can actually reach the
+    /// controller. NOTE: this does NOT change the TLS server certificate's
+    /// SAN — that stays `127.0.0.1` (the gateway's mTLS dial validates the
+    /// cert via SNI `domain_name("127.0.0.1")`, not the dialed IP), so
+    /// binding a routable IP here is purely a socket-bind change, not a
+    /// certificate change.
+    ///
+    /// Deliberately EXCLUDED: the Admin TCP listener (`admin_tcp_port`) is
+    /// plaintext gRPC with a bearer token as its only security boundary, so
+    /// it always binds loopback-only regardless of this field — see the
+    /// bind call at the Admin TCP listener's construction site for why
+    /// exposing it on a routable interface would make the bearer token
+    /// interceptable/replayable on the wire.
+    pub bind_ip: std::net::Ipv4Addr,
+}
+
+impl Config {
+    /// The default bind IP (`127.0.0.1`) — loopback-only, the historical
+    /// behavior every caller except the mesh-milestone test wants.
+    pub fn default_bind_ip() -> std::net::Ipv4Addr {
+        std::net::Ipv4Addr::LOCALHOST
+    }
 }
 
 /// A live, in-process controller instance. Dropping it stops both servers
@@ -341,13 +369,13 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     // without the concrete `EmbeddedTrust` type leaking into `services::*`.
     let trust: Arc<dyn CertificateIssuer> = Arc::new(trust);
 
-    let tcp_listener = TcpListener::bind(("127.0.0.1", config.tcp_port))
+    let tcp_listener = TcpListener::bind((config.bind_ip, config.tcp_port))
         .await
         .context("binding controller TCP listener")?;
     let tcp_addr = tcp_listener.local_addr().context("reading bound TCP addr")?;
     let tcp_stream = TcpListenerStream::new(tcp_listener);
 
-    let sync_tcp_listener = TcpListener::bind(("127.0.0.1", config.sync_tcp_port))
+    let sync_tcp_listener = TcpListener::bind((config.bind_ip, config.sync_tcp_port))
         .await
         .context("binding controller Sync TCP listener")?;
     let sync_tcp_addr = sync_tcp_listener
@@ -359,7 +387,7 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     // one of the TCP/UDS listeners above) since NATs map TCP/UDP
     // independently; see `Config::observe_udp_port`'s doc comment and
     // `crate::observe`'s module doc comment for the full scheme.
-    let observe_socket = tokio::net::UdpSocket::bind(("127.0.0.1", config.observe_udp_port))
+    let observe_socket = tokio::net::UdpSocket::bind((config.bind_ip, config.observe_udp_port))
         .await
         .context("binding controller observation UDP socket")?;
     let observe_addr = observe_socket
@@ -436,9 +464,18 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     // necessary for method-path-based classification. Plaintext gRPC (no
     // TLS) — the bearer token is this listener's security boundary in
     // cycle-2.
-    let admin_tcp_listener = TcpListener::bind(("127.0.0.1", config.admin_tcp_port))
-        .await
-        .context("binding Admin TCP listener")?;
+    //
+    // Bound to loopback UNCONDITIONALLY — NOT `config.bind_ip`. The bearer
+    // token is this listener's only security boundary; exposing it on a
+    // routable interface (as `bind_ip` does for the mesh-milestone netns
+    // test) would make the token interceptable/replayable on the wire. The
+    // Sync (mTLS), Enrollment (server-TLS), and observe (authenticated MAC)
+    // listeners are fine to expose via `bind_ip`; this one is not. See
+    // `Config::bind_ip`'s doc comment.
+    let admin_tcp_listener =
+        TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, config.admin_tcp_port))
+            .await
+            .context("binding Admin TCP listener")?;
     let admin_tcp_addr = admin_tcp_listener
         .local_addr()
         .context("reading bound Admin TCP addr")?;
