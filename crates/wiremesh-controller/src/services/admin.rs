@@ -12,7 +12,7 @@
 use std::str::FromStr;
 
 use ipnet::Ipv4Net;
-use rand::RngCore;
+use rand::{rngs::OsRng, RngCore};
 use sha2::{Digest, Sha256};
 use time::{Duration as TimeDuration, OffsetDateTime};
 use tokio::sync::broadcast;
@@ -195,12 +195,12 @@ impl Admin for AdminSvc {
         }
 
         let mut secret = [0u8; SECRET_LEN];
-        rand::thread_rng().fill_bytes(&mut secret);
+        OsRng.fill_bytes(&mut secret);
         let secret_hex = hex_encode(&secret);
         let secret_hash_hex = hex_encode(&Sha256::digest(secret));
 
         let mut id_bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut id_bytes);
+        OsRng.fill_bytes(&mut id_bytes);
         let token_id = hex_encode(&id_bytes);
 
         let rebind_segment_id = if req.rebind_segment_id == 0 {
@@ -407,12 +407,12 @@ impl Admin for AdminSvc {
         }
 
         let mut secret = [0u8; SECRET_LEN];
-        rand::thread_rng().fill_bytes(&mut secret);
+        OsRng.fill_bytes(&mut secret);
         let secret_hex = hex_encode(&secret);
         let secret_hash_hex = hex_encode(&Sha256::digest(secret));
 
         let mut id_bytes = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut id_bytes);
+        OsRng.fill_bytes(&mut id_bytes);
         let token_id = hex_encode(&id_bytes);
 
         let now = OffsetDateTime::now_utc()

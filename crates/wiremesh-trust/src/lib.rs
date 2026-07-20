@@ -415,11 +415,13 @@ fn load_or_create_ca(data_dir: &Path) -> Result<(rcgen::Certificate, KeyPair, St
 }
 
 /// Generates a 16-byte random serial number (hex-encoded for the handle
-/// returned to callers).
+/// returned to callers). Uses the OS CSPRNG directly (`OsRng`) rather than
+/// the thread-local `rand::thread_rng()` — this value ends up in
+/// certificate metadata, so it's crypto-adjacent key material (#8).
 fn random_serial() -> [u8; 16] {
-    use rand::RngCore;
+    use rand::{rngs::OsRng, RngCore};
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     bytes
 }
 

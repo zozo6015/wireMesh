@@ -5,12 +5,19 @@
 //! already owned by a segment — and, on success, the replaced gateway's old
 //! cert serial is pushed onto the revoked denylist: it's marked
 //! `revoked_at` in the DB and appears in a fresh `Sync.Watch` snapshot's
-//! `revoked_serials`. That denylist bookkeeping is ALL this test proves —
-//! it does NOT prove the retired gateway can no longer authenticate: its
-//! cert is still TLS-valid, and cycle-2's Sync mTLS handshake does not yet
-//! check `revoked_serials` against the presented client cert (a documented
-//! cycle-4 gap — see `docs/research/cycle2-controller-notes.md`), so a
-//! replaced gateway could still open a `Sync.Watch` connection this cycle.
+//! `revoked_serials`. That denylist bookkeeping is what THIS test proves.
+//!
+//! (Issue #7, fixed) It USED TO be true that this denylist bookkeeping was
+//! all that stood between a replaced gateway and the fabric: its cert is
+//! still TLS-valid, and cycle-2's Sync mTLS handshake still doesn't check
+//! `revoked_serials` against the presented client cert (a documented
+//! cycle-4 gap — see `docs/research/cycle2-controller-notes.md`). But
+//! `Db::find_gateway_by_name` — the identity-resolution step `Sync.Watch`/
+//! `Sync.Report` run AFTER the TLS handshake succeeds — now filters to
+//! `status = 'active'`, so a replaced gateway's old cert, even though still
+//! TLS-valid, no longer resolves to a live identity and can no longer open
+//! `Sync.Watch` at all. See `sync_identity_active_only.rs` for that
+//! coverage.
 use tokio_stream::StreamExt;
 use wiremesh_proto::v1::{
     sync_message, CreateSegmentRequest, EnrollRequest, MintTokenRequest,
