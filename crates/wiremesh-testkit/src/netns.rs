@@ -156,6 +156,51 @@ impl Lab {
     /// router's outside (public-facing) interface as `out0` and its inside
     /// (private-facing) interface as `in0` via `Lab::veth`.
     pub fn nat_router(&mut self, name: &str, kind: NatKind) -> Result<Ns> {
+        self.nat_router_impl(name, kind)
+    }
+
+    /// Same as [`Lab::nat_router`], but additionally gives the router a
+    /// `tc netem` delay on its outside interface (`out0`) — Phase-0 Finding
+    /// 2: a zero-latency veth lab lets a peer's inbound PING arrive before
+    /// the local side's own outbound packet has crossed its NAT, poisoning
+    /// conntrack and producing a FALSE punch-failure for ~30s. Any Cycle-4b
+    /// hole-punch test MUST have its NAT router(s) carry a delay like this
+    /// (`delay_ms` around 20ms, i.e. ≈40ms one-way, matching real-world NAT
+    /// traversal latencies) — see `docs/research/phase0-results.md`'s
+    /// Finding 2 and this crate's `netem` test.
+    ///
+    /// `nft`'s `oifname "out0"` masquerade rule (installed by both this and
+    /// plain `nat_router`) tolerates `out0` not existing yet at rule-install
+    /// time — the kernel matches it dynamically once traffic actually flows
+    /// — which is why the established convention (see `nat_router`'s own
+    /// doc comment and `spike/natlab/tests/nat_behavior.rs`) is
+    /// `nat_router(..)` THEN `Lab::veth(..)` to wire the real `out0`
+    /// afterward. `tc qdisc add` has no such tolerance: it hard-fails with
+    /// "Cannot find device" if `out0` doesn't exist yet (confirmed by
+    /// hand), so it cannot be bolted onto that same before-`veth` step. This
+    /// method instead gives the router a placeholder `out0` (a `dummy`
+    /// netdev, brought up immediately) purely so the delay is present and
+    /// independently verifiable (`assert_netem_present`/`netem_present`)
+    /// without requiring a full external topology — enough for exercising
+    /// the harness capability in isolation, as this crate's own `netem`
+    /// test does.
+    ///
+    /// A REAL dual-NAT hole-punch topology needs genuine connectivity
+    /// through `out0`, not a dummy: for that, use plain `nat_router`, wire
+    /// the real `out0` via `Lab::veth` (do NOT also call
+    /// `nat_router_delayed` on that router — its placeholder `out0` would
+    /// collide with `Lab::veth`'s rename-into-place and fail), and once
+    /// that real interface exists call [`apply_netem`] directly — the same
+    /// helper this method uses internally.
+    pub fn nat_router_delayed(&mut self, name: &str, kind: NatKind, delay_ms: u32) -> Result<Ns> {
+        let ns = self.nat_router_impl(name, kind)?;
+        ns.exec(&["ip", "link", "add", "out0", "type", "dummy"])?;
+        ns.exec(&["ip", "link", "set", "out0", "up"])?;
+        apply_netem(&ns, "out0", delay_ms)?;
+        Ok(ns)
+    }
+
+    fn nat_router_impl(&mut self, name: &str, kind: NatKind) -> Result<Ns> {
         let ns = self.ns(name)?;
         ns.exec(&["sysctl", "-w", "net.ipv4.ip_forward=1"])?;
         let flags = match kind {
@@ -175,6 +220,53 @@ impl Lab {
             .with_context(|| format!("write nft ruleset {ruleset_path}"))?;
         ns.exec(&["nft", "-f", &ruleset_path])?;
         Ok(ns)
+    }
+}
+
+/// Applies a `tc netem` delay qdisc to `iface` inside `ns`. `iface` must
+/// already exist as a real net device (e.g. already wired via `Lab::veth`,
+/// or a placeholder like [`Lab::nat_router_delayed`]'s dummy `out0`) —
+/// unlike nft's `oifname` matching, `tc qdisc add` hard-fails ("Cannot find
+/// device") against a not-yet-existing interface, so this is deliberately a
+/// separate step from ns/NAT creation rather than folded into it.
+pub fn apply_netem(ns: &Ns, iface: &str, delay_ms: u32) -> Result<()> {
+    let delay_arg = format!("{delay_ms}ms");
+    ns.exec(&[
+        "tc", "qdisc", "add", "dev", iface, "root", "netem", "delay", &delay_arg,
+    ])?;
+    Ok(())
+}
+
+/// Runs `tc qdisc show dev {iface}` inside `ns` and reports whether a
+/// `netem` qdisc is present — lets a punch test assert delay fidelity
+/// (Phase-0 Finding 2, see [`Lab::nat_router_delayed`]'s doc comment)
+/// before it starts punching, rather than silently running on a
+/// zero-latency link if the qdisc install were ever skipped/dropped. A
+/// nonexistent `iface` (e.g. a plain `nat_router`'s never-wired `out0`)
+/// reports `Ok(false)` rather than an error — no device trivially means no
+/// netem on it.
+pub fn netem_present(ns: &Ns, iface: &str) -> Result<bool> {
+    match ns.exec(&["tc", "qdisc", "show", "dev", iface]) {
+        Ok(out) => Ok(String::from_utf8_lossy(&out.stdout).contains("netem")),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Asserts [`netem_present`] is true, panicking with the actual `tc qdisc
+/// show` output (or the lookup error, if `iface` doesn't exist) on failure
+/// so a failed assertion is immediately diagnosable without a second manual
+/// `tc` invocation.
+pub fn assert_netem_present(ns: &Ns, iface: &str) {
+    match ns.exec(&["tc", "qdisc", "show", "dev", iface]) {
+        Ok(out) => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(
+                text.contains("netem"),
+                "expected netem qdisc on {iface} in {}, got: {text}",
+                ns.name
+            );
+        }
+        Err(e) => panic!("expected netem qdisc on {iface} in {}, but: {e}", ns.name),
     }
 }
 
