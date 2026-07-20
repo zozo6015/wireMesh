@@ -81,14 +81,17 @@ fn http_response(body: &str) -> String {
 
 /// Serve one Prometheus scrape per accepted TCP connection on `listener`,
 /// forever (until `listener` errors). `fetch` is called once per connection
-/// to obtain `(backend_kind, applied_policy_version, counters)`, which is
-/// rendered via [`render`] and written back verbatim (any HTTP request line
-/// the client sent is drained and ignored — this is a scrape-only stub
-/// server, not a general HTTP server).
+/// to obtain `(backend_kind, applied_policy_version, counters, peer_states,
+/// transition_counts)`, which is rendered via [`render`] +
+/// [`render_path_state`] + [`render_path_transitions`] and written back
+/// verbatim (any HTTP request line the client sent is drained and ignored —
+/// this is a scrape-only stub server, not a general HTTP server).
 pub async fn serve_metrics<F, Fut>(listener: TcpListener, fetch: F) -> anyhow::Result<()>
 where
     F: Fn() -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = anyhow::Result<(String, u64, Counters)>> + Send + 'static,
+    Fut: Future<Output = anyhow::Result<(String, u64, Counters, Vec<(String, PathState)>, Vec<((PathState, PathState), u64)>)>>
+        + Send
+        + 'static,
 {
     loop {
         let (mut stream, _) = listener.accept().await?;
@@ -99,7 +102,12 @@ where
             let mut buf = [0u8; 512];
             let _ = stream.read(&mut buf).await;
             let body = match fetch().await {
-                Ok((kind, version, counters)) => render(&kind, version, &counters),
+                Ok((kind, version, counters, peer_states, transitions)) => {
+                    let mut body = render(&kind, version, &counters);
+                    body.push_str(&render_path_state(&peer_states));
+                    body.push_str(&render_path_transitions(&transitions));
+                    body
+                }
                 Err(e) => format!("# error collecting counters: {e:#}\n"),
             };
             let _ = stream.write_all(http_response(&body).as_bytes()).await;
@@ -164,7 +172,9 @@ mod tests {
         tokio::spawn(serve_metrics(listener, || async {
             let counters =
                 Counters { by_rule: BTreeMap::from([("r9".to_string(), 2u64)]), default_deny: 1 };
-            Ok::<_, anyhow::Error>(("ebpf".to_string(), 9u64, counters))
+            let peer_states = vec![("42".to_string(), PathState::Direct)];
+            let transitions = vec![((PathState::Connecting, PathState::Direct), 3u64)];
+            Ok::<_, anyhow::Error>(("ebpf".to_string(), 9u64, counters, peer_states, transitions))
         }));
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect to metrics listener");
@@ -176,5 +186,16 @@ mod tests {
         assert!(text.contains("wiremesh_gateway_default_deny_total 1"), "body: {text}");
         assert!(text.contains("wiremesh_gateway_rule_hits_total{rule_id=\"r9\"} 2"), "body: {text}");
         assert!(text.contains("backend=\"ebpf\""), "body: {text}");
+        // The review finding this test now guards: path-state gauge +
+        // transition counters must reach the actual HTTP scrape body, not
+        // just exist as separately-tested pure renderers.
+        assert!(
+            text.contains("wiremesh_gateway_path_state{peer=\"42\",state=\"direct\"} 1"),
+            "path-state gauge must reach the scrape body: {text}"
+        );
+        assert!(
+            text.contains("wiremesh_gateway_path_transitions_total{from=\"connecting\",to=\"direct\"} 3"),
+            "path transitions must reach the scrape body: {text}"
+        );
     }
 }

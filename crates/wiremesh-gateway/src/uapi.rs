@@ -162,14 +162,53 @@ pub(crate) fn handshake_times_from(peers: &HashMap<String, PeerGetInfo>) -> Hash
 /// SystemTime}`; see [`handshake_times_from`] for why never-handshaked
 /// peers are absent rather than epoch-valued.
 pub fn get_latest_handshakes(ifname: &str) -> anyhow::Result<HashMap<String, SystemTime>> {
+    let peers = read_get_response(ifname)?;
+    Ok(handshake_times_from(&peers))
+}
+
+/// Reduce parsed `get=1` peer info to `{pubkey_hex -> (latest_handshake,
+/// rx_bytes)}`. `latest_handshake` is `None` for a never-handshaked peer,
+/// per [`handshake_times_from`]'s epoch-ambiguity rationale; `rx_bytes` is
+/// always present (0 for a peer with no traffic yet).
+///
+/// `rx_bytes` is the point of this reducer (review finding, Cycle 4b Task
+/// 10): the path-state driver's ~1s tick only ever called `on_handshake`,
+/// but WG handshakes advance only ~every 120s (rekey) while keepalives (15s)
+/// bump `rx_bytes` without touching the handshake time. Watching
+/// `rx_bytes` for an increase since the previous tick gives the driver a
+/// keepalive-visible liveness signal (`Path::on_authenticated_inbound`), so
+/// a healthy `Direct` path no longer oscillates to `Degraded` every ~45s.
+/// See `docs/research/cycle4b-path-liveness-note.md`.
+pub(crate) fn peer_liveness_from(
+    peers: &HashMap<String, PeerGetInfo>,
+) -> HashMap<String, (Option<SystemTime>, u64)> {
+    let times = handshake_times_from(peers);
+    peers
+        .iter()
+        .map(|(k, info)| (k.clone(), (times.get(k).copied(), info.rx_bytes)))
+        .collect()
+}
+
+/// Read the WireGuard device's per-peer latest-handshake time AND `rx_bytes`
+/// via UAPI `get=1` in a single round-trip — the liveness feed the
+/// path-state driver uses (see [`peer_liveness_from`]). Returns
+/// `{pubkey_hex -> (latest_handshake, rx_bytes)}`.
+pub fn get_peer_liveness(ifname: &str) -> anyhow::Result<HashMap<String, (Option<SystemTime>, u64)>> {
+    let peers = read_get_response(ifname)?;
+    Ok(peer_liveness_from(&peers))
+}
+
+/// Shared UAPI `get=1` round-trip: connect, request, read the full response,
+/// and parse it. Both [`get_latest_handshakes`] and [`get_peer_liveness`]
+/// build on this so there's exactly one socket dance to get right.
+fn read_get_response(ifname: &str) -> anyhow::Result<HashMap<String, PeerGetInfo>> {
     let path = format!("/var/run/wireguard/{ifname}.sock");
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("connecting to WG UAPI socket {path}"))?;
     stream.write_all(b"get=1\n\n").context("writing UAPI get request")?;
     let mut resp = String::new();
     stream.read_to_string(&mut resp).context("reading UAPI get response")?;
-    let peers = parse_get_response(&resp);
-    Ok(handshake_times_from(&peers))
+    Ok(parse_get_response(&resp))
 }
 
 // --- minimal base64 (avoid a new workspace dep for two 32-byte keys) ---
@@ -330,6 +369,28 @@ errno=0\n\
             !times.contains_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
             "never-handshaked peer must be absent, not epoch-valued: {times:?}"
         );
+    }
+
+    #[test]
+    fn peer_liveness_from_preserves_rx_bytes_for_both_peers() {
+        let parsed = parse_get_response(GET_RESPONSE_FIXTURE);
+        let liveness = peer_liveness_from(&parsed);
+        assert_eq!(liveness.len(), 2, "both peers present, unlike handshake_times_from: {liveness:?}");
+
+        let (a_time, a_rx) = liveness
+            .get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            .expect("peer a present");
+        assert_eq!(
+            *a_time,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000) + Duration::from_nanos(500000000))
+        );
+        assert_eq!(*a_rx, 12345, "handshaked peer's rx_bytes preserved");
+
+        let (b_time, b_rx) = liveness
+            .get("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+            .expect("peer b present even though never handshaked");
+        assert_eq!(*b_time, None, "never-handshaked peer still has no handshake time");
+        assert_eq!(*b_rx, 0, "never-handshaked peer's rx_bytes preserved (0)");
     }
 
     #[test]

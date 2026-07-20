@@ -1,6 +1,6 @@
 //! wiremesh-gateway boot sequence + supervision (spec §5.1).
 use anyhow::Context;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -85,18 +85,38 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         });
     }
 
+    // Per-peer NAT-traversal state, shared between the sync loop (which
+    // receives PunchDirectives), the spawned punch tasks, the periodic
+    // path-state driver, AND (below) the metrics scrape. See `PathCtx` for
+    // why these are std (not tokio) mutexes.
+    let ctx = PathCtx {
+        wg_port: cfg.wg_listen_port,
+        ifname: cfg.tun_ifname.clone(),
+        priv_key: tunnel.private_key_b64.clone(),
+        desired: Arc::new(std::sync::Mutex::new(applied.clone())),
+        paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        punching: Arc::new(std::sync::Mutex::new(HashSet::new())),
+    };
+
     // Metrics endpoint (Prometheus scrape) on an ephemeral loopback port,
-    // sharing `enforcer` with the sync loop below via Arc<Mutex<_>>.
+    // sharing `enforcer` with the sync loop below via Arc<Mutex<_>>, and
+    // `ctx.paths`/`ctx.transitions` with the path-tick driver below so the
+    // scrape body carries live path-state gauges + transition counters
+    // (review finding: these were rendered/tested in `metrics.rs` but never
+    // actually reached the HTTP scrape).
     {
         let metrics_listener =
             TcpListener::bind(cfg.metrics_addr).await.context("binding metrics listener")?;
         eprintln!("wiremesh-gateway: metrics listening on {}", metrics_listener.local_addr()?);
         let enforcer = enforcer.clone();
         let applied_version = applied_version.clone();
+        let ctx = ctx.clone();
         tokio::spawn(async move {
             let fetch = move || {
                 let enforcer = enforcer.clone();
                 let applied_version = applied_version.clone();
+                let ctx = ctx.clone();
                 async move {
                     let mut e = enforcer.lock().await;
                     let counters = e.counters()?;
@@ -104,7 +124,22 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         BackendKind::Ebpf => "ebpf",
                         BackendKind::Nftables => "nftables",
                     };
-                    Ok::<_, anyhow::Error>((kind.to_string(), applied_version.load(Ordering::Relaxed), counters))
+                    let peer_states: Vec<(String, PathState)> = ctx
+                        .paths
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(gid, path)| (gid.to_string(), path.state))
+                        .collect();
+                    let transitions: Vec<((PathState, PathState), u64)> =
+                        ctx.transitions.lock().unwrap().iter().map(|(k, v)| (*k, *v)).collect();
+                    Ok::<_, anyhow::Error>((
+                        kind.to_string(),
+                        applied_version.load(Ordering::Relaxed),
+                        counters,
+                        peer_states,
+                        transitions,
+                    ))
                 }
             };
             if let Err(e) = metrics::serve_metrics(metrics_listener, fetch).await {
@@ -113,18 +148,6 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         });
     }
 
-    // Per-peer NAT-traversal state, shared between the sync loop (which
-    // receives PunchDirectives), the spawned punch tasks, and the periodic
-    // path-state driver. See `PathCtx` for why these are std (not tokio)
-    // mutexes.
-    let ctx = PathCtx {
-        wg_port: cfg.wg_listen_port,
-        ifname: cfg.tun_ifname.clone(),
-        priv_key: tunnel.private_key_b64.clone(),
-        desired: Arc::new(std::sync::Mutex::new(applied.clone())),
-        paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-    };
     tokio::spawn(run_path_ticks(ctx.clone()));
 
     // Sync loop with reconnect.
@@ -155,18 +178,27 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             applied = Some(ds);
                         }
                         Ok(Some(sync::SyncEvent::Punch(d))) => {
+                            let gid = d.peer_gateway_id;
                             eprintln!(
-                                "wiremesh-gateway: punch directive for peer={} ({} candidates, go={}ms)",
-                                d.peer_gateway_id,
+                                "wiremesh-gateway: punch directive for peer={gid} ({} candidates, go={}ms)",
                                 d.candidates.len(),
                                 d.go_unix_ms
                             );
-                            tokio::spawn(punch_and_apply(
-                                ctx.clone(),
-                                d.peer_gateway_id,
-                                d.candidates,
-                                Some(d.go_unix_ms),
-                            ));
+                            match ctx.try_start_punch(gid) {
+                                Some(guard) => {
+                                    tokio::spawn(punch_and_apply(
+                                        ctx.clone(),
+                                        gid,
+                                        d.candidates,
+                                        Some(d.go_unix_ms),
+                                        guard,
+                                    ));
+                                }
+                                None => eprintln!(
+                                    "wiremesh-gateway: punch already in flight for peer={gid}; \
+                                     skipping controller directive"
+                                ),
+                            }
                         }
                         Ok(None) => {
                             eprintln!("sync stream closed; reconnecting");
@@ -206,6 +238,13 @@ struct PathCtx {
     /// Cumulative `{(from,to) -> count}` path-state transition tally — the
     /// bookkeeping behind `metrics::render_path_transitions`.
     transitions: Arc<std::sync::Mutex<HashMap<(PathState, PathState), u64>>>,
+    /// Gateway IDs with a `punch_and_apply` task currently in flight (review
+    /// finding: a controller `Punch` directive and a tick-driven
+    /// `StartPunch` for the SAME peer could otherwise spawn two concurrent
+    /// tasks that each `replace_peers`-apply the full device). Claimed via
+    /// [`PathCtx::try_start_punch`], released by dropping the returned
+    /// [`PunchGuard`].
+    punching: Arc<std::sync::Mutex<HashSet<u64>>>,
 }
 
 impl PathCtx {
@@ -223,14 +262,46 @@ impl PathCtx {
             after.as_str()
         );
     }
+
+    /// Try to claim the in-flight-punch slot for peer `gid`. Returns `None`
+    /// if a punch for this peer is already running — the caller should skip
+    /// spawning another `punch_and_apply` and just log it. Returns
+    /// `Some(guard)` otherwise, having marked `gid` as in-flight; the caller
+    /// must move the guard into the spawned task (e.g. as an extra
+    /// parameter to `punch_and_apply`) so it's held for the task's whole
+    /// lifetime and released — fail-static, on success OR error OR panic —
+    /// when the guard drops.
+    fn try_start_punch(&self, gid: u64) -> Option<PunchGuard> {
+        let mut set = self.punching.lock().unwrap();
+        if !set.insert(gid) {
+            return None;
+        }
+        Some(PunchGuard { punching: self.punching.clone(), gid })
+    }
+}
+
+/// RAII release for [`PathCtx::try_start_punch`]'s in-flight-punch slot.
+/// Removing `gid` on `Drop` (rather than requiring an explicit call at every
+/// `punch_and_apply` return site) means an early `return` on error, or even
+/// a task panic unwinding through it, still releases the slot — a punch
+/// failure must never permanently wedge future punches for that peer.
+struct PunchGuard {
+    punching: Arc<std::sync::Mutex<HashSet<u64>>>,
+    gid: u64,
+}
+
+impl Drop for PunchGuard {
+    fn drop(&mut self) {
+        self.punching.lock().unwrap().remove(&self.gid);
+    }
 }
 
 /// Decode a base64 WireGuard public key into the lowercase-hex form the WG
-/// UAPI keys its per-peer state by (`uapi::get_latest_handshakes`), so a
+/// UAPI keys its per-peer state by (`uapi::get_peer_liveness`), so a
 /// controller-provided `active_pubkey_b64` can be correlated with the device's
-/// live handshake times. Mirrors `uapi`'s private `key_b64_to_hex` (not part
-/// of the library's public surface). Returns `None` for malformed input or a
-/// key that isn't exactly 32 bytes.
+/// live handshake/rx_bytes state. Mirrors `uapi`'s private `key_b64_to_hex`
+/// (not part of the library's public surface). Returns `None` for malformed
+/// input or a key that isn't exactly 32 bytes.
 fn pubkey_b64_to_hex(b64: &str) -> Option<String> {
     fn val(c: u8) -> Option<u32> {
         match c {
@@ -269,7 +340,20 @@ fn pubkey_b64_to_hex(b64: &str) -> Option<String> {
 /// attempt in the peer's path SM (created `Connecting` if absent). Every
 /// blocking call (`punch::punch_candidates`, `uapi::apply`) runs inside
 /// `spawn_blocking`; no mutex guard is ever held across an `.await`.
-async fn punch_and_apply(ctx: PathCtx, gid: u64, candidates: Vec<String>, go_unix_ms: Option<u64>) {
+///
+/// `_guard` is the in-flight-punch slot from [`PathCtx::try_start_punch`] —
+/// unused by name, but its whole purpose is to be HELD for this function's
+/// entire lifetime (including every early `return` below) and released via
+/// `Drop` when it returns, so at most one `punch_and_apply` runs per peer at
+/// a time regardless of whether it was triggered by a controller `Punch`
+/// directive or a tick-driven `StartPunch`.
+async fn punch_and_apply(
+    ctx: PathCtx,
+    gid: u64,
+    candidates: Vec<String>,
+    go_unix_ms: Option<u64>,
+    _guard: PunchGuard,
+) {
     if let Some(go) = go_unix_ms {
         let now_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -347,22 +431,33 @@ async fn punch_and_apply(ctx: PathCtx, gid: u64, candidates: Vec<String>, go_uni
 }
 
 /// Periodic path-state driver (spec §6.1). Every `PATH_TICK_PERIOD`: read the
-/// device's per-peer latest-handshake times, advance each peer's `Path`
-/// (handshake → Direct; time-driven degrade/disconnect via `tick`), record
-/// transitions, and act on the returned `PathAction` (StartPunch/Retry re-run
-/// a bounded punch; MarkRelayNeeded is inert in 4b). `relay_available` is
-/// always `false` in 4b — no relay transport exists yet. All blocking I/O runs
-/// in `spawn_blocking`; no mutex guard is held across an `.await`.
+/// device's per-peer latest-handshake times AND `rx_bytes`
+/// (`uapi::get_peer_liveness`), advance each peer's `Path` (handshake →
+/// Direct; an `rx_bytes` increase without a handshake advance → refreshed
+/// liveness via `on_authenticated_inbound`, so 15s keepalives count as
+/// inbound even between ~120s handshake rekeys; time-driven degrade/
+/// disconnect via `tick`), record transitions, and act on the returned
+/// `PathAction` (StartPunch/Retry re-run a bounded punch; MarkRelayNeeded is
+/// inert in 4b). `relay_available` is always `false` in 4b — no relay
+/// transport exists yet. All blocking I/O runs in `spawn_blocking`; no mutex
+/// guard is held across an `.await`.
 async fn run_path_ticks(ctx: PathCtx) {
     // Last handshake time we've observed per peer, to detect *advancement*
     // (a repeated identical timestamp must NOT re-fire `on_handshake`).
     let mut last_seen: HashMap<u64, SystemTime> = HashMap::new();
+    // Last rx_bytes we've observed per peer, to detect an *increase* — WG
+    // keepalives (every 15s) bump rx_bytes without advancing the handshake
+    // time (which only moves on ~120s rekey). Without this, `last_inbound`
+    // only ever refreshes off `on_handshake`, so a healthy Direct path goes
+    // stale after `DEGRADED_AFTER` (45s) and spuriously degrades + re-punches
+    // every ~2 minutes. See docs/research/cycle4b-path-liveness-note.md.
+    let mut last_rx: HashMap<u64, u64> = HashMap::new();
     loop {
         tokio::time::sleep(PATH_TICK_PERIOD).await;
 
         let ifname = ctx.ifname.clone();
-        let handshakes = match tokio::task::spawn_blocking(move || {
-            uapi::get_latest_handshakes(&ifname)
+        let liveness = match tokio::task::spawn_blocking(move || {
+            uapi::get_peer_liveness(&ifname)
         })
         .await
         {
@@ -392,12 +487,21 @@ async fn run_path_ticks(ctx: PathCtx) {
                 let path = paths.entry(gid).or_insert_with(|| Path::new(now));
                 let before = path.state;
 
-                if let Some(&t) = handshakes.get(&hex) {
+                if let Some((Some(t), rx)) = liveness.get(&hex).copied() {
                     let advanced = last_seen.get(&gid).map_or(true, |prev| t > *prev);
                     if advanced {
                         path.on_handshake(now);
                         last_seen.insert(gid, t);
                     }
+
+                    let rx_increased = last_rx.get(&gid).map_or(false, |&prev| rx > prev);
+                    if rx_increased && !advanced {
+                        // A handshake advance already calls on_handshake
+                        // (which itself refreshes last_inbound); only need
+                        // this for the keepalive-only case in between.
+                        path.on_authenticated_inbound(now);
+                    }
+                    last_rx.insert(gid, rx);
                 }
 
                 match path.tick(now, false) {
@@ -419,8 +523,16 @@ async fn run_path_ticks(ctx: PathCtx) {
         }
         for (gid, candidates) in to_punch {
             // Bounded by the SM's own backoff (StartPunch only fires on
-            // Disconnected → Connecting expiry).
-            tokio::spawn(punch_and_apply(ctx.clone(), gid, candidates, None));
+            // Disconnected → Connecting expiry). Dedup against a concurrent
+            // controller-directed punch for the same peer (Fix 3).
+            match ctx.try_start_punch(gid) {
+                Some(guard) => {
+                    tokio::spawn(punch_and_apply(ctx.clone(), gid, candidates, None, guard));
+                }
+                None => eprintln!(
+                    "wiremesh-gateway: punch already in flight for peer={gid}; skipping tick-driven StartPunch"
+                ),
+            }
         }
     }
 }
@@ -463,7 +575,7 @@ mod tests {
     #[test]
     fn pubkey_b64_to_hex_matches_uapi_wire_form() {
         // 32 zero bytes: base64 is 43 'A's + one '=' pad; hex is "00" x32 —
-        // the lowercase-hex form `uapi::get_latest_handshakes` keys peers by.
+        // the lowercase-hex form `uapi::get_peer_liveness` keys peers by.
         let b64 = format!("{}=", "A".repeat(43));
         assert_eq!(pubkey_b64_to_hex(&b64), Some("00".repeat(32)));
     }
@@ -473,5 +585,35 @@ mod tests {
         assert_eq!(pubkey_b64_to_hex("not*base64"), None);
         // Well-formed base64 but far too short to be a 32-byte WG key.
         assert_eq!(pubkey_b64_to_hex("AAAA"), None);
+    }
+
+    fn test_ctx() -> PathCtx {
+        PathCtx {
+            wg_port: 0,
+            ifname: String::new(),
+            priv_key: String::new(),
+            desired: Arc::new(std::sync::Mutex::new(None)),
+            paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            punching: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Fix 3 (in-flight punch dedup): a second claim for the SAME peer while
+    /// the first guard is still held must be rejected (this is what stops a
+    /// controller `Punch` and a tick-driven `StartPunch` from both spawning
+    /// `punch_and_apply` for one peer); an unrelated peer is unaffected; and
+    /// the slot is released — fail-static — once the guard drops.
+    #[test]
+    fn try_start_punch_dedups_per_peer_and_releases_on_drop() {
+        let ctx = test_ctx();
+        let guard = ctx.try_start_punch(7).expect("first claim for peer 7 succeeds");
+        assert!(
+            ctx.try_start_punch(7).is_none(),
+            "second concurrent claim for the same peer must be rejected"
+        );
+        assert!(ctx.try_start_punch(8).is_some(), "a different peer is unaffected by peer 7's guard");
+        drop(guard);
+        assert!(ctx.try_start_punch(7).is_some(), "slot released once the guard drops");
     }
 }
