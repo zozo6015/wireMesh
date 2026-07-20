@@ -1920,6 +1920,33 @@ git commit -m "feat(gateway): fail-static boot sequence, supervision, metrics"
 
 ---
 
+### Task 11b: Gateway WG-pubkey registration at enrollment (inserted 2026-07-20)
+
+> **Why inserted:** implementation of Task 11 revealed the controller stores only
+> placeholder WG pubkeys — no path exists for a gateway's real WG public key to
+> reach peers (see spec §2 amendment). Task 12 cannot form a tunnel without this.
+> Owner decision 2026-07-20: add `wg_pubkey` to enrollment.
+
+**Files:**
+- Modify: `proto/wiremesh/v1/enrollment.proto` (`EnrollRequest` += `string wg_pubkey = 4;`)
+- Modify: `crates/wiremesh-controller/src/services/enrollment.rs` (read `req.wg_pubkey`, thread to db)
+- Modify: `crates/wiremesh-controller/src/db_async.rs` (`enroll_gateway` += `wg_pubkey: String`)
+- Modify: `crates/wiremesh-controller/src/db.rs` (`enroll_gateway` += `wg_pubkey: &str`; epoch-0 INSERT uses it when non-empty, else placeholder)
+- Modify: `crates/wiremesh-testkit/src/lib.rs` (additive: let a caller enroll with a real `wg_pubkey`; keep existing `enroll`/`enroll_one` back-compat sending empty)
+- Test: `crates/wiremesh-controller/tests/` (new or extend `keys.rs`): a gateway enrolled WITH a real `wg_pubkey` has that exact pubkey visible in a peer's snapshot `keys`; enrolled WITHOUT falls back to the placeholder.
+
+**Interfaces produced (Task 12 depends on):** a testkit way to enroll a StubGateway carrying a real base64 WG pubkey (e.g. `enroll_one_with_wg_pubkey(h, segment, cidr, wg_pubkey)` or an additive `StubGateway` method), returning a StubGateway whose identity the mesh test can pair with a matching `wg_private.key`.
+
+**Back-compat constraint:** existing `enroll`/`enroll_one` callers and all Cycle-2/3 tests must be unaffected — the new proto field defaults to `""`, and `""` → the existing placeholder epoch-0 key. The controller change must be additive to the enroll path (a new parameter threaded through, empty = old behavior).
+
+- [ ] Step 1: Write the failing controller test (enroll A with a real WG pubkey; B watches A's Sync; assert B's snapshot shows A's `PeerKey.pubkey` == the real value, not a placeholder). Run → RED.
+- [ ] Step 2: Add `wg_pubkey = 4` to `EnrollRequest`; thread `wg_pubkey` through `enrollment.rs` → `db_async::enroll_gateway` → `db::enroll_gateway`; epoch-0 INSERT uses `if wg_pubkey.is_empty() { placeholder } else { wg_pubkey }`.
+- [ ] Step 3: Add the additive testkit enroll-with-wg_pubkey path; update existing `StubGateway::enroll`'s `EnrollRequest` literal to include `wg_pubkey: String::new()` (back-compat).
+- [ ] Step 4: Run the new test → GREEN; run the full controller + testkit suites (`./dev.sh run "cargo test -p wiremesh-controller"` and the netns conformance if touched) to confirm no Cycle-2/3 regression.
+- [ ] Step 5: Commit `feat(enrollment): register gateway WG pubkey at enrollment (epoch-0 baseline)`.
+
+---
+
 ### Task 12: Full-mesh milestone netns test (the done bar)
 
 **Files:**

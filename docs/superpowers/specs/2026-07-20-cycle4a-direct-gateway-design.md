@@ -64,8 +64,21 @@ distinction — because they touch `wiremesh-enforcer` /
 9. **Throughput bench** — reusable iperf3-over-tunnel harness (measured number
    deferred, see §6).
 
-**No proto changes.** `Peer.candidate_endpoints`, `StateSnapshot.policy_ir`, and
-`Sync.Report` already exist. `relays` stays empty in 4a.
+**One proto change (amended 2026-07-20).** `Peer.candidate_endpoints`,
+`StateSnapshot.policy_ir`, and `Sync.Report` already exist; `relays` stays empty
+in 4a. **However**, implementation revealed that the Cycle-2/3 controller stores
+only a *placeholder* WireGuard pubkey per gateway (`placeholder-pubkey-gw{id}-
+epoch{N}`), written at enrollment and by admin `RotateKey`; there is no path for
+a gateway's real, locally-generated WG public key to reach its peers (that path
+was coupled to key rotation, which 4a defers — design §4.4). Without a real
+pubkey a peer cannot configure the WireGuard tunnel, so the direct mesh cannot
+form. Resolution (owner decision 2026-07-20): **`EnrollRequest` gains an optional
+`wg_pubkey` field**; the controller stores it as the gateway's epoch-0 baseline
+key (falling back to the placeholder when empty, preserving existing tests).
+This is the minimal, forward-compatible way to make 4a a genuinely deployable
+direct mesh — rotation later adds further epochs via `RotateKey`. `fabricctl`'s
+enrollment path carrying `wg_pubkey` for production provisioning is a small
+follow-up; the mesh milestone uses the testkit enrollment path.
 
 **Done bar — a controller-independent, policy-enforced direct mesh.** Two real
 `wiremesh-gateway` processes on routable addresses, each fronting a workload
