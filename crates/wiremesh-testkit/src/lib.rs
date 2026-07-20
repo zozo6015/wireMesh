@@ -541,6 +541,32 @@ impl StubGateway {
         token: &str,
         cidrs: &[&str],
     ) -> anyhow::Result<StubGateway> {
+        Self::enroll_inner(controller, token, cidrs, "").await
+    }
+
+    /// (Task 11b) Additive counterpart to [`Self::enroll`] that also
+    /// declares a real, caller-supplied base64 WireGuard public key on the
+    /// `EnrollRequest` — this is what lands as the gateway's epoch-0
+    /// baseline `GATEWAY_KEY.pubkey` instead of the cycle-2 placeholder (see
+    /// `wiremesh_controller::db::Db::enroll_gateway`). `enroll` itself is
+    /// left untouched (it delegates to the same private helper with `""`)
+    /// so every existing caller keeps getting the placeholder, unaffected by
+    /// this addition.
+    pub async fn enroll_with_wg_pubkey(
+        controller: &TestController,
+        token: &str,
+        cidrs: &[&str],
+        wg_pubkey: &str,
+    ) -> anyhow::Result<StubGateway> {
+        Self::enroll_inner(controller, token, cidrs, wg_pubkey).await
+    }
+
+    async fn enroll_inner(
+        controller: &TestController,
+        token: &str,
+        cidrs: &[&str],
+        wg_pubkey: &str,
+    ) -> anyhow::Result<StubGateway> {
         let (csr_pem, key_pair) = gen_csr("stub-gw");
         let key_pem = key_pair.serialize_pem();
 
@@ -550,6 +576,7 @@ impl StubGateway {
                 token: token.to_string(),
                 csr_pem,
                 cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
+                wg_pubkey: wg_pubkey.to_string(),
             })
             .await
             .map_err(|status| anyhow::anyhow!("Enrollment.Enroll failed: {status}"))?
@@ -997,6 +1024,46 @@ pub async fn enroll_one(h: &TestController, segment_name: &str, cidr: &str) -> S
     // stub, so a caller can later call `gw.segment_id()` (e.g. to mint a
     // `rebind` token bound to this exact segment) without needing a
     // dedicated lookup RPC.
+    gw.set_segment_id(segment.id as i64);
+    gw
+}
+
+/// (Task 11b) Additive counterpart to [`enroll_one`] that redeems the minted
+/// token via [`StubGateway::enroll_with_wg_pubkey`] instead of
+/// [`StubGateway::enroll`], so the resulting gateway's epoch-0 baseline key
+/// is `wg_pubkey` rather than the cycle-2 placeholder. `enroll_one` itself is
+/// untouched — every existing caller is unaffected.
+pub async fn enroll_one_with_wg_pubkey(
+    h: &TestController,
+    segment_name: &str,
+    cidr: &str,
+    wg_pubkey: &str,
+) -> StubGateway {
+    let mut admin = h.admin_client().await;
+
+    let segment = admin
+        .create_segment(CreateSegmentRequest {
+            name: segment_name.to_string(),
+            cidrs: vec![cidr.to_string()],
+        })
+        .await
+        .expect("creating segment for enroll_one_with_wg_pubkey")
+        .into_inner();
+
+    let token = admin
+        .mint_token(MintTokenRequest {
+            kind: "gateway".to_string(),
+            bound_cidrs: vec![cidr.to_string()],
+            rebind_segment_id: 0,
+        })
+        .await
+        .expect("minting gateway token for enroll_one_with_wg_pubkey")
+        .into_inner()
+        .token;
+
+    let mut gw = StubGateway::enroll_with_wg_pubkey(h, &token, &[cidr], wg_pubkey)
+        .await
+        .expect("enrolling stub gateway in enroll_one_with_wg_pubkey");
     gw.set_segment_id(segment.id as i64);
     gw
 }

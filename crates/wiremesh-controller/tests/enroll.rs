@@ -38,6 +38,7 @@ async fn enroll_issues_cert_then_token_is_single_use() {
             token: tok.clone(),
             csr_pem: csr.clone(),
             cidrs: vec!["10.0.0.0/16".into()],
+            wg_pubkey: String::new(),
         })
         .await
         .unwrap()
@@ -60,6 +61,7 @@ async fn enroll_issues_cert_then_token_is_single_use() {
             token: tok,
             csr_pem: csr,
             cidrs: vec!["10.0.0.0/16".into()],
+            wg_pubkey: String::new(),
         })
         .await
         .unwrap_err();
@@ -118,6 +120,7 @@ async fn token_bound_to_one_segment_cannot_enroll_into_another() {
             token: tok,
             csr_pem: csr,
             cidrs: vec!["10.1.0.0/16".into()],
+            wg_pubkey: String::new(),
         })
         .await
         .unwrap_err();

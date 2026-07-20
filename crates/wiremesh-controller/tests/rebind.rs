@@ -117,6 +117,7 @@ async fn second_gateway_token_rejected_on_occupied_segment() {
             token: tok,
             csr_pem: csr,
             cidrs: vec!["10.0.0.0/16".into()],
+            wg_pubkey: String::new(),
         })
         .await
         .expect_err(
@@ -175,6 +176,7 @@ async fn rebind_token_for_one_segment_refused_against_another() {
             token: tok,
             csr_pem: csr,
             cidrs: vec!["10.1.0.0/16".into()],
+            wg_pubkey: String::new(),
         })
         .await
         .expect_err(
