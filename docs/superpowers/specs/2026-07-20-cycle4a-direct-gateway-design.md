@@ -103,9 +103,31 @@ crates/wiremesh-gateway/
 
 Cargo deps: `wiremesh-proto`, `wiremesh-enforcer`, `wiremesh-policy`,
 `wiremesh-trust`; `boringtun 0.6` (`device`); `tokio`, `tonic` + `rustls`
-(workspace-pinned) for the mTLS Sync client; `rtnetlink` for routes; `prost`
-types via `wiremesh-proto`. The `punch::observe()` helper graduates from
-`spike/punch` into `observe.rs`.
+(workspace-pinned) for the mTLS Sync client; `sha2` for the observe-probe MAC;
+`prost` types via `wiremesh-proto`.
+
+**Route/link programming shells out to `ip`, and MSS clamping to `nft`**, via
+`std::process::Command` — the repo's established pattern (the whole netns
+harness and the nftables enforcer backend already drive `ip`/`nft`/`wg`/`sysctl`
+this way; there is no netlink crate anywhere in the tree). This adds `iproute2`
+and `nftables` as documented gateway runtime dependencies, alongside the
+existing `conntrack-tools` requirement of the nftables enforcer backend. (The
+in-process UAPI writer still stands: it avoids a `wireguard-tools` runtime
+dependency, which — unlike near-universal `iproute2` — is a separate package and
+is exactly what embedding boringtun exists to eliminate. Swapping route
+programming to an in-process netlink crate is a later option if the `iproute2`
+dependency ever becomes unacceptable.)
+
+**Observe-probe codec.** The authenticated probe format (`MAGIC` `AOBS`, 44-byte
+layout, `sha256(observe_key || MAGIC || gateway_id_be)` MAC) already exists as
+`pub` `build_probe`/`compute_mac` in `wiremesh_controller::observe`, but the
+gateway must not depend on the controller crate (wrong dependency direction +
+binary bloat). The gateway **replicates** this ~15-line builder in its own
+`observe.rs` (the controller module's own doc states 4b replaces the whole
+scheme, so a shared crate for a doomed codec is premature). Correctness is
+guaranteed by a cross-process **parity integration test**: the real in-process
+controller must accept the gateway's probe and record the candidate endpoint. A
+byte-vector unit test additionally pins the format.
 
 Integration (netns) tests live in `wiremesh-testkit` behind `--features netns`,
 building on the existing `Lab` / `Ns` / `wg_lab` harness; they run the real
@@ -161,7 +183,8 @@ and updates policy/relays/revocations. After every apply the reconciler:
    `allowed_ips` (peer segment CIDRs), `persistent_keepalive=15`.
 2. **Enforcer:** only when `policy_version` changed, deserialize `policy_ir` and
    `apply`. (Verbatim bytes; no recompile — no drift.)
-3. **Routes:** reconcile peer-CIDR routes via the tun device.
+3. **Routes:** reconcile peer-CIDR routes via the tun device (`ip route
+   add/del <cidr> dev <tun>`, shelled out).
 4. **Persist:** atomically rewrite `state.json` (temp file + `rename`, mode
    0600).
 
@@ -183,9 +206,12 @@ required for symmetric NAT rides with 4b (see §7-B).
 
 ### 5.5 MTU (§6.1)
 
-The tun device is created with MTU 1280 and the gateway applies TCP MSS clamping
-on the tun, per master §6.1 / PRD G-8. Per-peer MTU raising (1420 direct) stays a
-P1 item.
+The tun device is created with MTU 1280 (`ip link set <tun> mtu 1280`) and the
+gateway installs an `nft` MSS-clamp rule so forwarded TCP SYNs advertise
+MSS 1240 (1280 − 20 IPv4 − 20 TCP), per master §6.1 / PRD G-8 — transit MSS
+clamping requires rewriting in-transit SYN options, which a route `advmss`
+attribute does not do for forwarded traffic. Per-peer MTU raising (1420 direct)
+stays a P1 item.
 
 ## 6. Throughput bench (G-2)
 
@@ -197,10 +223,13 @@ netns-provable in CI; the perf gate is separate.
 
 ## 7. Scope boundaries (explicit)
 
-**A — Gateway identity.** 4a assumes a **pre-provisioned** client cert + key + CA
-bundle in the state dir (produced by the existing Cycle-2 enrollment flow /
-`fabricctl`). Wiring enrollment-token bootstrap *into the gateway process* is a
-small follow-up, not 4a.
+**A — Gateway identity.** 4a assumes a **pre-provisioned** identity bundle in the
+state dir (produced by the existing Cycle-2 enrollment flow / `fabricctl` /
+testkit `StubGateway::enroll`): client cert + key, CA bundle, the gateway's own
+`gateway_id`, and its `observe_key` (both returned by enrollment — the
+`observe_key` authenticates the observation probe, §5.4). Wiring
+enrollment-token bootstrap *into the gateway process* is a small follow-up, not
+4a.
 
 **B — Observation socket precision.** As §5.4: 4a observes from a `SO_REUSEPORT`
 sidecar socket, correct under routable / full-cone. Probing from the exact
