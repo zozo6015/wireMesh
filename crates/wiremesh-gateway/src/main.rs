@@ -12,7 +12,7 @@ use wiremesh_gateway::identity::Identity;
 use wiremesh_gateway::metrics;
 use wiremesh_gateway::state::DesiredState;
 use wiremesh_gateway::tunnel::Tunnel;
-use wiremesh_gateway::{observe, reconcile, routes, sync};
+use wiremesh_gateway::{observe, reconcile, routes, sync, uapi};
 
 const TUN_MTU: u32 = 1280;
 const MSS: u16 = 1240;
@@ -143,7 +143,17 @@ async fn apply_state(
     prev: Option<&DesiredState>,
     ds: &DesiredState,
 ) -> anyhow::Result<()> {
-    tunnel.reconcile(ds, KEEPALIVE)?;
+    // The UAPI apply itself is a blocking UnixStream connect/write/read
+    // (`uapi::apply`). Build the (cheap, synchronous) device config from the
+    // tunnel's plain fields first, then run ONLY the blocking call inside
+    // `spawn_blocking` with owned data — this avoids moving `Tunnel`/
+    // `DeviceHandle` (which owns boringtun's non-`Send` internals) into the
+    // blocking closure while still keeping the Tokio worker thread free.
+    let dev = reconcile::device_config(ds, &tunnel.private_key_b64, tunnel.listen_port, KEEPALIVE);
+    let ifname = tunnel.ifname.clone();
+    tokio::task::spawn_blocking(move || uapi::apply(&ifname, &dev))
+        .await
+        .context("tunnel UAPI apply task panicked")??;
     enforcer.lock().await.apply_if_changed(ds)?;
     let empty = DesiredState::default();
     let diff = reconcile::route_diff(prev.unwrap_or(&empty), ds);

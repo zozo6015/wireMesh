@@ -109,7 +109,7 @@ pub struct TestController {
     // at `start`/`start_on` so `restart` re-binds the SAME address (the OS
     // still re-assigns the ports). `127.0.0.1` for `start()` (unchanged);
     // a routable underlay IP for the mesh-milestone test's `start_on`.
-    bind_ip: std::net::IpAddr,
+    bind_ip: std::net::Ipv4Addr,
     // Held only so the directory (and everything the controller wrote under
     // it — DB, CA, secrets, the socket) is cleaned up on drop; never read
     // directly.
@@ -168,7 +168,7 @@ impl TestController {
     /// `start()` delegates here with `127.0.0.1`, so every existing caller is
     /// byte-for-byte unchanged. The TLS server cert SAN stays `127.0.0.1`
     /// regardless (see `Config::bind_ip`'s doc comment).
-    pub async fn start_on(bind_ip: std::net::IpAddr) -> TestController {
+    pub async fn start_on(bind_ip: std::net::Ipv4Addr) -> TestController {
         let data_dir = tempfile::tempdir().expect("creating temp data dir for TestController");
         let socket_path = data_dir.path().join("controller.sock");
 

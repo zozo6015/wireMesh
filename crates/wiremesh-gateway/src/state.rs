@@ -99,6 +99,14 @@ impl DesiredState {
             f.sync_all()?;
         }
         fs::rename(&tmp, &final_path).context("atomically renaming state.json")?;
+        // Fsync the containing directory too: on most POSIX filesystems the
+        // rename's directory-entry update is not itself durable until the
+        // directory inode is fsynced, so a crash right after `rename` could
+        // otherwise leave the rename un-persisted despite the file's own
+        // content already being synced above.
+        fs::File::open(state_dir)
+            .and_then(|d| d.sync_all())
+            .context("fsyncing state_dir after rename")?;
         Ok(())
     }
 

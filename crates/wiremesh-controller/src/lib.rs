@@ -113,14 +113,14 @@ pub struct Config {
     /// dial validates the cert via SNI `domain_name("127.0.0.1")`, not the
     /// dialed IP), so binding a routable IP here is purely a socket-bind
     /// change, not a certificate change.
-    pub bind_ip: std::net::IpAddr,
+    pub bind_ip: std::net::Ipv4Addr,
 }
 
 impl Config {
     /// The default bind IP (`127.0.0.1`) — loopback-only, the historical
     /// behavior every caller except the mesh-milestone test wants.
-    pub fn default_bind_ip() -> std::net::IpAddr {
-        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+    pub fn default_bind_ip() -> std::net::Ipv4Addr {
+        std::net::Ipv4Addr::LOCALHOST
     }
 }
 

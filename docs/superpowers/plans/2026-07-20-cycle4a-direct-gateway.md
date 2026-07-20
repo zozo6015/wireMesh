@@ -21,7 +21,7 @@
 
 ## File structure (new crate)
 
-```
+```text
 crates/wiremesh-gateway/
   Cargo.toml
   src/
@@ -1047,7 +1047,7 @@ git commit -m "feat(gateway): pure reconcile (peer list, route diff, apply-neede
   - `routes::install_mss_clamp(ifname: &str, mss: u16)` → installs nft table `inet wiremesh_mss` with a forward hook clamping SYN MSS on `<ifname>` to `<mss>` (idempotent: delete-then-add).
 
 **Detail — the nft ruleset** `install_mss_clamp` writes and loads:
-```
+```text
 table inet wiremesh_mss {
   chain forward {
     type filter hook forward priority mangle;
@@ -2093,7 +2093,7 @@ Update `docs/progress.html` to mark Cycle 4a done (mirror the auto-memory "progr
 - [ ] **Step 6: Run the smoke test + full suite one final time**
 
 Run:
-```
+```bash
 ./dev.sh run "cargo test -p wiremesh-gateway --lib"
 ./dev.sh run "cargo test -p wiremesh-gateway --features netns-tests -- --test-threads=1 --nocapture"
 ```

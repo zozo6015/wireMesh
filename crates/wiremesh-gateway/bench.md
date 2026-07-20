@@ -14,7 +14,7 @@ harness-only, never as evidence for or against G-2.
 
 ## Running the smoke test (any environment, informational only)
 
-```
+```sh
 ./dev.sh run "cargo test -p wiremesh-gateway --test throughput_bench \
   --features netns-tests -- --test-threads=1 --nocapture"
 ```
@@ -31,7 +31,7 @@ from the container.
    real veth/bridge, if you want a single-host approximation) are needed to
    host the two gateway ends.
 2. Build the release binary:
-   ```
+   ```sh
    cargo build --release -p wiremesh-gateway
    ```
 3. Stand up two `wiremesh-gateway` processes against a running
@@ -41,7 +41,7 @@ from the container.
    live WireGuard tunnel with policy permitting the iperf3 port.
 4. Run iperf3 **with parallel streams**, matching the spec's 8-tunnel
    aggregate methodology used for the PRD's G-2 acceptance:
-   ```
+   ```sh
    # on the receiving gateway's segment:
    iperf3 -s
 
@@ -50,7 +50,7 @@ from the container.
    ```
 5. Also capture the UDP loss profile, to settle whether the container-only
    receive-cap finding was environment noise or a real boringtun bottleneck:
-   ```
+   ```sh
    iperf3 -c <receiver-overlay-ip> -u -b 0 -t 10
    # inspect the Lost/Total datagrams column, not just the reported Mbit/s
    ```

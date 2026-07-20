@@ -95,7 +95,7 @@ tracked follow-up, not a 4a blocker.
 
 ## 3. Crate layout
 
-```
+```text
 crates/wiremesh-gateway/
   Cargo.toml            # workspace member; static-binary profile
   src/

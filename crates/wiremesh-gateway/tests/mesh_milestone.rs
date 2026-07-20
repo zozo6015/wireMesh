@@ -204,6 +204,12 @@ impl GwProc {
     }
 }
 
+impl Drop for GwProc {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
 fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, tag: &str) -> GwProc {
     let metrics = format!("0.0.0.0:{METRICS_PORT}");
     let statedir_s = statedir.to_str().unwrap();

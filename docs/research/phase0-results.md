@@ -8,7 +8,7 @@ shipped the real `wiremesh-gateway` binary and its own throughput smoke test,
 `crates/wiremesh-gateway/bench.md`). Run in the same macOS Docker-Desktop dev
 container as the Phase-0 Bet-1 measurement above:
 
-```
+```sh
 ./dev.sh run "cargo test -p wiremesh-gateway --test throughput_bench \
   --features netns-tests -- --test-threads=1 --nocapture"
 # THROUGHPUT SMOKE (netns, harness-only, NOT the G-2 gate): 6.90 Mbit/s
