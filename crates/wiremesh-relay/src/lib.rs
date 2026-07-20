@@ -398,8 +398,17 @@ fn extract_serial_hex(end_entity: &CertificateDer<'_>) -> Result<String> {
     let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
         .map_err(|e| anyhow::anyhow!("parsing end-entity cert DER for serial: {e}"))?;
     let raw = cert.raw_serial();
-    let trimmed: &[u8] = if raw.len() > 1 && raw[0] == 0x00 { &raw[1..] } else { raw };
-    Ok(trimmed.iter().map(|b| format!("{b:02x}")).collect())
+    // raw_serial() is the DER INTEGER content: leading zeros stripped, with at most
+    // one 0x00 pad re-added when the high bit is set. Undo the pad, then left-pad
+    // back to the original fixed 16-byte width so the hex matches wiremesh-trust's
+    // IssuedCert.serial (hex_encode of the raw 16 bytes, leading zeros included).
+    let content: &[u8] = if raw.len() == 17 && raw[0] == 0x00 { &raw[1..] } else { raw };
+    if content.len() > 16 {
+        anyhow::bail!("cert serial DER content longer than 16 bytes: {}", content.len());
+    }
+    let mut serial16 = [0u8; 16];
+    serial16[16 - content.len()..].copy_from_slice(content);
+    Ok(serial16.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// A `ClientCertVerifier` that delegates chain validation to an inner
@@ -472,8 +481,11 @@ impl rustls::server::danger::ClientCertVerifier for DenyingVerifier {
 /// Identical to [`server_config`] except the client-cert verifier ALSO
 /// rejects any client whose cert serial is present in `denylist` (checked
 /// after webpki chain validation succeeds — see [`DenyingVerifier`]). The
-/// plain `server_config` is left unchanged so the Task-2 bridge test (which
-/// has no denylist concept at all) keeps working exactly as before.
+/// plain `server_config` remains available for callers that want no
+/// denylist at all; the `relay` binary always uses THIS function instead.
+/// Task-2 bridge-test parity is preserved via the fail-static empty-denylist
+/// path: when no `denylist.json` is present, the denylist is simply empty,
+/// so no client is ever rejected on that basis.
 pub fn server_config_with_denylist(certdir: &Path, denylist: Denylist) -> Result<QuinnServerConfig> {
     ensure_crypto_provider();
 
@@ -554,14 +566,18 @@ pub async fn run_sync(
             Some(Body::Snapshot(s)) => {
                 let n = s.revoked_serials.len();
                 denylist.replace_all(s.revoked_serials);
-                denylist.persist(&persist_path)?;
+                if let Err(e) = denylist.persist(&persist_path) {
+                    eprintln!("relay: denylist persist failed (continuing with in-memory update): {e}");
+                }
                 eprintln!("relay: sync[{relay_id}] snapshot: {n} revoked serial(s)");
             }
             Some(Body::Delta(d)) => {
                 if !d.revoked_serials.is_empty() {
                     let n = d.revoked_serials.len();
                     denylist.union(d.revoked_serials);
-                    denylist.persist(&persist_path)?;
+                    if let Err(e) = denylist.persist(&persist_path) {
+                        eprintln!("relay: denylist persist failed (continuing with in-memory update): {e}");
+                    }
                     eprintln!("relay: sync[{relay_id}] delta: +{n} revoked serial(s)");
                 }
             }
