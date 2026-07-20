@@ -10,6 +10,7 @@
 //! `Arc<tokio::sync::Mutex<GatewayEnforcer>>` behind a real boringtun/eBPF
 //! boot — is proven end-to-end by Task 12's mesh milestone, which spawns the
 //! real binary and scrapes this port for real.
+use crate::path::PathState;
 use std::future::Future;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -28,6 +29,44 @@ pub fn render(kind: &str, applied_version: u64, counters: &Counters) -> String {
     s.push_str(&format!("wiremesh_gateway_applied_policy_version {applied_version}\n"));
     s.push_str("# TYPE wiremesh_gateway_backend_info gauge\n");
     s.push_str(&format!("wiremesh_gateway_backend_info{{backend=\"{kind}\"}} 1\n"));
+    s
+}
+
+/// Render current per-peer path-state gauges (spec §6.1) as a single
+/// labeled gauge — `wiremesh_gateway_path_state{peer,state} 1` for the
+/// peer's CURRENT state only, mirroring the `wiremesh_gateway_backend_info`
+/// info-gauge pattern above rather than emitting explicit 0-valued lines
+/// for the other four states. Task 10 wires `peer_states` from the live
+/// per-peer `Path` table (`main.rs`'s boot loop); this task only needs the
+/// pure render.
+pub fn render_path_state(peer_states: &[(String, PathState)]) -> String {
+    let mut s = String::new();
+    s.push_str("# TYPE wiremesh_gateway_path_state gauge\n");
+    for (peer, state) in peer_states {
+        s.push_str(&format!(
+            "wiremesh_gateway_path_state{{peer=\"{peer}\",state=\"{}\"}} 1\n",
+            state.as_str()
+        ));
+    }
+    s
+}
+
+/// Render path-state transition counters:
+/// `wiremesh_gateway_path_transitions_total{from,to} <count>`. Task 10
+/// accumulates these counts as `Path::tick`/`on_handshake` change state
+/// (comparing state before/after each call — `path.rs` itself doesn't
+/// track counts, only the current state); this task only needs the pure
+/// render.
+pub fn render_path_transitions(counts: &[((PathState, PathState), u64)]) -> String {
+    let mut s = String::new();
+    s.push_str("# TYPE wiremesh_gateway_path_transitions_total counter\n");
+    for ((from, to), count) in counts {
+        s.push_str(&format!(
+            "wiremesh_gateway_path_transitions_total{{from=\"{}\",to=\"{}\"}} {count}\n",
+            from.as_str(),
+            to.as_str()
+        ));
+    }
     s
 }
 
@@ -82,6 +121,40 @@ mod tests {
         assert!(out.contains("wiremesh_gateway_rule_hits_total{rule_id=\"r1\"} 7"));
         assert!(out.contains("wiremesh_gateway_applied_policy_version 5"));
         assert!(out.contains("backend=\"ebpf\""));
+    }
+
+    #[test]
+    fn render_path_state_emits_current_state_gauge_per_peer() {
+        let out = render_path_state(&[
+            ("peerA".to_string(), PathState::Direct),
+            ("peerB".to_string(), PathState::Degraded),
+        ]);
+        assert!(out.contains("# TYPE wiremesh_gateway_path_state gauge"));
+        assert!(
+            out.contains("wiremesh_gateway_path_state{peer=\"peerA\",state=\"direct\"} 1"),
+            "body: {out}"
+        );
+        assert!(
+            out.contains("wiremesh_gateway_path_state{peer=\"peerB\",state=\"degraded\"} 1"),
+            "body: {out}"
+        );
+    }
+
+    #[test]
+    fn render_path_transitions_emits_from_to_counter() {
+        let out = render_path_transitions(&[
+            ((PathState::Connecting, PathState::Direct), 3u64),
+            ((PathState::Direct, PathState::Degraded), 1u64),
+        ]);
+        assert!(out.contains("# TYPE wiremesh_gateway_path_transitions_total counter"));
+        assert!(
+            out.contains("wiremesh_gateway_path_transitions_total{from=\"connecting\",to=\"direct\"} 3"),
+            "body: {out}"
+        );
+        assert!(
+            out.contains("wiremesh_gateway_path_transitions_total{from=\"direct\",to=\"degraded\"} 1"),
+            "body: {out}"
+        );
     }
 
     #[tokio::test]

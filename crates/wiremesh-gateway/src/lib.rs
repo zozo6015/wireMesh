@@ -5,6 +5,7 @@ pub mod identity;
 pub mod metrics;
 pub mod netif;
 pub mod observe;
+pub mod path;
 pub mod punch;
 pub mod reconcile;
 pub mod routes;
