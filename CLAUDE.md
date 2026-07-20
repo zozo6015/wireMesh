@@ -17,8 +17,9 @@ The project ships binaries and docs, never hosted infrastructure.
 
 ## Project state
 
-Phase 0 spike, Cycle 2 (controller core), Cycle 3 (policy pipeline), and
-Cycle 4a (direct-only gateway) are complete. Cycle 3 delivered the DSL →
+Phase 0 spike, Cycle 2 (controller core), Cycle 3 (policy pipeline), Cycle 4a
+(direct-only gateway), and Cycle 4b (NAT traversal) are complete. Cycle 3
+delivered the DSL →
 canonical-JSON IR compiler (`wiremesh-policy`), the controller wiring that
 compiles/versions policy and streams real `policy_ir` over Sync (+ `fabricctl
 policy show|status`), and the `wiremesh-enforcer` library with **both**
@@ -46,14 +47,36 @@ number is DEFERRED to a cloud 4-vCPU run (bench built and smoke-tested,
 not measured — see `crates/wiremesh-gateway/bench.md` and
 `docs/research/phase0-results.md`).
 
+Cycle 4b delivered controller-brokered simultaneous hole punching: a new
+`PunchDirective` `SyncMessage` variant with a controller broker that sends
+both pair members' directives back-to-back (go-skew held below one-way
+latency, per Phase-0 Finding 2), the gateway's transient same-socket
+`SO_REUSEPORT` puncher (de-risked first by `spike/natpunch`, 4/4 runs, before
+any broker/state-machine work was built on it), a multi-candidate model
+(observed public mapping + gateway-reported local addresses via the new
+`ReportRequest.local_endpoints` field, empty-list-clears semantics), and the
+`Connecting/Direct/Degraded/Relayed/Disconnected` path state machine
+(`path.rs`) driven off the WG UAPI read side. NAT-matrix netns conformance
+(`crates/wiremesh-gateway/tests/nat_matrix.rs`, mandatory `tc netem delay
+20ms`) passes all 4 done-bar cases: port-restricted→Direct with a real WG
+handshake, symmetric→clean relay-needed verdict, go-skew determinism, and
+Direct→Degraded after 45s silence. **Relay transport is explicitly out of
+scope** — `Relayed` is wired but inert (a placeholder verdict, not a working
+path); that's Cycle 4c. A path-liveness product bug (boringtun's
+`last_handshake_time` can advance with no corroborating `rx_bytes` for a
+peer retrying an unanswered handshake) was found and fixed during
+conformance — see `docs/research/cycle4b-path-liveness-note.md` and
+`docs/research/cycle4b-nat-traversal-notes.md`.
+
 **Deployment notes:** the nftables enforcer backend requires
 `conntrack-tools` on the gateway host (`flush_flows` uses `conntrack -F`);
 the gateway binary itself requires `iproute2` and `nftables` on the host
 (route/link programming and the MSS clamp shell out to `ip`/`nft`).
 
-Next action is the key-rotation fast-follow, then Cycle 4b (NAT hole punching
-+ path state machine) and Cycle 4c (relay). Also pending: Cycle 2b fast-follow
-(OpenBao provider driver). Update this section as phases complete.
+Next action is Cycle 4c (relay: `wiremesh-relay` binary + gateway relay
+transport + relay advertisement + make-before-break) plus the key-rotation
+fast-follow (carried from 4a). Also pending: Cycle 2b fast-follow (OpenBao
+provider driver). Update this section as phases complete.
 
 ## Agent workflow rules
 
