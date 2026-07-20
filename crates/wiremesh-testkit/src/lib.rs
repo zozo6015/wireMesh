@@ -105,6 +105,11 @@ pub struct TestController {
     // panic here).
     server_runtime: Option<tokio::runtime::Runtime>,
     socket_path: PathBuf,
+    // (Cycle 4a Task 12) The IP every controller listener binds to, captured
+    // at `start`/`start_on` so `restart` re-binds the SAME address (the OS
+    // still re-assigns the ports). `127.0.0.1` for `start()` (unchanged);
+    // a routable underlay IP for the mesh-milestone test's `start_on`.
+    bind_ip: std::net::IpAddr,
     // Held only so the directory (and everything the controller wrote under
     // it — DB, CA, secrets, the socket) is cleaned up on drop; never read
     // directly.
@@ -151,6 +156,19 @@ impl TestController {
     /// field's doc comment for why this decoupling is load-bearing, not
     /// cosmetic.
     pub async fn start() -> TestController {
+        Self::start_on(Config::default_bind_ip()).await
+    }
+
+    /// (Cycle 4a Task 12) Additive counterpart to [`Self::start`] that binds
+    /// every controller listener (Enrollment/Sync/Admin TCP + observation
+    /// UDP) to `bind_ip` instead of the default `127.0.0.1`. Used by the
+    /// mesh-milestone netns test to bind a routable underlay address a
+    /// `wiremesh-gateway` process in a separate network namespace can reach —
+    /// `sync_tcp_addr()`/`observe_addr()` then return that routable `IP:port`.
+    /// `start()` delegates here with `127.0.0.1`, so every existing caller is
+    /// byte-for-byte unchanged. The TLS server cert SAN stays `127.0.0.1`
+    /// regardless (see `Config::bind_ip`'s doc comment).
+    pub async fn start_on(bind_ip: std::net::IpAddr) -> TestController {
         let data_dir = tempfile::tempdir().expect("creating temp data dir for TestController");
         let socket_path = data_dir.path().join("controller.sock");
 
@@ -161,6 +179,7 @@ impl TestController {
             socket_path: socket_path.clone(),
             admin_tcp_port: 0,
             observe_udp_port: 0,
+            bind_ip,
         };
 
         let server_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -180,6 +199,7 @@ impl TestController {
             socket_path,
             running: Some(running),
             server_runtime: Some(server_runtime),
+            bind_ip,
         }
     }
 
@@ -219,6 +239,7 @@ impl TestController {
             socket_path: self.socket_path.clone(),
             admin_tcp_port: 0,
             observe_udp_port: 0,
+            bind_ip: self.bind_ip,
         };
 
         // (Task 13) Reuse the SAME `server_runtime` across a restart (rather

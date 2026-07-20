@@ -10,6 +10,13 @@ pub struct GatewayConfig {
     pub tun_ifname: String,
     pub wg_listen_port: u16,
     pub state_dir: PathBuf,
+    /// Address the Prometheus metrics endpoint binds to. Optional flag
+    /// `--metrics <ip:port>`; defaults to `127.0.0.1:0` (loopback,
+    /// OS-assigned port) so the historical behavior is unchanged. The
+    /// mesh-milestone netns test passes a routable `0.0.0.0:<fixed-port>` so
+    /// it can scrape `wiremesh_gateway_default_deny_total` from the root
+    /// namespace over the underlay.
+    pub metrics_addr: SocketAddr,
 }
 
 impl GatewayConfig {
@@ -23,6 +30,7 @@ impl GatewayConfig {
         let mut tun = None;
         let mut wg_port = None;
         let mut state_dir = None;
+        let mut metrics_addr = None;
         let mut it = args.skip(1); // argv[0]
         while let Some(flag) = it.next() {
             let mut val = || it.next().ok_or_else(|| anyhow!("flag {flag} needs a value"));
@@ -32,6 +40,7 @@ impl GatewayConfig {
                 "--tun" => tun = Some(val()?),
                 "--wg-port" => wg_port = Some(val()?.parse().context("--wg-port")?),
                 "--state-dir" => state_dir = Some(PathBuf::from(val()?)),
+                "--metrics" => metrics_addr = Some(val()?.parse().context("--metrics")?),
                 other => return Err(anyhow!("unknown flag {other}")),
             }
         }
@@ -41,6 +50,10 @@ impl GatewayConfig {
             tun_ifname: tun.ok_or_else(|| anyhow!("--tun required"))?,
             wg_listen_port: wg_port.ok_or_else(|| anyhow!("--wg-port required"))?,
             state_dir: state_dir.ok_or_else(|| anyhow!("--state-dir required"))?,
+            // Optional: default to loopback + OS-assigned port (historical
+            // behavior) when `--metrics` is absent.
+            metrics_addr: metrics_addr
+                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
         })
     }
 }

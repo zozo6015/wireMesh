@@ -72,7 +72,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // sharing `enforcer` with the sync loop below via Arc<Mutex<_>>.
     {
         let metrics_listener =
-            TcpListener::bind("127.0.0.1:0").await.context("binding metrics listener")?;
+            TcpListener::bind(cfg.metrics_addr).await.context("binding metrics listener")?;
         eprintln!("wiremesh-gateway: metrics listening on {}", metrics_listener.local_addr()?);
         let enforcer = enforcer.clone();
         let applied_version = applied_version.clone();
