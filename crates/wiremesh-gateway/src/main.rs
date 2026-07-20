@@ -495,24 +495,74 @@ async fn run_path_ticks(ctx: PathCtx) {
                     let rx_increased = last_rx.get(&gid).map_or(false, |&prev| rx > prev);
                     last_rx.insert(gid, rx);
 
-                    // A handshake-time advance reliably signals recovery when
-                    // the peer ISN'T already Direct (Connecting/Degraded/
-                    // Relayed) -- boringtun genuinely just completed a fresh
-                    // Noise handshake there, and `on_handshake`'s own
-                    // authenticated-inbound bookkeeping is exactly right.
-                    // Once ALREADY Direct, only trust it corroborated by an
-                    // rx_bytes increase: this project's boringtun build has
-                    // been observed (netns conformance, Cycle 4b Task 11 —
-                    // see docs/research/cycle4b-nat-matrix-notes.md) to
-                    // advance `last_handshake_time` on EVERY driver tick for
-                    // a peer that is retrying an unanswered handshake (no
-                    // reply ever arrives, `rx_bytes` frozen) — i.e. the
-                    // timestamp climbs in lockstep with wall-clock time with
-                    // no corresponding received byte. Trusting it
-                    // unconditionally while already Direct would refresh
-                    // `last_inbound` forever and make `DEGRADED_AFTER`
-                    // unreachable for a genuinely dead link.
-                    if advanced && (path.state != PathState::Direct || rx_increased) {
+                    // Trust a handshake-time advance unconditionally only for
+                    // this peer's FIRST-EVER handshake (`path.last_handshake
+                    // == None`), i.e. genuine session bootstrap where no
+                    // prior session ever existed to go stale. Once the peer
+                    // HAS had a handshake before (Direct at some point, now
+                    // Degraded/Relayed/Connecting-again), require corroboration
+                    // by an rx_bytes increase this same tick.
+                    //
+                    // Why the split, not a uniform rx requirement: this
+                    // project's boringtun build has been observed (netns
+                    // conformance, Cycle 4b Task 11 — see
+                    // docs/research/cycle4b-nat-matrix-notes.md) to advance
+                    // `last_handshake_time` on EVERY driver tick for a peer
+                    // that is repeatedly RETRYING an established-but-now-stale
+                    // session with no reply ever arriving (`rx_bytes` frozen)
+                    // — i.e. the timestamp climbs in lockstep with wall-clock
+                    // time with no corresponding received byte. The PRIOR
+                    // version of this code trusted the advance unconditionally
+                    // whenever `path.state != Direct`, on the theory that
+                    // "advance while not Direct is always a genuine fresh
+                    // handshake" -- that theory is exactly what the quirk
+                    // contradicts for a Degraded path retrying a dead link:
+                    // the timestamp advances every tick there too, bouncing
+                    // Degraded back to Direct forever and never escalating to
+                    // Disconnected/relay-needed, defeating failover.
+                    //
+                    // A uniform "always require same-tick rx corroboration"
+                    // fix (tried first) is ALSO wrong, though, and for a
+                    // different reason: a genuine WireGuard handshake
+                    // completion is a control-plane event that does NOT
+                    // itself bump `rx_bytes` (only decrypted data-channel
+                    // packets, incl. keepalives, do — see the `last_rx`
+                    // comment above), and for a brand-new peer's first-ever
+                    // handshake, the first corroborating data packet can lag
+                    // the handshake advance by an unbounded amount (any fixed
+                    // grace window can miss it, e.g. under retry/backoff at
+                    // higher layers) -- confirmed empirically: requiring rx
+                    // corroboration (same-tick, or within a several-second
+                    // grace window) for the FIRST handshake made
+                    // `establish_direct` in the netns nat matrix stick in
+                    // `Connecting` forever on one side across cases 1/3/4,
+                    // because that side's one-shot `advanced` event was never
+                    // re-observed once missed. Gating only on "has this peer
+                    // ever had a handshake before" avoids that: a first
+                    // handshake is trusted immediately (matching every
+                    // previously-passing scenario), while a peer that has
+                    // already been Direct once — the ONLY case the documented
+                    // quirk actually needs guarding, since only an established
+                    // session can go stale and enter a retry-with-no-reply
+                    // loop — requires corroboration. Net effect:
+                    //   - genuine first-time connect (Connecting/Relayed ->
+                    //     Direct with no prior handshake) still fires
+                    //     immediately, exactly as before;
+                    //   - genuine recovery on a peer that's had a handshake
+                    //     before (Degraded/Relayed -> Direct on a real
+                    //     completed re-handshake) still fires, since
+                    //     `advanced && rx_increased` both hold once real data
+                    //     resumes;
+                    //   - a healthy keepalive'd Direct path stays Direct (rx
+                    //     increases every keepalive interval -> falls through
+                    //     to on_authenticated_inbound below);
+                    //   - a truly DEAD path that had a handshake before
+                    //     (spurious timestamp advance, rx frozen) no longer
+                    //     gets re-Directed -- it sticks in Degraded and
+                    //     correctly escalates to Disconnected/MarkRelayNeeded
+                    //     after DEGRADED_DEAD_AFTER.
+                    let is_first_handshake = path.last_handshake.is_none();
+                    if advanced && (is_first_handshake || rx_increased) {
                         path.on_handshake(now);
                     } else if rx_increased {
                         // A handshake advance already calls on_handshake
