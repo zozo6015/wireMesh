@@ -79,7 +79,13 @@ impl Default for EnforcerConfig {
 /// task) and the nftables fallback (later task) implement this same trait,
 /// so callers (the controller-facing gateway agent, `fabricctl`, tests) never
 /// need to know which one is actually loaded.
-pub trait Enforcer {
+///
+/// `: Send` (added Cycle 4a Task 11): `wiremesh-gateway` shares a live
+/// `Box<dyn Enforcer>` between its sync loop and its metrics-scrape task via
+/// `Arc<tokio::sync::Mutex<_>>`, which requires the trait object itself to be
+/// `Send`. Both concrete backends (`EbpfEnforcer`'s `aya::Ebpf`, `NftEnforcer`'s
+/// plain `String`/config fields) already are, so this is purely additive.
+pub trait Enforcer: Send {
     /// Which backend this instance is actually driving.
     fn kind(&self) -> BackendKind;
     /// Installs `ir` as the live rule set. Atomic: in-flight packets must

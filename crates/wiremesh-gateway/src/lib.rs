@@ -2,6 +2,7 @@
 pub mod config;
 pub mod enforce;
 pub mod identity;
+pub mod metrics;
 pub mod observe;
 pub mod reconcile;
 pub mod routes;
