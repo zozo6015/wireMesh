@@ -253,19 +253,19 @@
     <p class="eyebrow">WireMesh &middot; Build Progress</p>
     <h1>Zero-trust network fabric &mdash; cycle-by-cycle build tracker</h1>
     <p class="lede">Open-source (Apache-2.0), self-hosted, cloud-agnostic L3/L4 network fabric in Rust: WireGuard data plane, default-deny eBPF policy, one gateway per segment, no agents on workloads. The engineering design ships as four plan cycles; this page tracks what's done, in flight, and next.</p>
-    <p class="stamp">Last updated <b>2026-07-18</b> &middot; Phase 0 + Cycle 2 + Cycle 3 complete &middot; PRD reconciled to v0.4 &middot; Cycle 3 on branch <code>worktree-cycle3-policy-pipeline</code> (PR #6) &middot; Cycle 4 up next</p>
+    <p class="stamp">Last updated <b>2026-07-20</b> &middot; Phase 0 + Cycle 2 + Cycle 3 + Cycle 4a complete &middot; PRD reconciled to v0.4 &middot; Cycle 4a on branch <code>worktree-cycle4a-direct-gateway</code> &middot; Cycle 4b (NAT + path SM) up next</p>
   </header>
 
   <div class="metrics">
     <div class="metric">
       <p class="k">Plan cycles</p>
       <div class="v">3<small> / 4 complete</small></div>
-      <p class="sub">Cycle 4 up next</p>
+      <p class="sub">Cycle 4a done &middot; 4b/4c up next</p>
     </div>
     <div class="metric">
-      <p class="k">Cycle 3 tasks</p>
-      <div class="v">14<small> / 14 done</small></div>
-      <p class="sub">workspace 127 green &middot; conformance 22/22 both backends</p>
+      <p class="k">Cycle 4a tasks</p>
+      <div class="v">13<small> / 13 done</small></div>
+      <p class="sub">mesh milestone 4/4 assertions &middot; lib + netns suites green</p>
     </div>
     <div class="metric">
       <p class="k">Phase 0 bets</p>
@@ -274,8 +274,8 @@
     </div>
     <div class="metric">
       <p class="k">Current focus</p>
-      <div class="v" style="font-size:19px;">Cycle 4</div>
-      <p class="sub">Cycle 3 done &middot; DSL→IR→eBPF/nft shipped</p>
+      <div class="v" style="font-size:19px;">Cycle 4b</div>
+      <p class="sub">4a shipped direct-only gateway &middot; NAT punch + path SM next</p>
     </div>
   </div>
 
@@ -289,10 +289,12 @@
         <span class="darrow">&rarr;</span>
         <div class="dnode done"><span class="dk">Cycle 3</span><b>Policy pipeline</b><span class="dm">DSL &rarr; IR &rarr;<br>eBPF / nftables</span></div>
         <span class="darrow">&rarr;</span>
-        <div class="dnode pending"><span class="dk">Cycle 4</span><b>Gateway + Relay</b><span class="dm">tunnel mgr &middot; NAT matrix<br>relay path</span></div>
+        <div class="dnode done"><span class="dk">Cycle 4a</span><b>Direct-only gateway</b><span class="dm">Sync client &middot; UAPI tunnel<br>enforcer wiring &middot; fail-static</span></div>
+        <span class="darrow">&rarr;</span>
+        <div class="dnode pending"><span class="dk">Cycle 4b/4c</span><b>NAT + relay</b><span class="dm">hole punch &middot; path SM<br>relay failover</span></div>
       </div>
     </div>
-    <p class="schematic-cap">Cycle 2 unblocks 3 and 4 &middot; Cycle 3 feeds enforcement backends into Cycle 4 &middot; Phase 0 crates (natlab, enforcer, relay, punch) graduate into the gateway</p>
+    <p class="schematic-cap">Cycle 2 unblocks 3 and 4 &middot; Cycle 3 feeds enforcement backends into Cycle 4a &middot; Phase 0 crates (natlab, enforcer, relay, punch) graduate into the gateway &middot; Cycle 4a's Sync client + tunnel manager unblock 4b's path state machine</p>
     <div class="legend">
       <span class="l"><span class="dot" style="background:var(--go)"></span>done</span>
       <span class="l"><span class="dot" style="background:var(--caveat)"></span>in progress</span>
@@ -302,7 +304,7 @@
   </section>
 
   <section>
-    <h2>Cycles <span class="count">4 total</span></h2>
+    <h2>Cycles <span class="count">5 total</span></h2>
     <div class="cycles">
 
       <article class="cycle" data-status="done">
@@ -335,14 +337,24 @@
         <p class="dep"><b>14/14 tasks</b> &middot; workspace 127 tests green &middot; every task test-authored / implemented / executed / reviewed by separate agents. <b>Depends on:</b> Cycle 2 (IR over Sync; data model). <b>Reused &amp; graduated:</b> Phase 0 <code>enforcer</code> program + <code>natlab</code> harness into <code>wiremesh-enforcer{,-ebpf}</code> and <code>wiremesh-testkit</code>. <b>PRD v0.4 gates &mdash; both met:</b> G-8 ICMP-error semantics in the conformance suite (done, both backends); fail-open proto parse is now a hard error (invalid proto = compile error; omitted proto matches only tcp/udp/icmp on both backends). <b>Notes:</b> nft backend needs <code>conntrack-tools</code> on the gateway host; <b>triggers on merge:</b> submit the OSTIF / Sovereign Tech Fund audit application (PRD &sect;9).</p>
       </article>
 
+      <article class="cycle" data-status="done">
+        <div class="cycle-head">
+          <span class="cycle-no">04a</span>
+          <h3>Direct-only gateway</h3>
+          <span class="pill done"><span>Complete &middot; 2026-07-20</span></span>
+        </div>
+        <p>The real <code>wiremesh-gateway</code> binary: mTLS Sync client (snapshot + delta folding), an in-process WireGuard UAPI writer driving embedded boringtun, <code>wiremesh-enforcer</code> wiring (eBPF/nftables, version-gated apply), fail-static <code>state.json</code> boot (data plane up before Sync), SO_REUSEPORT endpoint observation, tun MTU 1280 + nft MSS clamp, and Prometheus metrics. Proven by a full-mesh netns milestone with two real gateway processes: allowed traffic, denied traffic + counter, fail-static with the controller dead, and a live policy update &mdash; all four green.</p>
+        <p class="dep"><b>13/13 tasks done.</b> <b>Scope decisions:</b> key rotation DEFERRED to a fast-follow (4a ships static single-epoch keys); an additive proto change landed &mdash; <code>EnrollRequest.wg_pubkey</code>, so gateways register their real WireGuard public key at enrollment (epoch-0 baseline), since Cycle 2/3 only stored placeholders; additive controller <code>Config.bind_ip</code> (default <code>127.0.0.1</code>) added for the netns milestone; <b>G-2 throughput number DEFERRED</b> to a 4-vCPU cloud run &mdash; bench built &amp; smoke-tested (<code>crates/wiremesh-gateway/bench.md</code>), not yet measured. <b>Deployment:</b> gateway host needs <code>iproute2</code> + <code>nftables</code> (alongside the nft-backend <code>conntrack-tools</code> note). <b>Depends on:</b> Cycle 2 (Sync client, enrollment) + Cycle 3 (<code>wiremesh-enforcer</code>).</p>
+      </article>
+
       <article class="cycle" data-status="pending">
         <div class="cycle-head">
-          <span class="cycle-no">04</span>
-          <h3>Gateway transport + relay</h3>
+          <span class="cycle-no">04b/c</span>
+          <h3>NAT traversal + relay</h3>
           <span class="pill pending"><span>Pending</span></span>
         </div>
-        <p>The gateway and relay binaries: tunnel manager (embedded boringtun, per-epoch keys), NAT traversal + brokered hole punch, relay failover, and the full NAT-matrix integration harness. Where the pending G-2 throughput gate is resolved.</p>
-        <p class="dep"><b>Next up.</b> <b>Depends on:</b> Cycle 2 (Sync client, enrollment) + Cycle 3 (<code>wiremesh-enforcer</code> — consumed by the gateway; state bundle carries the compiled IR). <b>Reuses:</b> <code>relay</code>, <code>punch</code>, <code>natlab</code>, <code>udpshim</code> logic. <b>Blockers carried in (PRD v0.4):</b> Sync-handshake rejection for revoked certs (C-9 &mdash; the tracked Cycle 2 seam); Sync <em>version-negotiation field</em> incl. the <b>IR-schema skew contract</b> before the first tagged release (X-6 &mdash; Cycle 3 built the <code>schema</code> field; the handshake negotiation is Cycle 4); CA rotation + compromise runbooks executed as integration tests (C-10). <b>Carried from the Cycle 3 whole-branch review:</b> a compile-time bound on distinct CIDRs (eBPF LPM capacity vs the PRD v0.4 50-segment envelope); <code>iface</code>-escaping guard at the enforcer boundary; the ~10s eBPF reap-grace vs the 5s-p99 propagation target (consider <code>GENERATIONS=3</code>).</p>
+        <p>Brokered UDP hole punch + path state machine (4b), then relay failover using the QUIC relay path (4c) for pairs that can't punch. Where the pending G-2 throughput gate is resolved on real hardware.</p>
+        <p class="dep"><b>Next up</b> (after the key-rotation fast-follow). <b>Depends on:</b> Cycle 4a (Sync client, tunnel manager, enforcer wiring). <b>Reuses:</b> Phase 0 <code>relay</code>, <code>punch</code>, <code>natlab</code>, <code>udpshim</code> logic. <b>Blockers carried in (PRD v0.4):</b> Sync-handshake rejection for revoked certs (C-9 &mdash; the tracked Cycle 2 seam); Sync <em>version-negotiation field</em> incl. the <b>IR-schema skew contract</b> before the first tagged release (X-6 &mdash; Cycle 3 built the <code>schema</code> field; the handshake negotiation lands here); CA rotation + compromise runbooks executed as integration tests (C-10). <b>Carried from the Cycle 3 whole-branch review:</b> a compile-time bound on distinct CIDRs (eBPF LPM capacity vs the PRD v0.4 50-segment envelope); <code>iface</code>-escaping guard at the enforcer boundary; the ~10s eBPF reap-grace vs the 5s-p99 propagation target (consider <code>GENERATIONS=3</code>).</p>
       </article>
 
     </div>
@@ -389,7 +401,7 @@
     <div class="risks">
       <div class="risk-item">
         <span class="chip top">Top risk</span>
-        <div class="rt"><b>G-2 throughput gate &mdash; cloud run pending.</b><span class="rd">The &ge;1 Gbps target on a 4-vCPU cloud VM cannot run in the local container. First check: <code>iperf3 -u -b 0</code>, inspect Lost/Total, to settle whether the ~7.7 Mbit/s cap is a Docker-Desktop-VM artifact or a boringtun receive-path issue. Resolves in Cycle 4.</span></div>
+        <div class="rt"><b>G-2 throughput gate &mdash; cloud run pending.</b><span class="rd">The &ge;1 Gbps target on a 4-vCPU cloud VM cannot run in the local container. Cycle 4a's real <code>wiremesh-gateway</code> throughput smoke test reproduced the same order-of-magnitude cap (~6.9 Mbit/s) as the Phase-0 spike binary, reinforcing the container as the likely shared cause. Bench procedure is built (<code>crates/wiremesh-gateway/bench.md</code>): run parallel <code>-P 4</code> streams plus <code>iperf3 -u -b 0</code> (inspect Lost/Total) on real 4-vCPU hardware. Does not block Cycle 4a/4b completion; still open.</span></div>
       </div>
       <div class="risk-item">
         <span class="chip sec">MVP-harden</span>
@@ -400,12 +412,16 @@
         <div class="rt"><b>Sync go-skew constraint (new hard requirement).</b><span class="rd">Phase 0 Bet 4 found the broker's "go" must arrive within one one-way path latency, or NAT mappings self-poison. The controller's Sync brokering (Cycle 2) must honor it; spec &sect;6.1 to be amended.</span></div>
       </div>
       <div class="risk-item">
-        <span class="chip sec">Cycle-4 blocker</span>
-        <div class="rt"><b>Revoked/drained gateway can still open Sync (C-9).</b><span class="rd">Elevated by the Cycle 2 whole-branch review; now a formal PRD requirement. Handshake-time rejection of revoked certs lands in Cycle 4 &mdash; no traffic-authz consequence until a data plane exists, but it gates the first end-to-end fabric.</span></div>
+        <span class="chip sec">Cycle-4b blocker</span>
+        <div class="rt"><b>Revoked/drained gateway can still open Sync (C-9).</b><span class="rd">Elevated by the Cycle 2 whole-branch review; now a formal PRD requirement. Cycle 4a now has a real data plane (previously the blocking rationale was "no data plane exists yet"), so this now has traffic-authz consequences and is carried into Cycle 4b as a real blocker, not just tracked.</span></div>
       </div>
       <div class="risk-item">
-        <span class="chip sec">Cycle-4 blocker</span>
-        <div class="rt"><b>Sync version negotiation before first tagged release (X-6).</b><span class="rd">The one-minor skew window (controller vN &harr; gateway vN-1) needs a min-supported-version field in the Sync handshake. Adding it in Cycle 4 is a field; adding it after a tagged release is a protocol migration.</span></div>
+        <span class="chip sec">Cycle-4b blocker</span>
+        <div class="rt"><b>Sync version negotiation before first tagged release (X-6).</b><span class="rd">The one-minor skew window (controller vN &harr; gateway vN-1) needs a min-supported-version field in the Sync handshake. Not built in Cycle 4a (<code>sync.rs</code> has no version/schema negotiation yet); adding it before a tagged release is a field, after is a protocol migration.</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip sec">Fast-follow</span>
+        <div class="rt"><b>Key rotation deferred (Cycle 4a scope decision).</b><span class="rd">4a ships static single-epoch WireGuard keys, registered at enrollment via the new <code>EnrollRequest.wg_pubkey</code> field. Per-gateway key-epoch rotation (spec &sect;1 decision record) is a dedicated fast-follow before Cycle 4b.</span></div>
       </div>
       <div class="risk-item">
         <span class="chip note">Calendar-critical</span>
@@ -425,6 +441,16 @@
   <section>
     <h2>Session log</h2>
     <div class="log">
+      <div class="entry">
+        <div class="date">2026-07-20</div>
+        <h4>Cycle 4a complete &mdash; direct-only <code>wiremesh-gateway</code> binary, full-mesh milestone green</h4>
+        <ul>
+          <li><b>13/13 tasks done</b>, each test-authored / implemented / executed / reviewed by separate agents. Real <code>wiremesh-gateway</code> binary: mTLS Sync client (snapshot + delta folding), in-process WireGuard UAPI writer over embedded boringtun, <code>wiremesh-enforcer</code> wiring (eBPF/nftables, version-gated apply), fail-static <code>state.json</code> boot, SO_REUSEPORT endpoint observation, tun MTU 1280 + nft MSS clamp, Prometheus metrics.</li>
+          <li><b>Full-mesh netns milestone green, all four done-bar assertions</b>, with two real gateway processes and a real in-process controller: allowed tcp/8080 delivered over the WG tunnel; denied tcp/9090 dropped with the deny counter incrementing; fail-static &mdash; the mesh keeps working with the controller killed, and survives a gateway process restart reloading only <code>state.json</code>, no controller alive; a live policy update (Admin.Apply) propagates over Sync and immediately permits the newly-allowed port.</li>
+          <li><b>Scope decisions:</b> key rotation DEFERRED to a fast-follow (4a ships static single-epoch keys); an additive proto change landed &mdash; <code>EnrollRequest.wg_pubkey</code>, so gateways register their real WireGuard public key at enrollment (epoch-0 baseline) since Cycle 2/3 only stored placeholders; additive controller <code>Config.bind_ip</code> (default <code>127.0.0.1</code>) added for the netns milestone's routable underlay; the G-2 throughput number is DEFERRED to a real 4-vCPU cloud VM &mdash; the bench is built and smoke-tested (<code>crates/wiremesh-gateway/bench.md</code>, <code>tests/throughput_bench.rs</code>), reproducing the same order-of-magnitude container receive-cap as the Phase-0 spike (~6.9 Mbit/s vs ~7.5&ndash;7.8 Mbit/s), reinforcing that the container itself is the shared confound, not the implementation.</li>
+          <li><b>Carried to Cycle 4b:</b> C-9 (revoked-gateway Sync rejection) is now a real blocker, not just tracked, since a data plane exists; X-6 (Sync version/schema negotiation) is unbuilt; the key-rotation fast-follow precedes 4b proper.</li>
+        </ul>
+      </div>
       <div class="entry">
         <div class="date">2026-07-18 &middot; later</div>
         <h4>Cycle 3 complete &mdash; policy pipeline shipped as PR #6</h4>

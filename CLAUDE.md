@@ -17,24 +17,43 @@ The project ships binaries and docs, never hosted infrastructure.
 
 ## Project state
 
-Phase 0 spike, Cycle 2 (controller core), and Cycle 3 (policy pipeline) are
-complete. Cycle 3 delivered the DSL → canonical-JSON IR compiler
-(`wiremesh-policy`), the controller wiring that compiles/versions policy and
-streams real `policy_ir` over Sync (+ `fabricctl policy show|status`), and the
-`wiremesh-enforcer` library with **both** enforcement backends — eBPF
-(tc-BPF, LPM-bitset first-match, map-in-map atomic generations, stateful flow
-table, sampled deny ring buffer) and the nftables fallback — proven
-behaviorally equivalent by a netns conformance packet-suite
-(`wiremesh-testkit`, `--features netns`). One ratified backend divergence is
-documented (one-way UDP live-flow survival; owner decision 2026-07-18, see
-`docs/research/cycle3-policy-notes.md`). **Deployment note:** the nftables
-backend requires `conntrack-tools` on the gateway host (`flush_flows` uses
-`conntrack -F`).
+Phase 0 spike, Cycle 2 (controller core), Cycle 3 (policy pipeline), and
+Cycle 4a (direct-only gateway) are complete. Cycle 3 delivered the DSL →
+canonical-JSON IR compiler (`wiremesh-policy`), the controller wiring that
+compiles/versions policy and streams real `policy_ir` over Sync (+ `fabricctl
+policy show|status`), and the `wiremesh-enforcer` library with **both**
+enforcement backends — eBPF (tc-BPF, LPM-bitset first-match, map-in-map
+atomic generations, stateful flow table, sampled deny ring buffer) and the
+nftables fallback — proven behaviorally equivalent by a netns conformance
+packet-suite (`wiremesh-testkit`, `--features netns`). One ratified backend
+divergence is documented (one-way UDP live-flow survival; owner decision
+2026-07-18, see `docs/research/cycle3-policy-notes.md`).
 
-Next action is Cycle 4 (gateway transport + relay: real `wiremesh-gateway`
-binary consuming `wiremesh-enforcer`, NAT traversal, relay path). Also pending:
-Cycle 2b fast-follow (OpenBao provider driver). Update this section as phases
-complete.
+Cycle 4a delivered the real `wiremesh-gateway` binary: mTLS Sync client, an
+in-process WireGuard UAPI writer driving embedded boringtun, enforcer wiring
+(eBPF/nftables, version-gated apply), fail-static `state.json` boot, SO_REUSEPORT
+endpoint observation, tun MTU 1280 + nft MSS clamp, and Prometheus metrics. The
+full-mesh netns milestone (`crates/wiremesh-gateway/tests/mesh_milestone.rs`)
+passes all four done-bar assertions — allowed traffic, denied+counter,
+fail-static (controller-independent), policy-update — with two real gateway
+processes. **Scope decisions this cycle:** key rotation DEFERRED to a
+fast-follow (4a ships static single-epoch keys); a proto change was made —
+`EnrollRequest` gained `wg_pubkey` so gateways register their real WireGuard
+public key at enrollment (epoch-0 baseline), since the Cycle-2/3 controller
+only stored placeholder keys; an additive controller `Config.bind_ip`
+(default `127.0.0.1`) was added for the netns milestone; the G-2 throughput
+number is DEFERRED to a cloud 4-vCPU run (bench built and smoke-tested,
+not measured — see `crates/wiremesh-gateway/bench.md` and
+`docs/research/phase0-results.md`).
+
+**Deployment notes:** the nftables enforcer backend requires
+`conntrack-tools` on the gateway host (`flush_flows` uses `conntrack -F`);
+the gateway binary itself requires `iproute2` and `nftables` on the host
+(route/link programming and the MSS clamp shell out to `ip`/`nft`).
+
+Next action is the key-rotation fast-follow, then Cycle 4b (NAT hole punching
++ path state machine) and Cycle 4c (relay). Also pending: Cycle 2b fast-follow
+(OpenBao provider driver). Update this section as phases complete.
 
 ## Agent workflow rules
 
