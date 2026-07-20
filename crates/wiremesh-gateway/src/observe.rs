@@ -7,6 +7,7 @@
 use anyhow::Context;
 use sha2::{Digest, Sha256};
 use std::net::{SocketAddr, UdpSocket};
+use std::os::unix::io::FromRawFd;
 use std::time::Duration;
 
 pub const MAGIC: &[u8; 4] = b"AOBS";
@@ -50,6 +51,58 @@ pub fn probe_once(
         }
     }
     anyhow::bail!("no observation reply from {server}")
+}
+
+/// Bind a UDP socket to `0.0.0.0:bind_port` with SO_REUSEPORT (shares the WG
+/// listen port; spec §5.4 — 4a's routable/full-cone observation) and send one
+/// authenticated probe, returning the observed public address.
+pub fn report_once(
+    bind_port: u16,
+    server: SocketAddr,
+    observe_key_hex: &str,
+    gateway_id: u64,
+) -> anyhow::Result<SocketAddr> {
+    let sock = reuseport_udp(bind_port)?;
+    probe_once(&sock, server, observe_key_hex, gateway_id)
+}
+
+fn reuseport_udp(port: u16) -> anyhow::Result<UdpSocket> {
+    unsafe {
+        let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
+        if fd < 0 {
+            return Err(anyhow::anyhow!("socket(): {}", std::io::Error::last_os_error()));
+        }
+        let one: libc::c_int = 1;
+        for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
+            if libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            ) != 0
+            {
+                libc::close(fd);
+                return Err(anyhow::anyhow!("setsockopt: {}", std::io::Error::last_os_error()));
+            }
+        }
+        let addr = libc::sockaddr_in {
+            sin_family: libc::AF_INET as libc::sa_family_t,
+            sin_port: port.to_be(),
+            sin_addr: libc::in_addr { s_addr: libc::INADDR_ANY.to_be() },
+            sin_zero: [0; 8],
+        };
+        if libc::bind(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+        ) != 0
+        {
+            libc::close(fd);
+            return Err(anyhow::anyhow!("bind(:{port}): {}", std::io::Error::last_os_error()));
+        }
+        Ok(UdpSocket::from_raw_fd(fd))
+    }
 }
 
 #[cfg(test)]

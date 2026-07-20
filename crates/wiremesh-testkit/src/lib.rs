@@ -834,6 +834,19 @@ impl StubGateway {
         self.gateway_id as u64
     }
 
+    /// (Task 10) This gateway's `observe_key` — the random per-gateway
+    /// secret the controller returned exactly once in
+    /// `EnrollResponse.observe_key` at enrollment (see the `observe_key`
+    /// field's doc comment). `probe_observe` already reaches this field
+    /// internally to build its own probe; this accessor exposes the same
+    /// value so a caller can build an equivalent probe itself (e.g. the
+    /// gateway crate's own `wiremesh_gateway::observe::report_once`, whose
+    /// cross-process parity with the controller's verifier is exactly what
+    /// `tests/observe_parity.rs` proves).
+    pub fn observe_key(&self) -> String {
+        self.observe_key.clone()
+    }
+
     /// This gateway's leaf certificate's serial number, as a lowercase hex
     /// string (e.g. `"01a2b3"`), parsed back out of `cert_pem`. Used by
     /// later tasks to correlate "the cert this stub is holding" with "the
