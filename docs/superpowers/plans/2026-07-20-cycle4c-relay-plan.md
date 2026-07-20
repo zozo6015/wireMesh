@@ -1,0 +1,27 @@
+# Cycle 4c — Relay Path Implementation Plan
+
+> Spec: `cycle4c-relay-spec-draft.md` (→ `docs/superpowers/specs/2026-07-20-cycle4c-relay-design.md`). Master §7 governs. Productionizes `spike/relay` (Bet 3: mTLS QUIC datagram bridge + WG-over-QUIC@1280 proven). Fills 4b's inert `Relayed` seam. Subagent-driven-development; separate implementer/reviewer/runner per CLAUDE.md; one `./dev.sh` at a time (OOM); every netns wait bounded.
+
+## Global constraints
+- **No de-risk spike needed** — `spike/relay` already proved WG-over-QUIC-relay@1280 end-to-end (`spike/relay/tests/wg_over_relay.rs`, relay reachable only via a forwarding router, right-reason guard that A has no direct path to B).
+- **`relays` proto → structured** `RelayInfo{relay_id, endpoint}` (safe: field always empty, no consumer today).
+- **Relay enrollment reuses the gateway `Enroll` flow** with `kind='relay'` (already allowed by `enrollment_token.kind`) + additive `EnrollRequest.endpoint`; `Db::enroll_relay` sibling; `certificate.subject_kind='relay'`.
+- **Offline denylist at the relay** — custom `rustls::ClientCertVerifier` wrapping webpki + a serial-denylist check; relay runs a Sync client to receive `revoked_serials`, persists them (fail-static).
+- **Gateway relay transport = productionized `udpshim`** — local UDP socket boringtun points at ↔ QUIC datagrams; reuse the one-UDP-port property so direct↔relay switches don't rekey.
+- IPv4-only; MTU 1280; every netns test bounded + `tc netem` where punch is involved.
+- **4c fills the path-SM `Relayed` seam** — real `relay_available`, `Relayed→Direct` make-before-break, `Relayed→Relayed` re-path (≤15s). The 4b path.rs `Relayed` arm + `MarkRelayNeeded` + `relay_available` param are the plug points.
+
+## Tasks
+1. **Proto** — `RelayInfo{relay_id,endpoint}`; `StateSnapshot.relays`/`Delta.relays` → `repeated RelayInfo` (was `repeated string`); `EnrollRequest.endpoint`; `ReportRequest.relay_health` (`repeated RelayHealth{relay_id,healthy}`). Round-trip tests. Update `DesiredState.relays` type in the gateway.
+2. **`crates/wiremesh-relay` binary** — graduate `spike/relay/src/{lib.rs,bin/relay.rs}`: `quinn` QUIC server, `server_config` (relay cert/key + WebPkiClientVerifier over fabric CA, client certs REQUIRED), ALPN `wiremesh-relay/0`, transport (30s idle, DPLPMTUD, 1MiB datagram buf), registration (8-byte gateway id on first bidi stream → ack → registry insert), forward `[dest_id][payload]` between the pair's connections, remove on disconnect. Identity/state at `/var/lib/wiremesh/` 0600. netns test (port `bridge`-style + certless-rejected).
+3. **Relay offline denylist + Sync client** — custom `ClientCertVerifier` (webpki chain THEN serial-not-on-denylist); relay Sync client (mTLS relay cert) receiving `revoked_serials` deltas → persist `denylist.json` (0600) → reject at TLS. Test: certless rejected + revoked-serial rejected offline (no controller).
+4. **Controller relay enrollment** — generalize `Enroll`: `kind='relay'` skips segment/CIDR resolution, takes `endpoint`, creates `relay` row + `certificate.subject_kind='relay'`; `Db::enroll_relay`. `fabricctl`/testkit helper `enroll_relay`. Tests (relay enrolls, gets fabric-CA cert; existing gateway enroll unaffected).
+5. **Controller relay advertisement** — `build_snapshot`/deltas populate `relays` from the `relay` table WHERE status='active' (was hardcoded empty); `ChangeEvent::RelaysChanged`/`RelayEnrolled` → delta. Tests (a peer's snapshot lists an active relay; enroll → delta adds it).
+6. **Controller relay health pipeline** — `Report.relay_health` aggregated; unhealthy/stale relay → flip `relay.status` + delta removing it from `relays` **within 15s** (R-3). Test (reported-unhealthy relay evicted within 15s).
+7. **Gateway relay transport** (`crates/wiremesh-gateway/src/relay.rs`) — `RelayTransport`: open QUIC `Client` to an advertised relay (mTLS gateway cert, register gateway_id), bind local UDP socket, two pumps (local↔QUIC), QUIC-ping health. Unit + a focused test.
+8. **Gateway path-SM relay wiring** — driver passes real `relay_available` (advertised+healthy relay AND a live QUIC conn); entering `Relayed`/`MarkRelayNeeded` points the peer's WG `endpoint=` at the local relay-transport socket; `Relayed→Direct` (low-rate background direct punch/probe → re-point on handshake, no rekey); `Relayed→Relayed` re-path on relay failure ≤15s; report `RelayHealth`. Unit tests (injectable) for the new transitions.
+9. **testkit relay conformance harness** — port `spike/relay/tests/wg_over_relay.rs` topology into `wiremesh-testkit` (relay netns reachable by both gateways; direct path blocked — integrate 4b's **symmetric** NAT cell so the punch genuinely fails; right-reason guard). Real `wiremesh-relay` + real gateway relay transport + real controller advertising the relay.
+10. **Relay netns conformance (done-bar) + docs** — cases: (a) symmetric pair → traffic via relay (`Relayed`, ≤30s); (b) make-before-break `Relayed→Direct` without flow drop; (c) relay eviction/re-path within 15s; (d) mTLS+denylist rejection offline; (e) MTU 1280 boundary. + `docs/research/cycle4c-relay-notes.md` + CLAUDE.md.
+
+## Done bar
+Two gateways whose direct path is blocked (symmetric NAT) pass real workload traffic over the WG-over-QUIC relay (path=Relayed) within ≤30s; make-before-break revert to Direct without dropping; unhealthy relay evicted+re-pathed within 15s; certless/revoked clients rejected offline at the relay TLS; MTU 1280 held. Cycle-3 conformance stays 22/22; 4a/4b milestones unregressed.
