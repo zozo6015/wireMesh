@@ -4,6 +4,7 @@ pub mod enforce;
 pub mod identity;
 pub mod metrics;
 pub mod observe;
+pub mod punch;
 pub mod reconcile;
 pub mod routes;
 pub mod state;
