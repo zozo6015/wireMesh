@@ -583,7 +583,7 @@ pub async fn run_sync(
 // the intended RED state, not a mistake.
 #[cfg(test)]
 mod denylist_tests {
-    use super::Denylist;
+    use super::{extract_serial_hex, Denylist};
     use std::collections::HashSet;
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
@@ -672,5 +672,73 @@ mod denylist_tests {
         let dl = Denylist::load(&path)
             .expect("a MISSING denylist file must be fail-static (empty), not an Err");
         assert!(dl.snapshot().is_empty());
+    }
+
+    /// Mints a self-signed leaf cert whose serial number is pinned to the
+    /// given 16 raw bytes (mirroring how `wiremesh-trust`/`mkcerts` set
+    /// `rcgen::SerialNumber::from_slice` on issuance) and returns its DER
+    /// encoding, i.e. exactly what `verify_client_cert` would hand
+    /// `extract_serial_hex` for a live connection's end-entity cert.
+    fn cert_der_with_serial(serial: &[u8; 16]) -> rustls::pki_types::CertificateDer<'static> {
+        let mut params = rcgen::CertificateParams::new(vec!["serialtest".to_string()])
+            .expect("building cert params");
+        params.serial_number = Some(rcgen::SerialNumber::from_slice(serial));
+        let key = rcgen::KeyPair::generate().expect("generating key pair");
+        let cert = params.self_signed(&key).expect("self-signing cert");
+        cert.der().clone()
+    }
+
+    /// Regression test for a revocation-bypass bug: `extract_serial_hex`
+    /// must reconstruct the cert's ORIGINAL 16-byte serial as 32 lowercase
+    /// hex chars — matching `wiremesh-trust`'s `IssuedCert.serial` — even
+    /// when that serial's raw bytes begin with `0x00`. x509-parser's
+    /// `raw_serial()` returns the DER INTEGER content, from which the DER
+    /// writer has stripped ALL leading `0x00` bytes (re-adding at most one
+    /// as a sign pad when the high bit is set). Stripping only a single
+    /// leading `0x00` and hex-encoding the remainder — the current
+    /// implementation — silently shortens/corrupts the hex for any serial
+    /// with more than one leading zero byte, so a revoked cert with such a
+    /// serial would never match the denylist.
+    #[test]
+    fn extract_serial_hex_reconstructs_full_16_byte_serial() {
+        let cases: [[u8; 16]; 3] = [
+            // Case 1 (THE bug): two leading 0x00 bytes. The DER writer
+            // strips both (an all-zero-byte prefix isn't needed to keep the
+            // DER INTEGER non-negative), leaving a 14-byte content field;
+            // naive single-strip-and-hex yields a 28-char string that has
+            // silently lost the two zero bytes wiremesh-trust's hex still
+            // has.
+            [
+                0x00, 0x00, 0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x11, 0x22, 0x33, 0x44,
+                0x55, 0x66,
+            ],
+            // Case 2: high first byte (>= 0x80) means the DER writer
+            // PREPENDS one 0x00 sign-pad byte, so raw_serial() is 17 bytes
+            // and exactly one leading 0x00 must be stripped to recover the
+            // original 16.
+            [
+                0x80, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ],
+            // Case 3: no leading zero byte and no sign pad needed —
+            // raw_serial() is already exactly the original 16 bytes.
+            [
+                0x7f, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+                0xee, 0xff,
+            ],
+        ];
+
+        for serial in cases {
+            let expected: String = serial.iter().map(|b| format!("{b:02x}")).collect();
+            let der = cert_der_with_serial(&serial);
+            let got = extract_serial_hex(&der).unwrap_or_else(|e| {
+                panic!("extract_serial_hex failed for serial {expected}: {e}")
+            });
+            assert_eq!(
+                got, expected,
+                "extract_serial_hex must reconstruct the full original 16-byte serial \
+                 (including any leading 0x00 bytes), case serial={expected}"
+            );
+        }
     }
 }
