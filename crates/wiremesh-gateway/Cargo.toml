@@ -25,11 +25,14 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 boringtun = { version = "0.6", features = ["device"] }
 libc = "0.2"
+# StreamExt::next() over tonic::Streaming<SyncMessage> in src/sync.rs — a
+# library-code dependency (not just tests), so it must live here rather than
+# [dev-dependencies].
+tokio-stream = "0.1"
 
 [dev-dependencies]
 wiremesh-testkit = { path = "../wiremesh-testkit", features = ["netns"] }
 tempfile = "3"
-tokio-stream = "0.1"
 
 [features]
 netns-tests = []
