@@ -248,52 +248,52 @@ impl Sync for SyncSvc {
             .await
             .map_err(|e| Status::internal(format!("recording applied_version: {e}")))?;
 
-        // (Cycle-4b Task 4, spec §6.1) `local_endpoints` is additive: an
-        // empty list (a pre-4b gateway binary, or one that just hasn't
-        // enumerated any routable local address this round) must be a
-        // no-op — `Db::set_local_candidates` already treats "identical to
-        // what's stored" as a no-op (returns `None`, no write, no revision
-        // bump), but an explicitly EMPTY report must never be allowed to
-        // WIPE an already-recorded local candidate set just because the
-        // caller sent nothing this round. Skip the call entirely rather
-        // than replacing a non-empty stored set with an empty one.
-        if !req.local_endpoints.is_empty() {
-            let revision = self
-                .db
-                .set_local_candidates(gw.id, req.local_endpoints)
-                .await
-                .map_err(|e| Status::internal(format!("recording local_endpoints: {e}")))?;
+        // (Cycle-4b Task 8, spec §5/§6.1 — supersedes the Task 4 "empty is a
+        // no-op" behavior) The gateway now reports its COMPLETE current
+        // local-address set on every `Report` call (there is no per-endpoint
+        // add/remove RPC — see `wiremesh_gateway::sync::report`'s doc
+        // comment). An empty `local_endpoints` is therefore no longer
+        // ambiguous ("didn't report" vs. "reported nothing"): it means the
+        // gateway genuinely has no routable local address right now, and
+        // must REPLACE (clear) any previously-reported set the same way a
+        // non-empty report replaces a different non-empty set —
+        // `Db::set_local_candidates`'s full-REPLACE contract already handles
+        // this uniformly, so the call is no longer conditioned on
+        // non-emptiness.
+        let revision = self
+            .db
+            .set_local_candidates(gw.id, req.local_endpoints)
+            .await
+            .map_err(|e| Status::internal(format!("recording local_endpoints: {e}")))?;
 
-            // `None` means the deduplicated incoming set was IDENTICAL to
-            // what's already stored (see `Db::set_local_candidates`'s doc
-            // comment) — nothing changed, so there is nothing new for an
-            // already-connected peer to learn; skip the publish entirely
-            // (mirrors `crate::observe::handle_probe`'s identical
-            // early-return on an unchanged observed endpoint).
-            if let Some(revision) = revision {
-                // Re-reads the gateway's current identity/allowed_ips/keys
-                // and its FULL current candidate set (observed + locals) —
-                // same "full peer refresh" pattern
-                // `crate::observe::handle_probe` already uses for the
-                // sibling `EndpointObserved` event, reused as-is here since
-                // its `Delta` shape already carries `candidate_endpoints`
-                // straight off `Db::candidates_for` (see that event's doc
-                // comment).
-                if let Ok(Some(identity)) = self.db.gateway_identity_by_id(gw.id).await {
-                    if let (Ok(allowed_ips), Ok(keys), Ok(candidate_endpoints)) = (
-                        self.db.cidrs_for_segment(identity.segment_id).await,
-                        self.db.all_keys_for_gateway(gw.id).await,
-                        self.db.candidates_for(gw.id).await,
-                    ) {
-                        let _ = self.change_tx.send(ChangeEvent::EndpointObserved {
-                            gateway_id: gw.id,
-                            segment_name: identity.segment_name,
-                            allowed_ips,
-                            keys,
-                            candidate_endpoints,
-                            revision,
-                        });
-                    }
+        // `None` means the deduplicated incoming set was IDENTICAL to
+        // what's already stored (see `Db::set_local_candidates`'s doc
+        // comment) — nothing changed, so there is nothing new for an
+        // already-connected peer to learn; skip the publish entirely
+        // (mirrors `crate::observe::handle_probe`'s identical early-return
+        // on an unchanged observed endpoint).
+        if let Some(revision) = revision {
+            // Re-reads the gateway's current identity/allowed_ips/keys and
+            // its FULL current candidate set (observed + locals) — same
+            // "full peer refresh" pattern `crate::observe::handle_probe`
+            // already uses for the sibling `EndpointObserved` event, reused
+            // as-is here since its `Delta` shape already carries
+            // `candidate_endpoints` straight off `Db::candidates_for` (see
+            // that event's doc comment).
+            if let Ok(Some(identity)) = self.db.gateway_identity_by_id(gw.id).await {
+                if let (Ok(allowed_ips), Ok(keys), Ok(candidate_endpoints)) = (
+                    self.db.cidrs_for_segment(identity.segment_id).await,
+                    self.db.all_keys_for_gateway(gw.id).await,
+                    self.db.candidates_for(gw.id).await,
+                ) {
+                    let _ = self.change_tx.send(ChangeEvent::EndpointObserved {
+                        gateway_id: gw.id,
+                        segment_name: identity.segment_name,
+                        allowed_ips,
+                        keys,
+                        candidate_endpoints,
+                        revision,
+                    });
                 }
             }
         }

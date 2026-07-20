@@ -28,12 +28,19 @@ pub async fn watch(client: &mut SyncClient<Channel>) -> anyhow::Result<tonic::St
     Ok(client.watch(WatchRequest {}).await.map_err(|s| anyhow!("Sync.Watch failed: {s}"))?.into_inner())
 }
 
-pub async fn report(client: &mut SyncClient<Channel>, applied_version: u64) -> anyhow::Result<()> {
-    // local_endpoints (cycle4b §5) is populated by a later task once the gateway
-    // enumerates its routable local addresses; empty vec is the documented
-    // additive-field default (equivalent to pre-4b client behavior).
+/// `local_endpoints` (cycle4b §5/§6.1) is the gateway's COMPLETE current
+/// routable local-address set (see `netif::local_wg_endpoints`), sent fresh
+/// on every `Report` call — there is no per-endpoint add/remove RPC, so an
+/// empty list here is a genuine, meaningful "I currently have no routable
+/// local addresses" and the controller applies it as a full REPLACE
+/// (`Db::set_local_candidates`), clearing any previously reported set.
+pub async fn report(
+    client: &mut SyncClient<Channel>,
+    applied_version: u64,
+    local_endpoints: Vec<String>,
+) -> anyhow::Result<()> {
     client
-        .report(ReportRequest { applied_version, local_endpoints: vec![] })
+        .report(ReportRequest { applied_version, local_endpoints })
         .await
         .map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
     Ok(())

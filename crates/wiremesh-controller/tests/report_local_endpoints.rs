@@ -16,10 +16,18 @@
 //!  2. It also reaches an ALREADY-connected peer's open `Sync.Watch` stream
 //!     as a `Delta` (no reconnect required) — the controller must publish a
 //!     `ChangeEvent` when the local set actually changes.
-//!  3. An EMPTY `local_endpoints` report is a no-op: it must not clear an
-//!     already-observed/-reported candidate, and it must not trigger a
-//!     spurious delta (proven by requiring the NEXT delta the peer receives,
-//!     if any arrives at all within the timeout, to be unrelated/absent).
+//!  3. (Cycle-4b Task 8 — supersedes the Task 4 "empty is a no-op" behavior
+//!     documented above when this test was first written) An EMPTY
+//!     `local_endpoints` report now CLEARS any previously-reported local
+//!     candidate: Task 8 makes the gateway report its COMPLETE current
+//!     local-address set every round (no per-endpoint add/remove RPC), so an
+//!     empty list unambiguously means "I have no routable local address
+//!     right now" and must be applied via `Db::set_local_candidates`'s
+//!     full-REPLACE contract like any other reported set. This is a
+//!     deliberate semantic change, not a weakened test: skipping the DB call
+//!     on an empty report (the old behavior) would leave a gateway that
+//!     lost its only local address stuck advertising a stale, no-longer-
+//!     valid candidate forever.
 use std::time::Duration;
 
 use tokio_stream::StreamExt;
@@ -151,7 +159,7 @@ async fn reported_local_endpoint_pushes_a_live_delta_to_an_already_connected_pee
 }
 
 #[tokio::test]
-async fn empty_local_endpoints_report_is_a_noop() {
+async fn empty_local_endpoints_report_clears_previously_reported_locals() {
     let h = wiremesh_testkit::TestController::start().await;
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
     let b = wiremesh_testkit::enroll_one(&h, "gcp", "10.1.0.0/16").await;
@@ -168,43 +176,45 @@ async fn empty_local_endpoints_report_is_a_noop() {
     let snap = expect_snapshot(b_stream.next().await);
     let snap_rev = snap.revision;
 
-    // ...then reports again with an EMPTY local_endpoints list (e.g. a
-    // pre-4b gateway binary, or a gateway that just hasn't enumerated any
-    // local addresses this round). This must be a no-op: the existing
-    // locally-reported candidate must survive untouched, and no delta may
-    // be published.
+    // ...then reports again with an EMPTY local_endpoints list (cycle4b
+    // Task 8: the gateway now sends its COMPLETE current local-address set
+    // every round, so an empty list means it genuinely has none right now —
+    // e.g. it lost its only interface address, or moved behind a NAT that
+    // hands out no routable address at all). This must CLEAR the
+    // previously-reported candidate, not preserve it.
     a.report(1, &[])
         .await
         .expect("Sync.Report with empty local_endpoints");
 
     assert_eq!(
         candidates_for(&h, a.id()).await,
-        baseline,
-        "an empty local_endpoints report must not clear an already-reported candidate"
+        Vec::<String>::new(),
+        "an empty local_endpoints report must clear a previously-reported local candidate"
     );
 
-    // No delta should arrive on B's still-open stream within a short
-    // window — an empty report changing nothing must not publish a
-    // ChangeEvent. (A short timeout proves absence the same way
-    // `tests/observe.rs::hostile_probe_is_rejected_no_echo_no_candidate`
-    // proves "no echo": if this regressed and a spurious delta WERE sent,
-    // this would receive it well inside the window and fail.)
-    let outcome = tokio::time::timeout(Duration::from_millis(500), b_stream.next()).await;
+    // A delta clearing the candidate MUST reach B's still-open stream — the
+    // change is real (a candidate disappeared), so it must publish a
+    // ChangeEvent, mirroring how the earlier "reported" case does.
+    let msg = tokio::time::timeout(Duration::from_secs(5), b_stream.next())
+        .await
+        .expect("timed out waiting for the delta triggered by A's clearing report")
+        .expect("Sync.Watch stream ended before delivering the delta")
+        .expect("Sync.Watch stream yielded an error instead of the delta");
+    let delta = match msg.body {
+        Some(sync_message::Body::Delta(d)) => d,
+        other => panic!("expected a Delta after A's clearing report, got: {other:?}"),
+    };
     assert!(
-        outcome.is_err(),
-        "an empty local_endpoints report must not push a spurious delta, but one arrived: {outcome:?}"
-    );
-
-    // And the applied_version=1 ack from the second Report must still have
-    // landed even though local_endpoints was a no-op (they're independent
-    // fields on the same call) — confirmed via a fresh snapshot's revision
-    // not having regressed and A still being a well-formed peer.
-    let mut b_stream2 = b.open_sync().await;
-    let snap2 = expect_snapshot(b_stream2.next().await);
-    assert!(
-        snap2.revision >= snap_rev,
-        "revision must never move backwards: snap2={}, snap_rev={}",
-        snap2.revision,
+        delta.revision > snap_rev,
+        "delta revision ({}) must be strictly newer than the initial snapshot's revision ({})",
+        delta.revision,
         snap_rev
+    );
+    assert_eq!(delta.upserted_peers.len(), 1, "expected exactly one upserted peer (A)");
+    assert_eq!(delta.upserted_peers[0].gateway_id, a.id());
+    assert!(
+        delta.upserted_peers[0].candidate_endpoints.is_empty(),
+        "A's peer entry in the delta must no longer list the cleared local endpoint, got: {:?}",
+        delta.upserted_peers[0].candidate_endpoints
     );
 }

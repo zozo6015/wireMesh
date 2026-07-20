@@ -12,7 +12,7 @@ use wiremesh_gateway::identity::Identity;
 use wiremesh_gateway::metrics;
 use wiremesh_gateway::state::DesiredState;
 use wiremesh_gateway::tunnel::Tunnel;
-use wiremesh_gateway::{observe, reconcile, routes, sync, uapi};
+use wiremesh_gateway::{netif, observe, reconcile, routes, sync, uapi};
 
 const TUN_MTU: u32 = 1280;
 const MSS: u16 = 1240;
@@ -114,7 +114,8 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         Ok(Some(ds)) => {
                             apply_state(&tunnel, &enforcer, &cfg, applied.as_ref(), &ds).await?;
                             ds.save(&cfg.state_dir)?;
-                            let _ = sync::report(&mut client, ds.policy_version).await;
+                            let local_endpoints = netif::local_wg_endpoints(cfg.wg_listen_port);
+                            let _ = sync::report(&mut client, ds.policy_version, local_endpoints).await;
                             applied_version.store(ds.policy_version, Ordering::Relaxed);
                             applied = Some(ds);
                         }

@@ -10,7 +10,7 @@ pub fn peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerConfig> {
             let public_key_b64 = p.active_pubkey_b64.clone()?;
             Some(PeerConfig {
                 public_key_b64,
-                endpoint: p.candidate_endpoint.clone(),
+                endpoint: p.primary_endpoint().cloned(),
                 allowed_ips: p.allowed_ips.clone(),
                 keepalive_secs,
             })
@@ -66,7 +66,7 @@ mod tests {
         PeerState {
             gateway_id: id, segment_name: format!("s{id}"),
             active_pubkey_b64: key.map(String::from),
-            candidate_endpoint: Some(format!("10.9.0.{id}:51820")),
+            candidates: vec![format!("10.9.0.{id}:51820")],
             allowed_ips: vec![cidr.into()],
         }
     }

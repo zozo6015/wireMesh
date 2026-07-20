@@ -49,6 +49,6 @@ async fn receives_snapshot_and_reports_version() {
     assert!(ds.peers.iter().any(|p| p.allowed_ips.contains(&"10.10.2.0/24".to_string())),
             "snapshot lists peer B's segment: {:?}", ds.peers);
 
-    sync::report(&mut client, ds.policy_version).await.expect("report ack");
+    sync::report(&mut client, ds.policy_version, vec![]).await.expect("report ack");
     let _ = stream; // keep alive
 }

@@ -3,6 +3,7 @@ pub mod config;
 pub mod enforce;
 pub mod identity;
 pub mod metrics;
+pub mod netif;
 pub mod observe;
 pub mod punch;
 pub mod reconcile;

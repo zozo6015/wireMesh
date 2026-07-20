@@ -54,7 +54,7 @@ fn two_gateways_handshake_and_ping_over_direct_wg() {
         let ds = DesiredState { peers: vec![PeerState {
             gateway_id: 1, segment_name: "a".into(),
             active_pubkey_b64: Some(a_pub.clone()),
-            candidate_endpoint: Some("10.9.0.1:51820".into()),
+            candidates: vec!["10.9.0.1:51820".into()],
             allowed_ips: vec!["10.10.1.0/24".into(), "10.10.2.2/32".into()],
         }], ..Default::default() };
         t.reconcile(&ds, 15).unwrap();
@@ -68,7 +68,7 @@ fn two_gateways_handshake_and_ping_over_direct_wg() {
     let ds_a = DesiredState { peers: vec![PeerState {
         gateway_id: 2, segment_name: "b".into(),
         active_pubkey_b64: Some(b_pub.clone()),
-        candidate_endpoint: Some("10.9.0.2:51820".into()),
+        candidates: vec!["10.9.0.2:51820".into()],
         allowed_ips: vec!["10.10.2.0/24".into(), "10.10.1.1/32".into()],
     }], ..Default::default() };
     ta.reconcile(&ds_a, 15).unwrap();
