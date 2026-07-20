@@ -124,6 +124,7 @@ async fn report_applied_version(gw: &StubGateway, sync_addr: SocketAddr, version
     SyncClient::new(channel)
         .report(ReportRequest {
             applied_version: version,
+            local_endpoints: vec![],
         })
         .await
         .expect("Sync.Report");

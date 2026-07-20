@@ -90,7 +90,13 @@ pub enum ChangeEvent {
         segment_name: String,
         allowed_ips: Vec<String>,
         keys: Vec<(i64, String, String)>,
-        candidate_endpoint: String,
+        /// (Cycle-4b Task 3) The gateway's FULL current candidate set
+        /// (observed + locals, deduplicated, observed first) — straight off
+        /// [`crate::db::Db::candidates_for`], not just the freshly observed
+        /// value, so an already-open `Sync.Watch` stream's view of this peer
+        /// stays consistent with what a fresh snapshot would show (mirroring
+        /// `SegmentCidrsChanged`'s identical widening below).
+        candidate_endpoints: Vec<String>,
         revision: u64,
     },
     /// (Task 16) `Admin.RevokeCert` revoked a single certificate by serial —
@@ -129,12 +135,12 @@ pub enum ChangeEvent {
         /// `gateway_id`, straight off [`crate::db::Db::all_keys_for_gateway`]
         /// — same full-key-set rationale as `KeyRotated`.
         keys: Vec<(i64, String, String)>,
-        /// `gateway_id`'s most recently observed candidate endpoint, if the
-        /// controller's UDP observation endpoint has ever recorded one for
-        /// it (same lookup `build_snapshot`/`routes::peers_of` use) — a CIDR
-        /// refresh must not erase a known endpoint from an already-open
+        /// `gateway_id`'s FULL current candidate set (observed + locals,
+        /// deduplicated, observed first — same [`crate::db::Db::candidates_for`]
+        /// lookup `build_snapshot`/`routes::peers_of` use) — a CIDR refresh
+        /// must not erase a known candidate from an already-open
         /// `Sync.Watch` stream's view of this peer.
-        candidate_endpoint: Option<String>,
+        candidate_endpoints: Vec<String>,
         revision: u64,
     },
 }
@@ -251,7 +257,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             segment_name,
             allowed_ips,
             keys,
-            candidate_endpoint,
+            candidate_endpoints,
             revision,
         } => Delta {
             revision,
@@ -266,7 +272,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
                         state,
                     })
                     .collect(),
-                candidate_endpoints: vec![candidate_endpoint],
+                candidate_endpoints,
                 allowed_ips,
             }],
             removed_peer_ids: Vec::new(),
@@ -301,7 +307,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             segment_name,
             allowed_ips,
             keys,
-            candidate_endpoint,
+            candidate_endpoints,
             revision,
         } => Delta {
             revision,
@@ -316,7 +322,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
                         state,
                     })
                     .collect(),
-                candidate_endpoints: candidate_endpoint.into_iter().collect(),
+                candidate_endpoints,
                 allowed_ips,
             }],
             removed_peer_ids: Vec::new(),
@@ -358,12 +364,11 @@ pub async fn build_snapshot(
                     state,
                 })
                 .collect(),
-            // (Task 15) At most one candidate: the peer's most recently
-            // observed address, if the controller's UDP observation
-            // endpoint has ever recorded one for it. Cycle-2 keeps a single
-            // last-observed-wins candidate rather than a bounded history
-            // (see `Db::set_candidate_endpoint`'s doc comment).
-            candidate_endpoints: p.candidate_endpoint.into_iter().collect(),
+            // (Task 15; cycle-4b Task 3 widened this to the full set —
+            // observed + locally-reported addresses, deduplicated, observed
+            // first) See `crate::routes::PeerRoute::candidate_endpoints`'s
+            // doc comment / `Db::candidates_for`.
+            candidate_endpoints: p.candidate_endpoints,
             allowed_ips: p.allowed_ips,
         })
         .collect();

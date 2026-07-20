@@ -208,6 +208,28 @@ const SCHEMA_V2: &str = r#"
 ALTER TABLE policy_version ADD COLUMN fingerprint TEXT NOT NULL DEFAULT '';
 "#;
 
+/// Schema migration to `user_version = 3` (cycle-4b Task 3, spec §6.1's
+/// multi-candidate model): adds `gateway_candidate`, which holds a gateway's
+/// LOCALLY-sourced candidate endpoints (its own observed public/local
+/// addresses, source `'local'`) as a proper set. This is deliberately
+/// ADDITIVE rather than a data migration: `gateway.candidate_endpoint` (the
+/// controller's own UDP-observed, last-observed-wins value) is UNCHANGED and
+/// keeps being written by `Db::set_candidate_endpoint` exactly as before —
+/// see [`Db::candidates_for`]'s doc comment for how the two are merged. The
+/// `source` check constraint also allows `'observed'` so the column shape
+/// doesn't have to change again if a future cycle ever does migrate the
+/// single-slot value into this table; cycle-4b never writes an `'observed'`
+/// row here.
+const SCHEMA_V3: &str = r#"
+CREATE TABLE gateway_candidate (
+    gateway_id  INTEGER NOT NULL REFERENCES gateway(id),
+    endpoint    TEXT NOT NULL,
+    source      TEXT NOT NULL CHECK (source IN ('observed', 'local')),
+    observed_at TEXT,
+    PRIMARY KEY (gateway_id, endpoint)
+);
+"#;
+
 /// Returned (wrapped in [`anyhow::Error`]) when [`Db::insert_segment`]'s CIDR
 /// overlap check finds a conflicting, already-registered CIDR. Names the
 /// existing segment so callers/operators can resolve it (master-spec §4.1,
@@ -586,7 +608,9 @@ impl Db {
     /// behind, each in its own transaction with the version bump. Idempotent:
     /// running it again once at the latest version is a no-op. v1 is the
     /// full initial schema; v2 (cycle-3 Task 4) adds
-    /// `policy_version.fingerprint` — see [`SCHEMA_V2`]'s doc comment.
+    /// `policy_version.fingerprint` — see [`SCHEMA_V2`]'s doc comment; v3
+    /// (cycle-4b Task 3) adds `gateway_candidate` — see [`SCHEMA_V3`]'s doc
+    /// comment.
     pub fn run_migrations(&self) -> Result<()> {
         let mut conn = self.conn.lock().unwrap();
 
@@ -608,6 +632,14 @@ impl Db {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA_V2)?;
             tx.execute_batch("PRAGMA user_version = 2")?;
+            tx.commit()?;
+        }
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 3 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V3)?;
+            tx.execute_batch("PRAGMA user_version = 3")?;
             tx.commit()?;
         }
 
@@ -2323,6 +2355,130 @@ impl Db {
             "UPDATE gateway SET candidate_endpoint = ?1 WHERE id = ?2 AND status = 'active'",
             params![addr, gateway_id],
         )?;
+
+        let revision = bump_revision_tx(&tx)?;
+        tx.commit()?;
+        Ok(Some(revision))
+    }
+
+    /// (Cycle-4b Task 3, spec §6.1) `gateway_id`'s full candidate-endpoint
+    /// SET: its controller-observed value first (the single
+    /// `gateway.candidate_endpoint` slot — unchanged since cycle-2, see
+    /// [`Db::set_candidate_endpoint`]'s doc comment), followed by its
+    /// locally-sourced candidates (the `gateway_candidate` rows with
+    /// `source = 'local'`, see [`Db::set_local_candidates`]), deduplicated —
+    /// a local row that happens to equal the observed value is not repeated.
+    /// Ordered deterministically (observed first, then locals sorted by
+    /// endpoint text) so callers/tests get a stable list rather than one that
+    /// depends on `gateway_candidate`'s physical row order.
+    ///
+    /// An observed-only gateway (no `gateway_candidate` rows at all) yields
+    /// exactly `[observed]` — the same single-element list
+    /// `p.candidate_endpoint.into_iter().collect()` produced before this
+    /// task, which is the back-compat guarantee `crate::routes`/
+    /// `crate::projection` depend on. A gateway with neither an observed
+    /// value nor any local rows yields an empty `Vec`. Only considers an
+    /// ACTIVE gateway row (same posture as `candidate_endpoint_for_gateway`)
+    /// — an unknown/inactive `gateway_id` yields an empty `Vec` rather than
+    /// erroring, since every caller here is iterating an already-resolved
+    /// peer/gateway id, not validating a fresh one.
+    pub fn candidates_for(&self, gateway_id: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+
+        let observed: Option<String> = conn
+            .query_row(
+                "SELECT candidate_endpoint FROM gateway WHERE id = ?1 AND status = 'active'",
+                params![gateway_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten();
+
+        let mut out: Vec<String> = Vec::new();
+        if let Some(o) = observed {
+            out.push(o);
+        }
+
+        let mut stmt = conn.prepare(
+            "SELECT endpoint FROM gateway_candidate \
+             WHERE gateway_id = ?1 AND source = 'local' ORDER BY endpoint",
+        )?;
+        let locals = stmt
+            .query_map(params![gateway_id], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        for l in locals {
+            if !out.contains(&l) {
+                out.push(l);
+            }
+        }
+
+        Ok(out)
+    }
+
+    /// (Cycle-4b Task 3, spec §6.1) Replaces `gateway_id`'s locally-sourced
+    /// candidate set (`gateway_candidate` rows with `source = 'local'`) with
+    /// exactly `endpoints` — a full REPLACE, not a merge, mirroring how a
+    /// gateway re-reports its complete current local-address set each time
+    /// (there is no per-endpoint add/remove RPC). Deduplicates `endpoints`
+    /// itself before comparing/writing. Only touches an ACTIVE gateway row
+    /// (same posture as [`Db::set_candidate_endpoint`]) — errors if
+    /// `gateway_id` doesn't currently resolve to one.
+    ///
+    /// Bumps the persisted revision in the same transaction, since this
+    /// changes what every OTHER gateway's projection shows (via
+    /// [`Db::candidates_for`]). Returns `Some(new_revision)` when the local
+    /// set actually changed — `None` (no write, no revision bump) when the
+    /// deduplicated incoming set is IDENTICAL to what's already stored,
+    /// mirroring `set_candidate_endpoint`'s change-detection discipline so a
+    /// gateway re-reporting an unchanged local-address set doesn't churn the
+    /// revision or trigger a delta broadcast every time.
+    pub fn set_local_candidates(&self, gateway_id: i64, endpoints: &[String]) -> Result<Option<u64>> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let active: Option<i64> = tx
+            .query_row(
+                "SELECT id FROM gateway WHERE id = ?1 AND status = 'active'",
+                params![gateway_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if active.is_none() {
+            tx.rollback()?;
+            anyhow::bail!("set_local_candidates: no active gateway row with id {gateway_id}");
+        }
+
+        let mut incoming: Vec<String> = endpoints.to_vec();
+        incoming.sort();
+        incoming.dedup();
+
+        let existing: Vec<String> = {
+            let mut stmt = tx.prepare(
+                "SELECT endpoint FROM gateway_candidate \
+                 WHERE gateway_id = ?1 AND source = 'local' ORDER BY endpoint",
+            )?;
+            let rows = stmt
+                .query_map(params![gateway_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<String>>>()?;
+            rows
+        };
+
+        if existing == incoming {
+            tx.rollback()?;
+            return Ok(None);
+        }
+
+        tx.execute(
+            "DELETE FROM gateway_candidate WHERE gateway_id = ?1 AND source = 'local'",
+            params![gateway_id],
+        )?;
+        for endpoint in &incoming {
+            tx.execute(
+                "INSERT INTO gateway_candidate (gateway_id, endpoint, source, observed_at) \
+                 VALUES (?1, ?2, 'local', datetime('now'))",
+                params![gateway_id, endpoint],
+            )?;
+        }
 
         let revision = bump_revision_tx(&tx)?;
         tx.commit()?;

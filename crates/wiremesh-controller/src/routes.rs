@@ -25,10 +25,14 @@ pub struct PeerRoute {
     pub keys: Vec<(i64, String, String)>,
     /// The peer's segment's CIDRs — this peer's `allowed_ips`.
     pub allowed_ips: Vec<String>,
-    /// (Task 15) This peer's most recently observed candidate endpoint, if
-    /// the controller's UDP observation endpoint has ever recorded one for
-    /// it — becomes this peer's (singleton) `candidate_endpoints` entry.
-    pub candidate_endpoint: Option<String>,
+    /// (Task 15; cycle-4b Task 3 widened this from a single
+    /// last-observed-wins value to the full set) This peer's candidate
+    /// endpoints — its controller-observed address (if any) plus its
+    /// locally-reported addresses, deduplicated, observed first — straight
+    /// off [`crate::db::Db::candidates_for`]. Becomes this peer's
+    /// `candidate_endpoints` entry. An observed-only peer (no locals) yields
+    /// the same single-element list cycle-2/3 always produced.
+    pub candidate_endpoints: Vec<String>,
 }
 
 /// The full-mesh peer set for `self_gateway_id`: every other enrolled
@@ -42,12 +46,16 @@ pub async fn peers_of(db: &DbHandle, self_gateway_id: i64) -> anyhow::Result<Vec
     for gw in others {
         let allowed_ips = db.cidrs_for_segment(gw.segment_id).await?;
         let keys = db.all_keys_for_gateway(gw.id).await?;
+        // (Cycle-4b Task 3) The full candidate set (observed + locals), not
+        // just `gw.candidate_endpoint` — see `PeerRoute::candidate_endpoints`'s
+        // doc comment.
+        let candidate_endpoints = db.candidates_for(gw.id).await?;
         peers.push(PeerRoute {
             gateway_id: gw.id,
             segment_name: gw.segment_name,
             keys,
             allowed_ips,
-            candidate_endpoint: gw.candidate_endpoint,
+            candidate_endpoints,
         });
     }
     Ok(peers)

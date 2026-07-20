@@ -17,11 +17,13 @@
 //! (deliberately) an empty message.
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use base64::Engine as _;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
@@ -29,6 +31,7 @@ use wiremesh_proto::v1::sync_server::Sync;
 use wiremesh_proto::v1::sync_message::Body;
 use wiremesh_proto::v1::{ReportRequest, ReportResponse, SyncMessage, WatchRequest};
 
+use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
 use crate::db_async::DbHandle;
 use crate::projection::{self, ChangeEvent};
 
@@ -42,11 +45,43 @@ pub struct SyncSvc {
     /// `Sync.Watch` connection below subscribes its own receiver and
     /// forwards relevant events as `Delta`s down its still-open stream.
     change_tx: broadcast::Sender<ChangeEvent>,
+    /// (Cycle-4b Task 5) The Sync broker. Every `Watch` connection registers
+    /// its per-connection punch channel into the broker's shared registry
+    /// (keyed by the AUTHENTICATED gateway id) so the broker can push a
+    /// `PunchDirective` explicitly to BOTH members of a pair — deliberately
+    /// NOT the `subject_gateway_id()` self-skip path the deltas below use.
+    broker: Arc<Broker>,
 }
 
 impl SyncSvc {
-    pub fn new(db: DbHandle, change_tx: broadcast::Sender<ChangeEvent>) -> Self {
-        Self { db, change_tx }
+    pub fn new(
+        db: DbHandle,
+        change_tx: broadcast::Sender<ChangeEvent>,
+        broker: Arc<Broker>,
+    ) -> Self {
+        Self {
+            db,
+            change_tx,
+            broker,
+        }
+    }
+}
+
+/// Wraps the `Watch` response stream with its [`RegistrationGuard`] so the
+/// connection's broker registry entry is removed exactly when the stream is
+/// dropped (client disconnect, RPC end, or a dropped `Response`) — the guard
+/// is a plain field, so it drops with the struct and no explicit deregister
+/// call is needed. Poll is a straight delegation to the inner stream.
+struct GuardedWatchStream {
+    _guard: RegistrationGuard,
+    inner: WatchStream,
+}
+
+impl Stream for GuardedWatchStream {
+    type Item = Result<SyncMessage, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 
@@ -86,6 +121,15 @@ impl Sync for SyncSvc {
         // client.
         let self_gateway_id = gw.id;
         let rx = self.change_tx.subscribe();
+
+        // (Cycle-4b Task 5) The per-connection broker punch channel: the broker
+        // pushes `SyncMessage{Punch}` here (keyed by this connection's
+        // AUTHENTICATED gateway id), merged into the outgoing stream below
+        // alongside the broadcast deltas. `guard`'s Drop deregisters this
+        // channel when the stream ends (see `GuardedWatchStream`), so a
+        // panic/early-return still cleans up the registry entry.
+        let (punch_tx, punch_rx) = mpsc::channel::<SyncMessage>(PUNCH_CHANNEL_CAPACITY);
+        let guard = self.broker.register(self_gateway_id, punch_tx);
 
         let snapshot = projection::build_snapshot(&self.db, gw.id, self_cert_pem)
             .await
@@ -148,8 +192,36 @@ impl Sync for SyncSvc {
             })
             .filter_map(|opt| opt);
 
-        let stream: Self::WatchStream =
-            Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(delta_stream));
+        // (Cycle-4b Task 5) The per-connection punch stream, MERGED with the
+        // broadcast deltas. `select!`-style fairness between {broadcast delta,
+        // broker punch channel} is exactly what `StreamExt::merge` provides —
+        // whichever has an item ready is yielded. The `Snapshot` stays the
+        // guaranteed FIRST message (chained ahead of the merge), so existing
+        // snapshot/delta/self-skip behavior is unchanged; punches are simply an
+        // additional interleaved item type. Unlike deltas, a punch is NOT
+        // subject to the `subject_gateway_id()` self-skip — the broker already
+        // targeted THIS connection's channel explicitly.
+        let punch_stream = ReceiverStream::new(punch_rx).map(Ok::<SyncMessage, Status>);
+        let merged = delta_stream.merge(punch_stream);
+
+        let inner: Self::WatchStream =
+            Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(merged));
+
+        // (Cycle-4b Task 5) Trigger (a): now that this connection is registered,
+        // give the broker a chance to punch any peer that is already connected
+        // with a mutual candidate set. Spawned (not awaited) so building the
+        // Watch response doesn't block on peer/candidate DB reads; the registry
+        // insert above already happened, so the spawned task sees this
+        // connection as present.
+        let broker = self.broker.clone();
+        tokio::spawn(async move {
+            broker.on_gateway_connected(self_gateway_id).await;
+        });
+
+        let stream: Self::WatchStream = Box::pin(GuardedWatchStream {
+            _guard: guard,
+            inner,
+        });
         Ok(Response::new(stream))
     }
 
@@ -170,11 +242,61 @@ impl Sync for SyncSvc {
                 )
             })?;
 
-        let applied_version = request.into_inner().applied_version;
+        let req = request.into_inner();
         self.db
-            .set_applied_version(gw.id, applied_version)
+            .set_applied_version(gw.id, req.applied_version)
             .await
             .map_err(|e| Status::internal(format!("recording applied_version: {e}")))?;
+
+        // (Cycle-4b Task 8, spec §5/§6.1 — supersedes the Task 4 "empty is a
+        // no-op" behavior) The gateway now reports its COMPLETE current
+        // local-address set on every `Report` call (there is no per-endpoint
+        // add/remove RPC — see `wiremesh_gateway::sync::report`'s doc
+        // comment). An empty `local_endpoints` is therefore no longer
+        // ambiguous ("didn't report" vs. "reported nothing"): it means the
+        // gateway genuinely has no routable local address right now, and
+        // must REPLACE (clear) any previously-reported set the same way a
+        // non-empty report replaces a different non-empty set —
+        // `Db::set_local_candidates`'s full-REPLACE contract already handles
+        // this uniformly, so the call is no longer conditioned on
+        // non-emptiness.
+        let revision = self
+            .db
+            .set_local_candidates(gw.id, req.local_endpoints)
+            .await
+            .map_err(|e| Status::internal(format!("recording local_endpoints: {e}")))?;
+
+        // `None` means the deduplicated incoming set was IDENTICAL to
+        // what's already stored (see `Db::set_local_candidates`'s doc
+        // comment) — nothing changed, so there is nothing new for an
+        // already-connected peer to learn; skip the publish entirely
+        // (mirrors `crate::observe::handle_probe`'s identical early-return
+        // on an unchanged observed endpoint).
+        if let Some(revision) = revision {
+            // Re-reads the gateway's current identity/allowed_ips/keys and
+            // its FULL current candidate set (observed + locals) — same
+            // "full peer refresh" pattern `crate::observe::handle_probe`
+            // already uses for the sibling `EndpointObserved` event, reused
+            // as-is here since its `Delta` shape already carries
+            // `candidate_endpoints` straight off `Db::candidates_for` (see
+            // that event's doc comment).
+            if let Ok(Some(identity)) = self.db.gateway_identity_by_id(gw.id).await {
+                if let (Ok(allowed_ips), Ok(keys), Ok(candidate_endpoints)) = (
+                    self.db.cidrs_for_segment(identity.segment_id).await,
+                    self.db.all_keys_for_gateway(gw.id).await,
+                    self.db.candidates_for(gw.id).await,
+                ) {
+                    let _ = self.change_tx.send(ChangeEvent::EndpointObserved {
+                        gateway_id: gw.id,
+                        segment_name: identity.segment_name,
+                        allowed_ips,
+                        keys,
+                        candidate_endpoints,
+                        revision,
+                    });
+                }
+            }
+        }
 
         Ok(Response::new(ReportResponse {}))
     }

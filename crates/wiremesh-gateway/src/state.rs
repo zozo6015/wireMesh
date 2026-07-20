@@ -13,7 +13,20 @@ pub struct PeerState {
     pub gateway_id: u64,
     pub segment_name: String,
     pub active_pubkey_b64: Option<String>,
-    pub candidate_endpoint: Option<String>,
+    /// The peer's FULL candidate-endpoint list, as reported by the
+    /// controller (`Peer.candidate_endpoints` — cycle4b §5/§6.1: the
+    /// controller-observed address plus any locally-reported ones,
+    /// deduplicated). Kept as a list (not collapsed to `.first()`) so a
+    /// future NAT-traversal puncher (Task 10) can iterate every candidate
+    /// rather than only ever trying the first.
+    ///
+    /// `#[serde(default)]` keeps `DesiredState::load()` backward-compatible:
+    /// a pre-4b `state.json` (which had a singular `candidate_endpoint` key,
+    /// now ignored as unknown) deserializes with an empty candidate list
+    /// rather than failing the boot-from-persisted-state path — the next
+    /// controller reconcile repopulates it.
+    #[serde(default)]
+    pub candidates: Vec<String>,
     pub allowed_ips: Vec<String>,
 }
 
@@ -28,9 +41,19 @@ impl PeerState {
             gateway_id: p.gateway_id,
             segment_name: p.segment_name.clone(),
             active_pubkey_b64,
-            candidate_endpoint: p.candidate_endpoints.first().cloned(),
+            candidates: p.candidate_endpoints.clone(),
             allowed_ips: p.allowed_ips.clone(),
         }
+    }
+
+    /// The endpoint to hand WireGuard as `endpoint=` right now: the
+    /// punch-confirmed candidate if one exists, else the first candidate in
+    /// the reported list (bootstrap). There is no punch-confirmation wired
+    /// yet (that's Task 10's job), so today this is always just the first
+    /// candidate — the list is retained precisely so that wiring has
+    /// something to iterate over once it lands.
+    pub fn primary_endpoint(&self) -> Option<&String> {
+        self.candidates.first()
     }
 }
 
@@ -154,7 +177,34 @@ mod tests {
         assert_eq!(ds.policy_version, 3);
         assert_eq!(ds.peers.len(), 1);
         assert_eq!(ds.peers[0].active_pubkey_b64.as_deref(), Some("PUBA"));
-        assert_eq!(ds.peers[0].candidate_endpoint.as_deref(), Some("203.0.113.2:51820"));
+        assert_eq!(ds.peers[0].candidates, vec!["203.0.113.2:51820".to_string()]);
+        assert_eq!(ds.peers[0].primary_endpoint().map(String::as_str), Some("203.0.113.2:51820"));
+    }
+
+    #[test]
+    fn from_proto_keeps_all_candidates_primary_is_first() {
+        let p = Peer {
+            gateway_id: 9,
+            segment_name: "seg9".into(),
+            keys: vec![PeerKey { epoch: 1, pubkey: "PUB9".into(), state: "active".into() }],
+            candidate_endpoints: vec![
+                "198.51.100.9:51820".into(),
+                "10.0.0.9:51820".into(),
+                "203.0.113.9:51820".into(),
+            ],
+            allowed_ips: vec!["10.10.9.0/24".into()],
+        };
+        let ps = PeerState::from_proto(&p);
+        assert_eq!(
+            ps.candidates,
+            vec![
+                "198.51.100.9:51820".to_string(),
+                "10.0.0.9:51820".to_string(),
+                "203.0.113.9:51820".to_string(),
+            ],
+            "from_proto must keep the FULL candidate list, not just .first()"
+        );
+        assert_eq!(ps.primary_endpoint().map(String::as_str), Some("198.51.100.9:51820"));
     }
 
     #[test]

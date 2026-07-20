@@ -1,5 +1,5 @@
 use prost::Message;
-use wiremesh_proto::v1::{StateSnapshot, Peer, sync_message::Body, SyncMessage};
+use wiremesh_proto::v1::{StateSnapshot, Peer, sync_message::Body, SyncMessage, PunchDirective, ReportRequest};
 
 #[test]
 fn snapshot_message_roundtrips() {
@@ -29,4 +29,43 @@ fn snapshot_message_roundtrips() {
         }
         other => panic!("wrong body: {other:?}"),
     }
+}
+
+#[test]
+fn punch_directive_message_roundtrips() {
+    let punch = PunchDirective {
+        peer_gateway_id: 7,
+        candidates: vec!["198.51.100.2:51820".into()],
+        go_unix_ms: 123,
+    };
+    let msg = SyncMessage { body: Some(Body::Punch(punch.clone())) };
+
+    // Genuine wire roundtrip (see rationale in snapshot_message_roundtrips
+    // above): encode to protobuf bytes, decode them back, and assert
+    // against the decoded value.
+    let bytes = msg.encode_to_vec();
+    let decoded = SyncMessage::decode(bytes.as_slice()).expect("decoding the encoded SyncMessage");
+
+    match decoded.body {
+        Some(Body::Punch(p)) => assert_eq!(p, punch),
+        other => panic!("wrong body: {other:?}"),
+    }
+}
+
+#[test]
+fn report_request_local_endpoints_roundtrips() {
+    let with_endpoints = ReportRequest {
+        applied_version: 5,
+        local_endpoints: vec!["10.0.0.5:51820".into()],
+    };
+    let bytes = with_endpoints.encode_to_vec();
+    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    assert_eq!(decoded, with_endpoints);
+
+    // Empty local_endpoints must still roundtrip cleanly (old-client behavior,
+    // pre-dating this additive field).
+    let no_endpoints = ReportRequest { applied_version: 5, local_endpoints: vec![] };
+    let bytes = no_endpoints.encode_to_vec();
+    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    assert_eq!(decoded, no_endpoints);
 }

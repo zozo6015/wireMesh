@@ -44,7 +44,7 @@ use wiremesh_proto::v1::enrollment_client::EnrollmentClient;
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{
     ApplyDiff, ApplyRequest, CreateSegmentRequest, MintApiTokenRequest, MintTokenRequest,
-    SyncMessage, WatchRequest,
+    ReportRequest, SyncMessage, WatchRequest,
 };
 
 /// (Task 13) Client-side counterpart to `crate::auth`'s bearer-auth
@@ -803,6 +803,49 @@ impl StubGateway {
         }
     }
 
+    /// (Cycle-4b Task 4) Calls `Sync.Report{applied_version, local_endpoints}`
+    /// against the controller, over a FRESH mTLS channel presenting this
+    /// gateway's own enrolled identity — the same dial recipe `open_sync`
+    /// uses, just a plain unary `Report` call instead of a `Watch` stream
+    /// (so it can't reuse `dial_sync`'s streaming return type). Promoted
+    /// here from what had been a hand-rolled private helper duplicated in
+    /// `wiremesh-testkit/tests/end_to_end_policy.rs` and
+    /// `fabricctl/tests/cli.rs` (each predating `local_endpoints`, so each
+    /// only ever sent an empty list) — this is the one shared place that
+    /// now also exercises reporting a gateway's own local candidate
+    /// endpoints (spec §6.1).
+    pub async fn report(
+        &self,
+        applied_version: u64,
+        local_endpoints: &[&str],
+    ) -> anyhow::Result<()> {
+        let uri = format!("https://{}", self.sync_addr);
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
+            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
+            .tls_config(tls)
+            .map_err(|e| anyhow::anyhow!("configuring StubGateway mTLS for Sync.Report: {e}"))?
+            .connect()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "connecting to the controller's Sync (mTLS) TCP port for Sync.Report: {e}"
+                )
+            })?;
+
+        SyncClient::new(channel)
+            .report(ReportRequest {
+                applied_version,
+                local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("Sync.Report failed: {status}"))?;
+        Ok(())
+    }
+
     /// Ensures this gateway's identity bundle (leaf cert, private key
     /// (`0600`), CA bundle) is durably on disk under `state_dir()` — the
     /// fail-static posture `fail_static.rs` exercises: a gateway must not
@@ -1087,6 +1130,48 @@ pub async fn enroll_one_with_wg_pubkey(
         .expect("enrolling stub gateway in enroll_one_with_wg_pubkey");
     gw.set_segment_id(segment.id as i64);
     gw
+}
+
+/// (Cycle-4b Task 5) Reads the next broker `PunchDirective` off a live
+/// `Sync.Watch` stream, transparently skipping any `Snapshot`/`Delta` messages
+/// that precede it, bounded by `timeout`. Additive test helper for the broker
+/// suite: a `Watch` stream always opens with a `Snapshot` and may interleave
+/// `Delta`s (e.g. a peer's candidate-report delta) before/around the punch, so
+/// a test that wants to assert on the punch specifically needs to filter for
+/// it rather than positionally index the stream.
+///
+/// Returns `Ok(PunchDirective)` on the first `Punch` body seen; `Err` if the
+/// stream ends, errors, or no punch arrives within `timeout` (the negative
+/// cases — one member not connected, or a member with no candidate — rely on
+/// this timing out).
+///
+/// Uses `tonic::Streaming::message()` (rather than a `StreamExt` combinator)
+/// so this lives in the crate's normal (non-dev) surface without pulling
+/// `tokio-stream` out of dev-dependencies.
+pub async fn next_punch(
+    stream: &mut tonic::Streaming<SyncMessage>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<wiremesh_proto::v1::PunchDirective> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("no PunchDirective arrived on the Sync.Watch stream within the timeout");
+        }
+        match tokio::time::timeout(remaining, stream.message()).await {
+            Ok(Ok(Some(msg))) => match msg.body {
+                Some(wiremesh_proto::v1::sync_message::Body::Punch(punch)) => return Ok(punch),
+                // A Snapshot or Delta ahead of the punch — skip and keep
+                // reading.
+                _ => continue,
+            },
+            Ok(Ok(None)) => anyhow::bail!("Sync.Watch stream ended before any PunchDirective"),
+            Ok(Err(status)) => anyhow::bail!("Sync.Watch stream yielded an error: {status}"),
+            Err(_) => {
+                anyhow::bail!("no PunchDirective arrived on the Sync.Watch stream within the timeout")
+            }
+        }
+    }
 }
 
 /// Generates a fresh keypair and a PEM-encoded CSR with common name `cn` —

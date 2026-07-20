@@ -44,11 +44,15 @@ async fn receives_snapshot_and_reports_version() {
     let mut client = sync::connect(h.sync_tcp_addr(), &id).await.expect("mTLS connect");
     let mut stream = sync::watch(&mut client).await.expect("watch");
     let mut cur = None;
-    let ds = sync::next_desired(&mut stream, &mut cur).await.expect("first msg").expect("snapshot");
+    // The first Sync message is always a snapshot, surfaced as SyncEvent::State.
+    let ds = match sync::next_event(&mut stream, &mut cur).await.expect("first msg").expect("snapshot") {
+        sync::SyncEvent::State(ds) => ds,
+        sync::SyncEvent::Punch(p) => panic!("expected snapshot, got punch directive: {p:?}"),
+    };
     // Gateway A's peer is gateway B (seg-b, 10.10.2.0/24).
     assert!(ds.peers.iter().any(|p| p.allowed_ips.contains(&"10.10.2.0/24".to_string())),
             "snapshot lists peer B's segment: {:?}", ds.peers);
 
-    sync::report(&mut client, ds.policy_version).await.expect("report ack");
+    sync::report(&mut client, ds.policy_version, vec![]).await.expect("report ack");
     let _ = stream; // keep alive
 }

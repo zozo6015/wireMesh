@@ -265,16 +265,20 @@ async fn handle_probe(
     // gateway's current identity/allowed_ips/keys the same way
     // `EnrollmentSvc`/`AdminSvc::rotate_key` do for their own events.
     if let Ok(Some(identity)) = db.gateway_identity_by_id(gateway_id as i64).await {
-        if let (Ok(allowed_ips), Ok(keys)) = (
+        if let (Ok(allowed_ips), Ok(keys), Ok(candidate_endpoints)) = (
             db.cidrs_for_segment(identity.segment_id).await,
             db.all_keys_for_gateway(gateway_id as i64).await,
+            // (Cycle-4b Task 3) The FULL current candidate set (observed +
+            // locals), not just the address this probe just observed — see
+            // `ChangeEvent::EndpointObserved`'s doc comment.
+            db.candidates_for(gateway_id as i64).await,
         ) {
             let _ = change_tx.send(ChangeEvent::EndpointObserved {
                 gateway_id: gateway_id as i64,
                 segment_name: identity.segment_name,
                 allowed_ips,
                 keys,
-                candidate_endpoint: observed,
+                candidate_endpoints,
                 revision,
             });
         }
