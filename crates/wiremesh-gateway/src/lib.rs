@@ -2,5 +2,6 @@
 pub mod config;
 pub mod identity;
 pub mod observe;
+pub mod reconcile;
 pub mod state;
 pub mod uapi;
