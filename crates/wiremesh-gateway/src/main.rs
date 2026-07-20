@@ -490,18 +490,36 @@ async fn run_path_ticks(ctx: PathCtx) {
                 if let Some((Some(t), rx)) = liveness.get(&hex).copied() {
                     let advanced = last_seen.get(&gid).map_or(true, |prev| t > *prev);
                     if advanced {
-                        path.on_handshake(now);
                         last_seen.insert(gid, t);
                     }
-
                     let rx_increased = last_rx.get(&gid).map_or(false, |&prev| rx > prev);
-                    if rx_increased && !advanced {
+                    last_rx.insert(gid, rx);
+
+                    // A handshake-time advance reliably signals recovery when
+                    // the peer ISN'T already Direct (Connecting/Degraded/
+                    // Relayed) -- boringtun genuinely just completed a fresh
+                    // Noise handshake there, and `on_handshake`'s own
+                    // authenticated-inbound bookkeeping is exactly right.
+                    // Once ALREADY Direct, only trust it corroborated by an
+                    // rx_bytes increase: this project's boringtun build has
+                    // been observed (netns conformance, Cycle 4b Task 11 —
+                    // see docs/research/cycle4b-nat-matrix-notes.md) to
+                    // advance `last_handshake_time` on EVERY driver tick for
+                    // a peer that is retrying an unanswered handshake (no
+                    // reply ever arrives, `rx_bytes` frozen) — i.e. the
+                    // timestamp climbs in lockstep with wall-clock time with
+                    // no corresponding received byte. Trusting it
+                    // unconditionally while already Direct would refresh
+                    // `last_inbound` forever and make `DEGRADED_AFTER`
+                    // unreachable for a genuinely dead link.
+                    if advanced && (path.state != PathState::Direct || rx_increased) {
+                        path.on_handshake(now);
+                    } else if rx_increased {
                         // A handshake advance already calls on_handshake
                         // (which itself refreshes last_inbound); only need
                         // this for the keepalive-only case in between.
                         path.on_authenticated_inbound(now);
                     }
-                    last_rx.insert(gid, rx);
                 }
 
                 match path.tick(now, false) {
