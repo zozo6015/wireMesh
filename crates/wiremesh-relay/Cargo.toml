@@ -1,0 +1,30 @@
+[package]
+name = "wiremesh-relay"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wiremesh_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "relay"
+path = "src/bin/relay.rs"
+
+[[bin]]
+name = "mkcerts"
+path = "src/bin/mkcerts.rs"
+
+[dependencies]
+quinn = "0.11"
+# Not in the Task 13 brief's dep list; added because mkcerts/relay/lib all
+# exchange certs as PEM files on disk (across process boundaries) and rustls
+# 0.23 no longer ships its own PEM parser — rustls-pemfile is the standard
+# complement for turning `ca.pem`/`relay.pem`/`gw-*.pem` back into the
+# `CertificateDer`/`PrivateKeyDer` types rustls::ServerConfig/ClientConfig want.
+rustls-pemfile = "2"
+clap = { version = "4", features = ["derive"] }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
