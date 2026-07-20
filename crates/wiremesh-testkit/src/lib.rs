@@ -598,6 +598,7 @@ impl StubGateway {
                 csr_pem,
                 cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
                 wg_pubkey: wg_pubkey.to_string(),
+                endpoint: String::new(),
             })
             .await
             .map_err(|status| anyhow::anyhow!("Enrollment.Enroll failed: {status}"))?
@@ -840,6 +841,7 @@ impl StubGateway {
             .report(ReportRequest {
                 applied_version,
                 local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
+                relay_health: vec![],
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report failed: {status}"))?;

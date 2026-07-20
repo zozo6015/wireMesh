@@ -27,16 +27,18 @@ message Peer {
   repeated string candidate_endpoints = 4;
   repeated string allowed_ips = 5;      // peer segment CIDRs
 }
+message RelayInfo { uint64 relay_id = 1; string endpoint = 2; }
+message RelayHealth { uint64 relay_id = 1; bool healthy = 2; }
 message StateSnapshot {
   uint64 revision = 1;
   string self_cert_pem = 2;
   repeated Peer peers = 3;
-  repeated string relays = 4;
+  repeated RelayInfo relays = 4;
   bytes policy_ir = 5;                    // empty IR v0 in cycle 2
   uint64 policy_version = 6;
   repeated string revoked_serials = 7;
 }
-message Delta { uint64 revision = 1; repeated Peer upserted_peers = 2; repeated uint64 removed_peer_ids = 3; repeated string relays = 4; bytes policy_ir = 5; uint64 policy_version = 6; repeated string revoked_serials = 7; }
+message Delta { uint64 revision = 1; repeated Peer upserted_peers = 2; repeated uint64 removed_peer_ids = 3; repeated RelayInfo relays = 4; bytes policy_ir = 5; uint64 policy_version = 6; repeated string revoked_serials = 7; }
 message ReportRequest {
   uint64 applied_version = 1;
   repeated string local_endpoints = 2;  // gateway's own routable local ip:wg_port
@@ -44,5 +46,7 @@ message ReportRequest {
                                          // local-source candidates for LAN/hairpin
                                          // reachability. Additive field; empty = old
                                          // (pre-4b) client behavior.
+  repeated RelayHealth relay_health = 3; // additive; gateway per-relay health
+                                          // reports (4c).
 }
 message ReportResponse {}

@@ -51,7 +51,7 @@ pub async fn report(
     local_endpoints: Vec<String>,
 ) -> anyhow::Result<()> {
     client
-        .report(ReportRequest { applied_version, local_endpoints })
+        .report(ReportRequest { applied_version, local_endpoints, relay_health: vec![] })
         .await
         .map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
     Ok(())

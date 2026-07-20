@@ -8,7 +8,9 @@ service Enrollment { rpc Enroll(EnrollRequest) returns (EnrollResponse); }
 // Empty means "no key supplied yet": the controller falls back to the
 // cycle-2 placeholder (`placeholder-pubkey-gw{id}-epoch0`), so older callers
 // that don't set this field are unaffected.
-message EnrollRequest { string token = 1; string csr_pem = 2; repeated string cidrs = 3; string wg_pubkey = 4; }
+// `endpoint` (Task 1, 4c): relay-only public endpoint; empty for gateways
+// (additive, 4c).
+message EnrollRequest { string token = 1; string csr_pem = 2; repeated string cidrs = 3; string wg_pubkey = 4; string endpoint = 5; }
 // (Task 11) `gateway_id` is the DB row id the controller assigned this
 // enrollment — lets a caller (e.g. `wiremesh-testkit::StubGateway::id`)
 // address itself in later Admin ops (e.g. `RotateKey`) without a dedicated

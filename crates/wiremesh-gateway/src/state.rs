@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use wiremesh_proto::v1::{Delta, Peer, StateSnapshot};
+use wiremesh_proto::v1::{Delta, Peer, RelayInfo, StateSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerState {
@@ -63,7 +63,7 @@ pub struct DesiredState {
     pub peers: Vec<PeerState>,
     pub policy_ir: Vec<u8>,
     pub policy_version: u64,
-    pub relays: Vec<String>,
+    pub relays: Vec<RelayInfo>,
     pub revoked_serials: Vec<String>,
 }
 

@@ -61,6 +61,7 @@ fn report_request_local_endpoints_roundtrips() {
     let with_endpoints = ReportRequest {
         applied_version: 5,
         local_endpoints: vec!["10.0.0.5:51820".into()],
+        relay_health: vec![],
     };
     let bytes = with_endpoints.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
@@ -68,7 +69,7 @@ fn report_request_local_endpoints_roundtrips() {
 
     // Empty local_endpoints must still roundtrip cleanly (old-client behavior,
     // pre-dating this additive field).
-    let no_endpoints = ReportRequest { applied_version: 5, local_endpoints: vec![] };
+    let no_endpoints = ReportRequest { applied_version: 5, local_endpoints: vec![], relay_health: vec![] };
     let bytes = no_endpoints.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
     assert_eq!(decoded, no_endpoints);
