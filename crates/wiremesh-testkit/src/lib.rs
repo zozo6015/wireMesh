@@ -1132,6 +1132,48 @@ pub async fn enroll_one_with_wg_pubkey(
     gw
 }
 
+/// (Cycle-4b Task 5) Reads the next broker `PunchDirective` off a live
+/// `Sync.Watch` stream, transparently skipping any `Snapshot`/`Delta` messages
+/// that precede it, bounded by `timeout`. Additive test helper for the broker
+/// suite: a `Watch` stream always opens with a `Snapshot` and may interleave
+/// `Delta`s (e.g. a peer's candidate-report delta) before/around the punch, so
+/// a test that wants to assert on the punch specifically needs to filter for
+/// it rather than positionally index the stream.
+///
+/// Returns `Ok(PunchDirective)` on the first `Punch` body seen; `Err` if the
+/// stream ends, errors, or no punch arrives within `timeout` (the negative
+/// cases — one member not connected, or a member with no candidate — rely on
+/// this timing out).
+///
+/// Uses `tonic::Streaming::message()` (rather than a `StreamExt` combinator)
+/// so this lives in the crate's normal (non-dev) surface without pulling
+/// `tokio-stream` out of dev-dependencies.
+pub async fn next_punch(
+    stream: &mut tonic::Streaming<SyncMessage>,
+    timeout: std::time::Duration,
+) -> anyhow::Result<wiremesh_proto::v1::PunchDirective> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("no PunchDirective arrived on the Sync.Watch stream within the timeout");
+        }
+        match tokio::time::timeout(remaining, stream.message()).await {
+            Ok(Ok(Some(msg))) => match msg.body {
+                Some(wiremesh_proto::v1::sync_message::Body::Punch(punch)) => return Ok(punch),
+                // A Snapshot or Delta ahead of the punch — skip and keep
+                // reading.
+                _ => continue,
+            },
+            Ok(Ok(None)) => anyhow::bail!("Sync.Watch stream ended before any PunchDirective"),
+            Ok(Err(status)) => anyhow::bail!("Sync.Watch stream yielded an error: {status}"),
+            Err(_) => {
+                anyhow::bail!("no PunchDirective arrived on the Sync.Watch stream within the timeout")
+            }
+        }
+    }
+}
+
 /// Generates a fresh keypair and a PEM-encoded CSR with common name `cn` —
 /// mirrors what a real gateway does before calling `Enrollment.Enroll`
 /// (same pattern as Phase 0's `spike/relay/src/bin/mkcerts.rs` and

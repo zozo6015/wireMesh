@@ -17,11 +17,13 @@
 //! (deliberately) an empty message.
 
 use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use base64::Engine as _;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
-use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
@@ -29,6 +31,7 @@ use wiremesh_proto::v1::sync_server::Sync;
 use wiremesh_proto::v1::sync_message::Body;
 use wiremesh_proto::v1::{ReportRequest, ReportResponse, SyncMessage, WatchRequest};
 
+use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
 use crate::db_async::DbHandle;
 use crate::projection::{self, ChangeEvent};
 
@@ -42,11 +45,43 @@ pub struct SyncSvc {
     /// `Sync.Watch` connection below subscribes its own receiver and
     /// forwards relevant events as `Delta`s down its still-open stream.
     change_tx: broadcast::Sender<ChangeEvent>,
+    /// (Cycle-4b Task 5) The Sync broker. Every `Watch` connection registers
+    /// its per-connection punch channel into the broker's shared registry
+    /// (keyed by the AUTHENTICATED gateway id) so the broker can push a
+    /// `PunchDirective` explicitly to BOTH members of a pair — deliberately
+    /// NOT the `subject_gateway_id()` self-skip path the deltas below use.
+    broker: Arc<Broker>,
 }
 
 impl SyncSvc {
-    pub fn new(db: DbHandle, change_tx: broadcast::Sender<ChangeEvent>) -> Self {
-        Self { db, change_tx }
+    pub fn new(
+        db: DbHandle,
+        change_tx: broadcast::Sender<ChangeEvent>,
+        broker: Arc<Broker>,
+    ) -> Self {
+        Self {
+            db,
+            change_tx,
+            broker,
+        }
+    }
+}
+
+/// Wraps the `Watch` response stream with its [`RegistrationGuard`] so the
+/// connection's broker registry entry is removed exactly when the stream is
+/// dropped (client disconnect, RPC end, or a dropped `Response`) — the guard
+/// is a plain field, so it drops with the struct and no explicit deregister
+/// call is needed. Poll is a straight delegation to the inner stream.
+struct GuardedWatchStream {
+    _guard: RegistrationGuard,
+    inner: WatchStream,
+}
+
+impl Stream for GuardedWatchStream {
+    type Item = Result<SyncMessage, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner).poll_next(cx)
     }
 }
 
@@ -86,6 +121,15 @@ impl Sync for SyncSvc {
         // client.
         let self_gateway_id = gw.id;
         let rx = self.change_tx.subscribe();
+
+        // (Cycle-4b Task 5) The per-connection broker punch channel: the broker
+        // pushes `SyncMessage{Punch}` here (keyed by this connection's
+        // AUTHENTICATED gateway id), merged into the outgoing stream below
+        // alongside the broadcast deltas. `guard`'s Drop deregisters this
+        // channel when the stream ends (see `GuardedWatchStream`), so a
+        // panic/early-return still cleans up the registry entry.
+        let (punch_tx, punch_rx) = mpsc::channel::<SyncMessage>(PUNCH_CHANNEL_CAPACITY);
+        let guard = self.broker.register(self_gateway_id, punch_tx);
 
         let snapshot = projection::build_snapshot(&self.db, gw.id, self_cert_pem)
             .await
@@ -148,8 +192,36 @@ impl Sync for SyncSvc {
             })
             .filter_map(|opt| opt);
 
-        let stream: Self::WatchStream =
-            Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(delta_stream));
+        // (Cycle-4b Task 5) The per-connection punch stream, MERGED with the
+        // broadcast deltas. `select!`-style fairness between {broadcast delta,
+        // broker punch channel} is exactly what `StreamExt::merge` provides —
+        // whichever has an item ready is yielded. The `Snapshot` stays the
+        // guaranteed FIRST message (chained ahead of the merge), so existing
+        // snapshot/delta/self-skip behavior is unchanged; punches are simply an
+        // additional interleaved item type. Unlike deltas, a punch is NOT
+        // subject to the `subject_gateway_id()` self-skip — the broker already
+        // targeted THIS connection's channel explicitly.
+        let punch_stream = ReceiverStream::new(punch_rx).map(Ok::<SyncMessage, Status>);
+        let merged = delta_stream.merge(punch_stream);
+
+        let inner: Self::WatchStream =
+            Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(merged));
+
+        // (Cycle-4b Task 5) Trigger (a): now that this connection is registered,
+        // give the broker a chance to punch any peer that is already connected
+        // with a mutual candidate set. Spawned (not awaited) so building the
+        // Watch response doesn't block on peer/candidate DB reads; the registry
+        // insert above already happened, so the spawned task sees this
+        // connection as present.
+        let broker = self.broker.clone();
+        tokio::spawn(async move {
+            broker.on_gateway_connected(self_gateway_id).await;
+        });
+
+        let stream: Self::WatchStream = Box::pin(GuardedWatchStream {
+            _guard: guard,
+            inner,
+        });
         Ok(Response::new(stream))
     }
 

@@ -10,6 +10,7 @@
 
 pub mod apply;
 pub mod auth;
+pub mod broker;
 pub mod db;
 pub mod db_async;
 pub mod observe;
@@ -158,6 +159,11 @@ pub struct RunningController {
     sync_join: Option<JoinHandle<()>>,
     observe_shutdown_tx: Option<oneshot::Sender<()>>,
     observe_join: Option<JoinHandle<()>>,
+    /// (Cycle-4b Task 5) The broker's background trigger loop (candidate-change
+    /// + periodic-retry punch triggers — see [`broker::Broker::spawn`]), torn
+    /// down the same bounded-join-then-abort way as every other server task.
+    broker_shutdown_tx: Option<oneshot::Sender<()>>,
+    broker_join: Option<JoinHandle<()>>,
 }
 
 impl RunningController {
@@ -243,11 +249,15 @@ impl RunningController {
         if let Some(tx) = self.observe_shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(tx) = self.broker_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
         join_bounded(self.admin_join.take()).await;
         join_bounded(self.admin_tcp_join.take()).await;
         join_bounded(self.enroll_join.take()).await;
         join_bounded(self.sync_join.take()).await;
         join_bounded(self.observe_join.take()).await;
+        join_bounded(self.broker_join.take()).await;
     }
 }
 
@@ -313,6 +323,12 @@ impl Drop for RunningController {
             let _ = tx.send(());
         }
         if let Some(join) = self.observe_join.take() {
+            join.abort();
+        }
+        if let Some(tx) = self.broker_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.broker_join.take() {
             join.abort();
         }
     }
@@ -513,7 +529,21 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         }
     });
 
-    let sync_svc = SyncSvc::new(db_handle, change_tx);
+    // (Cycle-4b Task 5) The broker + its shared connection registry. Built
+    // BEFORE `SyncSvc` (which registers each Watch connection into the same
+    // registry clone) and given a `ChangeEvent` subscriber of its own so its
+    // background loop re-punches a pair when a candidate changes; the periodic
+    // retry sweep lives in the same spawned task. `change_tx.subscribe()` here
+    // (before `change_tx` is moved into `SyncSvc` below) hands the broker its
+    // own receiver.
+    let punch_registry = broker::new_registry();
+    let broker = broker::Broker::new(db_handle.clone(), punch_registry.clone());
+    let (broker_shutdown_tx, broker_shutdown_rx) = oneshot::channel::<()>();
+    let broker_join = broker
+        .clone()
+        .spawn(change_tx.subscribe(), broker_shutdown_rx);
+
+    let sync_svc = SyncSvc::new(db_handle, change_tx, broker);
     // `client_auth_optional` defaults to `false` — i.e. REQUIRED — so this
     // is exactly the mTLS posture Sync needs: the Sync listener rejects any
     // TLS handshake that doesn't present a client cert chaining to
@@ -556,6 +586,8 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         sync_join: Some(sync_join),
         observe_shutdown_tx: Some(observe_shutdown_tx),
         observe_join: Some(observe_join),
+        broker_shutdown_tx: Some(broker_shutdown_tx),
+        broker_join: Some(broker_join),
     })
 }
 
