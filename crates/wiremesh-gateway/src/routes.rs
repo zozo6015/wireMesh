@@ -33,7 +33,10 @@ pub fn del_route(cidr: &str, ifname: &str) -> anyhow::Result<()> {
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
     // A route already gone is not an error (reconcile may double-delete).
-    if stderr.contains("No such process") || stderr.contains("not found") {
+    // Verified in-container: a genuinely-missing route yields exactly
+    // "RTNETLINK answers: No such process"; a bad device yields
+    // "Cannot find device \"...\"" (which must still error).
+    if stderr.contains("No such process") {
         return Ok(());
     }
     Err(anyhow!("ip route del {cidr} failed: {stderr}"))
@@ -52,14 +55,21 @@ pub fn install_mss_clamp(ifname: &str, mss: u16) -> anyhow::Result<()> {
          }}\n"
     );
     let mut child = Command::new("nft").args(["-f", "-"])
-        .stdin(std::process::Stdio::piped()).spawn().context("spawning nft -f -")?;
+        .stdin(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn().context("spawning nft -f -")?;
     {
         use std::io::Write;
+        // Drop the stdin handle before waiting, to avoid a pipe deadlock
+        // if nft writes enough stderr to fill its pipe buffer.
         child.stdin.take().unwrap().write_all(ruleset.as_bytes())?;
     }
-    let status = child.wait().context("waiting on nft")?;
-    if !status.success() {
-        return Err(anyhow!("nft load of wiremesh_mss failed"));
+    let out = child.wait_with_output().context("waiting on nft")?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "nft load of wiremesh_mss failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     Ok(())
 }

@@ -27,5 +27,8 @@ fn programs_mtu_forward_route_and_mss() {
     assert!(String::from_utf8_lossy(&nft.stdout).contains("maxseg"), "mss rule present");
 
     routes::del_route("10.10.2.0/24", "dum0").expect("del route idempotent");
+    // Route is now already gone: a second delete must swallow the
+    // "No such process" error and still return Ok.
+    routes::del_route("10.10.2.0/24", "dum0").expect("del route already-gone is Ok");
     drop(lab);
 }
