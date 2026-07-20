@@ -30,3 +30,6 @@ libc = "0.2"
 wiremesh-testkit = { path = "../wiremesh-testkit", features = ["netns"] }
 tempfile = "3"
 tokio-stream = "0.1"
+
+[features]
+netns-tests = []
