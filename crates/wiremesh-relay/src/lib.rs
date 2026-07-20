@@ -248,3 +248,107 @@ pub async fn ack_registration(mut send: quinn::SendStream) -> Result<()> {
     send.finish().context("finish registration ack stream")?;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Cycle 4c Task 3: offline certificate-revocation denylist.
+//
+// `Denylist` (an `Arc<RwLock<HashSet<String>>>` of lowercase-hex cert
+// serials — same format as `wiremesh-trust`'s `{b:02x}`-per-byte encoding of
+// a 16-byte random serial) and `server_config_with_denylist` do not exist
+// yet as of this commit; a separate implementer task adds them. These tests
+// are written against the shared API contract for that task (see the Task 3
+// brief) and are expected to fail to COMPILE until that code lands — that is
+// the intended RED state, not a mistake.
+#[cfg(test)]
+mod denylist_tests {
+    use super::Denylist;
+    use std::collections::HashSet;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    /// A tmp file path unique to this test process, distinguished by `tag`
+    /// so tests that run concurrently in the same test binary (same PID)
+    /// never collide on the same path. No `rand`/`Date` dependency
+    /// available here — same PID-derived-uniqueness pattern documented in
+    /// `tests/bridge.rs`'s `unique_dir`.
+    fn unique_path(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "wiremesh-relay-denylist-unit-{tag}-{}.json",
+            std::process::id()
+        ))
+    }
+
+    fn set(items: &[&str]) -> HashSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn replace_all_implements_snapshot_semantics() {
+        let dl = Denylist::new();
+        dl.replace_all(["aa".to_string(), "bb".to_string()]);
+        assert_eq!(dl.snapshot(), set(&["aa", "bb"]));
+
+        // A second `replace_all` must fully replace the set — "aa"/"bb"
+        // must be gone, not merged with "cc".
+        dl.replace_all(["cc".to_string()]);
+        assert_eq!(
+            dl.snapshot(),
+            set(&["cc"]),
+            "replace_all must implement snapshot (full-replace) semantics"
+        );
+    }
+
+    #[test]
+    fn union_implements_delta_semantics() {
+        let dl = Denylist::new();
+        dl.replace_all(["aa".to_string()]);
+        dl.union(["bb".to_string(), "aa".to_string()]);
+        assert_eq!(
+            dl.snapshot(),
+            set(&["aa", "bb"]),
+            "union must be additive/deduped and must never remove an existing entry"
+        );
+    }
+
+    #[test]
+    fn contains_reflects_current_membership() {
+        let dl = Denylist::new();
+        assert!(!dl.contains("aa"), "empty denylist must not contain anything");
+        dl.replace_all(["aa".to_string()]);
+        assert!(dl.contains("aa"));
+        assert!(!dl.contains("bb"));
+    }
+
+    #[test]
+    fn persist_then_load_round_trips_and_writes_mode_0600() {
+        let path = unique_path("roundtrip");
+        let _ = std::fs::remove_file(&path);
+
+        let dl = Denylist::new();
+        dl.replace_all(["aa".to_string(), "bb".to_string()]);
+        dl.persist(&path).expect("persist must succeed");
+
+        let meta = std::fs::metadata(&path).expect("persisted file must exist");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "denylist.json must be persisted with mode 0600, like wiremesh-gateway's state.json"
+        );
+
+        let loaded = Denylist::load(&path).expect("load must succeed for an existing file");
+        assert_eq!(loaded.snapshot(), set(&["aa", "bb"]));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_of_missing_file_is_empty_not_an_error() {
+        let path = unique_path("missing");
+        let _ = std::fs::remove_file(&path);
+        assert!(!path.exists(), "precondition: path must not exist");
+
+        let dl = Denylist::load(&path)
+            .expect("a MISSING denylist file must be fail-static (empty), not an Err");
+        assert!(dl.snapshot().is_empty());
+    }
+}
