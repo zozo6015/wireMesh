@@ -19,6 +19,13 @@ pub struct PeerState {
     /// deduplicated). Kept as a list (not collapsed to `.first()`) so a
     /// future NAT-traversal puncher (Task 10) can iterate every candidate
     /// rather than only ever trying the first.
+    ///
+    /// `#[serde(default)]` keeps `DesiredState::load()` backward-compatible:
+    /// a pre-4b `state.json` (which had a singular `candidate_endpoint` key,
+    /// now ignored as unknown) deserializes with an empty candidate list
+    /// rather than failing the boot-from-persisted-state path — the next
+    /// controller reconcile repopulates it.
+    #[serde(default)]
     pub candidates: Vec<String>,
     pub allowed_ips: Vec<String>,
 }

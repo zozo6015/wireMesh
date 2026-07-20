@@ -197,7 +197,13 @@ impl GwProc {
     }
     fn stderr_tail(&self) -> String {
         let s = std::fs::read_to_string(&self.err_log).unwrap_or_default();
-        let start = s.len().saturating_sub(4000);
+        // Snap the 4000-byte tail offset up to a char boundary: a raw byte
+        // offset can land mid-codepoint and panic in `dump_diag`, masking the
+        // real failure this tail was meant to surface.
+        let mut start = s.len().saturating_sub(4000);
+        while start < s.len() && !s.is_char_boundary(start) {
+            start += 1;
+        }
         s[start..].to_string()
     }
 }

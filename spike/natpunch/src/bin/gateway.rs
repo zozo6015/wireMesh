@@ -90,14 +90,22 @@ fn main() -> Result<()> {
     let mut buf = [0u8; 64];
     let mut punched = false;
     let mut punched_from: Option<SocketAddr> = None;
+    // Rate-limit the PING blast to every 50ms: a received packet makes
+    // `recv_from` return immediately, and re-blasting every candidate on each
+    // wake would amplify into a PING/PONG packet storm between the peers.
+    let mut next_ping = Instant::now();
     while Instant::now() < deadline {
-        for c in &go.candidates {
-            if let Ok(addr) = c.parse::<SocketAddr>() {
-                if addr.ip().is_unspecified() || addr.ip().is_loopback() {
-                    continue; // never dial wildcard/loopback (self-punch guard)
+        let now = Instant::now();
+        if now >= next_ping {
+            for c in &go.candidates {
+                if let Ok(addr) = c.parse::<SocketAddr>() {
+                    if addr.ip().is_unspecified() || addr.ip().is_loopback() {
+                        continue; // never dial wildcard/loopback (self-punch guard)
+                    }
+                    let _ = punch_sock.send_to(format!("PING {id}").as_bytes(), addr);
                 }
-                let _ = punch_sock.send_to(format!("PING {id}").as_bytes(), addr);
             }
+            next_ping = now + Duration::from_millis(50);
         }
         if let Ok((n, from)) = punch_sock.recv_from(&mut buf) {
             let msg = String::from_utf8_lossy(&buf[..n]).to_string();

@@ -96,10 +96,21 @@ fn run_cell(kind: NatKind, prefix: &str) -> (bool, bool, String) {
     ra.exec(&["ip", "route", "add", "default", "via", "198.51.100.1"]).unwrap();
     rb.exec(&["ip", "route", "add", "default", "via", "198.51.100.129"]).unwrap();
 
-    // Confirm netem is actually installed (honesty: fail loud if it's missing).
-    let netem = inet.exec(&["tc", "qdisc", "show", "dev", "ia"]).unwrap();
-    let netem = String::from_utf8_lossy(&netem.stdout).into_owned();
-    assert!(netem.contains("netem") && netem.contains("delay 20"), "netem not present: {netem}");
+    // Confirm netem is actually installed on BOTH internet-facing links
+    // (honesty: fail loud if it's missing). Phase-0 Finding 2 makes the 20ms
+    // delay on *each* link mandatory to avoid false punch-success negatives.
+    let mut netem = String::new();
+    for dev in ["ia", "ib"] {
+        let out = inet.exec(&["tc", "qdisc", "show", "dev", dev]).unwrap();
+        let netem_str = String::from_utf8_lossy(&out.stdout).into_owned();
+        assert!(
+            netem_str.contains("netem") && netem_str.contains("delay 20"),
+            "netem not present on {dev}: {netem_str}"
+        );
+        if dev == "ia" {
+            netem = netem_str; // retained for the evidence dump below
+        }
+    }
 
     let obs = KillOnDrop(inet.spawn(&[env!("CARGO_BIN_EXE_observe"), "198.51.100.1:7777"]).unwrap());
     let brk = KillOnDrop(inet.spawn(&[env!("CARGO_BIN_EXE_broker"), "198.51.100.1:7000"]).unwrap());
