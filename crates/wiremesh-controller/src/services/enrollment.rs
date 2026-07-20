@@ -91,13 +91,96 @@ impl Enrollment for EnrollmentSvc {
                     .map_err(|e| Status::invalid_argument(format!("invalid IPv4 CIDR {c:?}: {e}")))
             })
             .collect::<Result<_, _>>()?;
-        if cidrs.is_empty() {
-            return Err(Status::invalid_argument("cidrs must not be empty"));
-        }
 
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        // (Cycle-4c Task 4) A relay has no segment/cidrs to declare — it's
+        // routed by request SHAPE instead of an explicit field: a non-empty
+        // `endpoint` selects the relay path; an empty one is the ordinary
+        // gateway path below, entirely unchanged. The DB remains the
+        // kind-authority either way — `Db::enroll_relay` only matches
+        // `kind = 'relay'` tokens (a gateway/rebind token here comes back
+        // `InvalidToken`, indistinguishable from a bad secret), and
+        // `Db::enroll_gateway` below already only matches
+        // `kind IN ('gateway', 'rebind')` (a relay token there is likewise
+        // `InvalidToken`) — so a mismatched token/path combination is
+        // rejected by the same non-disclosure posture as any other invalid
+        // token, never a distinct error that would help an attacker probe
+        // token kinds.
+        if !req.endpoint.is_empty() {
+            let relay_name = format!("relay-{secret_hash_hex}");
+
+            // Signing (pure crypto, no DB dependency) happens before the
+            // single-use transaction, same rationale as the gateway path
+            // below: an invalid/spent token just means the freshly signed
+            // cert is discarded, never recorded or returned.
+            let issued = self
+                .trust
+                .sign(
+                    &req.csr_pem,
+                    CertProfile {
+                        subject_cn: relay_name.clone(),
+                        ttl: GATEWAY_CERT_TTL,
+                    },
+                )
+                .await
+                .map_err(|e| Status::invalid_argument(format!("signing CSR failed: {e}")))?;
+
+            let not_after = issued
+                .not_after
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| Status::internal(format!("formatting cert not_after: {e}")))?;
+
+            let ca_bundle_pem = self
+                .trust
+                .trust_bundle()
+                .await
+                .map_err(|e| Status::internal(format!("reading trust bundle: {e}")))?;
+
+            let relay_id = match self
+                .db
+                .enroll_relay(
+                    secret_hash_hex,
+                    relay_name,
+                    req.endpoint.clone(),
+                    issued.serial.clone(),
+                    issued.handle.clone(),
+                    not_after,
+                    now,
+                )
+                .await
+            {
+                Ok(id) => id,
+                Err(EnrollError::InvalidToken) => {
+                    return Err(Status::permission_denied(
+                        "enrollment token is invalid, expired, wrong kind, or already used",
+                    ));
+                }
+                Err(EnrollError::Other(e)) => {
+                    return Err(Status::internal(format!("relay enrollment failed: {e}")));
+                }
+                Err(other) => {
+                    return Err(Status::internal(format!("relay enrollment failed: {other:?}")));
+                }
+            };
+
+            return Ok(Response::new(EnrollResponse {
+                cert_pem: issued.cert_pem,
+                ca_bundle_pem,
+                // Not a gateway id at all — the field is reused to carry the
+                // newly enrolled relay's row id (the "id the controller
+                // assigned", same as the gateway path). Documented here since
+                // the proto field name doesn't say so itself.
+                gateway_id: relay_id as u64,
+                observe_key: String::new(),
+            }));
+        }
+
+        if cidrs.is_empty() {
+            return Err(Status::invalid_argument("cidrs must not be empty"));
+        }
 
         // The gateway's name/CN is derived from the token's secret hash
         // (already computed above) rather than parsed out of the CSR: it is

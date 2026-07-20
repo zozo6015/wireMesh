@@ -1134,6 +1134,49 @@ pub async fn enroll_one_with_wg_pubkey(
     gw
 }
 
+/// (Cycle-4c Task 4) Convenience wrapper mirroring `enroll_one`'s pattern for
+/// the RELAY enrollment path: mints a single-use `relay`-kind token,
+/// generates a keypair + CSR, and redeems it via `Enrollment.Enroll` with
+/// `endpoint` set (a relay declares no cidrs/segment — see
+/// `EnrollmentSvc::enroll`'s endpoint-routed branch). Returns `(cert_pem,
+/// ca_bundle_pem, relay_id)`, mirroring what `StubGateway::enroll` persists,
+/// minus the state-dir/key-file bookkeeping a `StubGateway` needs for its
+/// later `Sync` dial — no relay-side test yet needs a persisted identity on
+/// disk (a later cycle-4c task that does can grow this into a full
+/// `StubRelay` then). Panics (via `.expect`) on any failure — this is
+/// test-setup plumbing, not something callers need a partial-failure path
+/// for.
+pub async fn enroll_relay(h: &TestController, endpoint: &str) -> (String, String, i64) {
+    let mut admin = h.admin_client().await;
+
+    let token = admin
+        .mint_token(MintTokenRequest {
+            kind: "relay".to_string(),
+            bound_cidrs: vec![],
+            rebind_segment_id: 0,
+        })
+        .await
+        .expect("minting relay token for enroll_relay")
+        .into_inner()
+        .token;
+
+    let (csr_pem, _key_pair) = gen_csr("stub-relay");
+    let mut enr = h.enrollment_client().await;
+    let resp = enr
+        .enroll(wiremesh_proto::v1::EnrollRequest {
+            token,
+            csr_pem,
+            cidrs: vec![],
+            wg_pubkey: String::new(),
+            endpoint: endpoint.to_string(),
+        })
+        .await
+        .expect("Enrollment.Enroll (relay path) failed in enroll_relay")
+        .into_inner();
+
+    (resp.cert_pem, resp.ca_bundle_pem, resp.gateway_id as i64)
+}
+
 /// (Cycle-4b Task 5) Reads the next broker `PunchDirective` off a live
 /// `Sync.Watch` stream, transparently skipping any `Snapshot`/`Delta` messages
 /// that precede it, bounded by `timeout`. Additive test helper for the broker

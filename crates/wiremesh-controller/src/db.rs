@@ -1517,6 +1517,95 @@ impl Db {
         })
     }
 
+    /// (Cycle-4c Task 4) Sibling of [`Db::enroll_gateway`] for the RELAY
+    /// enrollment path (`EnrollmentSvc::enroll`'s endpoint-routed branch): a
+    /// relay declares no cidrs/segment, so there's no segment resolution,
+    /// bound-cidr scope check, or one-gateway-per-segment occupancy check —
+    /// just token consumption + a `relay` row + a `subject_kind = 'relay'`
+    /// `certificate` row, all in ONE transaction (same atomicity rationale
+    /// as `enroll_gateway`'s doc comment: no window where the same secret
+    /// could be redeemed twice). Returns the new relay's id.
+    ///
+    /// Token validation mirrors `enroll_gateway`'s non-disclosure posture
+    /// exactly (wrong secret, wrong kind, expired, or already-used are all
+    /// `InvalidToken`, indistinguishably) except the query additionally
+    /// requires `kind = 'relay'` specifically — a `gateway`- or
+    /// `rebind`-kind token's secret hash simply won't satisfy that filter,
+    /// so it comes back `InvalidToken` exactly like a wrong secret would.
+    ///
+    /// Deliberately does NOT call `bump_revision_tx`: like the existing
+    /// admin-path `Db::insert_relay`, a relay isn't part of the Sync
+    /// projection yet (that's Task 5 — advertising `relay` rows into
+    /// `Sync`'s `relays`), so there is no projection-affecting change here
+    /// to bump the revision for.
+    pub fn enroll_relay(
+        &self,
+        secret_hash: &str,
+        relay_name: &str,
+        endpoint: &str,
+        cert_serial: &str,
+        issuer_handle: &str,
+        cert_not_after: &str,
+        now: &str,
+    ) -> Result<i64, EnrollError> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let token_id: Option<String> = tx
+            .query_row(
+                "SELECT id FROM enrollment_token \
+                 WHERE secret_hash = ?1 AND used_at IS NULL AND expires_at > ?2 \
+                 AND kind = 'relay'",
+                params![secret_hash, now],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let Some(token_id) = token_id else {
+            tx.rollback()?;
+            return Err(EnrollError::InvalidToken);
+        };
+
+        tx.execute(
+            "INSERT INTO relay (name, endpoint, status, last_seen) VALUES (?1, ?2, 'active', NULL)",
+            params![relay_name, endpoint],
+        )?;
+        let relay_id = tx.last_insert_rowid();
+
+        tx.execute(
+            "INSERT INTO certificate (serial, subject_kind, subject_id, issuer_handle, not_after) \
+             VALUES (?1, 'relay', ?2, ?3, ?4)",
+            params![cert_serial, relay_id, issuer_handle, cert_not_after],
+        )?;
+
+        // Same redundant-but-defensive `AND used_at IS NULL` as
+        // `enroll_gateway`: costs nothing under the held lock, and turns any
+        // future lock-discipline regression into a loud `updated != 1`
+        // failure instead of a silent double-spend.
+        let updated = tx.execute(
+            "UPDATE enrollment_token SET used_at = ?1 WHERE id = ?2 AND used_at IS NULL",
+            params![now, token_id],
+        )?;
+        if updated != 1 {
+            tx.rollback()?;
+            return Err(EnrollError::InvalidToken);
+        }
+
+        tx.execute(
+            "INSERT INTO audit_log (ts, actor, action, entity, diff_json) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                now,
+                "enrollment-token",
+                "enroll",
+                format!("relay/{relay_name}"),
+                format!(r#"{{"relay_id":{relay_id}}}"#),
+            ],
+        )?;
+
+        tx.commit()?;
+        Ok(relay_id)
+    }
+
     /// The other N-1 *active* enrolled gateways (every `status = 'active'`
     /// `gateway` row except `exclude_gateway_id`), each with the segment it
     /// belongs to. Used by `routes::peers_of` to build the full-mesh peer

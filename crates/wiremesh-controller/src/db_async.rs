@@ -131,6 +131,40 @@ impl DbHandle {
         }
     }
 
+    /// See [`Db::enroll_relay`]. Returns [`EnrollError`] for the same
+    /// reason [`Self::enroll_gateway`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enroll_relay(
+        &self,
+        secret_hash: String,
+        relay_name: String,
+        endpoint: String,
+        cert_serial: String,
+        issuer_handle: String,
+        cert_not_after: String,
+        now: String,
+    ) -> Result<i64, EnrollError> {
+        let db = self.inner.clone();
+        match tokio::task::spawn_blocking(move || {
+            db.enroll_relay(
+                &secret_hash,
+                &relay_name,
+                &endpoint,
+                &cert_serial,
+                &issuer_handle,
+                &cert_not_after,
+                &now,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_err) => Err(EnrollError::Other(anyhow::anyhow!(
+                "enroll_relay blocking task panicked: {join_err}"
+            ))),
+        }
+    }
+
     /// See [`Db::list_other_gateways`].
     pub async fn list_other_gateways(&self, exclude_gateway_id: i64) -> Result<Vec<GatewayRow>> {
         let db = self.inner.clone();
