@@ -69,11 +69,20 @@ impl DesiredState {
         if !d.relays.is_empty() {
             self.relays = d.relays.clone();
         }
-        // policy fields always reflect the latest delta
-        self.policy_ir = d.policy_ir.clone();
-        self.policy_version = d.policy_version;
-        if !d.revoked_serials.is_empty() {
-            self.revoked_serials = d.revoked_serials.clone();
+        // Deltas are sparse: only PolicyUpdated carries policy fields (version >= 1);
+        // every other change type sends policy_version=0 / empty IR. Guard so a
+        // non-policy delta (e.g. EndpointObserved about a peer) does NOT wipe the
+        // applied policy. Verified against controller projection::delta_for_change.
+        if d.policy_version != 0 {
+            self.policy_ir = d.policy_ir.clone();
+            self.policy_version = d.policy_version;
+        }
+        // revoked_serials in a delta is additive (CertRevoked -> the single new
+        // serial), not a full replacement; union into the existing set.
+        for s in &d.revoked_serials {
+            if !self.revoked_serials.contains(s) {
+                self.revoked_serials.push(s.clone());
+            }
         }
     }
 
@@ -178,5 +187,79 @@ mod tests {
     fn load_absent_is_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(DesiredState::load(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn sparse_delta_does_not_wipe_policy() {
+        let mut ds = DesiredState {
+            revision: 1,
+            peers: vec![],
+            policy_ir: b"IRDATA".to_vec(),
+            policy_version: 5,
+            relays: vec![],
+            revoked_serials: vec![],
+        };
+        // Mimics an EndpointObserved delta: carries a peer upsert but no
+        // policy fields (sparse delta per controller projection).
+        let delta = Delta {
+            revision: 2,
+            upserted_peers: vec![peer(7, "PUBX", "c:3")],
+            removed_peer_ids: vec![],
+            relays: vec![],
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec![],
+        };
+        ds.apply_delta(&delta);
+        assert_eq!(ds.policy_ir, b"IRDATA");
+        assert_eq!(ds.policy_version, 5);
+    }
+
+    #[test]
+    fn policy_update_delta_applies() {
+        let mut ds = DesiredState::default();
+        let delta = Delta {
+            revision: 2,
+            upserted_peers: vec![],
+            removed_peer_ids: vec![],
+            relays: vec![],
+            policy_ir: b"NEW".to_vec(),
+            policy_version: 6,
+            revoked_serials: vec![],
+        };
+        ds.apply_delta(&delta);
+        assert_eq!(ds.policy_ir, b"NEW");
+        assert_eq!(ds.policy_version, 6);
+    }
+
+    #[test]
+    fn cert_revoked_delta_unions_serials() {
+        let mut ds = DesiredState {
+            revoked_serials: vec!["A".into()],
+            ..Default::default()
+        };
+        let delta = Delta {
+            revision: 2,
+            upserted_peers: vec![],
+            removed_peer_ids: vec![],
+            relays: vec![],
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec!["B".into()],
+        };
+        ds.apply_delta(&delta);
+        assert_eq!(ds.revoked_serials, vec!["A".to_string(), "B".to_string()]);
+
+        let delta2 = Delta {
+            revision: 3,
+            upserted_peers: vec![],
+            removed_peer_ids: vec![],
+            relays: vec![],
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec!["B".into()],
+        };
+        ds.apply_delta(&delta2);
+        assert_eq!(ds.revoked_serials, vec!["A".to_string(), "B".to_string()]);
     }
 }
