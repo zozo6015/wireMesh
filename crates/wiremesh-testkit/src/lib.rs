@@ -44,7 +44,7 @@ use wiremesh_proto::v1::enrollment_client::EnrollmentClient;
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{
     ApplyDiff, ApplyRequest, CreateSegmentRequest, MintApiTokenRequest, MintTokenRequest,
-    SyncMessage, WatchRequest,
+    ReportRequest, SyncMessage, WatchRequest,
 };
 
 /// (Task 13) Client-side counterpart to `crate::auth`'s bearer-auth
@@ -801,6 +801,49 @@ impl StubGateway {
                 ),
             }
         }
+    }
+
+    /// (Cycle-4b Task 4) Calls `Sync.Report{applied_version, local_endpoints}`
+    /// against the controller, over a FRESH mTLS channel presenting this
+    /// gateway's own enrolled identity — the same dial recipe `open_sync`
+    /// uses, just a plain unary `Report` call instead of a `Watch` stream
+    /// (so it can't reuse `dial_sync`'s streaming return type). Promoted
+    /// here from what had been a hand-rolled private helper duplicated in
+    /// `wiremesh-testkit/tests/end_to_end_policy.rs` and
+    /// `fabricctl/tests/cli.rs` (each predating `local_endpoints`, so each
+    /// only ever sent an empty list) — this is the one shared place that
+    /// now also exercises reporting a gateway's own local candidate
+    /// endpoints (spec §6.1).
+    pub async fn report(
+        &self,
+        applied_version: u64,
+        local_endpoints: &[&str],
+    ) -> anyhow::Result<()> {
+        let uri = format!("https://{}", self.sync_addr);
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
+            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
+            .tls_config(tls)
+            .map_err(|e| anyhow::anyhow!("configuring StubGateway mTLS for Sync.Report: {e}"))?
+            .connect()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "connecting to the controller's Sync (mTLS) TCP port for Sync.Report: {e}"
+                )
+            })?;
+
+        SyncClient::new(channel)
+            .report(ReportRequest {
+                applied_version,
+                local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("Sync.Report failed: {status}"))?;
+        Ok(())
     }
 
     /// Ensures this gateway's identity bundle (leaf cert, private key
