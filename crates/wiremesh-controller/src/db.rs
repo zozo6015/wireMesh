@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use anyhow::Result;
 use ipnet::Ipv4Net;
-use rand::RngCore;
+use rand::{rngs::OsRng, RngCore};
 use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 /// Increments the persisted `state_revision` counter and returns the NEW
@@ -30,7 +30,7 @@ use rusqlite::{params, Connection, OptionalExtension, Transaction};
 /// controller must recompute the exact same MAC the gateway did).
 fn generate_observe_key() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    OsRng.fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
