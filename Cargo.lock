@@ -2983,11 +2983,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "prost",
  "quinn",
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "serde_json",
  "tokio",
+ "tokio-stream",
+ "tonic",
+ "wiremesh-proto",
+ "x509-parser",
 ]
 
 [[package]]

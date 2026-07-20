@@ -17,8 +17,8 @@ path = "src/bin/mkcerts.rs"
 
 [dependencies]
 quinn = "0.11"
-# Not in the Task 13 brief's dep list; added because mkcerts/relay/lib all
-# exchange certs as PEM files on disk (across process boundaries) and rustls
+# Not in the 4c relay crate's original dep list; added because mkcerts/relay/lib
+# all exchange certs as PEM files on disk (across process boundaries) and rustls
 # 0.23 no longer ships its own PEM parser — rustls-pemfile is the standard
 # complement for turning `ca.pem`/`relay.pem`/`gw-*.pem` back into the
 # `CertificateDer`/`PrivateKeyDer` types rustls::ServerConfig/ClientConfig want.
@@ -28,3 +28,12 @@ rustls = { workspace = true }
 rcgen = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+# Task 3 (4c): parses the end-entity client cert's DER to extract its raw
+# serial for the offline-revocation-denylist check (see lib.rs's
+# `DenyingVerifier`) — matched against `wiremesh-trust`'s hex serial encoding.
+x509-parser = "0.16"
+serde_json = { workspace = true }
+tonic = { workspace = true }
+wiremesh-proto = { path = "../wiremesh-proto" }
+tokio-stream = "0.1"
+prost = { workspace = true }

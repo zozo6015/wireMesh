@@ -15,7 +15,13 @@ use quinn::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
-use std::{net::SocketAddr, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
 /// SNI / certificate-verification name used for every relay connection.
 /// mkcerts bakes this in as a SAN on `relay.pem`, so it is stable regardless
@@ -247,6 +253,322 @@ pub async fn ack_registration(mut send: quinn::SendStream) -> Result<()> {
     send.write_all(&[1]).await.context("write registration ack")?;
     send.finish().context("finish registration ack stream")?;
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 4c Task 3: offline certificate-revocation denylist.
+//
+// A `Denylist` is an in-memory set of lowercase-hex cert serials (same
+// format as `wiremesh-trust`'s `{b:02x}`-per-byte encoding of a 16-byte
+// random serial), persisted to a JSON array file (0600, atomic rename —
+// mirrors `wiremesh-gateway::state::DesiredState::save`). It is read
+// fail-static at relay startup (a missing file is an empty set, not an
+// error) so a relay that has never talked to a controller still enforces
+// "nothing revoked", and a relay whose controller is currently unreachable
+// still enforces the last snapshot it persisted.
+#[derive(Debug, Clone)]
+pub struct Denylist {
+    inner: Arc<RwLock<HashSet<String>>>,
+}
+
+impl Default for Denylist {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Denylist {
+    pub fn new() -> Denylist {
+        Denylist { inner: Arc::new(RwLock::new(HashSet::new())) }
+    }
+
+    /// Loads a denylist from `path` (a JSON array of lowercase-hex serial
+    /// strings). A MISSING file is fail-static: it yields an empty denylist,
+    /// not an error — a relay that has never received a Sync snapshot (or
+    /// booted before any cert was ever revoked) must still start and serve.
+    pub fn load(path: &Path) -> Result<Denylist> {
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let items: Vec<String> = serde_json::from_slice(&bytes)
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                let dl = Denylist::new();
+                dl.replace_all(items);
+                Ok(dl)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Denylist::new()),
+            Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
+        }
+    }
+
+    pub fn contains(&self, serial_hex: &str) -> bool {
+        self.inner
+            .read()
+            .expect("denylist RwLock poisoned")
+            .contains(serial_hex)
+    }
+
+    /// Snapshot (full-replace) semantics: the controller's `StateSnapshot`
+    /// carries the COMPLETE current `revoked_serials` set, so applying one
+    /// must discard anything not in it (e.g. a serial un-revoked, or a
+    /// stale entry from a prior persisted file).
+    pub fn replace_all(&self, serials: impl IntoIterator<Item = String>) {
+        let mut set = self.inner.write().expect("denylist RwLock poisoned");
+        *set = serials.into_iter().collect();
+    }
+
+    /// Delta semantics: a `Delta.revoked_serials` is additive-only (mirrors
+    /// `wiremesh-gateway::state::DesiredState::apply_delta`'s treatment of
+    /// the same field) — a delta only ever announces newly revoked serials,
+    /// never un-revokes one, so entries already present must never be
+    /// dropped.
+    pub fn union(&self, serials: impl IntoIterator<Item = String>) {
+        let mut set = self.inner.write().expect("denylist RwLock poisoned");
+        for s in serials {
+            set.insert(s);
+        }
+    }
+
+    pub fn snapshot(&self) -> HashSet<String> {
+        self.inner.read().expect("denylist RwLock poisoned").clone()
+    }
+
+    /// Atomically persists the current denylist to `path` as a JSON array,
+    /// mode 0600 from the moment the file is created — mirrors
+    /// `wiremesh-gateway::state::DesiredState::save`'s write-tmp +
+    /// fsync + rename + fsync-parent-dir sequence, so a crash never leaves
+    /// a partially-written or loosely-permissioned denylist.json on disk.
+    pub fn persist(&self, path: &Path) -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+        }
+
+        let items: Vec<String> = {
+            let set = self.inner.read().expect("denylist RwLock poisoned");
+            set.iter().cloned().collect()
+        };
+
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .with_context(|| format!("opening {}", tmp.display()))?;
+            f.write_all(&serde_json::to_vec_pretty(&items)?)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, path)
+            .with_context(|| format!("atomically renaming {}", tmp.display()))?;
+        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            std::fs::File::open(parent)
+                .and_then(|d| d.sync_all())
+                .with_context(|| format!("fsyncing {} after rename", parent.display()))?;
+        }
+        Ok(())
+    }
+}
+
+/// Extracts a client cert's serial number as the lowercase-hex string
+/// `wiremesh-trust` would have produced when it issued that cert (see
+/// `wiremesh_trust::hex_encode`/`random_serial`).
+///
+/// `x509-parser`'s `raw_serial()` returns the DER INTEGER content bytes,
+/// which per the DER positive-integer encoding rule get a leading `0x00`
+/// prepended whenever the serial's high bit is set (otherwise the value
+/// would be misread as negative). `rcgen::SerialNumber::from_slice` is given
+/// the original 16 raw bytes and does not itself add that padding — it is
+/// `rcgen`'s DER writer, applying the same encoding rule, that introduces
+/// the extra leading byte on the wire for exactly the serials whose first
+/// byte is >= 0x80. `wiremesh-trust`'s `IssuedCert.serial` is the hex of the
+/// original 16 bytes, with no such padding. So a single leading `0x00`, and
+/// ONLY a single leading `0x00`, must be stripped here before hex-encoding —
+/// otherwise every serial with a high first bit (roughly half of all random
+/// serials) would silently fail to match the denylist.
+fn extract_serial_hex(end_entity: &CertificateDer<'_>) -> Result<String> {
+    let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
+        .map_err(|e| anyhow::anyhow!("parsing end-entity cert DER for serial: {e}"))?;
+    let raw = cert.raw_serial();
+    let trimmed: &[u8] = if raw.len() > 1 && raw[0] == 0x00 { &raw[1..] } else { raw };
+    Ok(trimmed.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// A `ClientCertVerifier` that delegates chain validation to an inner
+/// `WebPkiClientVerifier` and, ONLY after that chain validation succeeds,
+/// additionally rejects the connection if the end-entity cert's serial is on
+/// a (live, mutably-updatable) denylist. Ordering matters: an untrusted or
+/// malformed cert must still fail for the chain reason, not be silently
+/// waved through because it happens not to be on the denylist.
+#[derive(Debug)]
+struct DenyingVerifier {
+    inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    denylist: Denylist,
+}
+
+impl rustls::server::danger::ClientCertVerifier for DenyingVerifier {
+    fn offer_client_auth(&self) -> bool {
+        true
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        true
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        // Chain validation FIRST: an untrusted/malformed/expired cert must
+        // fail for that reason, never be shadowed by the denylist check.
+        let verified = self.inner.verify_client_cert(end_entity, intermediates, now)?;
+
+        let serial_hex = extract_serial_hex(end_entity).map_err(|e| {
+            rustls::Error::General(format!("denylist: could not read client cert serial: {e}"))
+        })?;
+        if self.denylist.contains(&serial_hex) {
+            return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked));
+        }
+        Ok(verified)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// Identical to [`server_config`] except the client-cert verifier ALSO
+/// rejects any client whose cert serial is present in `denylist` (checked
+/// after webpki chain validation succeeds — see [`DenyingVerifier`]). The
+/// plain `server_config` is left unchanged so the Task-2 bridge test (which
+/// has no denylist concept at all) keeps working exactly as before.
+pub fn server_config_with_denylist(certdir: &Path, denylist: Denylist) -> Result<QuinnServerConfig> {
+    ensure_crypto_provider();
+
+    let relay_certs = load_certs(&certdir.join("relay.pem"))?;
+    let relay_key = load_key(&certdir.join("relay.key"))?;
+
+    let mut roots = RootCertStore::empty();
+    for ca_cert in load_certs(&certdir.join("ca.pem"))? {
+        roots.add(ca_cert)?;
+    }
+    let inner_verifier = WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
+    let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
+        Arc::new(DenyingVerifier { inner: inner_verifier, denylist });
+
+    let mut tls = rustls::ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(relay_certs, relay_key)?;
+    tls.alpn_protocols = vec![b"wiremesh-relay/0".to_vec()];
+
+    let quic_crypto = QuicServerConfig::try_from(tls)?;
+    let mut server_config = QuinnServerConfig::with_crypto(Arc::new(quic_crypto));
+    server_config.transport_config(transport_config());
+    Ok(server_config)
+}
+
+/// Relay Sync client (mirrors `wiremesh-gateway::sync::connect`+`watch`):
+/// mTLS-dials the controller with the relay's own cert (`<certdir>/relay.pem`
+/// / `.key`, root `<certdir>/ca.pem`), then folds every `revoked_serials`
+/// list it receives into `denylist`, persisting to `persist_path` (0600,
+/// atomic) after each update so a subsequent restart — even fully offline —
+/// still enforces the last-known revocation set.
+///
+/// Snapshot is a full replace (the controller's complete current set);
+/// Delta is additive-only, matching
+/// `wiremesh-gateway::state::DesiredState::apply_delta`'s treatment of the
+/// same field. Returns (with an error) when the Watch stream ends or errors;
+/// the caller (the `relay` bin) decides whether/how to retry.
+pub async fn run_sync(
+    sync_addr: SocketAddr,
+    certdir: &Path,
+    relay_id: &str,
+    denylist: Denylist,
+    persist_path: PathBuf,
+) -> Result<()> {
+    use tokio_stream::StreamExt;
+    use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity as TlsIdentity};
+    use wiremesh_proto::v1::sync_client::SyncClient;
+    use wiremesh_proto::v1::{sync_message::Body, WatchRequest};
+
+    let cert_pem = std::fs::read_to_string(certdir.join("relay.pem")).context("reading relay.pem")?;
+    let key_pem = std::fs::read_to_string(certdir.join("relay.key")).context("reading relay.key")?;
+    let ca_pem = std::fs::read_to_string(certdir.join("ca.pem")).context("reading ca.pem")?;
+
+    let uri = format!("https://{sync_addr}");
+    let tls = ClientTlsConfig::new()
+        .identity(TlsIdentity::from_pem(&cert_pem, &key_pem))
+        .ca_certificate(Certificate::from_pem(&ca_pem))
+        .domain_name("127.0.0.1");
+    let channel = Channel::from_shared(uri)
+        .context("controller Sync addr must form a valid URI")?
+        .tls_config(tls)
+        .context("configuring relay mTLS")?
+        .connect()
+        .await
+        .context("connecting to controller Sync (mTLS)")?;
+    let mut client = SyncClient::new(channel);
+    eprintln!("relay: sync[{relay_id}] connected to controller at {sync_addr}");
+
+    let mut stream = client
+        .watch(WatchRequest {})
+        .await
+        .map_err(|s| anyhow::anyhow!("Sync.Watch failed: {s}"))?
+        .into_inner();
+
+    while let Some(msg) = stream.next().await {
+        let msg = msg.map_err(|s| anyhow::anyhow!("Sync stream error: {s}"))?;
+        match msg.body {
+            Some(Body::Snapshot(s)) => {
+                let n = s.revoked_serials.len();
+                denylist.replace_all(s.revoked_serials);
+                denylist.persist(&persist_path)?;
+                eprintln!("relay: sync[{relay_id}] snapshot: {n} revoked serial(s)");
+            }
+            Some(Body::Delta(d)) => {
+                if !d.revoked_serials.is_empty() {
+                    let n = d.revoked_serials.len();
+                    denylist.union(d.revoked_serials);
+                    denylist.persist(&persist_path)?;
+                    eprintln!("relay: sync[{relay_id}] delta: +{n} revoked serial(s)");
+                }
+            }
+            _ => {}
+        }
+    }
+    bail!("relay: sync[{relay_id}] Watch stream ended")
 }
 
 // ---------------------------------------------------------------------------
