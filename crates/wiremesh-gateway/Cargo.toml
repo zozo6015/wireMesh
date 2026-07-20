@@ -1,0 +1,32 @@
+[package]
+name = "wiremesh-gateway"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wiremesh_gateway"
+path = "src/lib.rs"
+
+[[bin]]
+name = "wiremesh-gateway"
+path = "src/main.rs"
+
+[dependencies]
+wiremesh-proto = { path = "../wiremesh-proto" }
+wiremesh-policy = { path = "../wiremesh-policy" }
+wiremesh-enforcer = { path = "../wiremesh-enforcer" }
+wiremesh-trust = { path = "../wiremesh-trust" }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+boringtun = { version = "0.6", features = ["device"] }
+libc = "0.2"
+
+[dev-dependencies]
+wiremesh-testkit = { path = "../wiremesh-testkit", features = ["netns"] }
+tempfile = "3"
+tokio-stream = "0.1"
