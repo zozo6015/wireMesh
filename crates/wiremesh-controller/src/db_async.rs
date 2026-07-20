@@ -361,6 +361,22 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.set_candidate_endpoint(gateway_id, &addr)).await?
     }
 
+    /// See [`Db::candidates_for`].
+    pub async fn candidates_for(&self, gateway_id: i64) -> Result<Vec<String>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.candidates_for(gateway_id)).await?
+    }
+
+    /// See [`Db::set_local_candidates`].
+    pub async fn set_local_candidates(
+        &self,
+        gateway_id: i64,
+        endpoints: Vec<String>,
+    ) -> Result<Option<u64>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.set_local_candidates(gateway_id, &endpoints)).await?
+    }
+
     /// See [`Db::apply_fabric`]. Backs `Admin.Apply`.
     pub async fn apply_fabric(
         &self,
