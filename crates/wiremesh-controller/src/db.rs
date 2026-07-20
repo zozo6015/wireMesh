@@ -2190,12 +2190,31 @@ impl Db {
     /// into a gateway identity: it never trusts a client-supplied id, only
     /// the CN pulled off the cert tonic/rustls already validated chains to
     /// the CA.
+    ///
+    /// (Issue #7) `AND g.status = 'active'`: a gateway that's been drained
+    /// (`status = 'removed'`) or superseded by a rebind (`status =
+    /// 'replaced'`) must resolve to `None` here, even though its cert is
+    /// still TLS-valid (cycle-2's Sync mTLS handshake doesn't check
+    /// `revoked_serials` against the presented client cert — see
+    /// `rebind.rs`'s test doc comment). Without this filter, a
+    /// drained/replaced gateway could still present its old cert, resolve
+    /// its identity, and pull a full `Sync.Watch` projection snapshot of a
+    /// fabric it no longer belongs to — a topology disclosure. This is safe
+    /// to filter unconditionally: every call site (`services::sync`'s
+    /// `Watch`/`Report` identity resolution, and
+    /// `services::enrollment::EnrollmentSvc`'s post-enroll broadcast lookup
+    /// of the gateway row it JUST inserted with `status = 'active'`) only
+    /// ever wants the active row. Admin/rebind/drain flows that need to
+    /// resolve a non-active gateway (e.g. `enroll_gateway`'s rebind path,
+    /// which finds the incumbent to replace) look it up by `segment_id` +
+    /// `status`, not through this function — see `enroll_gateway`'s rebind
+    /// branch.
     pub fn find_gateway_by_name(&self, name: &str) -> Result<Option<GatewayIdentity>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(
             "SELECT g.id, g.segment_id, s.name \
              FROM gateway g JOIN segment s ON s.id = g.segment_id \
-             WHERE g.name = ?1",
+             WHERE g.name = ?1 AND g.status = 'active'",
             params![name],
             |row| {
                 Ok(GatewayIdentity {
