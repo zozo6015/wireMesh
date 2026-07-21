@@ -57,7 +57,7 @@ pub fn policy_changed(old: &DesiredState, new: &DesiredState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{DesiredState, PeerState};
+    use crate::state::{DesiredState, PeerKeyInfo, PeerState};
 
     fn ds_with(peers: Vec<PeerState>, ver: u64) -> DesiredState {
         DesiredState { peers, policy_version: ver, ..Default::default() }
@@ -67,6 +67,22 @@ mod tests {
             gateway_id: id, segment_name: format!("s{id}"),
             active_pubkey_b64: key.map(String::from),
             candidates: vec![format!("10.9.0.{id}:51820")],
+            allowed_ips: vec![cidr.into()],
+        }
+    }
+
+    /// Builds a `PeerState` with an explicit `keys` set (active + optionally
+    /// pending), for the `pending_peer_configs` tests below. Kept separate
+    /// from the shared `p(...)` helper above (which existing tests rely on
+    /// and does not carry a `keys` vec) so those tests are left untouched.
+    fn peer_full(id: u64, candidate: &str, keys: Vec<PeerKeyInfo>, cidr: &str) -> PeerState {
+        let active_pubkey_b64 = keys.iter().find(|k| k.state == "active").map(|k| k.pubkey_b64.clone());
+        PeerState {
+            gateway_id: id,
+            segment_name: format!("s{id}"),
+            active_pubkey_b64,
+            candidates: vec![candidate.to_string()],
+            keys,
             allowed_ips: vec![cidr.into()],
         }
     }
@@ -94,5 +110,69 @@ mod tests {
     fn policy_changed_tracks_version() {
         assert!(policy_changed(&ds_with(vec![], 1), &ds_with(vec![], 2)));
         assert!(!policy_changed(&ds_with(vec![], 2), &ds_with(vec![], 2)));
+    }
+
+    #[test]
+    fn pending_peer_configs_builds_offset_endpoint() {
+        let peer = peer_full(
+            2,
+            "10.9.0.2:51820",
+            vec![
+                PeerKeyInfo { epoch: 0, pubkey_b64: "KA".into(), state: "active".into() },
+                PeerKeyInfo { epoch: 1, pubkey_b64: "KP".into(), state: "pending".into() },
+            ],
+            "10.10.2.0/24",
+        );
+        let ds = ds_with(vec![peer], 0);
+        let cfgs = pending_peer_configs(&ds, 25);
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].public_key_b64, "KP");
+        assert_eq!(cfgs[0].endpoint.as_deref(), Some("10.9.0.2:51821"));
+        assert_eq!(cfgs[0].allowed_ips, vec!["10.10.2.0/24".to_string()]);
+        assert_eq!(cfgs[0].keepalive_secs, 25);
+    }
+
+    #[test]
+    fn pending_peer_configs_skips_active_only() {
+        let peer = peer_full(
+            3,
+            "10.9.0.3:51820",
+            vec![PeerKeyInfo { epoch: 0, pubkey_b64: "KA".into(), state: "active".into() }],
+            "10.10.3.0/24",
+        );
+        let ds = ds_with(vec![peer], 0);
+        assert!(pending_peer_configs(&ds, 25).is_empty());
+    }
+
+    #[test]
+    fn pending_peer_configs_skips_sentinel_pending() {
+        let peer = peer_full(
+            4,
+            "10.9.0.4:51820",
+            vec![
+                PeerKeyInfo { epoch: 0, pubkey_b64: "KA".into(), state: "active".into() },
+                PeerKeyInfo { epoch: 1, pubkey_b64: "awaiting-submission".into(), state: "pending".into() },
+            ],
+            "10.10.4.0/24",
+        );
+        let ds = ds_with(vec![peer], 0);
+        assert!(pending_peer_configs(&ds, 25).is_empty());
+    }
+
+    #[test]
+    fn pending_peer_configs_offset_survives_nonzero_active_epoch() {
+        let peer = peer_full(
+            5,
+            "10.9.0.2:51822",
+            vec![
+                PeerKeyInfo { epoch: 2, pubkey_b64: "KA".into(), state: "active".into() },
+                PeerKeyInfo { epoch: 3, pubkey_b64: "KP".into(), state: "pending".into() },
+            ],
+            "10.10.5.0/24",
+        );
+        let ds = ds_with(vec![peer], 0);
+        let cfgs = pending_peer_configs(&ds, 25);
+        assert_eq!(cfgs.len(), 1);
+        assert_eq!(cfgs[0].endpoint.as_deref(), Some("10.9.0.2:51823"));
     }
 }

@@ -226,6 +226,63 @@ mod tests {
     }
 
     #[test]
+    fn from_proto_retains_full_key_set() {
+        let p = Peer {
+            gateway_id: 11,
+            segment_name: "seg11".into(),
+            keys: vec![
+                PeerKey { epoch: 0, pubkey: "KA".into(), state: "active".into() },
+                PeerKey { epoch: 1, pubkey: "KP".into(), state: "pending".into() },
+            ],
+            candidate_endpoints: vec!["203.0.113.11:51820".into()],
+            allowed_ips: vec!["10.10.11.0/24".into()],
+        };
+        let ps = PeerState::from_proto(&p);
+        assert_eq!(ps.keys.len(), 2);
+        let active = ps.active_key().expect("active key present");
+        assert_eq!(active.epoch, 0);
+        assert_eq!(active.pubkey_b64, "KA");
+        let pending = ps.pending_key().expect("pending key present");
+        assert_eq!(pending.epoch, 1);
+        assert_eq!(pending.pubkey_b64, "KP");
+    }
+
+    #[test]
+    fn pending_key_ignores_sentinel() {
+        let p = Peer {
+            gateway_id: 12,
+            segment_name: "seg12".into(),
+            keys: vec![
+                PeerKey { epoch: 0, pubkey: "KA".into(), state: "active".into() },
+                PeerKey { epoch: 1, pubkey: "awaiting-submission".into(), state: "pending".into() },
+            ],
+            candidate_endpoints: vec!["203.0.113.12:51820".into()],
+            allowed_ips: vec!["10.10.12.0/24".into()],
+        };
+        let ps = PeerState::from_proto(&p);
+        assert!(ps.pending_key().is_none(), "sentinel pending key must not be reported as a real pending key");
+        let active = ps.active_key().expect("active key still present");
+        assert_eq!(active.pubkey_b64, "KA");
+    }
+
+    #[test]
+    fn active_pubkey_b64_still_populated() {
+        let p = Peer {
+            gateway_id: 13,
+            segment_name: "seg13".into(),
+            keys: vec![
+                PeerKey { epoch: 0, pubkey: "KA".into(), state: "active".into() },
+                PeerKey { epoch: 1, pubkey: "KP".into(), state: "pending".into() },
+            ],
+            candidate_endpoints: vec!["203.0.113.13:51820".into()],
+            allowed_ips: vec!["10.10.13.0/24".into()],
+        };
+        let ps = PeerState::from_proto(&p);
+        assert_eq!(ps.active_pubkey_b64.as_deref(), Some("KA"));
+        assert_eq!(ps.active_key().map(|k| k.pubkey_b64.as_str()), Some("KA"));
+    }
+
+    #[test]
     fn apply_delta_upserts_and_removes() {
         let mut ds = DesiredState::from_snapshot(&StateSnapshot {
             revision: 1, self_cert_pem: "C".into(),
