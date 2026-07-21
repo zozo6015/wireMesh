@@ -2882,6 +2882,7 @@ dependencies = [
  "boringtun",
  "libc",
  "prost",
+ "quinn",
  "serde",
  "serde_json",
  "sha2",
