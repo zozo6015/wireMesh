@@ -83,6 +83,18 @@ impl EpochKeys {
                 .open(&tmp)
                 .context("opening epoch_keys.json.tmp")?;
             f.write_all(&serde_json::to_vec_pretty(self)?)?;
+            // `mode(0o600)` above only applies the permission bits when the OS
+            // creates a *new* file; if `tmp` already existed (e.g. a leftover
+            // from a prior crashed write, or created under a looser umask),
+            // `create(true).truncate(true)` reuses the existing inode and its
+            // existing mode, which the atomic rename below would then carry
+            // onto the final `epoch_keys.json` — which holds raw WireGuard
+            // PRIVATE keys. So explicitly enforce 0600 here, unconditionally,
+            // while we still hold the open file handle (mirrors
+            // identity.rs::write_0600).
+            use std::os::unix::fs::PermissionsExt;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .context("chmod 0600 epoch_keys.json.tmp")?;
             f.sync_all()?;
         }
         fs::rename(&tmp, &final_path).context("atomically renaming epoch_keys.json")?;
