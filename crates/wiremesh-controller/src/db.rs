@@ -2159,6 +2159,45 @@ impl Db {
         Ok(rows)
     }
 
+    /// (CodeRabbit round 3, Major) Atomic combination of [`Db::active_relays`]
+    /// + [`Db::current_revision`]: acquires the connection `Mutex` guard
+    /// exactly ONCE and reads both the active-relay set AND the persisted
+    /// revision while holding it, so the pair is a single consistent
+    /// snapshot. Every `RelaysChanged`-emitting call site
+    /// (`AdminSvc::register_relay`, `EnrollmentSvc::enroll`'s relay path,
+    /// `SyncSvc::emit_relays_changed`) previously took these as TWO separate
+    /// `DbHandle` calls (two separate lock acquisitions, each hopping onto
+    /// its own `spawn_blocking`), which left a window where a concurrent
+    /// relay mutation (another `insert_relay`/`set_relay_status` committing
+    /// in between) could be observed by the revision read but not by the
+    /// relay-set read (or vice versa) — broadcasting an OLD relay list tagged
+    /// with a NEWER revision. That used to be merely confusing (a reconnect
+    /// would eventually correct it), but since `Delta.relays_updated` now
+    /// makes the gateway REPLACE its relay set on receipt (rather than
+    /// upsert), a stale (relays, revision) pair broadcast AFTER a fresher one
+    /// (same or higher revision, since revisions aren't required to be
+    /// strictly increasing per delta in flight order — see `projection.rs`)
+    /// can overwrite the correct set with a stale one and there's no
+    /// self-correction until the next reconnect. Reading both under one lock
+    /// hold (no `.await`/lock-release between them, since this whole
+    /// function runs synchronously to completion before the guard drops)
+    /// closes that window.
+    pub fn relays_snapshot(&self) -> Result<(Vec<(i64, String)>, u64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, endpoint FROM relay WHERE status = 'active' ORDER BY id")?;
+        let relays = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let revision: i64 = conn.query_row(
+            "SELECT revision FROM state_revision WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((relays, revision as u64))
+    }
+
     /// (Cycle-4c Task 6) The current `status` of relay `relay_id`, or `None`
     /// if no such relay row exists. Used by `SyncSvc::report`'s health
     /// pipeline to decide whether a newly computed per-relay health

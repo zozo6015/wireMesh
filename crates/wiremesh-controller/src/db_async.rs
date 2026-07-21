@@ -290,6 +290,14 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.active_relays()).await?
     }
 
+    /// See [`Db::relays_snapshot`]. Reads the active-relay set and the
+    /// persisted revision as ONE atomic pair (single lock hold), for every
+    /// `RelaysChanged`-emitting call site.
+    pub async fn relays_snapshot(&self) -> Result<(Vec<(i64, String)>, u64)> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.relays_snapshot()).await?
+    }
+
     /// See [`Db::relay_status`].
     pub async fn relay_status(&self, relay_id: i64) -> Result<Option<String>> {
         let db = self.inner.clone();

@@ -94,35 +94,39 @@ impl SyncSvc {
         }
     }
 
-    /// (Cycle-4c Task 6) Re-reads the current active-relay set + persisted
-    /// revision and publishes ONE `ChangeEvent::RelaysChanged` — the shared
-    /// tail end of both the enrollment path (`EnrollmentSvc::enroll`'s
-    /// relay-enrollment branch) and this file's health-driven eviction/
-    /// re-admission path. Active relays are read FIRST, then the revision
-    /// LAST (per the Cycle-4c Task 5 review fix): this guarantees the
-    /// revision attached to the emitted delta is >= the state the advertised
-    /// `relays` reflect, so an open `Sync.Watch` stream never sees the
-    /// revision regress relative to the relay set it just applied (see
-    /// `projection.rs`). Best-effort: a failure reading either is silently
-    /// swallowed (mirrors every other best-effort `change_tx.send` call in
-    /// this crate — a transient DB read failure here must never turn an
-    /// otherwise-successful `Report`/`Enroll` call into an error response),
-    /// and `send` itself only ever errors when there are currently no
-    /// `Sync.Watch` subscribers, which is not a failure either.
+    /// (Cycle-4c Task 6; CodeRabbit round 3) Re-reads the current
+    /// active-relay set + persisted revision as ONE atomic pair
+    /// (`Db::relays_snapshot`, single lock hold) and publishes ONE
+    /// `ChangeEvent::RelaysChanged` — the shared tail end of both the
+    /// enrollment path (`EnrollmentSvc::enroll`'s relay-enrollment branch)
+    /// and this file's health-driven eviction/re-admission path. Reading
+    /// both fields under one lock hold (rather than two separate
+    /// `active_relays()` + `current_revision()` calls, per the Cycle-4c
+    /// Task 5 review fix) guarantees the revision attached to the emitted
+    /// delta is consistent with the advertised `relays` — closing a race
+    /// where a concurrent relay mutation committing between two separate
+    /// reads could broadcast a stale relay set tagged with a newer revision
+    /// (see `Db::relays_snapshot`'s doc comment) — so an open `Sync.Watch`
+    /// stream never sees the revision regress relative to the relay set it
+    /// just applied (see `projection.rs`). Best-effort: a failure reading
+    /// the snapshot is silently swallowed (mirrors every other best-effort
+    /// `change_tx.send` call in this crate — a transient DB read failure
+    /// here must never turn an otherwise-successful `Report`/`Enroll` call
+    /// into an error response), and `send` itself only ever errors when
+    /// there are currently no `Sync.Watch` subscribers, which is not a
+    /// failure either.
     async fn emit_relays_changed(&self) {
-        if let Ok(active) = self.db.active_relays().await {
-            if let Ok(revision) = self.db.current_revision().await {
-                let relay_infos = active
-                    .into_iter()
-                    .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
-                        relay_id: id as u64,
-                        endpoint,
-                    })
-                    .collect();
-                let _ = self
-                    .change_tx
-                    .send(ChangeEvent::RelaysChanged { relay_infos, revision });
-            }
+        if let Ok((active, revision)) = self.db.relays_snapshot().await {
+            let relay_infos = active
+                .into_iter()
+                .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
+                    relay_id: id as u64,
+                    endpoint,
+                })
+                .collect();
+            let _ = self
+                .change_tx
+                .send(ChangeEvent::RelaysChanged { relay_infos, revision });
         }
     }
 }

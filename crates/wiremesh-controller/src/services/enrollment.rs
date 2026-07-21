@@ -201,29 +201,32 @@ impl Enrollment for EnrollmentSvc {
             // or active-relay set must never turn into an error response —
             // the relay row, cert, and response are already durably
             // committed/ready regardless.
-            // Read the active-relay set FIRST, then the revision LAST —
-            // mirroring the gateway path's convention so the revision attached
-            // to this delta is >= the state the advertised `relay_infos`
-            // reflect. An open `Sync.Watch` stream must never see the
-            // revision regress relative to the relay set it just applied
-            // (see projection.rs).
-            if let Ok(active) = self.db.active_relays().await {
-                if let Ok(revision) = self.db.current_revision().await {
-                    let relay_infos = active
-                        .into_iter()
-                        .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
-                            relay_id: id as u64,
-                            endpoint,
-                        })
-                        .collect();
-                    // `send` errors only when there are currently no
-                    // `Sync.Watch` subscribers — nobody to notify, which is
-                    // not a failure (mirrors the gateway path's identical
-                    // rationale below).
-                    let _ = self
-                        .change_tx
-                        .send(ChangeEvent::RelaysChanged { relay_infos, revision });
-                }
+            // (CodeRabbit round 3, Major) Reads the active-relay set AND the
+            // revision as ONE atomic pair via `relays_snapshot` (single lock
+            // hold) rather than two separate `active_relays()` +
+            // `current_revision()` calls — this guarantees the revision
+            // attached to this delta is consistent with the advertised
+            // `relay_infos`, closing a race where a concurrent relay
+            // mutation committing between two separate reads could
+            // broadcast a stale relay set tagged with a newer revision (see
+            // `Db::relays_snapshot`'s doc comment). An open `Sync.Watch`
+            // stream must never see the revision regress relative to the
+            // relay set it just applied (see projection.rs).
+            if let Ok((active, revision)) = self.db.relays_snapshot().await {
+                let relay_infos = active
+                    .into_iter()
+                    .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
+                        relay_id: id as u64,
+                        endpoint,
+                    })
+                    .collect();
+                // `send` errors only when there are currently no
+                // `Sync.Watch` subscribers — nobody to notify, which is
+                // not a failure (mirrors the gateway path's identical
+                // rationale below).
+                let _ = self
+                    .change_tx
+                    .send(ChangeEvent::RelaysChanged { relay_infos, revision });
             }
 
             return Ok(Response::new(EnrollResponse {
