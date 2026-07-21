@@ -195,6 +195,18 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.all_keys_for_gateway(gateway_id)).await?
     }
 
+    /// See [`Db::gateways_with_rotation_state`].
+    pub async fn gateways_with_rotation_state(&self) -> Result<Vec<i64>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.gateways_with_rotation_state()).await?
+    }
+
+    /// See [`Db::active_gateway_ids`].
+    pub async fn active_gateway_ids(&self) -> Result<Vec<i64>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.active_gateway_ids()).await?
+    }
+
     /// See [`Db::rotate_key`].
     pub async fn rotate_key(
         &self,

@@ -110,6 +110,17 @@ pub struct TestController {
     // still re-assigns the ports). `127.0.0.1` for `start()` (unchanged);
     // a routable underlay IP for the mesh-milestone test's `start_on`.
     bind_ip: std::net::Ipv4Addr,
+    // (Key-rotation Task 4) The rotation-initiation-timer/decision-sweep
+    // intervals this instance was booted with — captured at
+    // `start`/`start_on`/`start_with_rotation_intervals` so `restart` reuses
+    // the SAME small intervals a test started with, rather than reverting to
+    // `Config`'s 30-day/5s defaults. Without this, a test that shrinks these
+    // intervals to observe timer/sweep behavior would silently lose that
+    // after a `restart()` — exactly the scenario
+    // `sweep_retires_orphaned_retiring_row_after_crash` depends on NOT
+    // happening.
+    rotation_interval: std::time::Duration,
+    rotation_sweep_interval: std::time::Duration,
     // Held only so the directory (and everything the controller wrote under
     // it — DB, CA, secrets, the socket) is cleaned up on drop; never read
     // directly.
@@ -169,6 +180,45 @@ impl TestController {
     /// byte-for-byte unchanged. The TLS server cert SAN stays `127.0.0.1`
     /// regardless (see `Config::bind_ip`'s doc comment).
     pub async fn start_on(bind_ip: std::net::Ipv4Addr) -> TestController {
+        Self::start_inner(
+            bind_ip,
+            Config::default_rotation_interval(),
+            Config::default_rotation_sweep_interval(),
+        )
+        .await
+    }
+
+    /// (Key-rotation Task 4) Additive counterpart to [`Self::start`]/
+    /// [`Self::start_on`] that boots against the DEFAULT `bind_ip` but
+    /// caller-supplied `rotation_interval`/`rotation_sweep_interval` — what
+    /// every rotation-timer/decision-sweep test uses instead of `start()`'s
+    /// 30-day/5s production defaults, so the timer's/sweep's background
+    /// cadence can be observed within a test's own bounded budget rather than
+    /// requiring an actual 30-day (or even 5s-per-tick) wait. Both intervals
+    /// are stored on the returned `TestController` so a later `restart()`
+    /// reuses them (see the `rotation_interval`/`rotation_sweep_interval`
+    /// fields' doc comment) — a restart must NOT silently revert to
+    /// `Config`'s production defaults.
+    pub async fn start_with_rotation_intervals(
+        rotation_interval: std::time::Duration,
+        rotation_sweep_interval: std::time::Duration,
+    ) -> TestController {
+        Self::start_inner(
+            Config::default_bind_ip(),
+            rotation_interval,
+            rotation_sweep_interval,
+        )
+        .await
+    }
+
+    /// Shared boot logic behind [`Self::start_on`] (defaults) and
+    /// [`Self::start_with_rotation_intervals`] (caller-supplied intervals) —
+    /// see either method's doc comment for what each is for.
+    async fn start_inner(
+        bind_ip: std::net::Ipv4Addr,
+        rotation_interval: std::time::Duration,
+        rotation_sweep_interval: std::time::Duration,
+    ) -> TestController {
         let data_dir = tempfile::tempdir().expect("creating temp data dir for TestController");
         let socket_path = data_dir.path().join("controller.sock");
 
@@ -180,6 +230,8 @@ impl TestController {
             admin_tcp_port: 0,
             observe_udp_port: 0,
             bind_ip,
+            rotation_interval,
+            rotation_sweep_interval,
         };
 
         let server_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -200,6 +252,8 @@ impl TestController {
             running: Some(running),
             server_runtime: Some(server_runtime),
             bind_ip,
+            rotation_interval,
+            rotation_sweep_interval,
         }
     }
 
@@ -240,6 +294,14 @@ impl TestController {
             admin_tcp_port: 0,
             observe_udp_port: 0,
             bind_ip: self.bind_ip,
+            // (Key-rotation Task 4) Reuse the SAME intervals this instance
+            // was started with — NOT `Config`'s 30-day/5s production
+            // defaults — so a restart doesn't silently widen a test's
+            // shrunk rotation-timer/decision-sweep cadence back out. See the
+            // `rotation_interval`/`rotation_sweep_interval` fields' doc
+            // comment.
+            rotation_interval: self.rotation_interval,
+            rotation_sweep_interval: self.rotation_sweep_interval,
         };
 
         // (Task 13) Reuse the SAME `server_runtime` across a restart (rather

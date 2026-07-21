@@ -1722,6 +1722,43 @@ impl Db {
         Ok(rows)
     }
 
+    /// (Key-rotation Task 4) Distinct `gateway_id`s that currently have AT
+    /// LEAST ONE `gateway_key` row in state `pending` OR `retiring` — i.e.
+    /// every gateway with a rotation currently in flight (mid-rotation,
+    /// awaiting a real key or peer acks, or promoted-and-awaiting-retire-
+    /// grace). Backs both [`services::sync::sweep_rotations`]'s per-tick scan
+    /// (what needs a decision driven or an orphaned row cleaned) and
+    /// [`services::sync::initiate_due_rotations`]'s skip check (a gateway in
+    /// this set must NOT have a second rotation stacked on top of it).
+    ///
+    /// [`services::sync::sweep_rotations`]: crate::services::sync::sweep_rotations
+    /// [`services::sync::initiate_due_rotations`]: crate::services::sync::initiate_due_rotations
+    pub fn gateways_with_rotation_state(&self) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT gateway_id FROM gateway_key \
+             WHERE state IN ('pending', 'retiring') \
+             ORDER BY gateway_id",
+        )?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// (Key-rotation Task 4) Every currently `status = 'active'` gateway's
+    /// id — the population [`services::sync::initiate_due_rotations`] walks
+    /// on each rotation-timer tick, skipping any id also present in
+    /// [`Db::gateways_with_rotation_state`].
+    pub fn active_gateway_ids(&self) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT id FROM gateway WHERE status = 'active' ORDER BY id")?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, i64>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     /// (Task 11; sentinel pubkey since key-rotation Task 2) Starts a
     /// make-before-break key-epoch rotation for `gateway_id`: finds the
     /// gateway's current highest `gateway_key` epoch (every enrolled
