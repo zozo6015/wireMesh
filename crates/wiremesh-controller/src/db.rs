@@ -1533,11 +1533,13 @@ impl Db {
     /// `rebind`-kind token's secret hash simply won't satisfy that filter,
     /// so it comes back `InvalidToken` exactly like a wrong secret would.
     ///
-    /// Deliberately does NOT call `bump_revision_tx`: like the existing
-    /// admin-path `Db::insert_relay`, a relay isn't part of the Sync
-    /// projection yet (that's Task 5 — advertising `relay` rows into
-    /// `Sync`'s `relays`), so there is no projection-affecting change here
-    /// to bump the revision for.
+    /// (Cycle-4c Task 5) DOES call `bump_revision_tx`, unlike the
+    /// admin-path `Db::insert_relay`: a newly enrolled relay is now
+    /// projection-affecting (`Sync`'s `StateSnapshot.relays`/`Delta.relays`
+    /// advertise it), so — mirroring `enroll_gateway`'s identical rationale
+    /// — the persisted revision must advance in this same transaction, and
+    /// an early `InvalidToken` return above must NOT reach here (it rolls
+    /// back instead).
     pub fn enroll_relay(
         &self,
         secret_hash: &str,
@@ -1601,6 +1603,8 @@ impl Db {
                 format!(r#"{{"relay_id":{relay_id}}}"#),
             ],
         )?;
+
+        bump_revision_tx(&tx)?;
 
         tx.commit()?;
         Ok(relay_id)
@@ -2117,6 +2121,23 @@ impl Db {
             .query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
             })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// (Cycle-4c Task 5) Every `status = 'active'` relay's `(id, endpoint)`,
+    /// ordered by id — exactly the set `Sync`'s `StateSnapshot.relays`/
+    /// `Delta.relays` must advertise (a relay with any other status, e.g. one
+    /// this cycle's Task 6 health pipeline later marks unhealthy, is
+    /// deliberately excluded). Dedicated query rather than `list_relays()` +
+    /// a filter so the projection path never has to carry `name`/`status`
+    /// fields it doesn't need.
+    pub fn active_relays(&self) -> Result<Vec<(i64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, endpoint FROM relay WHERE status = 'active' ORDER BY id")?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }

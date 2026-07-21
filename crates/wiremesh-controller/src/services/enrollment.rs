@@ -110,6 +110,17 @@ impl Enrollment for EnrollmentSvc {
         // token, never a distinct error that would help an attacker probe
         // token kinds.
         if !req.endpoint.is_empty() {
+            // (Cycle-4c Task 5) A relay's `endpoint` is what every gateway's
+            // relay transport will eventually dial (Task 7) — reject
+            // anything that doesn't even parse as `ip:port` up front, before
+            // signing or touching the DB, so a malformed value can never be
+            // enrolled (and therefore never advertised in a snapshot/delta).
+            if req.endpoint.parse::<std::net::SocketAddr>().is_err() {
+                return Err(Status::invalid_argument(
+                    "relay endpoint must be a valid ip:port",
+                ));
+            }
+
             let relay_name = format!("relay-{secret_hash_hex}");
 
             // Signing (pure crypto, no DB dependency) happens before the
@@ -165,6 +176,33 @@ impl Enrollment for EnrollmentSvc {
                     return Err(Status::internal(format!("relay enrollment failed: {other:?}")));
                 }
             };
+
+            // Projection-affecting mutation succeeded (and its transaction
+            // already bumped the persisted revision — see
+            // `Db::enroll_relay`'s doc comment) and the single-use token is
+            // now spent. From here on this is best-effort, same discipline
+            // as the gateway path below: a failure re-reading the revision
+            // or active-relay set must never turn into an error response —
+            // the relay row, cert, and response are already durably
+            // committed/ready regardless.
+            if let Ok(revision) = self.db.current_revision().await {
+                if let Ok(active) = self.db.active_relays().await {
+                    let relays = active
+                        .into_iter()
+                        .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
+                            relay_id: id as u64,
+                            endpoint,
+                        })
+                        .collect();
+                    // `send` errors only when there are currently no
+                    // `Sync.Watch` subscribers — nobody to notify, which is
+                    // not a failure (mirrors the gateway path's identical
+                    // rationale below).
+                    let _ = self
+                        .change_tx
+                        .send(ChangeEvent::RelaysChanged { relays, revision });
+                }
+            }
 
             return Ok(Response::new(EnrollResponse {
                 cert_pem: issued.cert_pem,

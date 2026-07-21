@@ -9,14 +9,16 @@
 //! time, served VERBATIM — this module never recompiles, so a snapshot can
 //! never drift from what was actually validated and versioned. Still
 //! empty/`0` on a fresh controller that has never had a policy applied.
-//! `relays` is always empty (relay support is a later task). `revision` is
+//! `relays` (Cycle-4c Task 5) is every currently `active` relay row, off
+//! [`crate::db::Db::active_relays`] — empty on a fresh controller with none
+//! enrolled/registered yet. `revision` is
 //! the persisted `state_revision` counter
 //! ([`crate::db::Db::current_revision`]) — a value that survives a
 //! controller restart, so a reconnecting gateway never sees the revision go
 //! backwards (which would break T8 delta comparison / T9 fail-static
 //! resync).
 
-use wiremesh_proto::v1::{Delta, Peer, PeerKey, StateSnapshot};
+use wiremesh_proto::v1::{Delta, Peer, PeerKey, RelayInfo, StateSnapshot};
 
 use crate::db_async::DbHandle;
 use crate::routes;
@@ -143,6 +145,15 @@ pub enum ChangeEvent {
         candidate_endpoints: Vec<String>,
         revision: u64,
     },
+    /// (Cycle-4c Task 5) Relay enrollment created a new `active` `relay` row
+    /// — every already-connected gateway must learn the FULL current
+    /// active-relay set (not just the one just enrolled), so a delta stays
+    /// consistent with what a fresh `build_snapshot` would show, mirroring
+    /// `KeyRotated`/`SegmentCidrsChanged`'s full-refresh rationale.
+    RelaysChanged {
+        relays: Vec<RelayInfo>,
+        revision: u64,
+    },
 }
 
 impl ChangeEvent {
@@ -173,6 +184,11 @@ impl ChangeEvent {
             // above.
             ChangeEvent::PolicyUpdated { .. } => 0,
             ChangeEvent::SegmentCidrsChanged { gateway_id, .. } => *gateway_id,
+            // Not "about" any single gateway — a newly enrolled relay is a
+            // fabric-wide fact every connected gateway must learn, mirroring
+            // `CertRevoked`/`PolicyUpdated`'s rationale above (and, like
+            // them, `0` never collides with a real `gateway.id`).
+            ChangeEvent::RelaysChanged { .. } => 0,
         }
     }
 }
@@ -331,6 +347,17 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             policy_version: 0,
             revoked_serials: Vec::new(),
         },
+        ChangeEvent::RelaysChanged { relays, revision } => Delta {
+            revision,
+            // No peer/revocation change — only `relays` carries anything,
+            // per this variant's doc comment.
+            upserted_peers: Vec::new(),
+            removed_peer_ids: Vec::new(),
+            relays,
+            policy_ir: Vec::new(),
+            policy_version: 0,
+            revoked_serials: Vec::new(),
+        },
     }
 }
 
@@ -373,6 +400,15 @@ pub async fn build_snapshot(
         })
         .collect();
 
+    // (Cycle-4c Task 5) Every currently `active` relay, straight off
+    // `Db::active_relays` — see this module's doc comment.
+    let relays = db
+        .active_relays()
+        .await?
+        .into_iter()
+        .map(|(id, endpoint)| RelayInfo { relay_id: id as u64, endpoint })
+        .collect();
+
     let revoked_serials = db.revoked_serials().await?;
 
     // (Cycle-3 Task 4) The latest compiled policy's exact stored bytes —
@@ -388,8 +424,7 @@ pub async fn build_snapshot(
         revision,
         self_cert_pem,
         peers,
-        // Relay support is a later task — cycle-2 ships a direct-only mesh.
-        relays: Vec::new(),
+        relays,
         policy_ir,
         policy_version,
         revoked_serials,

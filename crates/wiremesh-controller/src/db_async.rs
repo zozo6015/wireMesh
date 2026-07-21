@@ -284,6 +284,12 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.list_relays()).await?
     }
 
+    /// See [`Db::active_relays`].
+    pub async fn active_relays(&self) -> Result<Vec<(i64, String)>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.active_relays()).await?
+    }
+
     /// See [`Db::insert_api_token`].
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_api_token(
