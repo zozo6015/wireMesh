@@ -18,7 +18,8 @@ The project ships binaries and docs, never hosted infrastructure.
 ## Project state
 
 Phase 0 spike, Cycle 2 (controller core), Cycle 3 (policy pipeline), Cycle 4a
-(direct-only gateway), and Cycle 4b (NAT traversal) are complete. Cycle 3
+(direct-only gateway), Cycle 4b (NAT traversal), and Cycle 4c (relay path) are
+complete. Cycle 3
 delivered the DSL →
 canonical-JSON IR compiler (`wiremesh-policy`), the controller wiring that
 compiles/versions policy and streams real `policy_ir` over Sync (+ `fabricctl
@@ -68,15 +69,40 @@ peer retrying an unanswered handshake) was found and fixed during
 conformance — see `docs/research/cycle4b-path-liveness-note.md` and
 `docs/research/cycle4b-nat-traversal-notes.md`.
 
+Cycle 4c delivered the relay path (productionizing the Phase-0 `spike/relay`
+Bet-3 mTLS QUIC-datagram bridge and filling 4b's inert `Relayed` seam): the
+`wiremesh-relay` binary (QUIC datagram bridge, mandatory mTLS, an offline
+revocation denylist), controller relay enrollment (`Enroll --kind relay`) +
+advertisement (`RelaysChanged` deltas) + a health/eviction pipeline (≤15s), a
+`RelayInfo`/`RelayHealth` proto surface, and the gateway `RelayTransport`
+(local UDP ↔ QUIC) wired into the path state machine with a **rekey-free**
+endpoint switch to the relay socket. The netns done-bar
+(`crates/wiremesh-gateway/tests/relay_matrix.rs`) proves a **symmetric-NAT
+pair whose direct punch fails flows real WG traffic over the relay** (`path =
+relayed`, relay-local endpoints, never `direct`) — reliably green; relay
+eviction/re-path is `case3`. Denylist (offline certless + revoked rejection)
+and the MTU-1280 datagram floor are covered by
+`wiremesh-relay/tests/{denylist,bridge}.rs`. **A genuine long-standing eBPF
+bug was found+fixed** (the ICMP-echo reverse-flow key asymmetry, a known
+Phase-0 carry — echo replies missed the flow table; Cycle-3 conformance stays
+22/22). See `docs/research/cycle4c-relay-notes.md` +
+`cycle4c-relay-stability-note.md`. **Scope:** the make-before-break
+`Relayed→Direct` cutover (done-bar case 2) is a documented **fast-follow** —
+WireGuard doesn't force a fresh noise handshake on a UAPI endpoint change, so
+reliable direct-cutover detection needs a forced rehandshake; the relay path
+itself is stable and the direct probe is rate-limited so it never disrupts it.
+
 **Deployment notes:** the nftables enforcer backend requires
 `conntrack-tools` on the gateway host (`flush_flows` uses `conntrack -F`);
 the gateway binary itself requires `iproute2` and `nftables` on the host
-(route/link programming and the MSS clamp shell out to `ip`/`nft`).
+(route/link programming and the MSS clamp shell out to `ip`/`nft`). The
+`wiremesh-relay` binary needs its identity (cert/key/ca, from fabric-CA
+enrollment with `--kind relay`) at `/var/lib/wiremesh/` mode 0600.
 
-Next action is Cycle 4c (relay: `wiremesh-relay` binary + gateway relay
-transport + relay advertisement + make-before-break) plus the key-rotation
-fast-follow (carried from 4a). Also pending: Cycle 2b fast-follow (OpenBao
-provider driver). Update this section as phases complete.
+Next action: the Cycle-4c fast-follows (make-before-break direct cutover;
+`relay_pair_id` width + per-relay connection multiplexing) and the
+key-rotation fast-follow (carried from 4a). Also pending: Cycle 2b fast-follow
+(OpenBao provider driver). Update this section as phases complete.
 
 ## Agent workflow rules
 
