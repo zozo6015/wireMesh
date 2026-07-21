@@ -290,6 +290,18 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.active_relays()).await?
     }
 
+    /// See [`Db::relay_status`].
+    pub async fn relay_status(&self, relay_id: i64) -> Result<Option<String>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.relay_status(relay_id)).await?
+    }
+
+    /// See [`Db::set_relay_status`].
+    pub async fn set_relay_status(&self, relay_id: i64, status: String) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.set_relay_status(relay_id, &status)).await?
+    }
+
     /// See [`Db::insert_api_token`].
     #[allow(clippy::too_many_arguments)]
     pub async fn insert_api_token(

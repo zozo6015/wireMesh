@@ -16,8 +16,9 @@
 //! field in `WatchRequest`) is trusted as identity — `WatchRequest` is
 //! (deliberately) an empty message.
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
 use base64::Engine as _;
@@ -51,6 +52,21 @@ pub struct SyncSvc {
     /// `PunchDirective` explicitly to BOTH members of a pair — deliberately
     /// NOT the `subject_gateway_id()` self-skip path the deltas below use.
     broker: Arc<Broker>,
+    /// (Cycle-4c Task 6) In-memory relay health votes: `relay_id -> (gw_id ->
+    /// healthy)`. Populated exclusively by `report`'s `req.relay_health`
+    /// handling below. Deliberately NOT persisted — lost on controller
+    /// restart is an accepted tradeoff (see the design notes' "known
+    /// limitation" section): a relay defaults back to whatever its DB
+    /// `status` already was (unaffected by this map resetting), and any
+    /// gateway that still considers a relay live/dead simply re-reports on
+    /// its next `Report` call. `Arc` so every `SyncSvc` produced by cloning
+    /// (if ever) — and, more immediately, every concurrent `report` call
+    /// against the same shared service instance — sees and mutates the SAME
+    /// map rather than a private copy. A plain `std::sync::Mutex` is fine:
+    /// every critical section below is a short, synchronous map read/write
+    /// with no `.await` inside the locked region (the lock is dropped before
+    /// any DB call or broadcast send).
+    relay_health: Arc<Mutex<HashMap<i64, HashMap<i64, bool>>>>,
 }
 
 impl SyncSvc {
@@ -63,6 +79,39 @@ impl SyncSvc {
             db,
             change_tx,
             broker,
+            relay_health: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// (Cycle-4c Task 6) Re-reads the current active-relay set + persisted
+    /// revision and publishes ONE `ChangeEvent::RelaysChanged` — the shared
+    /// tail end of both the enrollment path (`EnrollmentSvc::enroll`'s
+    /// relay-enrollment branch) and this file's health-driven eviction/
+    /// re-admission path. Active relays are read FIRST, then the revision
+    /// LAST (per the Cycle-4c Task 5 review fix): this guarantees the
+    /// revision attached to the emitted delta is >= the state the advertised
+    /// `relays` reflect, so an open `Sync.Watch` stream never sees the
+    /// revision regress relative to the relay set it just applied (see
+    /// `projection.rs`). Best-effort: a failure reading either is silently
+    /// swallowed (mirrors every other best-effort `change_tx.send` call in
+    /// this crate — a transient DB read failure here must never turn an
+    /// otherwise-successful `Report`/`Enroll` call into an error response),
+    /// and `send` itself only ever errors when there are currently no
+    /// `Sync.Watch` subscribers, which is not a failure either.
+    async fn emit_relays_changed(&self) {
+        if let Ok(active) = self.db.active_relays().await {
+            if let Ok(revision) = self.db.current_revision().await {
+                let relays = active
+                    .into_iter()
+                    .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
+                        relay_id: id as u64,
+                        endpoint,
+                    })
+                    .collect();
+                let _ = self
+                    .change_tx
+                    .send(ChangeEvent::RelaysChanged { relays, revision });
+            }
         }
     }
 }
@@ -295,6 +344,73 @@ impl Sync for SyncSvc {
                         revision,
                     });
                 }
+            }
+        }
+
+        // (Cycle-4c Task 6, R-3) Relay health pipeline: aggregate this
+        // gateway's votes into the shared `relay_id -> (gw_id -> healthy)`
+        // map, then for every relay THIS report touched, compare the fresh
+        // aggregate (healthy-override: a relay is unhealthy iff it has >=1
+        // vote on record and NONE of them is `true`) against its current DB
+        // status, flipping + tracking a change where they now differ. This
+        // runs synchronously on the `Report` call that tips the aggregate,
+        // so eviction/re-admission is trivially inside the 15s R-3 budget.
+        if !req.relay_health.is_empty() {
+            let touched_aggregates: Vec<(i64, bool)> = {
+                // Held only across the map mutation + aggregate computation
+                // below — no `.await` inside this block, so the lock is
+                // dropped well before the DB reads/broadcast that follow.
+                let mut health = self
+                    .relay_health
+                    .lock()
+                    .expect("relay_health mutex poisoned");
+                let mut touched = Vec::with_capacity(req.relay_health.len());
+                for vote in &req.relay_health {
+                    let relay_id = vote.relay_id as i64;
+                    health
+                        .entry(relay_id)
+                        .or_default()
+                        .insert(gw.id, vote.healthy);
+                    if !touched.contains(&relay_id) {
+                        touched.push(relay_id);
+                    }
+                }
+                touched
+                    .into_iter()
+                    .map(|relay_id| {
+                        let votes = health.get(&relay_id).expect(
+                            "relay_id just inserted above must have an entry in the map",
+                        );
+                        let healthy_agg = votes.values().any(|&h| h);
+                        (relay_id, healthy_agg)
+                    })
+                    .collect()
+            };
+
+            let mut any_changed = false;
+            for (relay_id, healthy_agg) in touched_aggregates {
+                let current_status = self
+                    .db
+                    .relay_status(relay_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("reading relay status: {e}")))?;
+                let Some(current_status) = current_status else {
+                    // Unknown relay id (e.g. a stale report about a relay
+                    // row that no longer exists) — nothing to flip.
+                    continue;
+                };
+                let desired_status = if healthy_agg { "active" } else { "inactive" };
+                if current_status != desired_status {
+                    self.db
+                        .set_relay_status(relay_id, desired_status.to_string())
+                        .await
+                        .map_err(|e| Status::internal(format!("flipping relay status: {e}")))?;
+                    any_changed = true;
+                }
+            }
+
+            if any_changed {
+                self.emit_relays_changed().await;
             }
         }
 

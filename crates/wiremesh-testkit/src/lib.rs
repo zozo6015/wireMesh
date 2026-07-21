@@ -848,6 +848,63 @@ impl StubGateway {
         Ok(())
     }
 
+    /// (Cycle-4c Task 6) Additive counterpart to [`Self::report`] that also
+    /// populates `ReportRequest.relay_health` — what a real gateway's own
+    /// QUIC-ping health (Task 7/8) will eventually compute, stood in here by
+    /// a caller-supplied `(relay_id, healthy)` list so controller-only tests
+    /// can exercise the health-aggregation/eviction pipeline without any real
+    /// gateway-side relay transport. `relay_id` is `i64` (matching
+    /// `enroll_relay`'s return tuple's third element / the DB row id type)
+    /// and cast up to the proto's `uint64` here, mirroring how
+    /// `tests/sync_relays.rs` casts `relay_id as u64` when comparing against
+    /// `RelayInfo.relay_id`. `report` itself is left untouched (it keeps
+    /// sending the hardcoded empty `relay_health: vec![]`) so every existing
+    /// caller is unaffected by this addition.
+    pub async fn report_with_relay_health(
+        &self,
+        applied_version: u64,
+        local_endpoints: &[&str],
+        relay_health: &[(i64, bool)],
+    ) -> anyhow::Result<()> {
+        let uri = format!("https://{}", self.sync_addr);
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
+            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
+            .tls_config(tls)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "configuring StubGateway mTLS for Sync.Report (relay health): {e}"
+                )
+            })?
+            .connect()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "connecting to the controller's Sync (mTLS) TCP port for Sync.Report \
+                     (relay health): {e}"
+                )
+            })?;
+
+        SyncClient::new(channel)
+            .report(ReportRequest {
+                applied_version,
+                local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
+                relay_health: relay_health
+                    .iter()
+                    .map(|(relay_id, healthy)| wiremesh_proto::v1::RelayHealth {
+                        relay_id: *relay_id as u64,
+                        healthy: *healthy,
+                    })
+                    .collect(),
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("Sync.Report (relay health) failed: {status}"))?;
+        Ok(())
+    }
+
     /// Ensures this gateway's identity bundle (leaf cert, private key
     /// (`0600`), CA bundle) is durably on disk under `state_dir()` — the
     /// fail-static posture `fail_static.rs` exercises: a gateway must not

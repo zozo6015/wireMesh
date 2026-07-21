@@ -2142,6 +2142,50 @@ impl Db {
         Ok(rows)
     }
 
+    /// (Cycle-4c Task 6) The current `status` of relay `relay_id`, or `None`
+    /// if no such relay row exists. Used by `SyncSvc::report`'s health
+    /// pipeline to decide whether a newly computed per-relay health
+    /// aggregate actually represents a CHANGE worth flipping + broadcasting
+    /// (comparing the aggregate against `active_relays()` membership would
+    /// work too, but this is the more direct "read this one relay's current
+    /// status" query the flip-decision wants).
+    pub fn relay_status(&self, relay_id: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT status FROM relay WHERE id = ?1",
+            params![relay_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// (Cycle-4c Task 6) Flips relay `relay_id`'s `status` to `status`
+    /// (`"active"` or `"inactive"`) and bumps the persisted revision in the
+    /// SAME transaction — mirroring `enroll_relay`'s `bump_revision_tx`
+    /// pattern — so that a `current_revision()` read taken right after this
+    /// call returns a revision that is guaranteed to already reflect this
+    /// status flip (the invariant `SyncSvc::report`'s eviction/re-admission
+    /// path depends on: the `RelaysChanged` delta it emits must carry a
+    /// revision at least as new as the relay set it advertises). A
+    /// nonexistent `relay_id` is a silent no-op (`UPDATE` affecting zero
+    /// rows) rather than an error — the health pipeline only ever calls this
+    /// for relay ids it just read out of its own health-report map, which by
+    /// construction came from a `RelayHealth.relay_id` a gateway reported on;
+    /// a stale/unknown id here would be a caller bug, not something this
+    /// method needs to detect (the revision still bumps, harmlessly).
+    pub fn set_relay_status(&self, relay_id: i64, status: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "UPDATE relay SET status = ?1 WHERE id = ?2",
+            params![status, relay_id],
+        )?;
+        bump_revision_tx(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// (Task 13) Inserts a new `api_token` row. `secret_hash` is the sha256
     /// (hex) of the token's random secret — same never-store-the-raw-secret
     /// discipline as [`Db::insert_enrollment_token`]. `role` is stored
