@@ -153,6 +153,17 @@ mod tests {
     }
 
     #[test]
+    fn classify_rotate_yields_rotate_event() {
+        let mut current = None;
+        let rotate = wiremesh_proto::v1::RotateDirective { epoch: 5 };
+        match classify(Some(Body::Rotate(rotate.clone())), &mut current).unwrap() {
+            SyncEvent::Rotate(d) => assert_eq!(d.epoch, 5),
+            other => panic!("expected Rotate, got {other:?}"),
+        }
+        assert!(current.is_none(), "a rotate directive must not fold into desired state");
+    }
+
+    #[test]
     fn classify_delta_before_snapshot_errors() {
         let mut current = None;
         let d = Delta {

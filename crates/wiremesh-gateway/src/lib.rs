@@ -10,6 +10,7 @@ pub mod path;
 pub mod punch;
 pub mod relay;
 pub mod reconcile;
+pub mod rotation;
 pub mod routes;
 pub mod state;
 pub mod sync;
