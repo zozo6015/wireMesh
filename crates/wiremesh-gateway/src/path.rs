@@ -33,6 +33,25 @@ pub const BACKOFF_INITIAL: Duration = Duration::from_secs(2);
 /// Backoff ceiling.
 pub const BACKOFF_MAX: Duration = Duration::from_secs(30);
 
+/// Cadence of the `Relayed` make-before-break background direct-recovery
+/// probe (`PathAction::ProbeDirect`). Debug note (Cycle 4c Task 9 stability
+/// fix): this used to fire on EVERY `tick` (~1s cadence) while `Relayed`,
+/// which stacked back-to-back hole-punch attempts (the driver's punch window
+/// is several seconds, so a fresh `ProbeDirect` was requested again before
+/// the previous punch had even finished, logging "punch already in flight;
+/// skipping" continuously) and kept the driver's transient same-port
+/// `SO_REUSEPORT` punch socket open nearly 100% of the time. That socket
+/// shares the WG listen port with `RelayTransport`'s local downlink delivery
+/// target (also `127.0.0.1:<wg_listen_port>` — see `main.rs`'s
+/// `ensure_relay_transport` `local_peer_hint`), so an almost-always-open
+/// punch socket intermittently stole inbound relayed WireGuard datagrams
+/// that the kernel's `SO_REUSEPORT` group would otherwise have delivered to
+/// boringtun's own socket, starving the relay path of traffic even though
+/// the relay itself was healthy. A low background rate (this constant) plus
+/// the grace period below give the relay path long, undisturbed windows to
+/// actually carry traffic. See docs/research/cycle4c-relay-stability-note.md.
+pub const PROBE_DIRECT_INTERVAL: Duration = Duration::from_secs(20);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PathState {
     Connecting,
@@ -102,6 +121,15 @@ pub struct Path {
     degraded_since: Option<Instant>,
     /// When the current `Disconnected` spell began (drives backoff timing).
     disconnected_since: Option<Instant>,
+    /// While `Relayed`: the instant of the last `ProbeDirect` emission, OR
+    /// (if none emitted yet this `Relayed` spell) the instant the peer
+    /// entered `Relayed` — gates `PROBE_DIRECT_INTERVAL` so the background
+    /// direct-recovery probe fires at a low rate rather than every tick, and
+    /// so a freshly-entered `Relayed` path gets one full, undisturbed
+    /// interval before the first probe ever touches it. `None` outside
+    /// `Relayed` (reset on leaving it, so a later re-entry starts its own
+    /// fresh grace period).
+    relayed_probe_last: Option<Instant>,
 }
 
 impl Path {
@@ -115,6 +143,7 @@ impl Path {
             backoff: BACKOFF_INITIAL,
             degraded_since: None,
             disconnected_since: None,
+            relayed_probe_last: None,
         }
     }
 
@@ -128,6 +157,7 @@ impl Path {
         self.state = PathState::Direct;
         self.degraded_since = None;
         self.disconnected_since = None;
+        self.relayed_probe_last = None;
         // Review fix (4c Task 8, IMPORTANT): a completed handshake means the
         // path recovered, so the next disconnect should start backoff fresh
         // rather than inheriting an already-escalated value from an earlier,
@@ -154,6 +184,10 @@ impl Path {
                 if now.saturating_duration_since(self.connecting_since) >= CONNECT_TIMEOUT {
                     if relay_available {
                         self.state = PathState::Relayed;
+                        // Start this Relayed spell's probe grace period now
+                        // (see `relayed_probe_last` doc) rather than probing
+                        // on the very next tick.
+                        self.relayed_probe_last = Some(now);
                     } else {
                         self.state = PathState::Disconnected;
                         self.disconnected_since = Some(now);
@@ -179,6 +213,9 @@ impl Path {
                 if now.saturating_duration_since(since) >= DEGRADED_DEAD_AFTER {
                     if relay_available {
                         self.state = PathState::Relayed;
+                        // See the `Connecting` arm above: start this spell's
+                        // probe grace period now.
+                        self.relayed_probe_last = Some(now);
                     } else {
                         self.state = PathState::Disconnected;
                         self.disconnected_since = Some(now);
@@ -190,11 +227,24 @@ impl Path {
             }
             PathState::Relayed => {
                 if relay_available {
-                    // The relay is still carrying traffic: ask the driver to
-                    // run a background direct probe (make-before-break).
-                    // Stay `Relayed` — only a real handshake (`on_handshake`)
+                    // The relay is still carrying traffic. Only ask the
+                    // driver to run its background direct-recovery probe
+                    // (make-before-break) at a low, bounded rate
+                    // (`PROBE_DIRECT_INTERVAL`) rather than every tick — see
+                    // `relayed_probe_last`'s doc for why firing every tick
+                    // was actively harmful (it starved the relay path of
+                    // traffic, not just wasted effort). Stay `Relayed`
+                    // either way — only a real handshake (`on_handshake`)
                     // cuts over to `Direct`.
-                    Some(PathAction::ProbeDirect)
+                    let due = self.relayed_probe_last.map_or(true, |last| {
+                        now.saturating_duration_since(last) >= PROBE_DIRECT_INTERVAL
+                    });
+                    if due {
+                        self.relayed_probe_last = Some(now);
+                        Some(PathAction::ProbeDirect)
+                    } else {
+                        None
+                    }
                 } else {
                     // The relay path itself died with nothing else
                     // available: re-path to `Disconnected` so the normal
@@ -202,6 +252,7 @@ impl Path {
                     // takes over.
                     self.state = PathState::Disconnected;
                     self.disconnected_since = Some(now);
+                    self.relayed_probe_last = None;
                     Some(PathAction::MarkRelayNeeded)
                 }
             }
@@ -370,8 +421,15 @@ mod tests {
         );
     }
 
+    /// Debug fix (Cycle 4c Task 9 stability): `ProbeDirect` used to fire on
+    /// EVERY tick while `Relayed`, which (via the driver's transient
+    /// same-port `SO_REUSEPORT` punch socket) intermittently stole inbound
+    /// relayed traffic and starved the relay path — see
+    /// `docs/research/cycle4c-relay-stability-note.md`. A freshly-entered
+    /// `Relayed` spell must get one full, undisturbed `PROBE_DIRECT_INTERVAL`
+    /// before the first background probe ever fires.
     #[test]
-    fn relayed_probes_direct_while_relay_available() {
+    fn relayed_grants_a_full_grace_period_before_the_first_probe() {
         let t0 = Instant::now();
         let mut p = Path::new(t0);
 
@@ -381,10 +439,46 @@ mod tests {
         assert_eq!(p.state, PathState::Relayed);
         assert_eq!(action, Some(PathAction::MarkRelayNeeded));
 
-        // While the relay stays available, tick should ask the driver to
-        // run a low-rate background direct probe (make-before-break) and
-        // MUST stay on the relay path — it keeps carrying traffic.
-        let action = p.tick(t0 + CONNECT_TIMEOUT + Duration::from_secs(1), true);
+        // Ticking repeatedly during the grace period must ask for NO action
+        // and must stay Relayed — the relay path gets an undisturbed window
+        // to actually carry traffic (e.g. complete the WG handshake).
+        for secs in [1, 5, 10, 19] {
+            let action = p.tick(t0 + CONNECT_TIMEOUT + Duration::from_secs(secs), true);
+            assert_eq!(action, None, "must not probe before the grace period elapses ({secs}s)");
+            assert_eq!(p.state, PathState::Relayed);
+        }
+    }
+
+    /// Once the grace period elapses, `ProbeDirect` fires exactly once, then
+    /// stays quiet again until the next `PROBE_DIRECT_INTERVAL` — a low,
+    /// bounded background rate, not every tick.
+    #[test]
+    fn relayed_probes_direct_at_a_low_bounded_rate() {
+        let t0 = Instant::now();
+        let mut p = Path::new(t0);
+
+        p.tick(t0 + CONNECT_TIMEOUT, true);
+        assert_eq!(p.state, PathState::Relayed);
+
+        let entered = t0 + CONNECT_TIMEOUT;
+
+        // Right at (>=) the grace period: fires once.
+        let action = p.tick(entered + PROBE_DIRECT_INTERVAL, true);
+        assert_eq!(action, Some(PathAction::ProbeDirect));
+        assert_eq!(p.state, PathState::Relayed);
+
+        // Immediately after: must NOT fire again (would otherwise stack a
+        // fresh punch attempt on top of the one just requested).
+        let action = p.tick(entered + PROBE_DIRECT_INTERVAL + Duration::from_secs(1), true);
+        assert_eq!(action, None);
+
+        // Still quiet just short of the next interval.
+        let action =
+            p.tick(entered + PROBE_DIRECT_INTERVAL + PROBE_DIRECT_INTERVAL - Duration::from_secs(1), true);
+        assert_eq!(action, None);
+
+        // A full interval after the last probe: fires again.
+        let action = p.tick(entered + PROBE_DIRECT_INTERVAL + PROBE_DIRECT_INTERVAL, true);
         assert_eq!(action, Some(PathAction::ProbeDirect));
         assert_eq!(p.state, PathState::Relayed);
     }

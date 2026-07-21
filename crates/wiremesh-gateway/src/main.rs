@@ -714,6 +714,36 @@ async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
 /// `.await` (the `tokio::sync::Mutex` guarding `relay_transports` is the only
 /// exception, and is never held at the same time as a `std::sync::Mutex`
 /// guard).
+///
+/// Stability debug note (Cycle 4c Task 9, `relay_matrix.rs` case 1 flake):
+/// `Path::tick`'s `Relayed` arm now rate-limits `ProbeDirect` to once per
+/// `path::PROBE_DIRECT_INTERVAL` (with a full grace interval before the
+/// FIRST probe of a `Relayed` spell), rather than every ~1s tick. Firing
+/// every tick stacked back-to-back `punch_and_apply` attempts (the punch
+/// window outlives a tick, so the next tick's request was rejected by
+/// `try_start_punch` — "punch already in flight; skipping" — and immediately
+/// retried the instant the guard released) and kept the driver's transient
+/// same-port `SO_REUSEPORT` punch socket (`punch::punch_candidates`) open
+/// almost continuously. That socket shares the WG listen port with
+/// `RelayTransport`'s local downlink delivery target (`ensure_relay_transport`
+/// binds its `local_peer_hint` at `127.0.0.1:<wg_listen_port>`, the very
+/// address boringtun's own socket listens on), so the kernel's
+/// `SO_REUSEPORT` load-balancing intermittently steered inbound relayed WG
+/// datagrams to the punch socket instead of boringtun's — silently starving
+/// an otherwise-healthy relay path of traffic, which is what actually broke
+/// case 1, not a bad state-machine transition. See
+/// docs/research/cycle4c-relay-stability-note.md. Note this only makes the
+/// RELAY path stable; a genuine `Relayed -> Direct` cutover for a pair whose
+/// NAT kind allows it was already correct (`punch_and_apply` only repoints
+/// the WG endpoint on a CONFIRMED candidate — never blindly) and is
+/// unaffected. For a symmetric<->symmetric pair specifically (this test's
+/// scenario), the punch can never confirm at all (`nat_matrix.rs`'s
+/// `case2_symmetric_relay_needed` already proves that for this NAT kind), so
+/// a real Direct cutover from `Relayed` for that pairing is out of scope here
+/// (Cycle 4c fast-follow, alongside `nat_matrix.rs`'s existing 4b-only
+/// direct-cutover coverage) — this fix's job is only to stop that
+/// known-futile probe from also breaking the relay path it's running
+/// alongside.
 async fn run_path_ticks(ctx: PathCtx) {
     // Last handshake time we've observed per peer, to detect *advancement*
     // (a repeated identical timestamp must NOT re-fire `on_handshake`).
@@ -747,14 +777,39 @@ async fn run_path_ticks(ctx: PathCtx) {
 
         // Snapshot desired state (guard dropped immediately).
         let Some(ds) = ctx.desired.lock().unwrap().clone() else { continue };
+        let desired_gids: HashSet<u64> = ds.peers.iter().map(|p| p.gateway_id).collect();
+
+        // Review/debug cleanup (Cycle 4c Task 9 minor): a peer dropped from
+        // desired state (removed from the fabric, or this segment's gateway
+        // deprovisioned) otherwise left its `relay_pointed`/`relay_transports`
+        // entries around forever — unbounded growth over the controller's
+        // lifetime, and a live `RelayTransport` (QUIC connection + two pump
+        // tasks) leaked open for a peer nothing references anymore. Prune
+        // both, closing any stale transport exactly like the make-before-break
+        // teardown does elsewhere in this function.
+        ctx.relay_pointed.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
+        ctx.relay_next_idx.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
 
         // Snapshot which peers currently have a healthy relay transport
         // (single `tokio::sync::Mutex` acquisition for the whole tick, ahead
         // of the `std::sync::Mutex` `paths` scope below so the two guards
-        // are never held simultaneously).
+        // are never held simultaneously). Also prunes/closes any transport
+        // for a peer no longer in desired state (same rationale as above).
         let relays_advertised = !ds.relays.is_empty();
         let healthy_relay: HashMap<u64, bool> = {
-            let map = ctx.relay_transports.lock().await;
+            let mut map = ctx.relay_transports.lock().await;
+            let stale: Vec<u64> =
+                map.keys().copied().filter(|gid| !desired_gids.contains(gid)).collect();
+            for gid in stale {
+                if let Some(peer_relay) = map.remove(&gid) {
+                    peer_relay.transport.close();
+                    eprintln!(
+                        "wiremesh-gateway: peer={gid} no longer in desired state; tore down \
+                         relay={} transport",
+                        peer_relay.relay_id
+                    );
+                }
+            }
             ds.peers
                 .iter()
                 .map(|p| {
