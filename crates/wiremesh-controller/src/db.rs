@@ -1849,6 +1849,134 @@ impl Db {
         Ok(())
     }
 
+    /// (Key-rotation Task 3) Promotes a real-keyed `pending` epoch to
+    /// `active`, demoting the prior `active` row (if any) to `retiring` — the
+    /// make-before-break completion `rotation::decide`'s `Promote` decision
+    /// drives. ONE transaction: verifies `(gateway_id, epoch)` is currently
+    /// `state = 'pending'` AND its pubkey is NOT the `"awaiting-submission"`
+    /// sentinel (bailing otherwise — this must never promote a sentinel, the
+    /// same invariant [`RotationState::pending_has_real_key`]/`decide`'s rule
+    /// 2 enforce one layer up; this is the DB-layer backstop), demotes
+    /// whatever row is currently `active` to `retiring`, flips the target
+    /// epoch to `active`, and bumps the persisted revision — all atomically,
+    /// so a caller observing success can rely on the projection revision
+    /// having advanced together with the state flip.
+    pub fn promote_epoch(&self, gateway_id: i64, epoch: u32) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let is_real_pending: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM gateway_key \
+             WHERE gateway_id = ?1 AND epoch = ?2 AND state = 'pending' \
+               AND pubkey != 'awaiting-submission')",
+            params![gateway_id, epoch],
+            |row| row.get(0),
+        )?;
+        if !is_real_pending {
+            tx.rollback()?;
+            anyhow::bail!(
+                "promote_epoch: no real-keyed pending epoch {epoch} for gateway {gateway_id} \
+                 (already promoted, wrong state, or still holding the sentinel pubkey)"
+            );
+        }
+
+        tx.execute(
+            "UPDATE gateway_key SET state = 'retiring' WHERE gateway_id = ?1 AND state = 'active'",
+            params![gateway_id],
+        )?;
+        tx.execute(
+            "UPDATE gateway_key SET state = 'active' WHERE gateway_id = ?1 AND epoch = ?2",
+            params![gateway_id, epoch],
+        )?;
+
+        bump_revision_tx(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// (Key-rotation Task 3) Retires (deletes) a `retiring` epoch — the tail
+    /// end of make-before-break, run [`RETIRE_GRACE`](crate::rotation::RETIRE_GRACE)
+    /// after [`Db::promote_epoch`] committed. ONE transaction: deletes the
+    /// `(gateway_id, epoch)` row IFF it's currently `state = 'retiring'`
+    /// (bailing if zero rows matched — a caller asking to retire something
+    /// that isn't actually in `retiring` state is a driver bug, not a
+    /// silent no-op), then bumps the persisted revision.
+    pub fn retire_epoch(&self, gateway_id: i64, epoch: u32) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let changed = tx.execute(
+            "DELETE FROM gateway_key WHERE gateway_id = ?1 AND epoch = ?2 AND state = 'retiring'",
+            params![gateway_id, epoch],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            anyhow::bail!(
+                "retire_epoch: no 'retiring' epoch {epoch} for gateway {gateway_id} to retire"
+            );
+        }
+
+        bump_revision_tx(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// (Key-rotation Task 3) Drops a rotation that never received a real key
+    /// within [`ABORT_AFTER`](crate::rotation::ABORT_AFTER) — non-destructive:
+    /// only the `pending` sentinel row is deleted, the prior `active` epoch
+    /// is untouched (it was never demoted, since `promote_epoch` never ran
+    /// for this epoch). ONE transaction: deletes the `(gateway_id, epoch)`
+    /// row IFF it's currently `state = 'pending'` (bailing if zero rows
+    /// matched), then bumps the persisted revision.
+    pub fn drop_pending_epoch(&self, gateway_id: i64, epoch: u32) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let changed = tx.execute(
+            "DELETE FROM gateway_key WHERE gateway_id = ?1 AND epoch = ?2 AND state = 'pending'",
+            params![gateway_id, epoch],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            anyhow::bail!(
+                "drop_pending_epoch: no 'pending' epoch {epoch} for gateway {gateway_id} to abort"
+            );
+        }
+
+        bump_revision_tx(&tx)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// (Key-rotation Task 3) Atomic combination of [`Db::all_keys_for_gateway`]
+    /// + [`Db::current_revision`]: acquires the connection `Mutex` guard
+    /// exactly ONCE and reads both the gateway's full key set AND the
+    /// persisted revision while holding it, so the pair is a single
+    /// consistent snapshot — mirrors [`Db::relays_snapshot`]'s doc comment
+    /// (same TOCTOU rationale: a `KeyRotated` delta must never carry a key
+    /// set tagged with a revision from a different point in time than the
+    /// key set itself was read at).
+    pub fn keys_snapshot(&self, gateway_id: i64) -> Result<(Vec<GatewayKeyRow>, u64)> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT epoch, pubkey, state FROM gateway_key \
+             WHERE gateway_id = ?1 \
+             ORDER BY epoch",
+        )?;
+        let keys = stmt
+            .query_map(params![gateway_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
+        let revision: i64 = conn.query_row(
+            "SELECT revision FROM state_revision WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok((keys, revision as u64))
+    }
+
     /// (Task 12, G-7) Drains `gateway_id`: revokes every still-unrevoked
     /// `certificate` row of its (`revoked_at = now`), marks its `gateway` row
     /// `status = 'removed'` (dropping it out of

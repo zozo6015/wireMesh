@@ -16,10 +16,11 @@
 //! field in `WatchRequest`) is trusted as identity — `WatchRequest` is
 //! (deliberately) an empty message.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use base64::Engine as _;
 use tokio::sync::{broadcast, mpsc, Mutex};
@@ -38,6 +39,7 @@ use wiremesh_proto::v1::{
 use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
 use crate::db_async::DbHandle;
 use crate::projection::{self, ChangeEvent};
+use crate::rotation::{self, RotationDecision, RotationState};
 
 pub type WatchStream = Pin<Box<dyn Stream<Item = Result<SyncMessage, Status>> + Send + 'static>>;
 
@@ -81,6 +83,37 @@ pub struct SyncSvc {
     /// behind this async mutex makes each decision atomic with respect to
     /// the live vote map.
     relay_health: Arc<Mutex<HashMap<i64, HashMap<i64, bool>>>>,
+    /// (Key-rotation Task 3) Ephemeral per-gateway rotation tracker, keyed by
+    /// the ROTATING gateway's id: `RotationTracker { pending_epoch,
+    /// prior_active_epoch, started_at, promoted_at, live_acks }`. Deliberately
+    /// NOT threaded in from `AdminSvc::rotate_key` at rotation-start time —
+    /// this crate uses a LAZY-REBUILD approach instead (see
+    /// `SyncSvc::drive_rotation`'s doc comment): the first time a Report's
+    /// `epoch_acks` or a `SubmitEpochKey` call touches a gateway that has a
+    /// DB `pending` epoch but no entry here yet, one is constructed on the
+    /// spot with `started_at = Instant::now()`. This is smaller than also
+    /// threading a shared `Arc` into `AdminSvc` (which is constructed before
+    /// the broker/registry exist in `lib.rs::serve`), and it gives correct
+    /// crash-recovery behavior for free: a controller restart simply rebuilds
+    /// every in-flight rotation's tracker (with a fresh grace/abort clock)
+    /// from whatever `pending` rows are still in the DB, rather than losing
+    /// track of them until an operator notices. `tokio::sync::Mutex` for the
+    /// same reason as `relay_health` — the guard is held across `.await`
+    /// points (DB reads/writes) in the read-decide-write critical section.
+    rotations: Arc<Mutex<HashMap<i64, RotationTracker>>>,
+}
+
+/// (Key-rotation Task 3) One gateway's in-flight rotation bookkeeping, kept
+/// in memory only (never persisted — see [`SyncSvc::rotations`]'s doc
+/// comment for the lazy-rebuild/crash-recovery story). Converted into a
+/// [`RotationState`] fresh on every `drive_rotation` call, alongside a live
+/// DB read for the real-key flag and the broker's live connected-peer set.
+struct RotationTracker {
+    pending_epoch: u32,
+    prior_active_epoch: u32,
+    started_at: Instant,
+    promoted_at: Option<Instant>,
+    live_acks: BTreeSet<u64>,
 }
 
 impl SyncSvc {
@@ -94,6 +127,7 @@ impl SyncSvc {
             change_tx,
             broker,
             relay_health: Arc::new(Mutex::new(HashMap::new())),
+            rotations: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -130,6 +164,173 @@ impl SyncSvc {
             let _ = self
                 .change_tx
                 .send(ChangeEvent::RelaysChanged { relay_infos, revision });
+        }
+    }
+
+    /// (Key-rotation Task 3) Runs one round of the ack-driven promote/retire/
+    /// abort state machine for `rotating_gateway_id`: (re)builds a
+    /// [`RotationState`] snapshot, calls [`rotation::decide`], and executes
+    /// whatever it returns. Called from both `report` (after recording any
+    /// `epoch_acks` targeting this gateway) and `submit_epoch_key` (a real
+    /// key arriving may itself immediately satisfy an already-fully-acked
+    /// rotation).
+    ///
+    /// LAZY-REBUILD: if `self.rotations` has no tracker for this gateway yet,
+    /// one is constructed here — but ONLY if the DB currently shows a
+    /// `pending` epoch for it; a gateway with no pending epoch has nothing in
+    /// flight, so this is a no-op. See `SyncSvc::rotations`'s doc comment for
+    /// why this (rather than seeding a tracker at `AdminSvc::rotate_key` time)
+    /// is this crate's chosen approach.
+    ///
+    /// Best-effort: every DB error along the way is logged and swallowed
+    /// rather than propagated, so a transient DB blip while driving a
+    /// rotation never fails the CALLER's own RPC (a `Report` whose acks
+    /// already recorded successfully, or a `SubmitEpochKey` whose real key
+    /// already committed) — the next Report/SubmitEpochKey call simply
+    /// re-drives the same decision.
+    ///
+    /// Locking note: this acquires `self.rotations` itself (a *second*,
+    /// separate critical section from the one `report`'s `epoch_acks` block
+    /// uses to record incoming acks) rather than being handed an
+    /// already-held guard — `tokio::sync::Mutex` is not reentrant, so a
+    /// single `drive_rotation` helper reusable from both `report` and
+    /// `submit_epoch_key` cannot also be called while the caller still holds
+    /// the same lock. `report`'s ack-recording block therefore fully
+    /// completes (and releases the guard) before calling this per touched
+    /// rotating gateway — still one continuous synchronous span with no
+    /// intervening `.await` back out to the caller's caller, just not
+    /// literally one unbroken lock hold across both phases.
+    async fn drive_rotation(&self, rotating_gateway_id: i64) {
+        let keys = match self.db.all_keys_for_gateway(rotating_gateway_id).await {
+            Ok(k) => k,
+            Err(e) => {
+                eprintln!(
+                    "wiremesh-controller: drive_rotation({rotating_gateway_id}) failed reading \
+                     keys: {e}"
+                );
+                return;
+            }
+        };
+
+        let mut rotations = self.rotations.lock().await;
+
+        if !rotations.contains_key(&rotating_gateway_id) {
+            if let Some((pending_epoch, _, _)) =
+                keys.iter().find(|(_, _, state)| state == "pending")
+            {
+                let prior_active_epoch = keys
+                    .iter()
+                    .find(|(_, _, state)| state == "active")
+                    .map(|(epoch, _, _)| *epoch as u32)
+                    .unwrap_or(0);
+                rotations.insert(
+                    rotating_gateway_id,
+                    RotationTracker {
+                        pending_epoch: *pending_epoch as u32,
+                        prior_active_epoch,
+                        started_at: Instant::now(),
+                        promoted_at: None,
+                        live_acks: BTreeSet::new(),
+                    },
+                );
+            }
+        }
+
+        let Some(tracker) = rotations.get(&rotating_gateway_id) else {
+            // No DB `pending` epoch and no tracker already in flight (e.g. a
+            // stray ack about a gateway that isn't currently rotating, or a
+            // rotation whose retire already completed) — nothing to drive.
+            return;
+        };
+
+        let pending_has_real_key = keys
+            .iter()
+            .any(|(epoch, pubkey, state)| {
+                *epoch as u32 == tracker.pending_epoch
+                    && state == "pending"
+                    && pubkey != "awaiting-submission"
+            });
+
+        let expected_peers: BTreeSet<u64> = self
+            .broker
+            .connected_gateway_ids()
+            .into_iter()
+            .filter(|id| *id != rotating_gateway_id)
+            .map(|id| id as u64)
+            .collect();
+
+        let state = RotationState {
+            pending_epoch: tracker.pending_epoch,
+            pending_has_real_key,
+            prior_active_epoch: tracker.prior_active_epoch,
+            started_at: tracker.started_at,
+            promoted_at: tracker.promoted_at,
+            expected_peers,
+            live_acks: tracker.live_acks.clone(),
+        };
+
+        match rotation::decide(&state, Instant::now()) {
+            RotationDecision::Wait => {}
+            RotationDecision::Promote { epoch } => {
+                match self.db.promote_epoch(rotating_gateway_id, epoch).await {
+                    Ok(()) => {
+                        if let Some(t) = rotations.get_mut(&rotating_gateway_id) {
+                            t.promoted_at = Some(Instant::now());
+                        }
+                        if let Err(e) =
+                            projection::emit_key_rotated(&self.db, &self.change_tx, rotating_gateway_id)
+                                .await
+                        {
+                            eprintln!(
+                                "wiremesh-controller: emit_key_rotated after promote({rotating_gateway_id}, \
+                                 {epoch}) failed: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "wiremesh-controller: promote_epoch({rotating_gateway_id}, {epoch}) failed: {e}"
+                    ),
+                }
+            }
+            RotationDecision::Retire { epoch } => {
+                match self.db.retire_epoch(rotating_gateway_id, epoch).await {
+                    Ok(()) => {
+                        rotations.remove(&rotating_gateway_id);
+                        if let Err(e) =
+                            projection::emit_key_rotated(&self.db, &self.change_tx, rotating_gateway_id)
+                                .await
+                        {
+                            eprintln!(
+                                "wiremesh-controller: emit_key_rotated after retire({rotating_gateway_id}, \
+                                 {epoch}) failed: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "wiremesh-controller: retire_epoch({rotating_gateway_id}, {epoch}) failed: {e}"
+                    ),
+                }
+            }
+            RotationDecision::Abort { epoch, reason } => {
+                match self.db.drop_pending_epoch(rotating_gateway_id, epoch).await {
+                    Ok(()) => {
+                        rotations.remove(&rotating_gateway_id);
+                        if let Err(e) =
+                            projection::emit_key_rotated(&self.db, &self.change_tx, rotating_gateway_id)
+                                .await
+                        {
+                            eprintln!(
+                                "wiremesh-controller: emit_key_rotated after abort({rotating_gateway_id}, \
+                                 {epoch}) failed: {e}"
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "wiremesh-controller: drop_pending_epoch({rotating_gateway_id}, {epoch}) \
+                         (reason: {reason}) failed: {e}"
+                    ),
+                }
+            }
         }
     }
 }
@@ -442,6 +643,71 @@ impl Sync for SyncSvc {
             // block proceed.
         }
 
+        // (Key-rotation Task 3) Ack-driven rotation pipeline. Per the ack
+        // direction rule (see `.superpowers/sdd/task-3-brief.md`): an
+        // `EpochAck{peer_gateway_id, epoch, live}` sent by THIS reporting
+        // gateway (`gw.id`) means "I (`gw.id`) have a live WireGuard session
+        // with the ROTATING gateway `peer_gateway_id`'s epoch `epoch` key" —
+        // so the ack advances `peer_gateway_id`'s tracker, recording that
+        // `gw.id` has acked, not the other way around.
+        //
+        // The `rotations` guard is held across this whole ack-recording
+        // loop (one critical section: read tracker-or-lazily-create-it,
+        // then mutate `live_acks`) so two concurrent `Report` calls acking
+        // the same rotating gateway can't interleave their inserts. It is
+        // then released BEFORE calling `drive_rotation` per touched
+        // rotating gateway below — see `drive_rotation`'s doc comment for
+        // why a single reusable helper can't also be called while this
+        // block still holds the same non-reentrant lock.
+        if !req.epoch_acks.is_empty() {
+            let mut touched_rotating_gateways: Vec<i64> = Vec::new();
+            {
+                let mut rotations = self.rotations.lock().await;
+                for ack in &req.epoch_acks {
+                    let rotating_id = ack.peer_gateway_id as i64;
+
+                    if !rotations.contains_key(&rotating_id) {
+                        if let Ok(keys) = self.db.all_keys_for_gateway(rotating_id).await {
+                            if let Some((pending_epoch, _, _)) =
+                                keys.iter().find(|(_, _, state)| state == "pending")
+                            {
+                                let prior_active_epoch = keys
+                                    .iter()
+                                    .find(|(_, _, state)| state == "active")
+                                    .map(|(epoch, _, _)| *epoch as u32)
+                                    .unwrap_or(0);
+                                rotations.insert(
+                                    rotating_id,
+                                    RotationTracker {
+                                        pending_epoch: *pending_epoch as u32,
+                                        prior_active_epoch,
+                                        started_at: Instant::now(),
+                                        promoted_at: None,
+                                        live_acks: BTreeSet::new(),
+                                    },
+                                );
+                            }
+                        }
+                    }
+
+                    if let Some(tracker) = rotations.get_mut(&rotating_id) {
+                        if ack.epoch == tracker.pending_epoch && ack.live {
+                            tracker.live_acks.insert(gw.id as u64);
+                        }
+                    }
+
+                    if !touched_rotating_gateways.contains(&rotating_id) {
+                        touched_rotating_gateways.push(rotating_id);
+                    }
+                }
+                // `rotations` (the guard) drops here.
+            }
+
+            for rotating_id in touched_rotating_gateways {
+                self.drive_rotation(rotating_id).await;
+            }
+        }
+
         Ok(Response::new(ReportResponse {}))
     }
 
@@ -493,6 +759,15 @@ impl Sync for SyncSvc {
             })?;
 
         projection::emit_key_rotated(&self.db, &self.change_tx, gw.id).await?;
+
+        // (Key-rotation Task 3) A real key arriving may itself immediately
+        // satisfy an already-fully-acked rotation (e.g. peers acked the
+        // still-sentinel epoch's eventual real key before this submission —
+        // though in practice a peer can't have a live WG session with a
+        // sentinel, so this mainly matters once acks and submission race).
+        // Drive the same decide-and-execute `report`'s `epoch_acks` block
+        // uses.
+        self.drive_rotation(gw.id).await;
 
         Ok(Response::new(SubmitEpochKeyResponse {}))
     }

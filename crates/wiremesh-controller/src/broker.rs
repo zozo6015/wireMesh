@@ -136,6 +136,21 @@ impl Broker {
         }
     }
 
+    /// (Key-rotation Task 3) The gateway ids currently registered in the
+    /// punch registry — i.e. every gateway with a currently-open `Sync.Watch`
+    /// stream. Used by `SyncSvc::drive_rotation` to compute a rotation's
+    /// `expected_peers` (every OTHER currently-connected gateway, since only
+    /// a peer that's actually connected right now can plausibly have acked a
+    /// live WireGuard session with the rotating epoch). Not `async` — the
+    /// registry is a plain `std::sync::Mutex`, held only long enough to copy
+    /// the keys out.
+    pub fn connected_gateway_ids(&self) -> Vec<i64> {
+        match self.registry.lock() {
+            Ok(reg) => reg.keys().copied().collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
     /// Trigger (a): a gateway's `Watch` stream just opened. Resets the periodic
     /// budget for every pair this gateway belongs to (a fresh connection is a
     /// fresh opportunity) and attempts a punch for each — a no-op for any peer

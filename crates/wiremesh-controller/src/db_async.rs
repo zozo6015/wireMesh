@@ -212,6 +212,33 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.set_epoch_pubkey(gateway_id, epoch, &pubkey)).await?
     }
 
+    /// See [`Db::promote_epoch`].
+    pub async fn promote_epoch(&self, gateway_id: i64, epoch: u32) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.promote_epoch(gateway_id, epoch)).await?
+    }
+
+    /// See [`Db::retire_epoch`].
+    pub async fn retire_epoch(&self, gateway_id: i64, epoch: u32) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.retire_epoch(gateway_id, epoch)).await?
+    }
+
+    /// See [`Db::drop_pending_epoch`].
+    pub async fn drop_pending_epoch(&self, gateway_id: i64, epoch: u32) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.drop_pending_epoch(gateway_id, epoch)).await?
+    }
+
+    /// See [`Db::keys_snapshot`]. Reads a gateway's full key set and the
+    /// persisted revision as one atomic pair (single lock hold) — see
+    /// [`Db::keys_snapshot`]'s doc comment for why this matters for
+    /// `KeyRotated` emission.
+    pub async fn keys_snapshot(&self, gateway_id: i64) -> Result<(Vec<GatewayKeyRow>, u64)> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.keys_snapshot(gateway_id)).await?
+    }
+
     /// See [`Db::gateway_identity_by_id`].
     pub async fn gateway_identity_by_id(&self, gateway_id: i64) -> Result<Option<GatewayIdentity>> {
         let db = self.inner.clone();

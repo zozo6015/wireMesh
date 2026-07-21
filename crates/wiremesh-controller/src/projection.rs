@@ -485,6 +485,16 @@ pub async fn build_snapshot(
 /// `change_tx.send`'s only error case (no current `Sync.Watch` subscribers)
 /// is not a failure and is silently ignored, mirroring every other
 /// best-effort publish in this crate.
+///
+/// (Key-rotation Task 3) `keys`/`revision` are read via
+/// [`crate::db_async::DbHandle::keys_snapshot`] — a single atomic lock hold
+/// over BOTH reads, not two separate `all_keys_for_gateway` +
+/// `current_revision` calls — so a `KeyRotated` delta's key set and the
+/// revision it's tagged with are always a single consistent snapshot. See
+/// [`crate::db::Db::keys_snapshot`]'s doc comment (mirrors
+/// [`crate::db::Db::relays_snapshot`]'s identical TOCTOU rationale): without
+/// this, a promote/retire racing a concurrent mutation between two separate
+/// reads could broadcast a stale key set tagged with a newer revision.
 pub(crate) async fn emit_key_rotated(
     db: &DbHandle,
     change_tx: &broadcast::Sender<ChangeEvent>,
@@ -503,14 +513,10 @@ pub(crate) async fn emit_key_rotated(
         .cidrs_for_segment(identity.segment_id)
         .await
         .map_err(|e| Status::internal(format!("reading segment cidrs after key change: {e}")))?;
-    let keys = db
-        .all_keys_for_gateway(gateway_id)
+    let (keys, revision) = db
+        .keys_snapshot(gateway_id)
         .await
         .map_err(|e| Status::internal(format!("reading gateway keys after key change: {e}")))?;
-    let revision = db
-        .current_revision()
-        .await
-        .map_err(|e| Status::internal(format!("reading revision after key change: {e}")))?;
 
     let _ = change_tx.send(ChangeEvent::KeyRotated {
         gateway_id,

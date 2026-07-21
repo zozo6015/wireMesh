@@ -946,6 +946,62 @@ impl StubGateway {
         Ok(())
     }
 
+    /// (Key-rotation Task 3) Additive counterpart to [`Self::report`] that
+    /// populates `ReportRequest.epoch_acks` instead — what a real gateway's
+    /// own WireGuard UAPI-driven liveness check (a later task) will
+    /// eventually compute, stood in here by a caller-supplied
+    /// `(peer_gateway_id, epoch, live)` list. Per the ack-direction rule
+    /// (`.superpowers/sdd/task-3-brief.md`): calling
+    /// `b.report_epoch_acks(_, &[(a.id(), n, true)])` means "B has a live
+    /// WireGuard session with rotating-gateway A's epoch-n key" — the ack is
+    /// recorded against A (the rotating gateway), not B (the reporter).
+    /// Mirrors [`Self::report_with_relay_health`]'s connection setup exactly.
+    pub async fn report_epoch_acks(
+        &self,
+        applied_version: u64,
+        acks: &[(u64, u32, bool)],
+    ) -> anyhow::Result<()> {
+        let uri = format!("https://{}", self.sync_addr);
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
+            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
+            .tls_config(tls)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "configuring StubGateway mTLS for Sync.Report (epoch acks): {e}"
+                )
+            })?
+            .connect()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "connecting to the controller's Sync (mTLS) TCP port for Sync.Report \
+                     (epoch acks): {e}"
+                )
+            })?;
+
+        SyncClient::new(channel)
+            .report(ReportRequest {
+                applied_version,
+                local_endpoints: vec![],
+                relay_health: vec![],
+                epoch_acks: acks
+                    .iter()
+                    .map(|(peer_gateway_id, epoch, live)| wiremesh_proto::v1::EpochAck {
+                        peer_gateway_id: *peer_gateway_id,
+                        epoch: *epoch,
+                        live: *live,
+                    })
+                    .collect(),
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("Sync.Report (epoch acks) failed: {status}"))?;
+        Ok(())
+    }
+
     /// Ensures this gateway's identity bundle (leaf cert, private key
     /// (`0600`), CA bundle) is durably on disk under `state_dir()` — the
     /// fail-static posture `fail_static.rs` exercises: a gateway must not
