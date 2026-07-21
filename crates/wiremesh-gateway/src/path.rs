@@ -128,6 +128,12 @@ impl Path {
         self.state = PathState::Direct;
         self.degraded_since = None;
         self.disconnected_since = None;
+        // Review fix (4c Task 8, IMPORTANT): a completed handshake means the
+        // path recovered, so the next disconnect should start backoff fresh
+        // rather than inheriting an already-escalated value from an earlier,
+        // unrelated disconnect (which could otherwise push a later relay
+        // re-path past the <=15s SLA).
+        self.backoff = BACKOFF_INITIAL;
     }
 
     /// Any authenticated inbound datagram (keepalive or data) that isn't

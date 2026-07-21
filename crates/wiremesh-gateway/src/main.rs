@@ -13,7 +13,7 @@ use wiremesh_gateway::enforce::GatewayEnforcer;
 use wiremesh_gateway::identity::Identity;
 use wiremesh_gateway::metrics;
 use wiremesh_gateway::path::{Path, PathAction, PathState};
-use wiremesh_gateway::relay::RelayTransport;
+use wiremesh_gateway::relay::{relay_pair_id, RelayTransport};
 use wiremesh_gateway::state::DesiredState;
 use wiremesh_gateway::tunnel::Tunnel;
 use wiremesh_gateway::{netif, observe, punch, reconcile, routes, sync, uapi};
@@ -594,8 +594,15 @@ async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_pro
     };
 
     let identity = ctx.identity.clone();
-    let my_id = identity.gateway_id.to_string();
-    let peer_id = gid.to_string();
+    // Review fix (4c Task 8, CRITICAL): register under a directional,
+    // per-pair id rather than this gateway's raw `gateway_id` — otherwise
+    // relaying 2+ peers through one relay collides in the relay's registry
+    // (see `relay_pair_id`'s doc). This gateway's transport-for-`gid`
+    // registers as `relay_pair_id(mine, gid)` and targets `relay_pair_id(gid,
+    // mine)`, which is exactly the id `gid`'s own transport-for-us registers
+    // under, so the two sides rendezvous.
+    let my_id = relay_pair_id(identity.gateway_id, gid);
+    let peer_id = relay_pair_id(gid, identity.gateway_id);
     let transport = match RelayTransport::start(
         addr,
         &identity.cert_pem,

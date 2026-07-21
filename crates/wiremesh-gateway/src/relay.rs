@@ -161,6 +161,31 @@ impl Drop for RelayTransport {
     }
 }
 
+/// Directional, deterministic per-(gateway,peer) relay registration id.
+///
+/// Review fix (4c Task 8, CRITICAL): every peer's `RelayTransport` used to
+/// register at the relay under this gateway's raw `gateway_id`, so a gateway
+/// relaying 2+ peers through one relay collided in the relay's
+/// `HashMap<[u8; 8], Connection>` registry and one peer's downlink silently
+/// died. Hashing `(my_gateway_id, peer_gateway_id)` in that order gives each
+/// ordered pair its own id, so gateway A's transport-for-B and A's
+/// transport-for-C never collide, while A's transport-for-B and B's
+/// transport-for-A still rendezvous at the relay by design (main.rs calls
+/// this with the arguments swapped on each side).
+///
+/// 32-bit id space (first 4 bytes of a SHA-256 digest, hex-encoded to 8 ASCII
+/// bytes to fit the relay's 8-byte truncated registration id): collision-safe
+/// at v1's ≤50-segment/~1225-pair scale; a wider raw-`[u8; 8]` id or a single
+/// per-(gateway,relay) multiplexed connection is a documented fast-follow.
+pub fn relay_pair_id(my_gateway_id: u64, peer_gateway_id: u64) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(my_gateway_id.to_be_bytes());
+    hasher.update(peer_gateway_id.to_be_bytes());
+    let digest = hasher.finalize();
+    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
