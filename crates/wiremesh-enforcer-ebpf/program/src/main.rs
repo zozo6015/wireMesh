@@ -454,7 +454,31 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     let now = unsafe { bpf_ktime_get_ns() };
 
     // 1) reply of an inside-initiated flow? (egress recorded src=inside)
-    let rev = FlowKey { src: dst, dst: src, sport: dport, dport: sport, proto, _pad: [0; 3] };
+    //
+    // Cycle 4c Task 9 fix: the reverse key must NOT swap sport/dport for
+    // ICMP. For tcp/udp, `ports_at` returns genuinely directional ports, so
+    // a reply's OWN (sport, dport) is the ORIGINAL request's (dport, sport)
+    // — swapping both address and port pairs correctly reconstructs the
+    // request's recorded key. But `ports_at`'s icmp arm returns (identifier,
+    // 0) for BOTH the echo request AND its matching echo reply (the
+    // identifier is copied verbatim by the replier; there is no separate
+    // "source port" to swap) — applying the tcp/udp-style port swap to icmp
+    // produces {sport: 0, dport: identifier}, which never matches the
+    // {sport: identifier, dport: 0} recorded at egress for the ORIGINAL
+    // request. That silently defeated icmp's fast-path return-traffic match
+    // for every echo reply, falling through to rule evaluation — where a
+    // typical one-directional `allow` rule (e.g. seg-a -> seg-b only, no
+    // matching seg-b -> seg-a rule) then default-denies the reply outright.
+    // First caught by `wiremesh-gateway/tests/relay_matrix.rs`'s case 1 (the
+    // first netns-conformance test to exercise icmp at all; every prior one
+    // uses tcp). Only the address pair is swapped for icmp; the (sport,
+    // dport) tuple is carried through unchanged since it's already in the
+    // form the original request was recorded under.
+    let rev = if proto == 1 {
+        FlowKey { src: dst, dst: src, sport, dport, proto, _pad: [0; 3] }
+    } else {
+        FlowKey { src: dst, dst: src, sport: dport, dport: sport, proto, _pad: [0; 3] }
+    };
     if flow_hit(&rev, proto, now, true) {
         bump(CTR_FLOW_HIT);
         return Ok(TC_ACT_PIPE);

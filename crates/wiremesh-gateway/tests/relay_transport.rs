@@ -80,10 +80,14 @@ async fn relay_transport_bridges_datagrams_between_two_gateways() {
     let gwb_cert = std::fs::read_to_string(dir.join("gw-B.pem")).expect("read gw-B.pem");
     let gwb_key = std::fs::read_to_string(dir.join("gw-B.key")).expect("read gw-B.key");
 
-    let a = RelayTransport::start(relay_addr, &gwa_cert, &gwa_key, &ca_pem, "gw-A", "gw-B")
+    // `None`: this test deliberately exercises the generic learn-from-first-
+    // datagram path (throwaway sockets standing in for "unknown ahead of
+    // time" local peers) — see `RelayTransport::start`'s doc comment on
+    // `local_peer_hint`.
+    let a = RelayTransport::start(relay_addr, &gwa_cert, &gwa_key, &ca_pem, "gw-A", "gw-B", None)
         .await
         .expect("gw-A RelayTransport::start (connect+register+pumps)");
-    let b = RelayTransport::start(relay_addr, &gwb_cert, &gwb_key, &ca_pem, "gw-B", "gw-A")
+    let b = RelayTransport::start(relay_addr, &gwb_cert, &gwb_key, &ca_pem, "gw-B", "gw-A", None)
         .await
         .expect("gw-B RelayTransport::start (connect+register+pumps)");
 

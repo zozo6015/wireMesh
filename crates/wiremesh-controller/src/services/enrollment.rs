@@ -137,6 +137,18 @@ impl Enrollment for EnrollmentSvc {
                     CertProfile {
                         subject_cn: relay_name.clone(),
                         ttl: GATEWAY_CERT_TTL,
+                        // The relay's QUIC server cert MUST carry SAN
+                        // "relay" — every gateway's relay client dials it
+                        // with `wiremesh_relay::RELAY_SERVER_NAME` ("relay")
+                        // as both the QUIC SNI and the rustls
+                        // hostname-verification target (see
+                        // `wiremesh_relay::Client::connect_with_pems`); a
+                        // leaf with zero SANs fails that check outright, no
+                        // matter what CN it carries. This is CA-decided
+                        // (the relay's CSR is never consulted for it), so it
+                        // can't be smuggled by a non-relay token that
+                        // happens to hit this branch.
+                        subject_alt_names: vec!["relay".to_string()],
                     },
                 )
                 .await
@@ -249,6 +261,9 @@ impl Enrollment for EnrollmentSvc {
                 CertProfile {
                     subject_cn: gateway_name.clone(),
                     ttl: GATEWAY_CERT_TTL,
+                    // Unchanged behavior: gateway certs are mTLS CLIENTS,
+                    // verified by chain, not by hostname — no SAN needed.
+                    subject_alt_names: vec![],
                 },
             )
             .await

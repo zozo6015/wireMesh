@@ -57,6 +57,16 @@ pub struct CertProfile {
     pub subject_cn: String,
     /// Requested lifetime of the leaf, from the moment of issuance.
     pub ttl: StdDuration,
+    /// Subject Alternative Names the CA has decided to stamp onto the issued
+    /// leaf — e.g. `["relay"]` for a relay's QUIC server cert, so that
+    /// rustls hostname verification (`wiremesh_relay::RELAY_SERVER_NAME`)
+    /// succeeds against it. **The caller (controller service code), not the
+    /// CSR, decides this list** — [`EmbeddedTrust::sign`] never reads SANs
+    /// out of the CSR itself (see that method's doc comment); this field is
+    /// the one and only source of truth for a leaf's SANs. An ordinary
+    /// gateway cert has no need of a SAN (gateways are mTLS *clients*,
+    /// verified by chain, not by hostname) and passes an empty `Vec` here.
+    pub subject_alt_names: Vec<String>,
 }
 
 /// A byte value paired with a monotonically increasing version number, as
@@ -235,14 +245,19 @@ impl CertificateIssuer for EmbeddedTrust {
         // key from the CSR and rebuild the leaf's parameters from scratch.
         // Any subject DN entries, SANs, key-usages, or extensions the CSR
         // requested are discarded — a gateway cannot smuggle a CN, SAN, or
-        // extension of its choosing into the issued cert.
+        // extension of its choosing into the issued cert. The ONLY SANs that
+        // ever land on the leaf are `profile.subject_alt_names` — chosen by
+        // the CALLER (controller service code), never read from the CSR
+        // itself. This is how a relay's QUIC server cert gets its required
+        // `"relay"` SAN (see `services::enrollment`'s relay branch) while an
+        // ordinary gateway cert (an mTLS client cert, verified by chain, not
+        // hostname) still gets none.
         let public_key = csr.public_key;
-        let mut params = CertificateParams::new(Vec::<String>::new())
+        let mut params = CertificateParams::new(profile.subject_alt_names.clone())
             .context("building leaf certificate params")?;
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, profile.subject_cn.as_str());
         params.distinguished_name = dn;
-        params.subject_alt_names.clear();
         params.key_usages.clear();
         params.extended_key_usages.clear();
         params.custom_extensions.clear();

@@ -46,6 +46,28 @@ impl RelayTransport {
     /// `relay_addr` with the given mTLS identity (registering as `my_id`),
     /// and spawns the uplink/downlink pumps bridging that local socket to
     /// `peer_id` over the relay.
+    ///
+    /// `local_peer_hint`, if given, seeds the downlink's `last_seen` address
+    /// UP FRONT instead of learning it from the first datagram the local
+    /// socket happens to receive (Cycle 4c Task 9 fix — see the module doc's
+    /// "last-seen socket dance" and `tests/relay_transport.rs`'s doc comment
+    /// for the generic udpshim-style chicken/egg this normally requires: a
+    /// relayed inbound datagram is dropped, silently, until the local peer
+    /// has sent at least one datagram of its own). The gateway's caller
+    /// (`main.rs::ensure_relay_transport`) always knows this in advance —
+    /// its own boringtun WG process is the only thing that will ever talk to
+    /// this local socket, always from its fixed, already-known
+    /// `127.0.0.1:<wg_listen_port>` — so there is no need to wait and learn
+    /// it: seeding it removes an otherwise-real risk that BOTH sides' very
+    /// first relayed handshake packets get silently dropped (each side's
+    /// `last_seen` still empty because neither had yet sent anything of its
+    /// own through its OWN transport), stalling the initial handshake until
+    /// boringtun's own retry timer eventually resolves it out-of-band —
+    /// slow enough to threaten a bounded conformance budget. `None` preserves
+    /// the original learn-from-first-datagram behavior (used by
+    /// `tests/relay_transport.rs`, which deliberately exercises that generic
+    /// path with throwaway sockets standing in for "unknown ahead of time"
+    /// peers).
     pub async fn start(
         relay_addr: SocketAddr,
         cert_pem: &str,
@@ -53,6 +75,7 @@ impl RelayTransport {
         ca_pem: &str,
         my_id: &str,
         peer_id: &str,
+        local_peer_hint: Option<SocketAddr>,
     ) -> Result<RelayTransport> {
         let sock = Arc::new(
             UdpSocket::bind("127.0.0.1:0")
@@ -65,7 +88,7 @@ impl RelayTransport {
             .await
             .with_context(|| format!("connect+register {my_id:?} with relay {relay_addr}"))?;
 
-        let last_seen: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let last_seen: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(local_peer_hint));
 
         // local socket -> relay
         let uplink = {
