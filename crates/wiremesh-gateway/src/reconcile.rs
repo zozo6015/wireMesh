@@ -18,6 +18,34 @@ pub fn peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerConfig> {
         .collect()
 }
 
+/// Peer-configs targeting each peer's real-keyed PENDING epoch. The pending
+/// endpoint reuses the peer's active-candidate IP with the UDP port offset by
+/// `(pending_epoch - active_epoch)`, matching the `base_wg_port + epoch` port
+/// convention both gateways use for their per-epoch Devices (key-rotation
+/// Task 6). A peer with no real pending key (active-only, or a sentinel
+/// pending) contributes nothing.
+pub fn pending_peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerConfig> {
+    ds.peers
+        .iter()
+        .filter_map(|p| {
+            let active = p.active_key()?;
+            let pending = p.pending_key()?;
+            let endpoint = p.primary_endpoint()?;
+            let (ip, port_str) = endpoint.rsplit_once(':')?;
+            let active_port: u16 = port_str.parse().ok()?;
+            let offset = pending.epoch.checked_sub(active.epoch)?;
+            let offset: u16 = offset.try_into().ok()?;
+            let pending_port = active_port.checked_add(offset)?;
+            Some(PeerConfig {
+                public_key_b64: pending.pubkey_b64.clone(),
+                endpoint: Some(format!("{ip}:{pending_port}")),
+                allowed_ips: p.allowed_ips.clone(),
+                keepalive_secs,
+            })
+        })
+        .collect()
+}
+
 pub fn device_config(
     ds: &DesiredState,
     private_key_b64: &str,
@@ -66,6 +94,7 @@ mod tests {
         PeerState {
             gateway_id: id, segment_name: format!("s{id}"),
             active_pubkey_b64: key.map(String::from),
+            keys: vec![],
             candidates: vec![format!("10.9.0.{id}:51820")],
             allowed_ips: vec![cidr.into()],
         }
