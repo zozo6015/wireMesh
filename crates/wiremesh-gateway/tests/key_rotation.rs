@@ -93,6 +93,30 @@ policy:
       - allow: { proto: icmp }
 "#;
 
+/// Fabric v2 for the "policy tightening after rotation" test — same
+/// ICMP-both-ways liveness rules as `FABRIC_ICMP_AND_TCP8080` (so the
+/// post-tighten liveness check keeps working), but the tcp/8080 seg-a ->
+/// seg-b allow rule has been REMOVED, so tcp/8080 becomes default-denied.
+/// This is the "v2" fabric applied AFTER the rotation completes to prove a
+/// policy tightening reaches whichever tun is actually carrying traffic
+/// post-cutover, not just `wg0`.
+const FABRIC_ICMP_ONLY_V2: &str = r#"
+segments:
+  - name: seg-a
+    cidrs: ["10.10.1.0/24"]
+  - name: seg-b
+    cidrs: ["10.10.2.0/24"]
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow: { proto: icmp }
+  - from: seg-b
+    to: seg-a
+    rules:
+      - allow: { proto: icmp }
+"#;
+
 // --- root-netns shell helpers (duplicated from mesh_milestone.rs) -----------
 
 fn run_root(args: &[&str]) {
@@ -758,4 +782,208 @@ async fn denied_flow_stays_denied_across_rotation() {
     pb.kill();
     drop(lab);
     eprintln!("\nDONE-BAR PASSED: default-deny holds across a key rotation — the enforcer stays attached to the new epoch tun.");
+}
+
+/// STEP 1 (old-epoch-teardown refactor) REGRESSION: a policy TIGHTENING
+/// applied AFTER a rotation has completed must reach whichever tun is
+/// actually carrying traffic post-cutover, not just `wg0`.
+///
+/// `denied_flow_stays_denied_across_rotation` (above) already proves that a
+/// STABLE policy (tcp/9090 never allowed) keeps being denied across a
+/// rotation — that only requires the new epoch's tun to get *an* enforcer
+/// attached at bring-up with the then-current policy. It does NOT prove
+/// that a policy CHANGE pushed after the cutover reaches that tun. Today,
+/// `apply_state` re-applies the (new) policy IR only to `wg0`'s enforcer —
+/// rotation tuns (`wg0e<N>`) receive the policy that was current at their
+/// bring-up and nothing since. So a tightening applied post-rotation (e.g.
+/// an operator revoking a previously-allowed port) would silently NOT take
+/// effect on the tun that is actually forwarding traffic — a default-deny
+/// bypass under a CHANGING policy.
+///
+/// Sequence: same direct mesh as the other two tests in this file, fabric
+/// v1 = ICMP both ways + tcp/8080 seg-a->seg-b allowed. Rotate gwA; confirm
+/// tcp/8080 still passes post-rotation (the new epoch tun works at all).
+/// Then push fabric v2 (`FABRIC_ICMP_ONLY_V2`), which drops the tcp/8080
+/// allow — seg-a->seg-b tcp/8080 becomes default-denied. Assert (bounded
+/// poll) that tcp/8080 stops passing. If it keeps passing, the tightening
+/// never reached the active tun's enforcer: the Step-1 gap this test exists
+/// to close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn policy_tighten_after_rotation_reaches_active_tun() {
+    // Underlay bridge in the root netns; controller binds its routable IP.
+    setup_bridge();
+    let _root_guard = RootNetGuard;
+
+    let h = TestController::start_on(CTRL_IP.parse().unwrap()).await;
+
+    // Fabric v1: ICMP both ways (liveness) + tcp/8080 seg-a->seg-b allowed,
+    // applied BEFORE enrollment so each gateway's first snapshot already
+    // carries the compiled policy.
+    let diff = h.apply(FABRIC_ICMP_AND_TCP8080).await;
+    assert!(
+        diff.policy_updated,
+        "fabric v1 apply must compile a real policy, got: {diff:?}"
+    );
+
+    // Real per-gateway WG keypairs; enroll into the existing segments.
+    let (a_priv, a_pub) = wg_keypair();
+    let (b_priv, b_pub) = wg_keypair();
+    let ga = enroll_into(&h, "10.10.1.0/24", &a_pub).await;
+    let gb = enroll_into(&h, "10.10.2.0/24", &b_pub).await;
+
+    // netns lab: two gateways, two workloads.
+    let mut lab = Lab::new("gwtgt").expect("lab");
+    let gwa = lab.ns("a").expect("gwA netns");
+    let gwb = lab.ns("b").expect("gwB netns");
+    let wla = lab.ns("wa").expect("wlA netns");
+    let wlb = lab.ns("wb").expect("wlB netns");
+
+    // Underlay veths from the bridge into each gateway netns.
+    attach_underlay(&gwa, "a", "10.9.0.1");
+    attach_underlay(&gwb, "b", "10.9.0.2");
+
+    // MANDATORY real one-way latency on both underlays (Phase-0 Finding 2) —
+    // must be applied AFTER the underlay `und` device exists.
+    apply_netem(&gwa, "und", 20).expect("netem on gwA underlay");
+    apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
+
+    // Segment veths + workload default routes.
+    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
+        .expect("seg-a veth");
+    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
+        .expect("seg-b veth");
+    wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
+        .expect("wlA default route");
+    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
+        .expect("wlB default route");
+
+    // Provision identity dirs and spawn the two REAL gateway binaries.
+    let sda = tempfile::tempdir().unwrap();
+    let sdb = tempfile::tempdir().unwrap();
+    write_identity(&ga, &a_priv, sda.path());
+    write_identity(&gb, &b_priv, sdb.path());
+    let logdir = tempfile::tempdir().unwrap();
+
+    let sync_addr = h.sync_tcp_addr().to_string();
+    let observe_addr = h.observe_addr().to_string();
+
+    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
+    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+
+    // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
+    let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
+    if !up {
+        dump_diag(
+            "mesh-not-up",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!("SETUP FAILED: workload A -> workload B ICMP (policy-permitted) never passed over the direct tunnel before rotation");
+    }
+    eprintln!("SETUP PASS: direct mesh is up (ICMP crosses wlA -> wlB)");
+
+    // ===== BASELINE (pre-rotation): tcp/8080 allowed =====
+    let baseline_8080 = check_tcp(&wla, &wlb, "10.10.2.2", 8080);
+    assert!(
+        baseline_8080,
+        "BASELINE FAILED: tcp/8080 (policy-allowed) did not pass before rotation — \
+         the test harness itself is broken, not the enforcer"
+    );
+    eprintln!("BASELINE PASS: tcp/8080 allowed (pre-rotation)");
+
+    // ===== Rotate gwA's key =====
+    h.admin_client()
+        .await
+        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .await
+        .expect("Admin.RotateKey");
+    eprintln!("Admin.RotateKey submitted for gwA (epoch 0 -> 1)");
+
+    // ===== Poll until the rotation has actually completed =====
+    let (completed, final_states) =
+        poll_rotation_complete(&h, ga.id(), Duration::from_secs(90)).await;
+    if !completed {
+        dump_diag(
+            "rotation-timeout",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "ROTATION TIMEOUT: gwA's key rotation (epoch 0 -> 1) did not complete within 90s \
+             (epoch 1 active + epoch 0 gone/retiring). Last observed debug_key_states: \
+             {final_states:?}"
+        );
+    }
+    eprintln!("ROTATION COMPLETE: {final_states:?}");
+
+    // ===== POST-ROTATION, PRE-TIGHTEN: tcp/8080 must still pass =====
+    // (traffic now crosses on the new epoch tun; this is the same sanity
+    // check `denied_flow_stays_denied_across_rotation` makes, proving the
+    // mesh itself survived the cutover before we go test the tightening.)
+    let post_rotation_8080 = check_tcp(&wla, &wlb, "10.10.2.2", 8080);
+    if !post_rotation_8080 {
+        dump_diag(
+            "post-rotation-pre-tighten-8080-failed",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+    }
+    assert!(
+        post_rotation_8080,
+        "POST-ROTATION FAILED: tcp/8080 (policy-allowed) stopped passing right after rotation \
+         (before any tightening) — the new epoch tun does not carry allowed traffic at all"
+    );
+    eprintln!("POST-ROTATION PASS: tcp/8080 still allowed on the new epoch tun (pre-tighten)");
+
+    // ===== THE KEY STEP: push fabric v2, which REMOVES the tcp/8080 allow =====
+    // ICMP stays allowed both ways so the mesh doesn't go dark; only the
+    // tcp/8080 rule is tightened away, so seg-a -> seg-b tcp/8080 becomes
+    // default-denied.
+    let diff2 = h.apply(FABRIC_ICMP_ONLY_V2).await;
+    assert!(
+        diff2.policy_updated,
+        "fabric v2 (tightening) apply must compile a real policy update, got: {diff2:?}"
+    );
+    eprintln!("TIGHTENING PUSHED: fabric v2 applied (tcp/8080 allow removed), diff={diff2:?}");
+
+    // ===== THE ASSERTION: tcp/8080 must become DENIED on the active tun =====
+    // Bounded retry loop (the delta must propagate over Sync + get applied)
+    // rather than a single check, since apply is asynchronous relative to
+    // this test.
+    let tighten_deadline = Instant::now() + Duration::from_secs(15);
+    let mut still_allowed = true;
+    while Instant::now() < tighten_deadline {
+        if !check_tcp(&wla, &wlb, "10.10.2.2", 8080) {
+            still_allowed = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if still_allowed {
+        dump_diag(
+            "tighten-did-not-reach-active-tun",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "policy tightening after a rotation did not reach the active epoch tun — \
+             post-cutover enforcement gap (Step 1): tcp/8080 was removed from the fabric \
+             but is still passing after a 15s bounded wait"
+        );
+    }
+    eprintln!("TIGHTEN PASS: tcp/8080 became denied on the active epoch tun after the post-rotation tightening (Step 1 closed)");
+
+    // Teardown.
+    pa.kill();
+    pb.kill();
+    drop(lab);
+    eprintln!("\nDONE-BAR PASSED: a policy tightening pushed after a rotation reaches the tun actually carrying traffic (Step 1: epoch-aware enforcer).");
 }
