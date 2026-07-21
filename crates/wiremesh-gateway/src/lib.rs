@@ -14,4 +14,5 @@ pub mod routes;
 pub mod state;
 pub mod sync;
 pub mod tunnel;
+pub mod tunnelset;
 pub mod uapi;
