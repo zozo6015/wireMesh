@@ -41,3 +41,13 @@ Task 8b (gateway rotation SM + SyncEvent::Rotate): complete (commits 416824a..96
   Minor carry→T9/10: on_epoch_retired doesn't cross-check epoch vs tracked new_epoch — the integration caller must pass the correct OLD epoch.
 Task 8 COMPLETE (8a controller projection guard + 8b gateway rotation SM). 8/10.
 === REMAINING: T9 (rotate-under-load testkit harness) + T10 (netns done-bar + wire the rotation SM into the live main loop). This is the netns integration — bring up 2nd Device, submit, path-liveness on new epoch, route-flip cutover, EpochAck reporting, tear down — proven by the 4 done-bar cases under tc netem. Expect real integration bugs (like 4b/4c). ===
+
+=== Task 9/10 CASE 1 (direct rotation zero-drop) — GREEN (commit b41daa5, opus review) ===
+Wired the full make-before-break choreography into the live gateway (Role A rotating + Role B peer), minimal epoch-aware boot refactor, controller broker now emits RotateDirective on sentinel-pending. TWO real bugs found+fixed (not test edits): (1) boringtun won't self-initiate the overlap handshake from keepalive → out-of-band probe; (2) ZERO-DROP KILLER: replace_peers rebuilt a fresh Tunn on every redundant apply → apply_wg0_if_changed change-guard (errs safe — encode_set injective, never skips a needed apply). Make-before-break STRUCTURALLY correct (flip only on rx-corroborated wg0e1 handshake). Done-bar: tx=11/rx=9 gap 2≤3. NON-REGRESSION ALL GREEN: gateway lib 76/76, full controller suite, mesh_milestone, nat_matrix 4/4, relay_matrix 2/2.
+
+REQUIRED REMAINING WORK (feature NOT complete — case 1 of 4 + these):
+  *** SECURITY (must-fix-before-ship) ***: enforcer NOT attached to wg0e<N> → post-rotation traffic UNFILTERED (default-deny bypass). Needs: attach enforcer to the new tun at bring-up + a conformance test that crosses a rotation with a DENY rule (case-1's allow-all-ICMP masks it).
+  - Old-epoch Device teardown: wire on_epoch_retired(E) (pass the correct OLD epoch — Task-8b Minor) + TunnelSet::tear_down, so old key material is actually retired. Currently wg0 stays up forever.
+  - Rotation failure recovery: handle_rotate moves SM to Overlapping before fallible work; a transient failure wedges rotation until process restart (no reset-to-Idle/abort path).
+  - Remaining done-bar cases: 2 (relayed zero-drop), 3 (non-destructive failure), 4 (crash-safety). + testkit rotate-under-load harness (T9). + Role B multi-peer overlap.
+  - Minors: send_epoch_ack per-tick mTLS connection churn (add backoff); set_rp_filter_loose global host change every boot; sentinel-literal→const cleanup.

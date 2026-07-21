@@ -238,6 +238,14 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // only ever reads a rotation Device's liveness by ifname (a `String`), so
     // it needs no handle to the Device itself.
     let mut tunnels = TunnelSet::new();
+    // L4 enforcer attached to each transient rotation tun (`wg0e<N>`), keyed by
+    // ifname. Lives here alongside `tunnels` in the `block_on`'d `run()` task —
+    // holding each `GatewayEnforcer` in the map keeps its tc-BPF/nft program
+    // attached for the overlap Device's lifetime (dropping it would detach).
+    // Closes the default-deny-bypass-on-new-tun security gap: without this, a
+    // rotation's new-epoch tun carries traffic with NO policy hook at all.
+    let mut rotation_enforcers: std::collections::HashMap<String, GatewayEnforcer> =
+        std::collections::HashMap::new();
     let rot = RotationShared {
         base_wg_port: cfg.wg_listen_port,
         base_tun: cfg.tun_ifname.clone(),
@@ -287,7 +295,9 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // peer's new key so the make-before-break cutover
                             // can happen once that session is live. No-op for
                             // steady state (no rotating peers).
-                            if let Err(e) = maybe_start_role_b(&mut tunnels, &rot, &ds) {
+                            if let Err(e) =
+                                maybe_start_role_b(&mut tunnels, &mut rotation_enforcers, &rot, &ds)
+                            {
                                 eprintln!("wiremesh-gateway: Role B setup failed: {e}");
                             }
                             // Publish the latest desired state to the punch /
@@ -338,6 +348,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             if let Err(e) = handle_rotate(
                                 &mut epoch_keys,
                                 &mut tunnels,
+                                &mut rotation_enforcers,
                                 &rot,
                                 d.epoch,
                                 applied.as_ref(),
@@ -1279,6 +1290,7 @@ struct RoleB {
 async fn handle_rotate(
     epoch_keys: &mut EpochKeys,
     tunnels: &mut TunnelSet,
+    rotation_enforcers: &mut HashMap<String, GatewayEnforcer>,
     rot: &RotationShared,
     directive_epoch: u32,
     applied: Option<&DesiredState>,
@@ -1316,6 +1328,17 @@ async fn handle_rotate(
         reconcile::device_config_at_port(ds, &new_key.private_key_b64, new_port, ROTATION_KEEPALIVE);
     uapi::apply(&new_tun, &dev)?;
 
+    // SECURITY: attach the L4 enforcer to the new epoch tun with the current
+    // policy at bring-up — BEFORE any route flips onto it — so there is never
+    // an unfiltered window. Without this, post-cutover traffic on `wg0e<N>`
+    // would ingress/egress with no policy hook (default-deny bypass). Keeping
+    // the `GatewayEnforcer` alive in `rotation_enforcers` keeps its tc-BPF/nft
+    // program attached for the Device's lifetime.
+    let mut ke = GatewayEnforcer::attach(&new_tun)
+        .with_context(|| format!("attaching enforcer to rotation tun {new_tun}"))?;
+    ke.apply_if_changed(ds)?;
+    rotation_enforcers.insert(new_tun.clone(), ke);
+
     let peers: Vec<(String, Vec<String>)> = ds
         .peers
         .iter()
@@ -1341,6 +1364,7 @@ async fn handle_rotate(
 /// flip+ack once that session is live. No-op in steady state.
 fn maybe_start_role_b(
     tunnels: &mut TunnelSet,
+    rotation_enforcers: &mut HashMap<String, GatewayEnforcer>,
     rot: &RotationShared,
     ds: &DesiredState,
 ) -> anyhow::Result<()> {
@@ -1376,6 +1400,17 @@ fn maybe_start_role_b(
             &new_tun,
             &DeviceConfig { private_key_b64: own_priv, listen_port, peers },
         )?;
+
+        // SECURITY: attach the L4 enforcer to this overlap Device with the
+        // current policy at bring-up — BEFORE any route flips onto it — so the
+        // Role-B ingress point for the rotating peer's post-cutover traffic is
+        // never unfiltered (default-deny bypass). Keeping the `GatewayEnforcer`
+        // alive in `rotation_enforcers` keeps its tc-BPF/nft program attached
+        // for the Device's lifetime.
+        let mut ke = GatewayEnforcer::attach(&new_tun)
+            .with_context(|| format!("attaching enforcer to rotation tun {new_tun}"))?;
+        ke.apply_if_changed(ds)?;
+        rotation_enforcers.insert(new_tun.clone(), ke);
 
         let Some(peer_pending_hex) = pubkey_b64_to_hex(&pending.pubkey_b64) else {
             anyhow::bail!("rotating peer {aid} pending pubkey is not valid base64");
