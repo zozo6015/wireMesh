@@ -15,6 +15,7 @@ pub mod db;
 pub mod db_async;
 pub mod observe;
 pub mod projection;
+pub mod rotation;
 pub mod routes;
 pub mod services;
 
