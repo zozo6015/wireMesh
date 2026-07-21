@@ -987,3 +987,249 @@ async fn policy_tighten_after_rotation_reaches_active_tun() {
     drop(lab);
     eprintln!("\nDONE-BAR PASSED: a policy tightening pushed after a rotation reaches the tun actually carrying traffic (Step 1: epoch-aware enforcer).");
 }
+
+/// STEP 2+3 (old-epoch-teardown refactor) done bar: after a rotation
+/// completes and every peer has provably cut over to the new epoch, the OLD
+/// epoch's Device (`wg0`) must actually be torn down — `ip link del`'d, its
+/// private key gone from any live boringtun Device — while the NEW epoch's
+/// tun (`wg0e1`) stays up and continues carrying (and correctly enforcing)
+/// traffic. This is the sharpest possible proof that `apply_state`, the
+/// punch/relay `set_peer_endpoint`, and `run_path_ticks` all resolve the
+/// "active tun" dynamically (Step 2) rather than hardcoding `wg0`: if any of
+/// them still targeted `wg0`, then either (a) `wg0` could never safely be
+/// torn down (so this test's central assertion — `wg0` gone — would never
+/// pass), or (b) tearing it down anyway would break the live mesh/enforcement
+/// (so the post-teardown assertions below would fail instead).
+///
+/// Sequence: same direct-mesh topology as the other three tests in this
+/// file, fabric v1 = ICMP both ways + tcp/8080 seg-a->seg-b allowed
+/// (`FABRIC_ICMP_AND_TCP8080`). Rotate gwA; wait for the rotation to
+/// complete (epoch 1 active, epoch 0 gone/retiring). Then bound-wait for
+/// gwA's `wg0` interface to actually disappear (the retire grace is a
+/// handful of keepalives, not instant) while `wg0e1` stays present. Once
+/// torn down, re-confirm the mesh still works on the new tun (ICMP +
+/// tcp/8080), then push fabric v2 (`FABRIC_ICMP_ONLY_V2`, which removes the
+/// tcp/8080 allow) and assert the tightening reaches the *live* tun — proof
+/// `apply_state` is applying to `wg0e1`, not silently erroring against a
+/// Device that no longer exists.
+///
+/// RED NOW: the gateway never tears down `wg0` after a rotation retires it
+/// (assertion 4 below fails — `wg0` stays present forever).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn old_epoch_device_is_torn_down_after_rotation() {
+    // Underlay bridge in the root netns; controller binds its routable IP.
+    setup_bridge();
+    let _root_guard = RootNetGuard;
+
+    let h = TestController::start_on(CTRL_IP.parse().unwrap()).await;
+
+    // Fabric v1: ICMP both ways (liveness) + tcp/8080 seg-a->seg-b allowed,
+    // applied BEFORE enrollment so each gateway's first snapshot already
+    // carries the compiled policy.
+    let diff = h.apply(FABRIC_ICMP_AND_TCP8080).await;
+    assert!(
+        diff.policy_updated,
+        "fabric v1 apply must compile a real policy, got: {diff:?}"
+    );
+
+    // Real per-gateway WG keypairs; enroll into the existing segments.
+    let (a_priv, a_pub) = wg_keypair();
+    let (b_priv, b_pub) = wg_keypair();
+    let ga = enroll_into(&h, "10.10.1.0/24", &a_pub).await;
+    let gb = enroll_into(&h, "10.10.2.0/24", &b_pub).await;
+
+    // netns lab: two gateways, two workloads.
+    let mut lab = Lab::new("gwtd").expect("lab");
+    let gwa = lab.ns("a").expect("gwA netns");
+    let gwb = lab.ns("b").expect("gwB netns");
+    let wla = lab.ns("wa").expect("wlA netns");
+    let wlb = lab.ns("wb").expect("wlB netns");
+
+    // Underlay veths from the bridge into each gateway netns.
+    attach_underlay(&gwa, "a", "10.9.0.1");
+    attach_underlay(&gwb, "b", "10.9.0.2");
+
+    // MANDATORY real one-way latency on both underlays (Phase-0 Finding 2) —
+    // must be applied AFTER the underlay `und` device exists.
+    apply_netem(&gwa, "und", 20).expect("netem on gwA underlay");
+    apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
+
+    // Segment veths + workload default routes.
+    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
+        .expect("seg-a veth");
+    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
+        .expect("seg-b veth");
+    wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
+        .expect("wlA default route");
+    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
+        .expect("wlB default route");
+
+    // Provision identity dirs and spawn the two REAL gateway binaries.
+    let sda = tempfile::tempdir().unwrap();
+    let sdb = tempfile::tempdir().unwrap();
+    write_identity(&ga, &a_priv, sda.path());
+    write_identity(&gb, &b_priv, sdb.path());
+    let logdir = tempfile::tempdir().unwrap();
+
+    let sync_addr = h.sync_tcp_addr().to_string();
+    let observe_addr = h.observe_addr().to_string();
+
+    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
+    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+
+    // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
+    let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
+    if !up {
+        dump_diag(
+            "mesh-not-up",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!("SETUP FAILED: workload A -> workload B ICMP (policy-permitted) never passed over the direct tunnel before rotation");
+    }
+    eprintln!("SETUP PASS: direct mesh is up (ICMP crosses wlA -> wlB)");
+
+    // ===== BASELINE (pre-rotation): tcp/8080 allowed =====
+    let baseline_8080 = check_tcp(&wla, &wlb, "10.10.2.2", 8080);
+    assert!(
+        baseline_8080,
+        "BASELINE FAILED: tcp/8080 (policy-allowed) did not pass before rotation — \
+         the test harness itself is broken, not the enforcer"
+    );
+    eprintln!("BASELINE PASS: tcp/8080 allowed (pre-rotation)");
+
+    // ===== Rotate gwA's key =====
+    h.admin_client()
+        .await
+        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .await
+        .expect("Admin.RotateKey");
+    eprintln!("Admin.RotateKey submitted for gwA (epoch 0 -> 1)");
+
+    // ===== Poll until the rotation has actually completed (epoch 1 active,
+    // epoch 0 gone/retiring) =====
+    let (completed, final_states) =
+        poll_rotation_complete(&h, ga.id(), Duration::from_secs(90)).await;
+    if !completed {
+        dump_diag(
+            "rotation-timeout",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "ROTATION TIMEOUT: gwA's key rotation (epoch 0 -> 1) did not complete within 90s \
+             (epoch 1 active + epoch 0 gone/retiring). Last observed debug_key_states: \
+             {final_states:?}"
+        );
+    }
+    eprintln!("ROTATION COMPLETE: {final_states:?}");
+
+    // ===== THE TEARDOWN ASSERTION =====
+    // The retire grace is a handful of keepalives after every peer's session
+    // on the new tun is rx-corroborated live, so this is a bounded retry loop
+    // (up to ~30s, 1s sleeps) rather than a single check: `wg0` must
+    // disappear entirely (the `ip link show wg0` Command must fail/exit
+    // non-zero) while `wg0e1` stays present the whole time.
+    let teardown_deadline = Instant::now() + Duration::from_secs(30);
+    let mut torn_down = false;
+    loop {
+        let wg0_gone = gwa.exec(&["ip", "link", "show", "wg0"]).is_err();
+        let wg0e1_present = gwa.exec(&["ip", "link", "show", "wg0e1"]).is_ok();
+        if wg0_gone && wg0e1_present {
+            torn_down = true;
+            break;
+        }
+        if Instant::now() >= teardown_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if !torn_down {
+        dump_diag(
+            "old-epoch-not-torn-down",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "old-epoch Device wg0 was not torn down after the rotation retired epoch 0"
+        );
+    }
+    eprintln!("TEARDOWN PASS: gwA's wg0 (epoch 0) is gone; wg0e1 (epoch 1) is present");
+
+    // ===== POST-TEARDOWN: the mesh still works on the new tun =====
+    let still_works = wait_until(Duration::from_secs(15), || ping_ok(&wla, "10.10.2.2"));
+    if !still_works {
+        dump_diag(
+            "post-teardown-icmp-failed",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!("POST-TEARDOWN FAILED: ICMP wlA -> wlB no longer passes after wg0 was torn down");
+    }
+    let post_teardown_8080 = check_tcp(&wla, &wlb, "10.10.2.2", 8080);
+    if !post_teardown_8080 {
+        dump_diag(
+            "post-teardown-8080-failed",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+    }
+    assert!(
+        post_teardown_8080,
+        "POST-TEARDOWN FAILED: tcp/8080 (policy-allowed) stopped passing after wg0 was torn down \
+         — traffic is not actually being carried/enforced on the new tun"
+    );
+    eprintln!("POST-TEARDOWN PASS: ICMP and tcp/8080 both still work on wg0e1 after wg0 was torn down");
+
+    // ===== POST-TEARDOWN: a policy tightening still reaches the LIVE tun =====
+    // Push fabric v2, which removes the tcp/8080 allow. If `apply_state`
+    // still targeted the torn-down `wg0`, this would either error/crash the
+    // gateway or silently no-op; the gateway staying up AND tcp/8080
+    // becoming denied is proof `apply_state` follows the active (live) tun.
+    let diff2 = h.apply(FABRIC_ICMP_ONLY_V2).await;
+    assert!(
+        diff2.policy_updated,
+        "fabric v2 (tightening) apply must compile a real policy update, got: {diff2:?}"
+    );
+    eprintln!("TIGHTENING PUSHED: fabric v2 applied (tcp/8080 allow removed), diff={diff2:?}");
+
+    let tighten_deadline = Instant::now() + Duration::from_secs(15);
+    let mut still_allowed = true;
+    while Instant::now() < tighten_deadline {
+        if !check_tcp(&wla, &wlb, "10.10.2.2", 8080) {
+            still_allowed = false;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if still_allowed {
+        dump_diag(
+            "tighten-did-not-reach-live-tun-post-teardown",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "policy tightening after old-epoch teardown did not reach the live epoch tun: \
+             tcp/8080 was removed from the fabric but is still passing after a 15s bounded wait"
+        );
+    }
+    eprintln!("TIGHTEN PASS: tcp/8080 became denied on the live tun after teardown (apply_state follows the active tun, not torn-down wg0)");
+
+    // Teardown.
+    pa.kill();
+    pb.kill();
+    drop(lab);
+    eprintln!("\nDONE-BAR PASSED: the old epoch's Device (wg0) is torn down after its rotation retires, the mesh keeps working on the new tun, and policy changes keep reaching the live tun (Step 2+3: epoch-aware device unification + retire/teardown).");
+}
