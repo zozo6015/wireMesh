@@ -111,3 +111,15 @@ confidentiality/integrity), but it is a real cross-gateway authorization gap and
 
 ## Deployment
 `wiremesh-relay` needs identity (cert/key/ca) at `/var/lib/wiremesh/` 0600 (from fabric-CA enrollment, `--kind relay`).
+
+## Cert-binding review — accepted fast-follows (commit 4ab8b59, security review READY)
+- **Important — enrollment signing-failure-after-token-spend:** with gateway-path signing now AFTER the
+  atomic commit, a `sign()` failure post-commit leaves a spent token + an active gateway row + a
+  certificate row but no issued leaf. Not attacker-exploitable (needs a legitimate segment-scoped token
+  AND a CSR that passes `validate_csr_pem` but fails the crypto `signed_by()` — only unusual keys);
+  recoverable via an operator `rebind` token (which correctly revokes the phantom row). Fast-follow: on a
+  post-commit signing failure, compensate (revoke the just-recorded cert / free the segment) so the holder
+  can retry. NOT a blocker (single-tenant, self-inflicted, recoverable).
+- **Minor:** `handle == serial` coupling holds for `EmbeddedTrust` only — revisit for the OpenBao/non-embedded
+  issuer fast-follow (already flagged inline). Orphaned old connection on a same-owner relay reconnect is
+  closed only by its own idle timeout (pre-existing resource note, not security).
