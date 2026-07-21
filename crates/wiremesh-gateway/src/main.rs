@@ -1324,20 +1324,34 @@ async fn handle_rotate(
     let new_tun = format!("{}e{}", rot.base_tun, n);
 
     tunnels.bring_up(n, &new_tun, &new_key.private_key_b64, new_port, TUN_MTU)?;
+
+    // SECURITY (fail-closed): attach the L4 enforcer to the new epoch tun with
+    // the current policy BEFORE the device is made session-capable (peer
+    // apply, below). `bring_up` only brought the Device up with an EMPTY peer
+    // set, so at this point the tun cannot yet form a WG session with anyone —
+    // attaching the enforcer here, ahead of the peer-apply, closes the
+    // default-deny-bypass-on-new-tun gap with no unfiltered window. If
+    // `attach`/`apply_if_changed` errors, tear the half-built tun back down
+    // and propagate the error: the device never received peers, so it never
+    // became traffic-capable — no fail-open on this path, unlike attaching
+    // after the peer-apply (which would leave a session-capable, unenforced
+    // tun on an attach failure).
+    let mut ke = match GatewayEnforcer::attach(&new_tun) {
+        Ok(ke) => ke,
+        Err(e) => {
+            let _ = tunnels.tear_down(n);
+            return Err(e).with_context(|| format!("attaching enforcer to rotation tun {new_tun}"));
+        }
+    };
+    if let Err(e) = ke.apply_if_changed(ds) {
+        let _ = tunnels.tear_down(n);
+        return Err(e).with_context(|| format!("applying policy to rotation tun {new_tun}"));
+    }
+    rotation_enforcers.insert(new_tun.clone(), ke);
+
     let dev =
         reconcile::device_config_at_port(ds, &new_key.private_key_b64, new_port, ROTATION_KEEPALIVE);
     uapi::apply(&new_tun, &dev)?;
-
-    // SECURITY: attach the L4 enforcer to the new epoch tun with the current
-    // policy at bring-up — BEFORE any route flips onto it — so there is never
-    // an unfiltered window. Without this, post-cutover traffic on `wg0e<N>`
-    // would ingress/egress with no policy hook (default-deny bypass). Keeping
-    // the `GatewayEnforcer` alive in `rotation_enforcers` keeps its tc-BPF/nft
-    // program attached for the Device's lifetime.
-    let mut ke = GatewayEnforcer::attach(&new_tun)
-        .with_context(|| format!("attaching enforcer to rotation tun {new_tun}"))?;
-    ke.apply_if_changed(ds)?;
-    rotation_enforcers.insert(new_tun.clone(), ke);
 
     let peers: Vec<(String, Vec<String>)> = ds
         .peers
@@ -1396,21 +1410,36 @@ fn maybe_start_role_b(
 
         let own_priv = rot.identity.wg_private_key_b64.clone();
         tunnels.bring_up(pending_epoch, &new_tun, &own_priv, listen_port, TUN_MTU)?;
+
+        // SECURITY (fail-closed): attach the L4 enforcer to this overlap
+        // Device with the current policy BEFORE the device is made
+        // session-capable (peer apply, below). `bring_up` only brought the
+        // Device up with an EMPTY peer set, so at this point the tun cannot
+        // yet form a WG session toward the rotating peer — attaching the
+        // enforcer here, ahead of the peer-apply, closes the
+        // default-deny-bypass-on-new-tun gap with no unfiltered window. If
+        // `attach`/`apply_if_changed` errors, tear the half-built tun back
+        // down and propagate the error: the device never received peers, so
+        // it never became traffic-capable — no fail-open on this path, unlike
+        // attaching after the peer-apply (which would leave a
+        // session-capable, unenforced tun on an attach failure).
+        let mut ke = match GatewayEnforcer::attach(&new_tun) {
+            Ok(ke) => ke,
+            Err(e) => {
+                let _ = tunnels.tear_down(pending_epoch);
+                return Err(e).with_context(|| format!("attaching enforcer to rotation tun {new_tun}"));
+            }
+        };
+        if let Err(e) = ke.apply_if_changed(ds) {
+            let _ = tunnels.tear_down(pending_epoch);
+            return Err(e).with_context(|| format!("applying policy to rotation tun {new_tun}"));
+        }
+        rotation_enforcers.insert(new_tun.clone(), ke);
+
         uapi::apply(
             &new_tun,
             &DeviceConfig { private_key_b64: own_priv, listen_port, peers },
         )?;
-
-        // SECURITY: attach the L4 enforcer to this overlap Device with the
-        // current policy at bring-up — BEFORE any route flips onto it — so the
-        // Role-B ingress point for the rotating peer's post-cutover traffic is
-        // never unfiltered (default-deny bypass). Keeping the `GatewayEnforcer`
-        // alive in `rotation_enforcers` keeps its tc-BPF/nft program attached
-        // for the Device's lifetime.
-        let mut ke = GatewayEnforcer::attach(&new_tun)
-            .with_context(|| format!("attaching enforcer to rotation tun {new_tun}"))?;
-        ke.apply_if_changed(ds)?;
-        rotation_enforcers.insert(new_tun.clone(), ke);
 
         let Some(peer_pending_hex) = pubkey_b64_to_hex(&pending.pubkey_b64) else {
             anyhow::bail!("rotating peer {aid} pending pubkey is not valid base64");
