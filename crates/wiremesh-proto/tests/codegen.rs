@@ -1,3 +1,4 @@
+#![allow(deprecated)] // constructing StateSnapshot/Delta requires setting deprecated_relays (field 4)
 use prost::Message;
 use wiremesh_proto::v1::{
     StateSnapshot, Peer, sync_message::Body, SyncMessage, PunchDirective, ReportRequest,
@@ -8,7 +9,8 @@ use wiremesh_proto::v1::{
 fn snapshot_message_roundtrips() {
     let snap = StateSnapshot { revision: 7, self_cert_pem: "PEM".into(),
         peers: vec![Peer { gateway_id: 2, segment_name: "aws".into(), ..Default::default() }],
-        relays: vec![RelayInfo { relay_id: 7, endpoint: "r1:4443".into() }], policy_ir: vec![], policy_version: 0,
+        deprecated_relays: vec![],
+        relay_infos: vec![RelayInfo { relay_id: 7, endpoint: "r1:4443".into() }], policy_ir: vec![], policy_version: 0,
         revoked_serials: vec![] };
     let msg = SyncMessage { body: Some(Body::Snapshot(snap.clone())) };
 
@@ -28,8 +30,9 @@ fn snapshot_message_roundtrips() {
             assert_eq!(s.peers[0].gateway_id, 2);
             assert_eq!(s.peers[0].segment_name, "aws");
             assert_eq!(s.self_cert_pem, "PEM");
-            assert_eq!(s.relays[0].relay_id, 7);
-            assert_eq!(s.relays[0].endpoint, "r1:4443");
+            assert_eq!(s.relay_infos[0].relay_id, 7);
+            assert_eq!(s.relay_infos[0].endpoint, "r1:4443");
+            assert!(s.deprecated_relays.is_empty());
         }
         other => panic!("wrong body: {other:?}"),
     }
@@ -76,15 +79,21 @@ fn report_request_local_endpoints_roundtrips() {
 }
 
 #[test]
-fn state_snapshot_relays_roundtrips_multiple_relay_infos() {
-    // StateSnapshot.relays changed from `repeated string` to `repeated
-    // RelayInfo` (4c Task 1) — confirm two distinct relays, each with both
-    // fields set, survive a genuine wire roundtrip.
+fn state_snapshot_relay_infos_roundtrips_multiple_relay_infos() {
+    // (4c review fix) The structured relay data lives in `relay_infos`
+    // (field 8, `repeated RelayInfo`) — a NEW field, added rather than
+    // repurposing field 4 (`deprecated_relays`, kept at its ORIGINAL
+    // `repeated string` type; see `sync.proto`'s doc comment on that field
+    // for why changing an existing field's wire type is a hazard). Confirm
+    // two distinct relays, each with both fields set, survive a genuine
+    // wire roundtrip in the new field, and that the deprecated field still
+    // roundtrips cleanly as an empty (unused) `repeated string`.
     let snap = StateSnapshot {
         revision: 11,
         self_cert_pem: "PEM".into(),
         peers: vec![],
-        relays: vec![
+        deprecated_relays: vec![],
+        relay_infos: vec![
             RelayInfo { relay_id: 1, endpoint: "relay-a.example:4443".into() },
             RelayInfo { relay_id: 2, endpoint: "relay-b.example:4443".into() },
         ],
@@ -96,22 +105,28 @@ fn state_snapshot_relays_roundtrips_multiple_relay_infos() {
     let bytes = snap.encode_to_vec();
     let decoded = StateSnapshot::decode(bytes.as_slice()).expect("decoding the encoded StateSnapshot");
 
-    assert_eq!(decoded.relays.len(), 2);
-    assert_eq!(decoded.relays[0].relay_id, 1);
-    assert_eq!(decoded.relays[0].endpoint, "relay-a.example:4443");
-    assert_eq!(decoded.relays[1].relay_id, 2);
-    assert_eq!(decoded.relays[1].endpoint, "relay-b.example:4443");
+    assert_eq!(decoded.relay_infos.len(), 2);
+    assert_eq!(decoded.relay_infos[0].relay_id, 1);
+    assert_eq!(decoded.relay_infos[0].endpoint, "relay-a.example:4443");
+    assert_eq!(decoded.relay_infos[1].relay_id, 2);
+    assert_eq!(decoded.relay_infos[1].endpoint, "relay-b.example:4443");
+    assert!(
+        decoded.deprecated_relays.is_empty(),
+        "deprecated_relays (field 4, legacy repeated string) must still roundtrip as empty \
+         when unused"
+    );
 }
 
 #[test]
-fn delta_relays_roundtrips_relay_info() {
-    // Delta.relays underwent the same `repeated string` -> `repeated
-    // RelayInfo` change as StateSnapshot.relays.
+fn delta_relay_infos_roundtrips_relay_info() {
+    // See `state_snapshot_relay_infos_roundtrips_multiple_relay_infos` above
+    // — `Delta` gets the identical field-8 treatment as `StateSnapshot`.
     let delta = Delta {
         revision: 12,
         upserted_peers: vec![],
         removed_peer_ids: vec![],
-        relays: vec![RelayInfo { relay_id: 3, endpoint: "relay-c.example:4443".into() }],
+        deprecated_relays: vec![],
+        relay_infos: vec![RelayInfo { relay_id: 3, endpoint: "relay-c.example:4443".into() }],
         policy_ir: vec![],
         policy_version: 0,
         revoked_serials: vec![],
@@ -120,9 +135,10 @@ fn delta_relays_roundtrips_relay_info() {
     let bytes = delta.encode_to_vec();
     let decoded = Delta::decode(bytes.as_slice()).expect("decoding the encoded Delta");
 
-    assert_eq!(decoded.relays.len(), 1);
-    assert_eq!(decoded.relays[0].relay_id, 3);
-    assert_eq!(decoded.relays[0].endpoint, "relay-c.example:4443");
+    assert_eq!(decoded.relay_infos.len(), 1);
+    assert_eq!(decoded.relay_infos[0].relay_id, 3);
+    assert_eq!(decoded.relay_infos[0].endpoint, "relay-c.example:4443");
+    assert!(decoded.deprecated_relays.is_empty());
 }
 
 #[test]

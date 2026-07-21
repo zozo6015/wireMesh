@@ -102,6 +102,7 @@ fn classify(body: Option<Body>, current: &mut Option<DesiredState>) -> anyhow::R
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // constructing StateSnapshot/Delta requires setting deprecated_relays (field 4)
 mod tests {
     use super::*;
     use wiremesh_proto::v1::{Delta, StateSnapshot};
@@ -113,7 +114,8 @@ mod tests {
             revision: 7,
             self_cert_pem: "C".into(),
             peers: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
             policy_ir: vec![],
             policy_version: 2,
             revoked_serials: vec![],
@@ -150,7 +152,8 @@ mod tests {
             revision: 1,
             upserted_peers: vec![],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec![],

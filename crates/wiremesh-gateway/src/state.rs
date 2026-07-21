@@ -63,6 +63,12 @@ pub struct DesiredState {
     pub peers: Vec<PeerState>,
     pub policy_ir: Vec<u8>,
     pub policy_version: u64,
+    /// (4c review fix) `#[serde(default)]` so a `state.json` written before
+    /// this field existed — or one written by a version of this binary that
+    /// last saw an empty relay set — still deserializes cleanly on boot
+    /// (fail-static: booting from stale/older persisted state must never
+    /// fail just because a newer field is missing from the JSON).
+    #[serde(default)]
     pub relays: Vec<RelayInfo>,
     pub revoked_serials: Vec<String>,
 }
@@ -74,7 +80,12 @@ impl DesiredState {
             peers: s.peers.iter().map(PeerState::from_proto).collect(),
             policy_ir: s.policy_ir.clone(),
             policy_version: s.policy_version,
-            relays: s.relays.clone(),
+            // (4c review fix) Sourced from the proto's `relay_infos` (field
+            // 8) — the structured relay data moved there rather than
+            // repurposing `deprecated_relays` (field 4, kept at its
+            // original `repeated string` type; see `sync.proto`). This
+            // domain field keeps its own name (`DesiredState.relays`).
+            relays: s.relay_infos.clone(),
             revoked_serials: s.revoked_serials.clone(),
         }
     }
@@ -89,8 +100,8 @@ impl DesiredState {
             }
         }
         self.peers.retain(|p| !d.removed_peer_ids.contains(&p.gateway_id));
-        if !d.relays.is_empty() {
-            self.relays = d.relays.clone();
+        if !d.relay_infos.is_empty() {
+            self.relays = d.relay_infos.clone();
         }
         // Deltas are sparse: only PolicyUpdated carries policy fields (version >= 1);
         // every other change type sends policy_version=0 / empty IR. Guard so a
@@ -144,6 +155,7 @@ impl DesiredState {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // constructing StateSnapshot/Delta requires setting deprecated_relays (field 4)
 mod tests {
     use super::*;
     use wiremesh_proto::v1::{Delta, Peer, PeerKey, StateSnapshot};
@@ -167,7 +179,8 @@ mod tests {
             revision: 5,
             self_cert_pem: "C".into(),
             peers: vec![peer(2, "PUBA", "203.0.113.2:51820")],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
             policy_ir: b"{\"schema\":1}".to_vec(),
             policy_version: 3,
             revoked_serials: vec![],
@@ -212,13 +225,13 @@ mod tests {
         let mut ds = DesiredState::from_snapshot(&StateSnapshot {
             revision: 1, self_cert_pem: "C".into(),
             peers: vec![peer(2, "PUBA", "a:1"), peer(3, "PUBB", "b:2")],
-            relays: vec![], policy_ir: vec![], policy_version: 0, revoked_serials: vec![],
+            deprecated_relays: vec![], relay_infos: vec![], policy_ir: vec![], policy_version: 0, revoked_serials: vec![],
         });
         let delta = Delta {
             revision: 2,
             upserted_peers: vec![peer(2, "PUBA2", "a:9")],
             removed_peer_ids: vec![3],
-            relays: vec![], policy_ir: b"NEW".to_vec(), policy_version: 4, revoked_serials: vec![],
+            deprecated_relays: vec![], relay_infos: vec![], policy_ir: b"NEW".to_vec(), policy_version: 4, revoked_serials: vec![],
         };
         ds.apply_delta(&delta);
         assert_eq!(ds.revision, 2);
@@ -263,7 +276,8 @@ mod tests {
             revision: 2,
             upserted_peers: vec![peer(7, "PUBX", "c:3")],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec![],
@@ -280,7 +294,8 @@ mod tests {
             revision: 2,
             upserted_peers: vec![],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
             policy_ir: b"NEW".to_vec(),
             policy_version: 6,
             revoked_serials: vec![],
@@ -300,7 +315,8 @@ mod tests {
             revision: 2,
             upserted_peers: vec![],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec!["B".into()],
@@ -312,7 +328,8 @@ mod tests {
             revision: 3,
             upserted_peers: vec![],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec!["B".into()],

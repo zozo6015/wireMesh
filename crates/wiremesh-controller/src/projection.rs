@@ -9,7 +9,7 @@
 //! time, served VERBATIM — this module never recompiles, so a snapshot can
 //! never drift from what was actually validated and versioned. Still
 //! empty/`0` on a fresh controller that has never had a policy applied.
-//! `relays` (Cycle-4c Task 5) is every currently `active` relay row, off
+//! `relay_infos` (Cycle-4c Task 5) is every currently `active` relay row, off
 //! [`crate::db::Db::active_relays`] — empty on a fresh controller with none
 //! enrolled/registered yet. `revision` is
 //! the persisted `state_revision` counter
@@ -151,7 +151,7 @@ pub enum ChangeEvent {
     /// consistent with what a fresh `build_snapshot` would show, mirroring
     /// `KeyRotated`/`SegmentCidrsChanged`'s full-refresh rationale.
     RelaysChanged {
-        relays: Vec<RelayInfo>,
+        relay_infos: Vec<RelayInfo>,
         revision: u64,
     },
 }
@@ -195,6 +195,13 @@ impl ChangeEvent {
 
 /// Turns a [`ChangeEvent`] into the [`Delta`] a `Sync.Watch` connection
 /// forwards to its gateway.
+///
+/// `#[allow(deprecated)]`: every branch below must set `deprecated_relays`
+/// (field 4, kept at its original `repeated string` type and never
+/// populated — see `sync.proto`'s doc comment) since it's a required struct
+/// field of the generated `Delta` type; this is the one place that's
+/// expected to still reference it, deliberately, as an always-empty value.
+#[allow(deprecated)]
 pub fn delta_for_change(event: ChangeEvent) -> Delta {
     match event {
         ChangeEvent::GatewayEnrolled {
@@ -220,7 +227,8 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
                 allowed_ips,
             }],
             removed_peer_ids: Vec::new(),
-            relays: Vec::new(),
+            deprecated_relays: Vec::new(),
+            relay_infos: Vec::new(),
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
@@ -248,7 +256,8 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
                 allowed_ips,
             }],
             removed_peer_ids: Vec::new(),
-            relays: Vec::new(),
+            deprecated_relays: Vec::new(),
+            relay_infos: Vec::new(),
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
@@ -263,7 +272,8 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             // withdrawn, not updated.
             upserted_peers: Vec::new(),
             removed_peer_ids: vec![gateway_id as u64],
-            relays: Vec::new(),
+            deprecated_relays: Vec::new(),
+            relay_infos: Vec::new(),
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials,
@@ -292,7 +302,8 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
                 allowed_ips,
             }],
             removed_peer_ids: Vec::new(),
-            relays: Vec::new(),
+            deprecated_relays: Vec::new(),
+            relay_infos: Vec::new(),
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
@@ -302,7 +313,8 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             // No peer identity changes — see this variant's doc comment.
             upserted_peers: Vec::new(),
             removed_peer_ids: Vec::new(),
-            relays: Vec::new(),
+            deprecated_relays: Vec::new(),
+            relay_infos: Vec::new(),
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: vec![serial],
@@ -313,7 +325,8 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             // anything, per this variant's doc comment.
             upserted_peers: Vec::new(),
             removed_peer_ids: Vec::new(),
-            relays: Vec::new(),
+            deprecated_relays: Vec::new(),
+            relay_infos: Vec::new(),
             policy_ir: ir,
             policy_version: version,
             revoked_serials: Vec::new(),
@@ -342,18 +355,20 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
                 allowed_ips,
             }],
             removed_peer_ids: Vec::new(),
-            relays: Vec::new(),
+            deprecated_relays: Vec::new(),
+            relay_infos: Vec::new(),
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
         },
-        ChangeEvent::RelaysChanged { relays, revision } => Delta {
+        ChangeEvent::RelaysChanged { relay_infos, revision } => Delta {
             revision,
-            // No peer/revocation change — only `relays` carries anything,
-            // per this variant's doc comment.
+            // No peer/revocation change — only `relay_infos` carries
+            // anything, per this variant's doc comment.
             upserted_peers: Vec::new(),
             removed_peer_ids: Vec::new(),
-            relays,
+            deprecated_relays: Vec::new(),
+            relay_infos,
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
@@ -369,6 +384,10 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
 /// has the exact PEM bytes from the mTLS peer certificate it just used to
 /// identify the gateway, so re-deriving/storing a second copy would be
 /// redundant and could drift from what's actually on the wire.
+///
+/// `#[allow(deprecated)]`: constructing `StateSnapshot` requires setting
+/// `deprecated_relays` (see `delta_for_change`'s identical note).
+#[allow(deprecated)]
 pub async fn build_snapshot(
     db: &DbHandle,
     gateway_id: i64,
@@ -401,8 +420,11 @@ pub async fn build_snapshot(
         .collect();
 
     // (Cycle-4c Task 5) Every currently `active` relay, straight off
-    // `Db::active_relays` — see this module's doc comment.
-    let relays = db
+    // `Db::active_relays` — see this module's doc comment. Carried on the
+    // wire in `relay_infos` (field 8) — see `sync.proto`'s doc comment on
+    // `deprecated_relays` (field 4) for why the structured data lives in a
+    // new field rather than the original one.
+    let relay_infos = db
         .active_relays()
         .await?
         .into_iter()
@@ -424,7 +446,8 @@ pub async fn build_snapshot(
         revision,
         self_cert_pem,
         peers,
-        relays,
+        deprecated_relays: Vec::new(),
+        relay_infos,
         policy_ir,
         policy_version,
         revoked_serials,

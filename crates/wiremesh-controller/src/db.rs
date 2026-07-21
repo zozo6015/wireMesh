@@ -1539,13 +1539,13 @@ impl Db {
     /// `rebind`-kind token's secret hash simply won't satisfy that filter,
     /// so it comes back `InvalidToken` exactly like a wrong secret would.
     ///
-    /// (Cycle-4c Task 5) DOES call `bump_revision_tx`, unlike the
-    /// admin-path `Db::insert_relay`: a newly enrolled relay is now
-    /// projection-affecting (`Sync`'s `StateSnapshot.relays`/`Delta.relays`
-    /// advertise it), so — mirroring `enroll_gateway`'s identical rationale
-    /// — the persisted revision must advance in this same transaction, and
-    /// an early `InvalidToken` return above must NOT reach here (it rolls
-    /// back instead).
+    /// Calls `bump_revision_tx` (same as the admin-path `Db::insert_relay` —
+    /// Cycle-4c review fix): a newly enrolled relay is projection-affecting
+    /// (`Sync`'s `StateSnapshot.relay_infos`/`Delta.relay_infos` advertise
+    /// it), so — mirroring `enroll_gateway`'s identical rationale — the
+    /// persisted revision must advance in this same transaction, and an
+    /// early `InvalidToken` return above must NOT reach here (it rolls back
+    /// instead).
     pub fn enroll_relay(
         &self,
         secret_hash: &str,
@@ -2090,6 +2090,15 @@ impl Db {
     /// yet). Returns the new relay's id. A duplicate `name` surfaces as a
     /// `rusqlite::Error` (UNIQUE constraint) — `AdminSvc::register_relay`
     /// maps that to `AlreadyExists`, mirroring `insert_segment`'s pattern.
+    ///
+    /// (Cycle-4c review fix) Calls `bump_revision_tx` in the SAME
+    /// transaction as the insert + audit — mirroring `enroll_relay`/
+    /// `set_relay_status`'s identical pattern: a relay registered through
+    /// this admin path is exactly as projection-affecting as one that
+    /// self-enrolled (`Sync`'s `StateSnapshot.relay_infos`/`Delta.relay_infos`
+    /// must advertise it), so `AdminSvc::register_relay`'s post-commit
+    /// `current_revision()` re-read (used to publish `RelaysChanged`) must
+    /// observe a revision that already reflects this insert.
     pub fn insert_relay(&self, name: &str, endpoint: &str, actor: &str, now: &str) -> Result<i64> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
@@ -2114,6 +2123,8 @@ impl Db {
             ],
         )?;
 
+        bump_revision_tx(&tx)?;
+
         tx.commit()?;
         Ok(relay_id)
     }
@@ -2132,8 +2143,8 @@ impl Db {
     }
 
     /// (Cycle-4c Task 5) Every `status = 'active'` relay's `(id, endpoint)`,
-    /// ordered by id — exactly the set `Sync`'s `StateSnapshot.relays`/
-    /// `Delta.relays` must advertise (a relay with any other status, e.g. one
+    /// ordered by id — exactly the set `Sync`'s `StateSnapshot.relay_infos`/
+    /// `Delta.relay_infos` must advertise (a relay with any other status, e.g. one
     /// this cycle's Task 6 health pipeline later marks unhealthy, is
     /// deliberately excluded). Dedicated query rather than `list_relays()` +
     /// a filter so the projection path never has to carry `name`/`status`

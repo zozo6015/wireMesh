@@ -99,9 +99,15 @@ confidentiality/integrity), but it is a real cross-gateway authorization gap and
 - **registration_key** 32-bit → raw `[u8;8]`; **per-(gateway,relay) connection multiplexing** (one QUIC conn
   per peer today — correct via unique cert-bound ids, but N connections). The cert-binding fix keeps the one-conn-
   per-pair model (design A); the multiplexing carry (design B) is orthogonal and still open.
-- Relay endpoint `SocketAddrV4` only (IPv4 v1); admin `RegisterRelay` path still doesn't bump revision/emit
-  a delta (superseded by enrollment); `(revision, active_relays)` not read atomically under one lock
-  (narrow, inherited pattern); enrollment vs SyncSvc `RelaysChanged` emission not DRY'd (separate structs).
+- Relay endpoint `SocketAddrV4` only (IPv4 v1); `(revision, active_relays)` not read atomically under one
+  lock (narrow, inherited pattern — same read-then-read ordering `emit_relays_changed`, the relay-enrollment
+  path, and admin `RegisterRelay` all use, mitigated by reading active relays FIRST then the revision LAST so
+  the emitted delta's revision is never older than what it advertises); the three `RelaysChanged`-emitting call
+  sites (enrollment, health eviction/re-admission, admin `RegisterRelay`) are not DRY'd into one shared helper
+  (separate call sites, same pattern copy-pasted three times). **Fixed this review round:** admin `RegisterRelay`
+  now bumps the persisted revision (`Db::insert_relay`) and publishes `ChangeEvent::RelaysChanged` after the
+  insert commits, so a relay registered via `fabricctl relay register` reaches an already-connected gateway
+  the same way a self-enrolled relay does.
 - **ProbeDirect permanent churn (Minor):** a symmetric↔symmetric relayed pair fires `ProbeDirect` every 20s
   forever (the punch can never confirm), keeping the transient `SO_REUSEPORT` punch socket at ~30% duty cycle
   on the WG port. Mitigated by the 20s interval + grace (case 1 reliably green 5×); tie a "give up probing after
@@ -110,7 +116,9 @@ confidentiality/integrity), but it is a real cross-gateway authorization gap and
   relayed until its QUIC connection idle-drops (≤30s) — the denylist only blocks NEW handshakes, not live ones.
 
 ## Deployment
-`wiremesh-relay` needs identity (cert/key/ca) at `/var/lib/wiremesh/` 0600 (from fabric-CA enrollment, `--kind relay`).
+`wiremesh-relay` needs identity (cert/key/ca) at `/var/lib/wiremesh/` (from fabric-CA enrollment,
+`--kind relay`) — the certificate, private-key, AND CA identity files EACH require mode `0600` individually
+(not just the containing directory).
 
 ## Cert-binding review — accepted fast-follows (commit 4ab8b59, security review READY)
 - **Important — enrollment signing-failure-after-token-spend:** with gateway-path signing now AFTER the

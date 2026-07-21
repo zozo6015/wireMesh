@@ -112,7 +112,7 @@ impl SyncSvc {
     async fn emit_relays_changed(&self) {
         if let Ok(active) = self.db.active_relays().await {
             if let Ok(revision) = self.db.current_revision().await {
-                let relays = active
+                let relay_infos = active
                     .into_iter()
                     .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
                         relay_id: id as u64,
@@ -121,7 +121,7 @@ impl SyncSvc {
                     .collect();
                 let _ = self
                     .change_tx
-                    .send(ChangeEvent::RelaysChanged { relays, revision });
+                    .send(ChangeEvent::RelaysChanged { relay_infos, revision });
             }
         }
     }

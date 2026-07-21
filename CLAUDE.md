@@ -97,7 +97,9 @@ itself is stable and the direct probe is rate-limited so it never disrupts it.
 the gateway binary itself requires `iproute2` and `nftables` on the host
 (route/link programming and the MSS clamp shell out to `ip`/`nft`). The
 `wiremesh-relay` binary needs its identity (cert/key/ca, from fabric-CA
-enrollment with `--kind relay`) at `/var/lib/wiremesh/` mode 0600.
+enrollment with `--kind relay`) at `/var/lib/wiremesh/` — the certificate,
+private-key, and CA identity files EACH require mode 0600 individually (not
+just the containing directory).
 
 Next action: the Cycle-4c fast-follows (make-before-break direct cutover;
 `relay_pair_id` width + per-relay connection multiplexing) and the

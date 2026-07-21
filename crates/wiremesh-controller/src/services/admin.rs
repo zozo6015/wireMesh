@@ -324,9 +324,19 @@ impl Admin for AdminSvc {
         Ok(Response::new(DeleteSegmentResponse {}))
     }
 
-    /// (Task 13) Registers a relay — cycle-2 bookkeeping only (no real relay
-    /// data-plane wiring yet, mirroring `RotateKey`'s placeholder-pubkey
-    /// posture).
+    /// (Task 13; Cycle-4c review fix) Registers a relay — the insert + audit
+    /// commit atomically in one DB transaction (`Db::insert_relay`, which
+    /// also bumps the persisted revision in that same transaction, mirroring
+    /// `Db::set_relay_status`). AFTER that commits, this re-reads the active-
+    /// relay set and publishes a [`ChangeEvent::RelaysChanged`] on the same
+    /// `change_tx` fan-out `EnrollmentSvc::enroll`'s relay-enrollment branch
+    /// and `SyncSvc::emit_relays_changed` use — without this, a gateway
+    /// enrolled via `fabricctl relay register` (as opposed to relay self-
+    /// enrollment) would never reach an already-connected gateway's open
+    /// `Sync.Watch` stream until it happened to reconnect. Active relays are
+    /// read FIRST, then the revision LAST — same ordering rationale as those
+    /// two call sites (the emitted delta's revision must be >= the state the
+    /// advertised `relay_infos` reflect).
     async fn register_relay(
         &self,
         request: Request<RegisterRelayRequest>,
@@ -350,6 +360,26 @@ impl Admin for AdminSvc {
             .insert_relay(req.name.clone(), req.endpoint.clone(), actor, now)
             .await
             .map_err(|e| Status::already_exists(e.to_string()))?;
+
+        // Best-effort, same discipline as every other post-commit publish in
+        // this file (`RotateKey`/`Drain`/`RevokeCert`/`Apply`): the relay row
+        // and response are already durably committed regardless of whether
+        // this re-read/publish succeeds, so a transient failure here must
+        // never turn into an error response.
+        if let Ok(active) = self.db.active_relays().await {
+            if let Ok(revision) = self.db.current_revision().await {
+                let relay_infos = active
+                    .into_iter()
+                    .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
+                        relay_id: id as u64,
+                        endpoint,
+                    })
+                    .collect();
+                let _ = self
+                    .change_tx
+                    .send(ChangeEvent::RelaysChanged { relay_infos, revision });
+            }
+        }
 
         Ok(Response::new(Relay {
             id: relay_id as u64,

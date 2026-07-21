@@ -82,8 +82,8 @@ fn expect_snapshot(msg: Option<Result<wiremesh_proto::v1::SyncMessage, tonic::St
 }
 
 /// The set of relay ids advertised in a `relays: &[RelayInfo]` slice —
-/// order-independent, since neither `StateSnapshot.relays` nor
-/// `Delta.relays`'s ordering is part of the contract under test here (only
+/// order-independent, since neither `StateSnapshot.relay_infos` nor
+/// `Delta.relay_infos`'s ordering is part of the contract under test here (only
 /// membership and count are).
 fn relay_id_set(relays: &[RelayInfo]) -> HashSet<u64> {
     relays.iter().map(|r| r.relay_id).collect()
@@ -99,7 +99,7 @@ fn find_relay(relays: &[RelayInfo], id: u64) -> Option<&RelayInfo> {
 /// filed the report receives a live `RelaysChanged` delta carrying the
 /// reduced active-relay set. Uses TWO relays (R1, R2) so the eviction delta
 /// is non-empty (per the design notes' "empty-clears" carry: evicting the
-/// LAST relay would yield an empty `Delta.relays` that the gateway's
+/// LAST relay would yield an empty `Delta.relay_infos` that the gateway's
 /// `apply_delta` currently ignores — not exercised here, that's a documented
 /// carry, not this test's concern).
 #[tokio::test]
@@ -117,10 +117,10 @@ async fn reported_unhealthy_relay_is_evicted_from_advertisement() {
 
     let snap = expect_snapshot(stream.next().await);
     assert_eq!(
-        relay_id_set(&snap.relays),
+        relay_id_set(&snap.relay_infos),
         HashSet::from([r1, r2]),
         "before any health report, the initial snapshot must advertise both enrolled relays, got: {:?}",
-        snap.relays
+        snap.relay_infos
     );
 
     // Mark R1 unhealthy. This is the ONLY report on record for R1, so per
@@ -148,20 +148,20 @@ async fn reported_unhealthy_relay_is_evicted_from_advertisement() {
         snap.revision
     );
     assert_eq!(
-        delta.relays.len(),
+        delta.relay_infos.len(),
         1,
         "expected exactly one relay (R2) left advertised after evicting R1, got: {:?}",
-        delta.relays
+        delta.relay_infos
     );
     assert!(
-        find_relay(&delta.relays, r2).is_some(),
+        find_relay(&delta.relay_infos, r2).is_some(),
         "the eviction delta must still carry R2, got: {:?}",
-        delta.relays
+        delta.relay_infos
     );
     assert!(
-        find_relay(&delta.relays, r1).is_none(),
+        find_relay(&delta.relay_infos, r1).is_none(),
         "the eviction delta must NOT carry R1 (it was just reported unhealthy), got: {:?}",
-        delta.relays
+        delta.relay_infos
     );
 
     // (b) A freshly-opened second gateway's snapshot must advertise only R2.
@@ -169,10 +169,10 @@ async fn reported_unhealthy_relay_is_evicted_from_advertisement() {
     let mut stream2 = gw2.open_sync().await;
     let snap2 = expect_snapshot(stream2.next().await);
     assert_eq!(
-        relay_id_set(&snap2.relays),
+        relay_id_set(&snap2.relay_infos),
         HashSet::from([r2]),
         "a fresh snapshot taken after R1's eviction must advertise only R2, got: {:?}",
-        snap2.relays
+        snap2.relay_infos
     );
 }
 
@@ -193,7 +193,7 @@ async fn readmitted_relay_reappears_when_reported_healthy() {
     let gw = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
     let mut stream = gw.open_sync().await;
     let snap = expect_snapshot(stream.next().await);
-    assert_eq!(relay_id_set(&snap.relays), HashSet::from([r1, r2]));
+    assert_eq!(relay_id_set(&snap.relay_infos), HashSet::from([r1, r2]));
 
     // Evict R1 first (same mechanism as the eviction test above), consuming
     // the resulting delta so the stream is positioned for the re-admission
@@ -211,10 +211,10 @@ async fn readmitted_relay_reappears_when_reported_healthy() {
         other => panic!("expected an eviction Delta, got: {other:?}"),
     };
     assert_eq!(
-        relay_id_set(&evict_delta.relays),
+        relay_id_set(&evict_delta.relay_infos),
         HashSet::from([r2]),
         "precondition: R1 must be evicted (only R2 advertised) before testing re-admission, got: {:?}",
-        evict_delta.relays
+        evict_delta.relay_infos
     );
     let evict_rev = evict_delta.revision;
 
@@ -240,10 +240,10 @@ async fn readmitted_relay_reappears_when_reported_healthy() {
         evict_rev
     );
     assert_eq!(
-        relay_id_set(&delta.relays),
+        relay_id_set(&delta.relay_infos),
         HashSet::from([r1, r2]),
         "the re-admission delta must carry BOTH relays (R1 back, R2 still present), got: {:?}",
-        delta.relays
+        delta.relay_infos
     );
 
     // A fresh snapshot must also list both again.
@@ -251,10 +251,10 @@ async fn readmitted_relay_reappears_when_reported_healthy() {
     let mut stream2 = gw2.open_sync().await;
     let snap2 = expect_snapshot(stream2.next().await);
     assert_eq!(
-        relay_id_set(&snap2.relays),
+        relay_id_set(&snap2.relay_infos),
         HashSet::from([r1, r2]),
         "a fresh snapshot taken after R1's re-admission must advertise both relays again, got: {:?}",
-        snap2.relays
+        snap2.relay_infos
     );
 }
 
@@ -294,10 +294,10 @@ async fn one_gateway_unhealthy_does_not_evict_a_relay_another_vouches_for() {
     let mut stream_c = gw_c.open_sync().await;
     let snap = expect_snapshot(stream_c.next().await);
     assert!(
-        find_relay(&snap.relays, r1).is_some(),
+        find_relay(&snap.relay_infos, r1).is_some(),
         "R1 must still be advertised after only ONE of two reporting gateways calls it \
          unhealthy (the other vouches for it as healthy), got: {:?}",
-        snap.relays
+        snap.relay_infos
     );
 
     // Cross-check directly against the DB row's status (independent of the
