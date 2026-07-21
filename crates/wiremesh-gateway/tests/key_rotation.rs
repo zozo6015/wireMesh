@@ -69,6 +69,30 @@ policy:
       - allow: { proto: icmp }
 "#;
 
+/// Fabric for the enforcer-on-new-tun security regression test: same
+/// ICMP-both-ways liveness rules as `FABRIC_ICMP` (so the mesh-up wait and
+/// the poll for a working tunnel don't need a TCP-capable listener), PLUS an
+/// allow for tcp/8080 seg-a -> seg-b only (mirrors `mesh_milestone.rs`'s
+/// `FABRIC_V1`). tcp/9090 is deliberately left un-declared: default-deny
+/// must reject it both before AND after a rotation.
+const FABRIC_ICMP_AND_TCP8080: &str = r#"
+segments:
+  - name: seg-a
+    cidrs: ["10.10.1.0/24"]
+  - name: seg-b
+    cidrs: ["10.10.2.0/24"]
+policy:
+  - from: seg-a
+    to: seg-b
+    rules:
+      - allow: { proto: icmp }
+      - allow: { proto: tcp, ports: [8080] }
+  - from: seg-b
+    to: seg-a
+    rules:
+      - allow: { proto: icmp }
+"#;
+
 // --- root-netns shell helpers (duplicated from mesh_milestone.rs) -----------
 
 fn run_root(args: &[&str]) {
@@ -278,6 +302,52 @@ fn parse_ping_summary(stdout: &str) -> (u64, u64) {
         }
     }
     panic!("no 'packets transmitted' summary line found in ping output:\n{stdout}");
+}
+
+// --- TCP policy-check probes (duplicated from mesh_milestone.rs) -----------
+
+fn spawn_listener(ns: &Ns, port: u16) -> Child {
+    let script = format!(
+        r#"
+import socket
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", {port}))
+s.listen(8)
+while True:
+    c, _ = s.accept()
+    c.close()
+"#
+    );
+    ns.spawn(&["python3", "-c", &script]).expect("spawn listener")
+}
+
+fn tcp_connect(ns: &Ns, dst: &str, port: u16) -> bool {
+    let script = format!(
+        r#"
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect(("{dst}", {port}))
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+"#
+    );
+    ns.exec(&["python3", "-c", &script]).is_ok()
+}
+
+/// `true` iff a TCP connection from `from` to `to`:`port` actually completes
+/// (a listener is running in `to`, so `false` means the enforcer dropped the
+/// SYN before it reached the listener).
+fn check_tcp(from: &Ns, to: &Ns, to_addr: &str, port: u16) -> bool {
+    let mut lst = spawn_listener(to, port);
+    std::thread::sleep(Duration::from_millis(300));
+    let ok = tcp_connect(from, to_addr, port);
+    let _ = lst.kill();
+    let _ = lst.wait();
+    ok
 }
 
 /// Polls `h.debug_key_states(gateway_id)` every 500ms (bounded `timeout`)
@@ -507,4 +577,185 @@ async fn direct_rotation_is_zero_drop() {
     pb.kill();
     drop(lab);
     eprintln!("\nDONE-BAR PASSED: direct rotation completed under a continuous ICMP flood with zero (near-zero) drop, and the mesh still works after.");
+}
+
+/// SECURITY REGRESSION: the L4 enforcer must stay attached across a key
+/// rotation's tun cutover. Cycle key-rotation introduces a second WireGuard
+/// tun device per epoch (`wg0` for epoch 0, `wg0e<N>` for epoch N) as part of
+/// the make-before-break cutover; if the enforcer program is only ever
+/// attached to `wg0` at boot and never (re-)attached to the new epoch's tun,
+/// then after a rotation completes and traffic moves onto `wg0e1`, ALL
+/// traffic — including flows the fabric policy denies — ingresses/egresses
+/// with no policy hook at all. That is a default-deny bypass: a previously
+/// denied flow becomes silently allowed the moment the mesh rotates.
+///
+/// Same direct-mesh topology as `direct_rotation_is_zero_drop`, but instead
+/// of a zero-drop ICMP flood this test asks a policy question before and
+/// after the rotation: does tcp/8080 (allowed) keep working, and — the
+/// security-critical assertion — does tcp/9090 (never allowed by the fabric)
+/// stay denied? gwB's tun is the interesting side here: it is the Role-B
+/// receiver of gwA's rotation, so gwB's overlap/new-epoch tun is the
+/// critical ingress point for gwA's post-rotation traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn denied_flow_stays_denied_across_rotation() {
+    // Underlay bridge in the root netns; controller binds its routable IP.
+    setup_bridge();
+    let _root_guard = RootNetGuard;
+
+    let h = TestController::start_on(CTRL_IP.parse().unwrap()).await;
+
+    // ICMP-both-ways (for liveness) + tcp/8080 seg-a->seg-b (allowed) fabric,
+    // applied BEFORE enrollment so each gateway's first snapshot already
+    // carries the compiled policy. tcp/9090 is intentionally NOT in this
+    // fabric: default-deny must reject it, both pre- and post-rotation.
+    let diff = h.apply(FABRIC_ICMP_AND_TCP8080).await;
+    assert!(
+        diff.policy_updated,
+        "fabric apply must compile a real policy, got: {diff:?}"
+    );
+
+    // Real per-gateway WG keypairs; enroll into the existing segments.
+    let (a_priv, a_pub) = wg_keypair();
+    let (b_priv, b_pub) = wg_keypair();
+    let ga = enroll_into(&h, "10.10.1.0/24", &a_pub).await;
+    let gb = enroll_into(&h, "10.10.2.0/24", &b_pub).await;
+
+    // netns lab: two gateways, two workloads.
+    let mut lab = Lab::new("gwsec").expect("lab");
+    let gwa = lab.ns("a").expect("gwA netns");
+    let gwb = lab.ns("b").expect("gwB netns");
+    let wla = lab.ns("wa").expect("wlA netns");
+    let wlb = lab.ns("wb").expect("wlB netns");
+
+    // Underlay veths from the bridge into each gateway netns.
+    attach_underlay(&gwa, "a", "10.9.0.1");
+    attach_underlay(&gwb, "b", "10.9.0.2");
+
+    // MANDATORY real one-way latency on both underlays (Phase-0 Finding 2) —
+    // must be applied AFTER the underlay `und` device exists.
+    apply_netem(&gwa, "und", 20).expect("netem on gwA underlay");
+    apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
+
+    // Segment veths + workload default routes.
+    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
+        .expect("seg-a veth");
+    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
+        .expect("seg-b veth");
+    wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
+        .expect("wlA default route");
+    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
+        .expect("wlB default route");
+
+    // Provision identity dirs and spawn the two REAL gateway binaries.
+    let sda = tempfile::tempdir().unwrap();
+    let sdb = tempfile::tempdir().unwrap();
+    write_identity(&ga, &a_priv, sda.path());
+    write_identity(&gb, &b_priv, sdb.path());
+    let logdir = tempfile::tempdir().unwrap();
+
+    let sync_addr = h.sync_tcp_addr().to_string();
+    let observe_addr = h.observe_addr().to_string();
+
+    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
+    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+
+    // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
+    let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
+    if !up {
+        dump_diag(
+            "mesh-not-up",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!("SETUP FAILED: workload A -> workload B ICMP (policy-permitted) never passed over the direct tunnel before rotation");
+    }
+    eprintln!("SETUP PASS: direct mesh is up (ICMP crosses wlA -> wlB)");
+
+    // ===== BASELINE (pre-rotation): tcp/8080 allowed, tcp/9090 denied =====
+    let baseline_8080 = check_tcp(&wla, &wlb, "10.10.2.2", 8080);
+    assert!(
+        baseline_8080,
+        "BASELINE FAILED: tcp/8080 (policy-allowed) did not pass before rotation — \
+         the test harness itself is broken, not the enforcer"
+    );
+    let baseline_9090 = check_tcp(&wla, &wlb, "10.10.2.2", 9090);
+    assert!(
+        !baseline_9090,
+        "BASELINE FAILED: tcp/9090 was NOT denied before rotation — the test is \
+         meaningless without a working pre-rotation deny to compare against"
+    );
+    eprintln!("BASELINE PASS: tcp/8080 allowed, tcp/9090 denied (pre-rotation)");
+
+    // ===== Rotate gwA's key =====
+    h.admin_client()
+        .await
+        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .await
+        .expect("Admin.RotateKey");
+    eprintln!("Admin.RotateKey submitted for gwA (epoch 0 -> 1)");
+
+    // ===== Poll until the rotation has actually completed =====
+    let (completed, final_states) =
+        poll_rotation_complete(&h, ga.id(), Duration::from_secs(90)).await;
+    if !completed {
+        dump_diag(
+            "rotation-timeout",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "ROTATION TIMEOUT: gwA's key rotation (epoch 0 -> 1) did not complete within 90s \
+             (epoch 1 active + epoch 0 gone/retiring). Last observed debug_key_states: \
+             {final_states:?}"
+        );
+    }
+    eprintln!("ROTATION COMPLETE: {final_states:?}");
+
+    // ===== THE SECURITY ASSERTIONS (post-rotation) =====
+    // tcp/8080 must still work — the new epoch tun must actually carry
+    // policy-allowed traffic (a sanity check that the mesh itself, not just
+    // the enforcer, survived the cutover).
+    let post_8080 = check_tcp(&wla, &wlb, "10.10.2.2", 8080);
+    if !post_8080 {
+        dump_diag(
+            "post-rotation-8080-failed",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+    }
+    assert!(
+        post_8080,
+        "POST-ROTATION FAILED: tcp/8080 (policy-allowed) stopped passing after rotation — \
+         the new epoch tun does not carry allowed traffic at all"
+    );
+
+    // THE key assertion: tcp/9090 (never allowed by the fabric) must STILL
+    // be denied on the new epoch tun. If this fails, the enforcer is not
+    // attached to the new epoch tun and default-deny has been bypassed.
+    let post_9090 = check_tcp(&wla, &wlb, "10.10.2.2", 9090);
+    if post_9090 {
+        dump_diag(
+            "post-rotation-9090-leaked",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+    }
+    assert!(
+        !post_9090,
+        "SECURITY: tcp/9090 (policy-denied) leaked after rotation — the enforcer is not \
+         attached to the new epoch tun (default-deny bypass)"
+    );
+    eprintln!("POST-ROTATION PASS: tcp/8080 still allowed, tcp/9090 still denied (enforcer follows the new epoch tun)");
+
+    // Teardown.
+    pa.kill();
+    pb.kill();
+    drop(lab);
+    eprintln!("\nDONE-BAR PASSED: default-deny holds across a key rotation — the enforcer stays attached to the new epoch tun.");
 }
