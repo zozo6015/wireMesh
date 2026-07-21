@@ -2,26 +2,45 @@
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
+use tonic::transport::Channel;
 use wiremesh_enforcer::BackendKind;
 use wiremesh_gateway::config::GatewayConfig;
 use wiremesh_gateway::enforce::GatewayEnforcer;
+use wiremesh_gateway::epochkeys::EpochKeys;
 use wiremesh_gateway::identity::Identity;
 use wiremesh_gateway::metrics;
 use wiremesh_gateway::path::{Path, PathAction, PathState};
 use wiremesh_gateway::relay::RelayTransport;
+use wiremesh_gateway::rotation::{Rotation, RotationAction};
 use wiremesh_gateway::state::DesiredState;
 use wiremesh_gateway::tunnel::Tunnel;
+use wiremesh_gateway::tunnelset::TunnelSet;
+use wiremesh_gateway::uapi::DeviceConfig;
 use wiremesh_gateway::{netif, observe, punch, reconcile, routes, sync, uapi};
-use wiremesh_proto::v1::RelayHealth;
+use wiremesh_proto::v1::sync_client::SyncClient;
+use wiremesh_proto::v1::{EpochAck, RelayHealth};
 
 const TUN_MTU: u32 = 1280;
 const MSS: u16 = 1240;
 const KEEPALIVE: u16 = 15;
+
+/// Persistent-keepalive for a rotation's transient overlap Devices
+/// (`wg0e<N>`), deliberately much shorter than the steady-state
+/// [`KEEPALIVE`]. persistent-keepalive is what makes boringtun proactively
+/// INITIATE (and retry) a handshake for a peer that has an endpoint but no
+/// data yet — a rotation Device carries no traffic until the cutover, so
+/// without a tight keepalive its session can take a full 15s (or a missed
+/// retry) to come live, stretching the rotation and risking the done-bar's
+/// 90s budget. 3s brings the overlap session up promptly and re-tries fast if
+/// the first handshake races the peer's Device coming up. Matches the
+/// `spike/keyrot` choreography's short keepalive.
+const ROTATION_KEEPALIVE: u16 = 3;
 const OBSERVE_PERIOD: Duration = Duration::from_secs(20);
 
 /// How long each hole-punch session blasts candidates before giving up — the
@@ -39,6 +58,16 @@ const MAX_PUNCH_DELAY: Duration = Duration::from_secs(5);
 /// UAPI socket.
 const PATH_TICK_PERIOD: Duration = Duration::from_secs(1);
 
+/// Cadence of the rotation observation driver ([`run_rotation_ticks`]).
+/// Deliberately much tighter than [`PATH_TICK_PERIOD`]: the make-before-break
+/// cutover's brief asymmetric-forwarding window (one gateway flipped its route
+/// onto the new epoch's tun, its peer not yet) lasts at most the SKEW between
+/// the two gateways' independent flip ticks, and each dropped datagram in that
+/// window is a lost flood packet against the tight zero-drop bar. A 200ms poll
+/// caps that skew (and thus the worst-case loss) at ~1 packet's worth of a
+/// 0.2s-interval flood, versus ~5 at a 1s poll.
+const ROTATION_TICK_PERIOD: Duration = Duration::from_millis(200);
+
 fn main() -> anyhow::Result<()> {
     let cfg = GatewayConfig::from_env()?;
     let rt = tokio::runtime::Runtime::new()?;
@@ -52,6 +81,15 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // spec §5.1/§5.3: this happens BEFORE the controller is ever contacted).
     let tunnel = Tunnel::up(&cfg.tun_ifname, &id.wg_private_key_b64, cfg.wg_listen_port, TUN_MTU)?;
     routes::enable_ip_forward()?;
+    // Loose reverse-path filtering so a make-before-break rotation's brief
+    // asymmetric-forwarding window (send route on the new tun, reverse route
+    // still on the old) doesn't get its decrypted packets dropped by strict
+    // rp_filter — see `routes::set_rp_filter_loose`. Best-effort: a gateway
+    // that can't set it still runs (and, absent a rotation, never forwards
+    // asymmetrically anyway).
+    if let Err(e) = routes::set_rp_filter_loose() {
+        eprintln!("wiremesh-gateway: could not set loose rp_filter (continuing): {e}");
+    }
     routes::install_mss_clamp(&cfg.tun_ifname, MSS)?;
     let enforcer = Arc::new(Mutex::new(GatewayEnforcer::attach(&cfg.tun_ifname)?));
 
@@ -59,10 +97,28 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // does not hold the enforcer lock just to report this gauge).
     let applied_version = Arc::new(AtomicU64::new(0));
 
+    // The last `wg0` device config actually pushed to boringtun (its encoded
+    // UAPI `set` string), shared by every site that applies `wg0` — `apply_state`
+    // AND the punch/relay `set_peer_endpoint`. boringtun REPLACES a peer's whole
+    // session (a fresh `Tunn`, no handshake state) on every `replace_peers`
+    // apply — it can't modify a peer in place — so re-pushing a byte-identical
+    // config needlessly tears the live WireGuard session down and forces a
+    // re-handshake, dropping in-flight traffic. Skipping an unchanged apply
+    // (see `apply_wg0_if_changed`) is what keeps a continuous flow zero-drop
+    // across the make-before-break rotation window, where several deltas
+    // (submit, promote) and punch re-confirms would otherwise each reset the
+    // session.
+    let applied_wg0 = Arc::new(std::sync::Mutex::new(None::<String>));
+    // Rotating peers whose `wg0` entry must stay pinned to their OLD epoch key
+    // for the overlap's lifetime (Role B make-before-break) — read by every
+    // `wg0` apply site so the peer's promote delta doesn't rekey `wg0`. Empty
+    // in steady state.
+    let wg0_pins = Arc::new(std::sync::Mutex::new(HashMap::<u64, String>::new()));
+
     let mut applied: Option<DesiredState> = DesiredState::load(&cfg.state_dir)?;
     if let Some(ds) = &applied {
         eprintln!("wiremesh-gateway: fail-static boot from state.json rev {}", ds.revision);
-        apply_state(&tunnel, &enforcer, &cfg, None, ds).await?;
+        apply_state(&tunnel, &enforcer, None, ds, &cfg.tun_ifname, &wg0_pins, &applied_wg0).await?;
         applied_version.store(ds.policy_version, Ordering::Relaxed);
     }
 
@@ -105,6 +161,8 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
         relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        applied_wg0: applied_wg0.clone(),
+        wg0_pins: wg0_pins.clone(),
     };
 
     // Metrics endpoint (Prometheus scrape) on an ephemeral loopback port,
@@ -158,6 +216,42 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
 
     tokio::spawn(run_path_ticks(ctx.clone()));
 
+    // --- Key-rotation wiring (make-before-break) ---------------------------
+    // Migrate the pre-rotation single identity key into a one-epoch store
+    // (epoch 0, "active") the first time a rotation-aware gateway boots, so
+    // `generate_next` has a base to mint from. Steady-state (no rotation)
+    // behavior is completely unchanged: epoch 0 already runs on `wg0` at the
+    // base port from the boot above; the epoch store is only consulted when a
+    // rotation actually starts.
+    let mut epoch_keys = match EpochKeys::load(&cfg.state_dir)? {
+        Some(k) => k,
+        None => {
+            let k = EpochKeys::from_legacy(&id.wg_private_key_b64)?;
+            k.persist(&cfg.state_dir)?;
+            k
+        }
+    };
+    // Rotation Devices (own new epoch on Role A; the transient overlap Device
+    // on Role B) live here, owned by THIS (`block_on`'d, so non-`Send`-safe)
+    // task alongside boot's `tunnel` — never moved into a spawned task, since
+    // boringtun's `DeviceHandle` is not `Send`. The observation tick below
+    // only ever reads a rotation Device's liveness by ifname (a `String`), so
+    // it needs no handle to the Device itself.
+    let mut tunnels = TunnelSet::new();
+    let rot = RotationShared {
+        base_wg_port: cfg.wg_listen_port,
+        base_tun: cfg.tun_ifname.clone(),
+        state_dir: cfg.state_dir.clone(),
+        identity: Arc::new(id.clone()),
+        controller_sync_addr: cfg.controller_sync_addr,
+        rotation: Arc::new(std::sync::Mutex::new(Rotation::new())),
+        role_a: Arc::new(std::sync::Mutex::new(None)),
+        role_b: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        active_tun: Arc::new(std::sync::Mutex::new(cfg.tun_ifname.clone())),
+        wg0_pins: wg0_pins.clone(),
+    };
+    tokio::spawn(run_rotation_ticks(rot.clone()));
+
     // Sync loop with reconnect.
     loop {
         match sync::connect(cfg.controller_sync_addr, &id).await {
@@ -174,8 +268,28 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                 loop {
                     match sync::next_event(&mut stream, &mut current).await {
                         Ok(Some(sync::SyncEvent::State(ds))) => {
-                            apply_state(&tunnel, &enforcer, &cfg, applied.as_ref(), &ds).await?;
+                            let route_ifname = rot.active_tun.lock().unwrap().clone();
+                            apply_state(
+                                &tunnel,
+                                &enforcer,
+                                applied.as_ref(),
+                                &ds,
+                                &route_ifname,
+                                &wg0_pins,
+                                &applied_wg0,
+                            )
+                            .await?;
                             ds.save(&cfg.state_dir)?;
+                            // (Key-rotation Role B) If desired state now shows a
+                            // peer that is rotating (a real-keyed `pending`
+                            // epoch advertised alongside its `active` one),
+                            // stand up the transient overlap Device toward the
+                            // peer's new key so the make-before-break cutover
+                            // can happen once that session is live. No-op for
+                            // steady state (no rotating peers).
+                            if let Err(e) = maybe_start_role_b(&mut tunnels, &rot, &ds) {
+                                eprintln!("wiremesh-gateway: Role B setup failed: {e}");
+                            }
                             // Publish the latest desired state to the punch /
                             // path-tick tasks (guard dropped before the await
                             // below — never held across it).
@@ -187,6 +301,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 ds.policy_version,
                                 local_endpoints,
                                 relay_health,
+                                vec![],
                             )
                             .await;
                             applied_version.store(ds.policy_version, Ordering::Relaxed);
@@ -215,11 +330,23 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 ),
                             }
                         }
-                        Ok(Some(sync::SyncEvent::Rotate(_))) => {
+                        Ok(Some(sync::SyncEvent::Rotate(d))) => {
                             eprintln!(
-                                "wiremesh-gateway: RotateDirective received (rotation wiring \
-                                 lands in the netns-integration task)"
+                                "wiremesh-gateway: RotateDirective received (epoch={})",
+                                d.epoch
                             );
+                            if let Err(e) = handle_rotate(
+                                &mut epoch_keys,
+                                &mut tunnels,
+                                &rot,
+                                d.epoch,
+                                applied.as_ref(),
+                                &mut client,
+                            )
+                            .await
+                            {
+                                eprintln!("wiremesh-gateway: Role A rotation failed: {e}");
+                            }
                         }
                         Ok(None) => {
                             eprintln!("sync stream closed; reconnecting");
@@ -306,6 +433,15 @@ struct PathCtx {
     /// default for a peer that has never been relayed at all, preserving
     /// every pre-4c-Task-9 direct-only scenario's behavior unchanged.
     relay_pointed: Arc<std::sync::Mutex<HashMap<u64, bool>>>,
+    /// Shared last-applied `wg0` config (encoded UAPI `set` string) — see the
+    /// field's construction in `run`. `set_peer_endpoint` consults it via
+    /// [`apply_wg0_if_changed`] so a punch/relay re-confirm that resolves to
+    /// the SAME config doesn't reset the live session.
+    applied_wg0: Arc<std::sync::Mutex<Option<String>>>,
+    /// Shared Role-B `wg0` pin map (peer `gateway_id` -> old-epoch pubkey) — so
+    /// `set_peer_endpoint` builds the same pinned config `apply_state` does and
+    /// a punch during a rotation overlap can't rekey `wg0` off the pin.
+    wg0_pins: Arc<std::sync::Mutex<HashMap<u64, String>>>,
 }
 
 impl PathCtx {
@@ -560,12 +696,15 @@ async fn set_peer_endpoint(
             peer.candidates.retain(|c| c != &a);
             peer.candidates.insert(0, a);
         }
-        reconcile::device_config(&ds, &ctx.priv_key, ctx.wg_port, KEEPALIVE)
+        // Honor the same Role-B `wg0` pin `apply_state` uses, so a punch/relay
+        // re-point during a rotation overlap can't rekey `wg0` off the pinned
+        // old-epoch key (make-before-break), and — with the change-guard below
+        // — resolving to an already-applied endpoint is a true no-op that
+        // never resets the live session.
+        let pins = ctx.wg0_pins.lock().unwrap();
+        reconcile::device_config_pinned(&ds, &ctx.priv_key, ctx.wg_port, KEEPALIVE, &pins)
     };
-    let ifname = ctx.ifname.clone();
-    tokio::task::spawn_blocking(move || uapi::apply(&ifname, &dev))
-        .await
-        .context("uapi apply task panicked")??;
+    apply_wg0_if_changed(&ctx.ifname, &dev, &ctx.applied_wg0).await?;
     ctx.relay_pointed.lock().unwrap().insert(gid, is_relay);
     Ok(())
 }
@@ -1001,35 +1140,460 @@ async fn run_path_ticks(ctx: PathCtx) {
     }
 }
 
+/// Apply `dev` to `ifname` ONLY if it differs from the last config recorded in
+/// `applied_wg0` (its encoded UAPI `set` string). boringtun rebuilds a peer's
+/// entire session on every `replace_peers` apply (see `applied_wg0`'s field
+/// doc), so re-pushing an identical config would needlessly reset the live
+/// WireGuard session and drop in-flight traffic — this is the guard that makes
+/// a redundant re-reconcile (a policy-only delta, a punch re-confirm of the
+/// same endpoint, a peer's promote under an active Role-B pin) a genuine no-op
+/// on the data plane. The blocking `uapi::apply` runs inside `spawn_blocking`.
+async fn apply_wg0_if_changed(
+    ifname: &str,
+    dev: &DeviceConfig,
+    applied_wg0: &Arc<std::sync::Mutex<Option<String>>>,
+) -> anyhow::Result<()> {
+    let encoded = uapi::encode_set(dev).context("encoding wg0 device config")?;
+    if applied_wg0.lock().unwrap().as_deref() == Some(encoded.as_str()) {
+        return Ok(());
+    }
+    let ifn = ifname.to_string();
+    let dev = dev.clone();
+    tokio::task::spawn_blocking(move || uapi::apply(&ifn, &dev))
+        .await
+        .context("wg0 UAPI apply task panicked")??;
+    *applied_wg0.lock().unwrap() = Some(encoded);
+    Ok(())
+}
+
 /// Apply one desired state to the data plane (tunnel peers, enforcer, routes).
+///
+/// `route_ifname` is the tun the peer-segment routes are (re)pointed at — the
+/// CURRENTLY-active tun, which is boot's `wg0` in steady state and after a
+/// rotation becomes the new epoch's tun (`wg0e<N>`). The WG device peers
+/// themselves are always reconciled on boot's `tunnel` (`wg0`), which stays
+/// up through the make-before-break overlap; only where new/removed CIDRs are
+/// routed follows the active tun.
 async fn apply_state(
     tunnel: &Tunnel,
     enforcer: &Arc<Mutex<GatewayEnforcer>>,
-    cfg: &GatewayConfig,
     prev: Option<&DesiredState>,
     ds: &DesiredState,
+    route_ifname: &str,
+    wg0_pins: &Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    applied_wg0: &Arc<std::sync::Mutex<Option<String>>>,
 ) -> anyhow::Result<()> {
-    // The UAPI apply itself is a blocking UnixStream connect/write/read
-    // (`uapi::apply`). Build the (cheap, synchronous) device config from the
-    // tunnel's plain fields first, then run ONLY the blocking call inside
-    // `spawn_blocking` with owned data — this avoids moving `Tunnel`/
-    // `DeviceHandle` (which owns boringtun's non-`Send` internals) into the
-    // blocking closure while still keeping the Tokio worker thread free.
-    let dev = reconcile::device_config(ds, &tunnel.private_key_b64, tunnel.listen_port, KEEPALIVE);
-    let ifname = tunnel.ifname.clone();
-    tokio::task::spawn_blocking(move || uapi::apply(&ifname, &dev))
-        .await
-        .context("tunnel UAPI apply task panicked")??;
+    // Build the (cheap, synchronous) `wg0` device config, pinning any rotating
+    // peer's entry to its old epoch key (Role B make-before-break; empty pin
+    // map in steady state = identical to the pre-rotation config), then apply
+    // it only if it actually changed.
+    let dev = {
+        let pins = wg0_pins.lock().unwrap();
+        reconcile::device_config_pinned(ds, &tunnel.private_key_b64, tunnel.listen_port, KEEPALIVE, &pins)
+    };
+    apply_wg0_if_changed(&tunnel.ifname, &dev, applied_wg0).await?;
     enforcer.lock().await.apply_if_changed(ds)?;
     let empty = DesiredState::default();
     let diff = reconcile::route_diff(prev.unwrap_or(&empty), ds);
     for cidr in &diff.to_add {
-        routes::add_route(cidr, &cfg.tun_ifname)?;
+        routes::add_route(cidr, route_ifname)?;
     }
     for cidr in &diff.to_del {
-        routes::del_route(cidr, &cfg.tun_ifname)?;
+        routes::del_route(cidr, route_ifname)?;
     }
     Ok(())
+}
+
+// --- Key-rotation make-before-break wiring -----------------------------------
+
+/// Shared, `Send` rotation state — cloned into the observation tick
+/// ([`run_rotation_ticks`]) and read/written from the sync loop. Deliberately
+/// holds NO boringtun `Device`/`TunnelSet` (those are non-`Send` and stay
+/// owned by the `block_on`'d `run` task); the tick only ever needs a rotation
+/// Device's ifname (a `String`) to read its liveness by UAPI, never a handle
+/// to the Device itself. Every field is `Copy`/`String`/`Arc<_>`, and every
+/// `std::sync::Mutex` guard is taken in a tight scope and dropped before any
+/// `.await` (same discipline as [`PathCtx`]).
+#[derive(Clone)]
+struct RotationShared {
+    /// Base WireGuard listen port (epoch-0 / `wg0`), the offset anchor for a
+    /// rotation Device's port (`base + (N - active_epoch)`).
+    base_wg_port: u16,
+    /// Boot tun ifname (`wg0`); a rotation Device is `<base_tun>e<N>`.
+    base_tun: String,
+    state_dir: PathBuf,
+    identity: Arc<Identity>,
+    controller_sync_addr: SocketAddr,
+    /// This gateway's own rotation state machine (Role A). `on_directive`
+    /// (sync loop) and `on_new_epoch_session` (tick) both drive it.
+    rotation: Arc<std::sync::Mutex<Rotation>>,
+    /// Present while THIS gateway is rotating its own key (Role A): what the
+    /// tick must watch on the new tun to trigger the route flip.
+    role_a: Arc<std::sync::Mutex<Option<RoleA>>>,
+    /// Rotating PEERS this gateway is overlapping toward (Role B), keyed by
+    /// the rotating peer's `gateway_id`.
+    role_b: Arc<std::sync::Mutex<HashMap<u64, RoleB>>>,
+    /// The tun peer-segment routes are currently pointed at — `wg0` until a
+    /// cutover flips it to the new epoch's tun.
+    active_tun: Arc<std::sync::Mutex<String>>,
+    /// Shared Role-B `wg0` pin map (same `Arc` [`PathCtx`] holds). Role B adds
+    /// an entry when it stands up an overlap so every `wg0` apply keeps that
+    /// peer's base-tun session on its old epoch key across the promote.
+    wg0_pins: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+}
+
+/// Role A (this gateway is rotating its own key): the observation the tick
+/// needs to decide the make-before-break flip.
+#[derive(Clone)]
+struct RoleA {
+    /// The new epoch's tun (`wg0e<N>`) — watched for the peer's handshake.
+    new_tun: String,
+    /// `(peer active-key hex, that peer's segment CIDRs)`: the peer talks to
+    /// us on `new_tun` with its ACTIVE key; once that session is
+    /// rx-corroborated live we flip the peer's CIDR routes onto `new_tun`.
+    peers: Vec<(String, Vec<String>)>,
+}
+
+/// Role B (a PEER of this gateway is rotating): the transient overlap Device
+/// this gateway stood up toward the peer's new key, and what to do once its
+/// session is live.
+#[derive(Clone)]
+struct RoleB {
+    pending_epoch: u32,
+    new_tun: String,
+    /// The rotating peer's PENDING-key hex — the peer entry we watch on
+    /// `new_tun` for a live, rx-corroborated session.
+    peer_pending_hex: String,
+    /// The rotating peer's segment CIDRs, flipped onto `new_tun` at cutover.
+    peer_cidrs: Vec<String>,
+    /// Set once we've flipped routes AND reported the live epoch ack — a
+    /// completed Role-B cutover for this peer, not re-driven.
+    done: bool,
+}
+
+/// Role A: handle a `RotateDirective`. Mint+persist the new epoch key, bring
+/// its Device up alongside `wg0` (the "make"), reconcile it against the
+/// current peers at the offset port, submit the real pubkey to the controller,
+/// and arm the observation tick to watch for the peer's live session. Idempotent
+/// against a re-entrant directive (the SM only honors one from `Idle`).
+async fn handle_rotate(
+    epoch_keys: &mut EpochKeys,
+    tunnels: &mut TunnelSet,
+    rot: &RotationShared,
+    directive_epoch: u32,
+    applied: Option<&DesiredState>,
+    client: &mut SyncClient<Channel>,
+) -> anyhow::Result<()> {
+    let action = rot.rotation.lock().unwrap().on_directive(directive_epoch);
+    let Some(RotationAction::MintBringUpSubmit { epoch: n }) = action else {
+        eprintln!(
+            "wiremesh-gateway: ignoring RotateDirective(epoch={directive_epoch}) — a rotation is \
+             already in flight"
+        );
+        return Ok(());
+    };
+    let ds = applied.ok_or_else(|| {
+        anyhow::anyhow!("RotateDirective arrived before any desired state; no peer set to mint against")
+    })?;
+
+    let new_key = epoch_keys.generate_next()?.clone();
+    epoch_keys.persist(&rot.state_dir)?;
+    if new_key.epoch != n {
+        eprintln!(
+            "wiremesh-gateway: WARNING minted epoch {} != directive epoch {n}; proceeding on the \
+             directive epoch for the port/tun convention",
+            new_key.epoch
+        );
+    }
+
+    let active_epoch = epoch_keys.active().map(|k| k.epoch).unwrap_or(0);
+    let offset = u16::try_from(n.saturating_sub(active_epoch)).unwrap_or(0);
+    let new_port = rot.base_wg_port.saturating_add(offset);
+    let new_tun = format!("{}e{}", rot.base_tun, n);
+
+    tunnels.bring_up(n, &new_tun, &new_key.private_key_b64, new_port, TUN_MTU)?;
+    let dev =
+        reconcile::device_config_at_port(ds, &new_key.private_key_b64, new_port, ROTATION_KEEPALIVE);
+    uapi::apply(&new_tun, &dev)?;
+
+    let peers: Vec<(String, Vec<String>)> = ds
+        .peers
+        .iter()
+        .filter_map(|p| {
+            let hex = pubkey_b64_to_hex(p.active_pubkey_b64.as_deref()?)?;
+            Some((hex, p.allowed_ips.clone()))
+        })
+        .collect();
+    *rot.role_a.lock().unwrap() = Some(RoleA { new_tun: new_tun.clone(), peers });
+
+    sync::submit_epoch_key(client, n, new_key.pubkey_b64.clone()).await?;
+    eprintln!(
+        "wiremesh-gateway: Role A minted epoch {n} on {new_tun}:{new_port}, submitted pubkey; \
+         awaiting rx-corroborated session to flip routes"
+    );
+    Ok(())
+}
+
+/// Role B: for each peer in `ds` that is rotating (advertises a real-keyed
+/// `pending` epoch alongside its `active` one) and isn't already being
+/// overlapped, bring up a transient overlap Device toward the peer's pending
+/// key (this gateway's OWN active key on the offset port) and arm the tick to
+/// flip+ack once that session is live. No-op in steady state.
+fn maybe_start_role_b(
+    tunnels: &mut TunnelSet,
+    rot: &RotationShared,
+    ds: &DesiredState,
+) -> anyhow::Result<()> {
+    for peer in &ds.peers {
+        let (Some(active), Some(pending)) = (peer.active_key(), peer.pending_key()) else {
+            continue;
+        };
+        let aid = peer.gateway_id;
+        if rot.role_b.lock().unwrap().contains_key(&aid) {
+            continue;
+        }
+
+        let pending_epoch = pending.epoch;
+        let offset = u16::try_from(pending_epoch.saturating_sub(active.epoch)).unwrap_or(0);
+        let listen_port = rot.base_wg_port.saturating_add(offset);
+        let new_tun = format!("{}e{}", rot.base_tun, pending_epoch);
+
+        // Peer set for the overlap Device: exactly the rotating peer at its
+        // pending key + offset endpoint (`pending_peer_configs`, filtered to
+        // this peer's pending pubkey so a second rotating peer never lands on
+        // this peer's single-purpose Device).
+        let peers: Vec<_> = reconcile::pending_peer_configs(ds, ROTATION_KEEPALIVE)
+            .into_iter()
+            .filter(|pc| pc.public_key_b64 == pending.pubkey_b64)
+            .collect();
+        if peers.is_empty() {
+            continue; // couldn't build the peer's offset endpoint — skip this round
+        }
+
+        let own_priv = rot.identity.wg_private_key_b64.clone();
+        tunnels.bring_up(pending_epoch, &new_tun, &own_priv, listen_port, TUN_MTU)?;
+        uapi::apply(
+            &new_tun,
+            &DeviceConfig { private_key_b64: own_priv, listen_port, peers },
+        )?;
+
+        let Some(peer_pending_hex) = pubkey_b64_to_hex(&pending.pubkey_b64) else {
+            anyhow::bail!("rotating peer {aid} pending pubkey is not valid base64");
+        };
+        // Pin this peer's `wg0` entry to its CURRENT (old) epoch key for the
+        // overlap, so its later promote delta can't rekey `wg0` and reset the
+        // still-in-use old session (make-before-break on the base tun).
+        rot.wg0_pins.lock().unwrap().insert(aid, active.pubkey_b64.clone());
+        rot.role_b.lock().unwrap().insert(
+            aid,
+            RoleB {
+                pending_epoch,
+                new_tun: new_tun.clone(),
+                peer_pending_hex,
+                peer_cidrs: peer.allowed_ips.clone(),
+                done: false,
+            },
+        );
+        eprintln!(
+            "wiremesh-gateway: Role B overlap Device up on {new_tun}:{listen_port} toward peer \
+             {aid} epoch {pending_epoch}"
+        );
+    }
+    Ok(())
+}
+
+/// First host address of an `ip/prefix` CIDR (network address + 1), e.g.
+/// `10.10.2.0/24` -> `10.10.2.1` — conventionally the peer gateway's own
+/// segment address, and always a member of the peer's `allowed_ips`. Used as
+/// an out-of-band handshake-probe target. `None` for a malformed CIDR.
+fn first_host_of(cidr: &str) -> Option<String> {
+    let (ip, prefix) = cidr.split_once('/')?;
+    let addr: std::net::Ipv4Addr = ip.parse().ok()?;
+    let prefix: u32 = prefix.parse().ok()?;
+    if prefix > 32 {
+        return None;
+    }
+    let base = u32::from(addr);
+    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let network = base & mask;
+    Some(std::net::Ipv4Addr::from(network.wrapping_add(1)).to_string())
+}
+
+/// Out-of-band handshake kick for a rotation Device (blocking; shells out like
+/// the rest of `routes`). boringtun does NOT proactively initiate a WG
+/// handshake from persistent-keepalive alone (Cycle-4b/keyrot-spike finding:
+/// the `spike/keyrot` choreography had to send a probe to bring the new key's
+/// session live) — it only starts one when it has an actual packet to send to
+/// the peer. So temporarily route a single ICMP echo at the peer segment's
+/// first host THROUGH the new tun (a /32, so the real flood's route is
+/// untouched — make-before-break preserved) sourced from a real local address:
+/// that gives boringtun a packet whose destination matches the peer's
+/// `allowed_ips`, which fires the handshake. The echo itself may be lost (the
+/// point is the handshake); the route is removed immediately after. Entirely
+/// best-effort — every step is ignore-on-error, since this only needs to
+/// SUCCEED often enough that one handshake completes, after which the 3s
+/// keepalive keeps the session live.
+fn probe_overlap_handshake(new_tun: &str, cidr: &str, src_ip: &str) {
+    use std::process::Command;
+    let Some(target) = first_host_of(cidr) else { return };
+    let route = format!("{target}/32");
+    let _ = Command::new("ip").args(["route", "replace", &route, "dev", new_tun]).status();
+    let _ = Command::new("ping").args(["-c", "1", "-W", "1", "-I", src_ip, &target]).status();
+    let _ = Command::new("ip").args(["route", "del", &route, "dev", new_tun]).status();
+}
+
+/// Kick the overlap handshake for `new_tun` toward each of `cidrs`, sourced
+/// from this gateway's first routable local address (needed so the probe
+/// packet actually has a source and gets sent; the destination — not the
+/// source — is what makes boringtun pick the peer and handshake). No-op if the
+/// gateway has no routable local address to source from. Runs the blocking
+/// shell-outs off the async runtime.
+async fn kick_overlap(new_tun: String, cidrs: Vec<String>, base_wg_port: u16) {
+    let _ = tokio::task::spawn_blocking(move || {
+        let locals = netif::local_wg_endpoints(base_wg_port);
+        let Some(src) = locals.first().and_then(|e| e.rsplit_once(':').map(|(ip, _)| ip.to_string()))
+        else {
+            return;
+        };
+        for cidr in &cidrs {
+            probe_overlap_handshake(&new_tun, cidr, &src);
+        }
+    })
+    .await;
+}
+
+/// Read `ifname`'s per-peer liveness and return the subset of `wanted`
+/// pubkey-hexes whose session is rx-corroborated live: a completed handshake
+/// AND `rx_bytes > 0` (real decrypted inbound, e.g. a keepalive) — the
+/// make-before-break gate. `rx > 0` is what distinguishes a genuinely live
+/// new-epoch session from boringtun advancing `last_handshake_time` while
+/// retrying an unanswered handshake with no reply (Cycle 4b path-liveness
+/// finding); we must NEVER flip routes onto the new epoch on a handshake
+/// alone. `None` if the Device's UAPI can't be read yet (not up).
+async fn read_live_peers(
+    ifname: &str,
+    wanted: impl Iterator<Item = String>,
+) -> Option<HashSet<String>> {
+    let wanted: HashSet<String> = wanted.collect();
+    let ifn = ifname.to_string();
+    let liveness = match tokio::task::spawn_blocking(move || uapi::get_peer_liveness(&ifn)).await {
+        Ok(Ok(m)) => m,
+        _ => return None,
+    };
+    let mut live = HashSet::new();
+    for w in wanted {
+        if let Some((Some(_), rx)) = liveness.get(&w).copied() {
+            if rx > 0 {
+                live.insert(w);
+            }
+        }
+    }
+    Some(live)
+}
+
+/// Report a single live epoch ack to the controller over a fresh short-lived
+/// mTLS Sync channel (a unary `Report`, like the testkit's helper) — the
+/// observation tick has no access to the sync loop's own `client`, and a
+/// unary Report neither registers a Watch nor disturbs the open one.
+async fn send_epoch_ack(rot: &RotationShared, ack: EpochAck) -> anyhow::Result<()> {
+    let mut client: SyncClient<Channel> =
+        sync::connect(rot.controller_sync_addr, &rot.identity).await?;
+    sync::report(&mut client, 0, vec![], vec![], vec![ack]).await
+}
+
+/// The rotation observation driver: every `PATH_TICK_PERIOD`, watch any
+/// in-flight rotation's new-epoch tun for a live, rx-corroborated session and
+/// execute the make-before-break cutover — Role A flips its own peer routes
+/// (driven through the `Rotation` SM's `on_new_epoch_session`/`FlipRoutes`),
+/// Role B flips the rotating peer's routes and reports the live epoch ack that
+/// advances the controller's promote SM. Never tears down the old epoch's
+/// Device (case-1 scope: `wg0` stays up — safe under make-before-break, and
+/// the old wg0↔wg0 session simply idles once routes have moved).
+async fn run_rotation_ticks(rot: RotationShared) {
+    loop {
+        tokio::time::sleep(ROTATION_TICK_PERIOD).await;
+
+        // Role A: our own new epoch's Device.
+        let role_a = rot.role_a.lock().unwrap().clone();
+        if let Some(a) = role_a {
+            let hexes = a.peers.iter().map(|(h, _)| h.clone());
+            let live = read_live_peers(&a.new_tun, hexes).await;
+            let any_live =
+                live.as_ref().map_or(false, |l| a.peers.iter().any(|(hex, _)| l.contains(hex)));
+            if any_live {
+                let action = rot.rotation.lock().unwrap().on_new_epoch_session(true);
+                if let Some(RotationAction::FlipRoutes { epoch }) = action {
+                    for (_, cidrs) in &a.peers {
+                        for cidr in cidrs {
+                            if let Err(e) = routes::add_route(cidr, &a.new_tun) {
+                                eprintln!(
+                                    "wiremesh-gateway: Role A route flip {cidr} -> {} failed: {e}",
+                                    a.new_tun
+                                );
+                            }
+                        }
+                    }
+                    *rot.active_tun.lock().unwrap() = a.new_tun.clone();
+                    eprintln!(
+                        "wiremesh-gateway: Role A cutover — routes flipped onto {} (epoch {epoch})",
+                        a.new_tun
+                    );
+                }
+            } else {
+                // Not live yet: kick the overlap handshake (boringtun won't
+                // initiate from keepalive alone). The `ping -W1` timeout
+                // naturally rate-limits this to ~once/sec while the peer's
+                // Device isn't up yet.
+                let cidrs: Vec<String> = a.peers.iter().flat_map(|(_, c)| c.clone()).collect();
+                kick_overlap(a.new_tun.clone(), cidrs, rot.base_wg_port).await;
+            }
+        }
+
+        // Role B: transient overlap Device(s) toward rotating peer(s).
+        let pending_b: Vec<(u64, RoleB)> = rot
+            .role_b
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, b)| !b.done)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for (aid, b) in pending_b {
+            let live =
+                read_live_peers(&b.new_tun, std::iter::once(b.peer_pending_hex.clone())).await;
+            if !live.map_or(false, |l| l.contains(&b.peer_pending_hex)) {
+                // Not live yet: kick the overlap handshake toward the rotating
+                // peer (same rationale as Role A above).
+                kick_overlap(b.new_tun.clone(), b.peer_cidrs.clone(), rot.base_wg_port).await;
+                continue;
+            }
+            for cidr in &b.peer_cidrs {
+                if let Err(e) = routes::add_route(cidr, &b.new_tun) {
+                    eprintln!(
+                        "wiremesh-gateway: Role B route flip {cidr} -> {} failed: {e}",
+                        b.new_tun
+                    );
+                }
+            }
+            let ack = EpochAck { peer_gateway_id: aid, epoch: b.pending_epoch, live: true };
+            match send_epoch_ack(&rot, ack).await {
+                Ok(()) => {
+                    if let Some(e) = rot.role_b.lock().unwrap().get_mut(&aid) {
+                        e.done = true;
+                    }
+                    *rot.active_tun.lock().unwrap() = b.new_tun.clone();
+                    eprintln!(
+                        "wiremesh-gateway: Role B cutover — peer {aid} epoch {} live; routes on {}, \
+                         epoch ack sent",
+                        b.pending_epoch, b.new_tun
+                    );
+                }
+                Err(e) => eprintln!(
+                    "wiremesh-gateway: Role B epoch ack for peer {aid} failed (will retry): {e}"
+                ),
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1072,6 +1636,8 @@ mod tests {
             relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
             relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            applied_wg0: Arc::new(std::sync::Mutex::new(None)),
+            wg0_pins: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 

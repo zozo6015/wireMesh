@@ -13,7 +13,7 @@ Baseline: 50fa06d (plan committed)
 - [x] Task 5: gateway — multi-epoch key store + state.json persistence
 - [x] Task 6: gateway — EpochTunnel/TunnelSet (two Devices, overlay IP on lo)
 - [x] Task 7: gateway — PeerState multi-key + transient peer Device
-- [ ] Task 8: gateway — rotation driver + projection guard
+- [x] Task 8: gateway — rotation driver + projection guard
 - [ ] Task 9: testkit — rotate-under-load harness
 - [ ] Task 10: netns done-bar + docs
 
@@ -37,3 +37,7 @@ Task 6: complete (commits e3fe666..46f8dc6, review clean — additive TunnelSet 
 Task 7: complete (commits 7358aa2..a353b9a, review clean — PeerState.keys + active_key/pending_key (sentinel-skip) + pending_peer_configs with relative port offset (ep-ea), checked/panic-free; active_pubkey_b64 non-regression; gateway lib 68/68, netns-tests build compiles).
 Task 8a (controller projection guard): complete (commits fa29d92..94f843a, review clean — sentinel-pending withheld at all 4 advertised-key sites (KeyRotated/EndpointObserved/SegmentCidrsChanged deltas + build_snapshot); KeyRotated preserves candidate_endpoints; keys.rs updated to new behavior per owner decision; projection_guard 2/2, full controller suite green).
   Minor carries→final review: no dedicated build_snapshot sentinel test (verified by reading); raw "awaiting-submission" literals in set_epoch_pubkey/promote_epoch/sync.rs:289 could use AWAITING_SUBMISSION_SENTINEL const.
+Task 8b (gateway rotation SM + SyncEvent::Rotate): complete (commits 416824a..9664f48, review clean — pure Rotation SM, make-before-break STRUCTURALLY guaranteed (FlipRoutes only on rx_corroborated; no TearDown while Overlapping); SyncEvent::Rotate wired into classify; main.rs has a log-only placeholder arm (full I/O deferred to netns-integration). gateway lib 76/76.)
+  Minor carry→T9/10: on_epoch_retired doesn't cross-check epoch vs tracked new_epoch — the integration caller must pass the correct OLD epoch.
+Task 8 COMPLETE (8a controller projection guard + 8b gateway rotation SM). 8/10.
+=== REMAINING: T9 (rotate-under-load testkit harness) + T10 (netns done-bar + wire the rotation SM into the live main loop). This is the netns integration — bring up 2nd Device, submit, path-liveness on new epoch, route-flip cutover, EpochAck reporting, tear down — proven by the 4 done-bar cases under tc netem. Expect real integration bugs (like 4b/4c). ===

@@ -44,8 +44,9 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use wiremesh_proto::v1::sync_message::Body;
-use wiremesh_proto::v1::{PunchDirective, SyncMessage};
+use wiremesh_proto::v1::{PunchDirective, RotateDirective, SyncMessage};
 
+use crate::db::AWAITING_SUBMISSION_SENTINEL;
 use crate::db_async::DbHandle;
 use crate::projection::ChangeEvent;
 
@@ -151,6 +152,38 @@ impl Broker {
         }
     }
 
+    /// (Key-rotation) If `keys` (a gateway's full `(epoch, pubkey, state)`
+    /// row set from a `ChangeEvent::KeyRotated`) contains a `pending` epoch
+    /// still carrying the [`AWAITING_SUBMISSION_SENTINEL`] pubkey — i.e. a
+    /// rotation that has just been initiated and whose gateway hasn't yet
+    /// submitted its real key — deliver a [`RotateDirective`] for that epoch
+    /// to `gateway_id`'s registered Watch channel (a non-blocking `try_send`,
+    /// like every other broker emit). A no-op if the gateway isn't currently
+    /// connected (nothing registered) or the channel is full — the rotation
+    /// sweep/timer re-emits KeyRotated on subsequent ticks, and an unconnected
+    /// gateway can't be rotating a live session anyway.
+    pub fn send_rotate_if_pending(&self, gateway_id: i64, keys: &[(i64, String, String)]) {
+        let Some((epoch, _, _)) = keys
+            .iter()
+            .find(|(_, pubkey, state)| state == "pending" && pubkey == AWAITING_SUBMISSION_SENTINEL)
+        else {
+            return;
+        };
+        let msg = SyncMessage {
+            body: Some(Body::Rotate(RotateDirective { epoch: *epoch as u32 })),
+        };
+        let sent = match self.registry.lock() {
+            Ok(reg) => reg.get(&gateway_id).map(|tx| tx.try_send(msg).is_ok()).unwrap_or(false),
+            Err(_) => false,
+        };
+        if sent {
+            eprintln!(
+                "wiremesh-controller: sent RotateDirective(epoch={}) to gateway {gateway_id}",
+                *epoch
+            );
+        }
+    }
+
     /// Trigger (a): a gateway's `Watch` stream just opened. Resets the periodic
     /// budget for every pair this gateway belongs to (a fresh connection is a
     /// fresh opportunity) and attempts a punch for each — a no-op for any peer
@@ -189,6 +222,26 @@ impl Broker {
                         // re-punch its pairs, resetting their periodic budget.
                         Ok(ChangeEvent::EndpointObserved { gateway_id, .. }) => {
                             self.punch_peers_of(gateway_id, true).await;
+                        }
+                        // (Key-rotation) A rotation was just initiated
+                        // (`Admin.RotateKey` / the rotation timer inserted a
+                        // fresh `pending` epoch still carrying the
+                        // `awaiting-submission` sentinel) — tell the rotating
+                        // gateway to mint+submit its real key and begin
+                        // make-before-break by delivering a `RotateDirective`
+                        // on ITS OWN Watch stream. This is the one
+                        // controller->rotating-gateway imperative signal (the
+                        // declarative KeyRotated delta self-skips the subject
+                        // gateway, so it can never learn of its own rotation
+                        // that way); it rides the same per-connection registry
+                        // channel a `PunchDirective` does. A KeyRotated event
+                        // whose pending epoch already holds a REAL key (a
+                        // re-emit after submission/promote/retire) carries no
+                        // sentinel row, so `send_rotate_if_pending` is a no-op
+                        // — the directive fires exactly once, at rotation
+                        // start.
+                        Ok(ChangeEvent::KeyRotated { gateway_id, keys, .. }) => {
+                            self.send_rotate_if_pending(gateway_id, &keys);
                         }
                         // No other event changes a candidate set the broker
                         // acts on.

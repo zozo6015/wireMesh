@@ -7,8 +7,8 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity as TlsIdentity};
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{
-    sync_message::Body, PunchDirective, RelayHealth, ReportRequest, RotateDirective, SyncMessage,
-    WatchRequest,
+    sync_message::Body, EpochAck, PunchDirective, RelayHealth, ReportRequest, RotateDirective,
+    SubmitEpochKeyRequest, SyncMessage, WatchRequest,
 };
 
 /// One decoded Sync message, surfaced to the gateway boot loop. `Snapshot`/
@@ -60,16 +60,41 @@ pub async fn watch(client: &mut SyncClient<Channel>) -> anyhow::Result<tonic::St
 /// driver), sent fresh every `Report` call; an empty list is the equally
 /// meaningful "no relay transports open right now" (e.g. every peer is
 /// `Direct`), not "leave the previous snapshot alone".
+///
+/// `epoch_acks` (key-rotation Task 1/3) carries this gateway's liveness acks
+/// for a rotating PEER's pending epoch: an `EpochAck{peer_gateway_id: A,
+/// epoch: N, live: true}` means "I have a live, rx-corroborated WireGuard
+/// session with rotating gateway A's epoch-N key" — the signal that drives
+/// the controller's promote state machine. The steady-state sync loop sends
+/// an empty vec; only the rotation observation tick (Role B) populates it.
 pub async fn report(
     client: &mut SyncClient<Channel>,
     applied_version: u64,
     local_endpoints: Vec<String>,
     relay_health: Vec<RelayHealth>,
+    epoch_acks: Vec<EpochAck>,
 ) -> anyhow::Result<()> {
     client
-        .report(ReportRequest { applied_version, local_endpoints, relay_health, epoch_acks: vec![] })
+        .report(ReportRequest { applied_version, local_endpoints, relay_health, epoch_acks })
         .await
         .map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
+    Ok(())
+}
+
+/// Submit this gateway's freshly-minted REAL WireGuard public key for a
+/// pending rotation `epoch` (key-rotation Role A) — the private key never
+/// leaves the gateway. The controller overwrites the epoch's
+/// `awaiting-submission` sentinel with `pubkey`, then fans it out to peers so
+/// they can bring up their overlap Device toward the real key.
+pub async fn submit_epoch_key(
+    client: &mut SyncClient<Channel>,
+    epoch: u32,
+    pubkey: String,
+) -> anyhow::Result<()> {
+    client
+        .submit_epoch_key(SubmitEpochKeyRequest { epoch, pubkey })
+        .await
+        .map_err(|s| anyhow!("Sync.SubmitEpochKey failed: {s}"))?;
     Ok(())
 }
 

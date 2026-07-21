@@ -59,6 +59,86 @@ pub fn device_config(
     }
 }
 
+/// Like [`device_config`], but for any peer whose `gateway_id` appears in
+/// `pinned_pubkeys`, use that pinned base64 pubkey instead of the peer's
+/// current `active_pubkey_b64` (key-rotation Task 9, Role B make-before-break).
+///
+/// While this gateway is overlapping a rotating peer — carrying the peer's NEW
+/// epoch on a transient `wg0e<N>` Device — its base `wg0` Device must keep the
+/// peer's OLD-epoch session alive so traffic the peer is still sending on its
+/// old key (until it cuts over) keeps decrypting. But a `replace_peers` apply
+/// driven by the peer's promote delta (which flips the peer's advertised
+/// `active` key to the new epoch) would otherwise rekey the `wg0` peer entry to
+/// the new key, tearing that old session down mid-flight. Pinning the `wg0`
+/// entry to the epoch this gateway originally brought `wg0` up against holds
+/// the old receive path open across the peer's promote — the "break" never
+/// happens on the base tun.
+pub fn device_config_pinned(
+    ds: &DesiredState,
+    private_key_b64: &str,
+    listen_port: u16,
+    keepalive_secs: u16,
+    pinned_pubkeys: &std::collections::HashMap<u64, String>,
+) -> DeviceConfig {
+    let peers = ds
+        .peers
+        .iter()
+        .filter_map(|p| {
+            let public_key_b64 = match pinned_pubkeys.get(&p.gateway_id) {
+                Some(pinned) => pinned.clone(),
+                None => p.active_pubkey_b64.clone()?,
+            };
+            Some(PeerConfig {
+                public_key_b64,
+                endpoint: p.primary_endpoint().cloned(),
+                allowed_ips: p.allowed_ips.clone(),
+                keepalive_secs,
+            })
+        })
+        .collect();
+    DeviceConfig { private_key_b64: private_key_b64.to_string(), listen_port, peers }
+}
+
+/// Rewrite the UDP port of an `ip:port` endpoint string, preserving the host.
+/// `None` for a malformed endpoint (no `:port` suffix). Used by
+/// [`device_config_at_port`] to retarget peers at a rotation epoch's offset
+/// port (key-rotation Task 9).
+fn rewrite_endpoint_port(endpoint: &str, port: u16) -> Option<String> {
+    let (ip, _) = endpoint.rsplit_once(':')?;
+    Some(format!("{ip}:{port}"))
+}
+
+/// A device config for a NEW own-epoch Device (key-rotation Task 9, Role A):
+/// the gateway's own rotated private key on `port`, peering the SAME current
+/// peers by their ACTIVE keys, but with each peer's endpoint retargeted to
+/// `port` — the peer's own new-epoch Device listens on the identical offset
+/// port (`base_wg_port + (N - active_epoch)`), so both sides rendezvous on it
+/// during the make-before-break overlap while the old epoch keeps carrying
+/// traffic on the base port. A peer with no active key or no endpoint
+/// contributes nothing (it can't be reached on the new epoch yet).
+pub fn device_config_at_port(
+    ds: &DesiredState,
+    private_key_b64: &str,
+    port: u16,
+    keepalive_secs: u16,
+) -> DeviceConfig {
+    let peers = ds
+        .peers
+        .iter()
+        .filter_map(|p| {
+            let public_key_b64 = p.active_pubkey_b64.clone()?;
+            let endpoint = p.primary_endpoint().and_then(|ep| rewrite_endpoint_port(ep, port));
+            Some(PeerConfig {
+                public_key_b64,
+                endpoint,
+                allowed_ips: p.allowed_ips.clone(),
+                keepalive_secs,
+            })
+        })
+        .collect();
+    DeviceConfig { private_key_b64: private_key_b64.to_string(), listen_port: port, peers }
+}
+
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RouteDiff {
     pub to_add: Vec<String>,
