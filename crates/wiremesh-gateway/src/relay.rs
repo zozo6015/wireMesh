@@ -138,10 +138,24 @@ impl RelayTransport {
     pub fn is_healthy(&self) -> bool {
         self.client.is_alive()
     }
+
+    /// Explicitly close the relay QUIC connection (Task 7 carry: `Client` is
+    /// a `Clone`-able handle onto a refcounted `quinn::Connection`, so a bare
+    /// `Drop` of this `RelayTransport` — which only aborts the two pump
+    /// tasks below — does not itself tell the relay the session is over; the
+    /// pumps' own clones of `client` would otherwise leave the connection
+    /// open until QUIC's idle timeout). Callers tearing a transport down on
+    /// purpose (relay-to-direct cutover, relay-to-relay re-path) should call
+    /// this before/while dropping the `RelayTransport` so the relay frees
+    /// its registry entry promptly; see `main.rs`'s teardown call site.
+    pub fn close(&self) {
+        self.client.close();
+    }
 }
 
 impl Drop for RelayTransport {
     fn drop(&mut self) {
+        self.client.close();
         self.uplink.abort();
         self.downlink.abort();
     }

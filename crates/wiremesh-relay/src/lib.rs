@@ -297,6 +297,21 @@ impl Client {
     pub fn is_alive(&self) -> bool {
         self.conn.close_reason().is_none()
     }
+
+    /// Explicitly close the underlying QUIC connection (error code 0, no
+    /// reason text). `Client` is `Clone` (a refcounted handle onto the same
+    /// `quinn::Connection`), so simply dropping one clone does NOT close the
+    /// connection — only this (or the last handle's drop, which quinn treats
+    /// as an implicit abrupt close with a generic reason) actually tells the
+    /// peer/relay the session is over. A caller tearing down a
+    /// `RelayTransport` it no longer needs (e.g. the gateway's
+    /// make-before-break relay-to-direct cutover, cycle4c Task 8) should call
+    /// this explicitly rather than relying on `Drop`, so the relay frees the
+    /// registry entry and any buffered state promptly instead of waiting on
+    /// QUIC's idle timeout.
+    pub fn close(&self) {
+        self.conn.close(0u32.into(), b"");
+    }
 }
 
 /// In-memory registry the relay binary uses to map a registered id to its

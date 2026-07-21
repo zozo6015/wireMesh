@@ -38,10 +38,13 @@ pub enum PathState {
     Connecting,
     Direct,
     Degraded,
-    /// Make-before-break relay path. Real relay transport lands in Cycle
-    /// 4c; in 4b this state is only reachable when `tick` is called with
-    /// `relay_available = true`, which the driver never does yet (no relay
-    /// transport exists) — wired-but-inert stub.
+    /// Make-before-break relay path (spec §6.1). Traffic flows over a live
+    /// `RelayTransport` while the driver periodically probes for a direct
+    /// path in the background (`PathAction::ProbeDirect`); a completed WG
+    /// handshake (`on_handshake`) cuts over straight to `Direct` and the
+    /// relay is torn down. If the relay itself goes unhealthy with nothing
+    /// else available, `tick` re-paths to `Disconnected` so the driver finds
+    /// another one.
     Relayed,
     Disconnected,
 }
@@ -66,16 +69,23 @@ pub enum PathAction {
     /// (Re-)enter `Connecting` and kick off a fresh hole-punch attempt now
     /// (fires on `Disconnected -> Connecting` backoff expiry).
     StartPunch,
-    /// The convergence budget for direct is exhausted (or a live path went
-    /// dead) with no relay available: the driver should ensure a relay is
-    /// requested/health-checked for this peer. In Cycle 4b, since relay
-    /// transport doesn't exist yet, this just leaves the peer parked in
-    /// `Disconnected`.
+    /// The driver needs to (re-)establish relay coverage for this peer.
+    /// Fires in two situations: entering `Relayed` (a convergence budget was
+    /// exhausted, or a live path died, WITH a relay available) — the driver
+    /// should ensure a live `RelayTransport` exists for this peer and its WG
+    /// endpoint points at it; and parking in `Disconnected` with NO relay
+    /// available — the driver should keep trying to find/health-check a
+    /// relay for next time, since there's nothing else to do meanwhile.
     MarkRelayNeeded,
     /// Still waiting (degraded, not yet dead): retry whatever low-rate
     /// recovery probe is already appropriate — no fresh punch session, no
     /// relay escalation yet.
     Retry,
+    /// Make-before-break: while `Relayed` and the relay stays available, ask
+    /// the driver to run a low-rate background direct hole-punch probe. The
+    /// relay keeps carrying traffic in the meantime; only a completed WG
+    /// handshake (`on_handshake`) actually cuts over to `Direct`.
+    ProbeDirect,
 }
 
 /// One peer's direct-path state. See module docs for the timers driving
@@ -130,8 +140,8 @@ impl Path {
 
     /// Time-driven transitions. Returns the action the driver should take,
     /// if any. `relay_available` reflects whether a healthy relay path
-    /// exists for this peer right now (always `false` in Cycle 4b — no
-    /// relay transport yet).
+    /// exists for this peer right now (the driver computes this from a live,
+    /// healthy `RelayTransport` — Cycle 4c).
     pub fn tick(&mut self, now: Instant, relay_available: bool) -> Option<PathAction> {
         match self.state {
             PathState::Connecting => {
@@ -173,10 +183,21 @@ impl Path {
                 }
             }
             PathState::Relayed => {
-                // Make-before-break direct re-probe and relay-unhealthy
-                // re-path (spec §6.1's `Relayed` self-loops) are Cycle 4c —
-                // wired-but-inert stub here.
-                None
+                if relay_available {
+                    // The relay is still carrying traffic: ask the driver to
+                    // run a background direct probe (make-before-break).
+                    // Stay `Relayed` — only a real handshake (`on_handshake`)
+                    // cuts over to `Direct`.
+                    Some(PathAction::ProbeDirect)
+                } else {
+                    // The relay path itself died with nothing else
+                    // available: re-path to `Disconnected` so the normal
+                    // backoff/StartPunch cycle (and a fresh relay search)
+                    // takes over.
+                    self.state = PathState::Disconnected;
+                    self.disconnected_since = Some(now);
+                    Some(PathAction::MarkRelayNeeded)
+                }
             }
             PathState::Disconnected => {
                 let since = self.disconnected_since.unwrap_or(now);

@@ -1,6 +1,7 @@
 //! wiremesh-gateway boot sequence + supervision (spec §5.1).
 use anyhow::Context;
 use std::collections::{HashMap, HashSet};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -12,9 +13,11 @@ use wiremesh_gateway::enforce::GatewayEnforcer;
 use wiremesh_gateway::identity::Identity;
 use wiremesh_gateway::metrics;
 use wiremesh_gateway::path::{Path, PathAction, PathState};
+use wiremesh_gateway::relay::RelayTransport;
 use wiremesh_gateway::state::DesiredState;
 use wiremesh_gateway::tunnel::Tunnel;
 use wiremesh_gateway::{netif, observe, punch, reconcile, routes, sync, uapi};
+use wiremesh_proto::v1::RelayHealth;
 
 const TUN_MTU: u32 = 1280;
 const MSS: u16 = 1240;
@@ -93,10 +96,14 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         wg_port: cfg.wg_listen_port,
         ifname: cfg.tun_ifname.clone(),
         priv_key: tunnel.private_key_b64.clone(),
+        identity: Arc::new(id.clone()),
         desired: Arc::new(std::sync::Mutex::new(applied.clone())),
         paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
         transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         punching: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        relay_transports: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+        relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     // Metrics endpoint (Prometheus scrape) on an ephemeral loopback port,
@@ -173,7 +180,14 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // below — never held across it).
                             *ctx.desired.lock().unwrap() = Some(ds.clone());
                             let local_endpoints = netif::local_wg_endpoints(cfg.wg_listen_port);
-                            let _ = sync::report(&mut client, ds.policy_version, local_endpoints).await;
+                            let relay_health = ctx.relay_health_snapshot().await;
+                            let _ = sync::report(
+                                &mut client,
+                                ds.policy_version,
+                                local_endpoints,
+                                relay_health,
+                            )
+                            .await;
                             applied_version.store(ds.policy_version, Ordering::Relaxed);
                             applied = Some(ds);
                         }
@@ -229,6 +243,12 @@ struct PathCtx {
     wg_port: u16,
     ifname: String,
     priv_key: String,
+    /// This gateway's own identity (mTLS cert/key/CA PEMs + `gateway_id`),
+    /// needed to mint a `RelayTransport` connection on this peer's behalf
+    /// (Cycle 4c Task 8). `Arc`-wrapped since `Identity` holds several PEM
+    /// `String`s and `PathCtx` (and thus this field) is cloned into every
+    /// spawned punch/relay-connect task.
+    identity: Arc<Identity>,
     /// Latest applied desired state (peers, candidate endpoints), published by
     /// the sync loop so punch/tick tasks can map pubkeys → gateway_ids and
     /// re-reconcile with a confirmed endpoint.
@@ -245,6 +265,26 @@ struct PathCtx {
     /// [`PathCtx::try_start_punch`], released by dropping the returned
     /// [`PunchGuard`].
     punching: Arc<std::sync::Mutex<HashSet<u64>>>,
+    /// Live relay transport per peer `gateway_id` currently relying on relay
+    /// help — present only while that peer is (or very recently was)
+    /// `Relayed`. A `tokio::sync::Mutex` (unlike every other `PathCtx` map)
+    /// because establishing/tearing down a transport requires holding the
+    /// guard across the `async` `RelayTransport::start` / UAPI-apply calls in
+    /// [`ensure_relay_transport`]/[`teardown_relay_transport`] — those
+    /// functions are careful never to also hold `paths`/`desired` (the
+    /// `std::sync::Mutex`es) across an `.await` at the same time.
+    relay_transports: Arc<tokio::sync::Mutex<HashMap<u64, PeerRelay>>>,
+    /// Gateway IDs with a relay-connect task (`ensure_relay_transport`)
+    /// currently in flight — the relay analogue of `punching`, so a
+    /// `MarkRelayNeeded`/re-path firing on two consecutive ticks before the
+    /// first `RelayTransport::start` lands doesn't race two connect attempts
+    /// for the same peer.
+    relay_connecting: Arc<std::sync::Mutex<HashSet<u64>>>,
+    /// Round-robin cursor into the advertised-relay list, per peer, so a
+    /// relay-to-relay re-path (the peer's current transport died) tries the
+    /// NEXT advertised relay rather than immediately reconnecting to the one
+    /// that just died.
+    relay_next_idx: Arc<std::sync::Mutex<HashMap<u64, usize>>>,
 }
 
 impl PathCtx {
@@ -278,6 +318,35 @@ impl PathCtx {
         }
         Some(PunchGuard { punching: self.punching.clone(), gid })
     }
+
+    /// Try to claim the in-flight-relay-connect slot for peer `gid`. Same
+    /// dedup shape as [`try_start_punch`] — see [`RelayConnectGuard`].
+    fn try_start_relay_connect(&self, gid: u64) -> Option<RelayConnectGuard> {
+        let mut set = self.relay_connecting.lock().unwrap();
+        if !set.insert(gid) {
+            return None;
+        }
+        Some(RelayConnectGuard { connecting: self.relay_connecting.clone(), gid })
+    }
+
+    /// Snapshot the gateway's current per-relay health for `Sync.Report`
+    /// (cycle4c Task 8): one [`RelayHealth`] entry per DISTINCT `relay_id`
+    /// this gateway currently has at least one `RelayTransport` open to
+    /// (`healthy` true if ANY such transport reports alive — a peer's dead
+    /// transport doesn't mark a relay unhealthy if another peer's transport
+    /// to the same relay is still fine). A relay this gateway has never
+    /// needed to connect to (no peer currently relayed through it) simply
+    /// has no entry, mirroring `local_endpoints`' "report only what's true
+    /// right now" semantics.
+    async fn relay_health_snapshot(&self) -> Vec<RelayHealth> {
+        let map = self.relay_transports.lock().await;
+        let mut by_relay: HashMap<u64, bool> = HashMap::new();
+        for peer_relay in map.values() {
+            let healthy = by_relay.entry(peer_relay.relay_id).or_insert(false);
+            *healthy = *healthy || peer_relay.transport.is_healthy();
+        }
+        by_relay.into_iter().map(|(relay_id, healthy)| RelayHealth { relay_id, healthy }).collect()
+    }
 }
 
 /// RAII release for [`PathCtx::try_start_punch`]'s in-flight-punch slot.
@@ -294,6 +363,30 @@ impl Drop for PunchGuard {
     fn drop(&mut self) {
         self.punching.lock().unwrap().remove(&self.gid);
     }
+}
+
+/// RAII release for [`PathCtx::try_start_relay_connect`]'s in-flight-connect
+/// slot — the relay analogue of [`PunchGuard`], same fail-static rationale
+/// (an error or panic mid-connect must not permanently wedge future relay
+/// attempts for that peer).
+struct RelayConnectGuard {
+    connecting: Arc<std::sync::Mutex<HashSet<u64>>>,
+    gid: u64,
+}
+
+impl Drop for RelayConnectGuard {
+    fn drop(&mut self) {
+        self.connecting.lock().unwrap().remove(&self.gid);
+    }
+}
+
+/// One peer's live relay transport plus which advertised relay it's
+/// connected to (`RelayInfo.relay_id`) — the latter isn't recoverable from
+/// `RelayTransport` itself, but [`PathCtx::relay_health_snapshot`] needs it
+/// to report [`RelayHealth`] keyed by relay, not by peer.
+struct PeerRelay {
+    transport: RelayTransport,
+    relay_id: u64,
 }
 
 /// Decode a base64 WireGuard public key into the lowercase-hex form the WG
@@ -399,34 +492,160 @@ async fn punch_and_apply(
 
     // Re-reconcile the FULL device (replace_peers) with the confirmed endpoint
     // moved to the front of this peer's candidate list so `primary_endpoint()`
-    // prefers it. Only the `desired` guard is held here — dropped before the
-    // blocking apply.
+    // prefers it — this doubles as the make-before-break direct cutover when
+    // `gid` was `Relayed` (the relay transport is torn down separately by
+    // `run_path_ticks` once the ensuing handshake actually lands `Direct`).
+    match set_peer_endpoint(&ctx, gid, addr).await {
+        Ok(()) => {
+            eprintln!("wiremesh-gateway: punch confirmed peer={gid} endpoint={addr}");
+            // The path SM transitions to Direct off the ensuing WG handshake,
+            // observed by `run_path_ticks` — not off this punch confirmation.
+        }
+        Err(e) => {
+            eprintln!("wiremesh-gateway: applying punched endpoint for peer={gid} failed: {e}")
+        }
+    }
+}
+
+/// Point peer `gid`'s WG endpoint at `endpoint` and re-apply the full device
+/// config. This does NOT re-add the peer or rekey it: WireGuard's UAPI keys
+/// a peer's live session by its (unchanged) `public_key=`, so a
+/// `replace_peers=true` `set` that repeats the same peers with just a
+/// different `endpoint=` for one of them only changes where WireGuard sends
+/// its next packet — the running noise session survives untouched. Shared by
+/// [`punch_and_apply`] (a hole-punch-confirmed direct candidate) and
+/// [`ensure_relay_transport`] (pointing a peer at its `RelayTransport`'s
+/// local relay socket, Cycle 4c Task 8).
+async fn set_peer_endpoint(ctx: &PathCtx, gid: u64, endpoint: SocketAddr) -> anyhow::Result<()> {
     let dev = {
         let desired = ctx.desired.lock().unwrap();
-        let Some(ds) = desired.as_ref() else {
-            eprintln!("wiremesh-gateway: no desired state yet; dropping punch result for peer={gid}");
-            return;
-        };
+        let ds = desired.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("no desired state yet; cannot set endpoint for peer={gid}")
+        })?;
         let mut ds = ds.clone();
         if let Some(peer) = ds.peers.iter_mut().find(|p| p.gateway_id == gid) {
-            let a = addr.to_string();
+            let a = endpoint.to_string();
             peer.candidates.retain(|c| c != &a);
             peer.candidates.insert(0, a);
         }
         reconcile::device_config(&ds, &ctx.priv_key, ctx.wg_port, KEEPALIVE)
     };
-
     let ifname = ctx.ifname.clone();
-    match tokio::task::spawn_blocking(move || uapi::apply(&ifname, &dev)).await {
-        Ok(Ok(())) => {
-            eprintln!("wiremesh-gateway: punch confirmed peer={gid} endpoint={addr}");
-            // The path SM transitions to Direct off the ensuing WG handshake,
-            // observed by `run_path_ticks` — not off this punch confirmation.
+    tokio::task::spawn_blocking(move || uapi::apply(&ifname, &dev))
+        .await
+        .context("uapi apply task panicked")??;
+    Ok(())
+}
+
+/// Ensure peer `gid` has a live, healthy [`RelayTransport`] and that its WG
+/// endpoint points at it (Cycle 4c Task 8 — the `MarkRelayNeeded` action,
+/// both for freshly entering `Relayed` and for a relay-to-relay re-path once
+/// the peer's current transport dies). No-op if a healthy transport already
+/// exists. `relays` is the controller's currently-advertised relay list
+/// (`DesiredState.relays`); a peer's round-robin cursor
+/// (`PathCtx::relay_next_idx`) picks which one to (re)connect to, advancing
+/// on every attempt so a dead relay isn't retried first. Dedups against a
+/// concurrent attempt for the same peer via
+/// [`PathCtx::try_start_relay_connect`], mirroring [`punch_and_apply`]'s
+/// `punching` guard.
+async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_proto::v1::RelayInfo>) {
+    if relays.is_empty() {
+        return;
+    }
+
+    {
+        let map = ctx.relay_transports.lock().await;
+        if map.get(&gid).is_some_and(|pr| pr.transport.is_healthy()) {
+            return; // already covered
         }
-        Ok(Err(e)) => {
-            eprintln!("wiremesh-gateway: applying punched endpoint for peer={gid} failed: {e}")
+    }
+
+    let Some(_guard) = ctx.try_start_relay_connect(gid) else {
+        return; // another connect attempt for this peer is already in flight
+    };
+
+    // Re-check under the guard: the in-flight attempt that held the slot
+    // before us may have just succeeded.
+    {
+        let map = ctx.relay_transports.lock().await;
+        if map.get(&gid).is_some_and(|pr| pr.transport.is_healthy()) {
+            return;
         }
-        Err(e) => eprintln!("wiremesh-gateway: uapi apply task for peer={gid} panicked: {e}"),
+    }
+
+    let idx = {
+        let mut idxs = ctx.relay_next_idx.lock().unwrap();
+        let cursor = idxs.entry(gid).or_insert(0);
+        let i = *cursor % relays.len();
+        *cursor = cursor.wrapping_add(1);
+        i
+    };
+    let relay_info = &relays[idx];
+
+    let addr: SocketAddr = match relay_info.endpoint.parse() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!(
+                "wiremesh-gateway: relay={} endpoint {:?} unparseable for peer={gid}: {e}",
+                relay_info.relay_id, relay_info.endpoint
+            );
+            return;
+        }
+    };
+
+    let identity = ctx.identity.clone();
+    let my_id = identity.gateway_id.to_string();
+    let peer_id = gid.to_string();
+    let transport = match RelayTransport::start(
+        addr,
+        &identity.cert_pem,
+        &identity.key_pem,
+        &identity.ca_bundle_pem,
+        &my_id,
+        &peer_id,
+    )
+    .await
+    {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!(
+                "wiremesh-gateway: connecting relay={} for peer={gid} failed: {e}",
+                relay_info.relay_id
+            );
+            return;
+        }
+    };
+    let local_addr = transport.local_addr();
+    let relay_id = relay_info.relay_id;
+
+    // Insert (any prior transport for this peer is dropped here, closing its
+    // QUIC connection — see `RelayTransport::Drop`).
+    {
+        let mut map = ctx.relay_transports.lock().await;
+        map.insert(gid, PeerRelay { transport, relay_id });
+    }
+
+    if let Err(e) = set_peer_endpoint(&ctx, gid, local_addr).await {
+        eprintln!("wiremesh-gateway: pointing peer={gid} at relay={relay_id} endpoint failed: {e}");
+    } else {
+        eprintln!("wiremesh-gateway: peer={gid} now relayed via relay={relay_id} ({local_addr})");
+    }
+}
+
+/// Tear down peer `gid`'s relay transport, if any (Cycle 4c Task 8's
+/// make-before-break cutover: called once a peer reaches `Direct`, whether
+/// it arrived there from `Relayed` or never needed relay help at all — a
+/// no-op in the latter case). Explicitly [`RelayTransport::close`]s the QUIC
+/// connection before dropping (see that method's doc: `Client` clones don't
+/// close on drop by themselves).
+async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
+    let removed = ctx.relay_transports.lock().await.remove(&gid);
+    if let Some(peer_relay) = removed {
+        peer_relay.transport.close();
+        eprintln!(
+            "wiremesh-gateway: peer={gid} reached Direct; tore down relay={} transport",
+            peer_relay.relay_id
+        );
     }
 }
 
@@ -437,10 +656,22 @@ async fn punch_and_apply(
 /// liveness via `on_authenticated_inbound`, so 15s keepalives count as
 /// inbound even between ~120s handshake rekeys; time-driven degrade/
 /// disconnect via `tick`), record transitions, and act on the returned
-/// `PathAction` (StartPunch/Retry re-run a bounded punch; MarkRelayNeeded is
-/// inert in 4b). `relay_available` is always `false` in 4b — no relay
-/// transport exists yet. All blocking I/O runs in `spawn_blocking`; no mutex
-/// guard is held across an `.await`.
+/// `PathAction`: `StartPunch`/`Retry`/`ProbeDirect` all re-run a bounded
+/// punch (`ProbeDirect`'s make-before-break background probe reuses the same
+/// `punching` dedup guard as a fresh `StartPunch`); `MarkRelayNeeded` spawns
+/// [`ensure_relay_transport`] (Cycle 4c Task 8 — a no-op if the controller
+/// hasn't advertised any relay). `relay_available` is computed per peer as
+/// "the controller has advertised ≥1 relay AND this peer already has a live,
+/// healthy `RelayTransport`" — so the FIRST time a peer's direct budget is
+/// exhausted it still parks `Disconnected` (no transport exists yet) while
+/// `ensure_relay_transport` connects one in the background; the peer's next
+/// `Connecting` cycle sees `relay_available = true` and lands in `Relayed`.
+/// A peer that reaches `Direct` has any relay transport it was using torn
+/// down (make-before-break cutover). All blocking I/O runs in
+/// `spawn_blocking`; no `std::sync::Mutex` guard is ever held across an
+/// `.await` (the `tokio::sync::Mutex` guarding `relay_transports` is the only
+/// exception, and is never held at the same time as a `std::sync::Mutex`
+/// guard).
 async fn run_path_ticks(ctx: PathCtx) {
     // Last handshake time we've observed per peer, to detect *advancement*
     // (a repeated identical timestamp must NOT re-fire `on_handshake`).
@@ -475,9 +706,27 @@ async fn run_path_ticks(ctx: PathCtx) {
         // Snapshot desired state (guard dropped immediately).
         let Some(ds) = ctx.desired.lock().unwrap().clone() else { continue };
 
+        // Snapshot which peers currently have a healthy relay transport
+        // (single `tokio::sync::Mutex` acquisition for the whole tick, ahead
+        // of the `std::sync::Mutex` `paths` scope below so the two guards
+        // are never held simultaneously).
+        let relays_advertised = !ds.relays.is_empty();
+        let healthy_relay: HashMap<u64, bool> = {
+            let map = ctx.relay_transports.lock().await;
+            ds.peers
+                .iter()
+                .map(|p| {
+                    let healthy = map.get(&p.gateway_id).is_some_and(|pr| pr.transport.is_healthy());
+                    (p.gateway_id, healthy)
+                })
+                .collect()
+        };
+
         let now = Instant::now();
         let mut to_record: Vec<(u64, PathState, PathState)> = Vec::new();
         let mut to_punch: Vec<(u64, Vec<String>)> = Vec::new();
+        let mut to_relay_needed: Vec<u64> = Vec::new();
+        let mut to_teardown_relay: Vec<u64> = Vec::new();
         {
             let mut paths = ctx.paths.lock().unwrap();
             for peer in &ds.peers {
@@ -572,16 +821,24 @@ async fn run_path_ticks(ctx: PathCtx) {
                     }
                 }
 
-                match path.tick(now, false) {
-                    Some(PathAction::StartPunch) => to_punch.push((gid, peer.candidates.clone())),
-                    Some(PathAction::MarkRelayNeeded) => {
-                        eprintln!("wiremesh-gateway: relay-needed for peer={gid} (inert in 4b)")
+                let relay_available =
+                    relays_advertised && *healthy_relay.get(&gid).unwrap_or(&false);
+                match path.tick(now, relay_available) {
+                    Some(PathAction::StartPunch) | Some(PathAction::ProbeDirect) => {
+                        to_punch.push((gid, peer.candidates.clone()))
                     }
+                    Some(PathAction::MarkRelayNeeded) => to_relay_needed.push(gid),
                     Some(PathAction::Retry) | None => {}
                 }
 
                 if before != path.state {
                     to_record.push((gid, before, path.state));
+                    if path.state == PathState::Direct {
+                        // Make-before-break cutover: a relay transport (if
+                        // any) is no longer needed now that a real WG
+                        // handshake has landed.
+                        to_teardown_relay.push(gid);
+                    }
                 }
             }
         } // paths guard dropped before the awaits/spawns below
@@ -589,16 +846,29 @@ async fn run_path_ticks(ctx: PathCtx) {
         for (gid, before, after) in to_record {
             ctx.record_transition(gid, before, after);
         }
+        for gid in to_teardown_relay {
+            teardown_relay_transport(&ctx, gid).await;
+        }
+        for gid in to_relay_needed {
+            // Spawned rather than awaited inline: a `RelayTransport::start`
+            // QUIC handshake can take noticeably longer than one tick
+            // period, and must not delay every other peer's tick. Dedup
+            // against a concurrent attempt for the same peer is handled
+            // inside `ensure_relay_transport` itself (`try_start_relay_connect`).
+            tokio::spawn(ensure_relay_transport(ctx.clone(), gid, ds.relays.clone()));
+        }
         for (gid, candidates) in to_punch {
             // Bounded by the SM's own backoff (StartPunch only fires on
-            // Disconnected → Connecting expiry). Dedup against a concurrent
-            // controller-directed punch for the same peer (Fix 3).
+            // Disconnected → Connecting expiry; ProbeDirect fires on every
+            // Relayed tick while the relay stays up). Dedup against a
+            // concurrent controller-directed punch — or another
+            // StartPunch/ProbeDirect tick — for the same peer (Fix 3).
             match ctx.try_start_punch(gid) {
                 Some(guard) => {
                     tokio::spawn(punch_and_apply(ctx.clone(), gid, candidates, None, guard));
                 }
                 None => eprintln!(
-                    "wiremesh-gateway: punch already in flight for peer={gid}; skipping tick-driven StartPunch"
+                    "wiremesh-gateway: punch already in flight for peer={gid}; skipping tick-driven StartPunch/ProbeDirect"
                 ),
             }
         }
@@ -660,10 +930,21 @@ mod tests {
             wg_port: 0,
             ifname: String::new(),
             priv_key: String::new(),
+            identity: Arc::new(Identity {
+                cert_pem: String::new(),
+                key_pem: String::new(),
+                ca_bundle_pem: String::new(),
+                gateway_id: 0,
+                observe_key: String::new(),
+                wg_private_key_b64: String::new(),
+            }),
             desired: Arc::new(std::sync::Mutex::new(None)),
             paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             punching: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            relay_transports: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
