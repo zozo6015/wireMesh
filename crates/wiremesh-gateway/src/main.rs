@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tonic::transport::Channel;
-use wiremesh_enforcer::BackendKind;
+use wiremesh_enforcer::{BackendKind, Counters};
 use wiremesh_gateway::config::GatewayConfig;
 use wiremesh_gateway::enforce::GatewayEnforcer;
 use wiremesh_gateway::epochkeys::EpochKeys;
@@ -91,7 +91,18 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         eprintln!("wiremesh-gateway: could not set loose rp_filter (continuing): {e}");
     }
     routes::install_mss_clamp(&cfg.tun_ifname, MSS)?;
-    let enforcer = Arc::new(Mutex::new(GatewayEnforcer::attach(&cfg.tun_ifname)?));
+    // All live L4 enforcers, keyed by epoch (0 = boot tun `wg0`; `wg0e<N>` per
+    // rotation). `apply_state` applies the current policy to EVERY entry so a
+    // policy update reaches every tun that may be carrying traffic during a
+    // rotation overlap (not just `wg0`). A `tokio::sync::Mutex` (same as the
+    // old single `enforcer`) because `apply_if_changed`/`counters` are held
+    // across the metrics task's `.await`. The map only grows in Step 1 — old
+    // entries are torn down in a later step.
+    let enforcers: Arc<Mutex<HashMap<u32, GatewayEnforcer>>> = Arc::new(Mutex::new({
+        let mut m = HashMap::new();
+        m.insert(0u32, GatewayEnforcer::attach(&cfg.tun_ifname)?);
+        m
+    }));
 
     // Last-applied policy version, shared with the metrics task below (it
     // does not hold the enforcer lock just to report this gauge).
@@ -118,7 +129,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     let mut applied: Option<DesiredState> = DesiredState::load(&cfg.state_dir)?;
     if let Some(ds) = &applied {
         eprintln!("wiremesh-gateway: fail-static boot from state.json rev {}", ds.revision);
-        apply_state(&tunnel, &enforcer, None, ds, &cfg.tun_ifname, &wg0_pins, &applied_wg0).await?;
+        apply_state(&tunnel, &enforcers, None, ds, &cfg.tun_ifname, &wg0_pins, &applied_wg0).await?;
         applied_version.store(ds.policy_version, Ordering::Relaxed);
     }
 
@@ -175,21 +186,34 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         let metrics_listener =
             TcpListener::bind(cfg.metrics_addr).await.context("binding metrics listener")?;
         eprintln!("wiremesh-gateway: metrics listening on {}", metrics_listener.local_addr()?);
-        let enforcer = enforcer.clone();
+        let enforcers = enforcers.clone();
         let applied_version = applied_version.clone();
         let ctx = ctx.clone();
         tokio::spawn(async move {
             let fetch = move || {
-                let enforcer = enforcer.clone();
+                let enforcers = enforcers.clone();
                 let applied_version = applied_version.clone();
                 let ctx = ctx.clone();
                 async move {
-                    let mut e = enforcer.lock().await;
-                    let counters = e.counters()?;
-                    let kind = match e.kind() {
-                        BackendKind::Ebpf => "ebpf",
-                        BackendKind::Nftables => "nftables",
+                    // Aggregate deny counters across ALL live enforcers (boot
+                    // tun + any rotation tun) so a post-rotation deny on the new
+                    // tun is still counted; `kind` is the same backend for every
+                    // entry, so any one's is representative. In the no-rotation
+                    // case the map has exactly one entry (`wg0`), so the value is
+                    // identical to the single-enforcer past behavior.
+                    let mut map = enforcers.lock().await;
+                    let kind = match map.values().next().map(|e| e.kind()) {
+                        Some(BackendKind::Nftables) => "nftables",
+                        // eBPF is also the safe default for the (unreachable)
+                        // empty map — epoch 0 is always present.
+                        Some(BackendKind::Ebpf) | None => "ebpf",
                     };
+                    let mut per_tun = Vec::with_capacity(map.len());
+                    for e in map.values_mut() {
+                        per_tun.push(e.counters()?);
+                    }
+                    drop(map);
+                    let counters = aggregate_counters(per_tun);
                     let peer_states: Vec<(String, PathState)> = ctx
                         .paths
                         .lock()
@@ -238,14 +262,13 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // only ever reads a rotation Device's liveness by ifname (a `String`), so
     // it needs no handle to the Device itself.
     let mut tunnels = TunnelSet::new();
-    // L4 enforcer attached to each transient rotation tun (`wg0e<N>`), keyed by
-    // ifname. Lives here alongside `tunnels` in the `block_on`'d `run()` task —
-    // holding each `GatewayEnforcer` in the map keeps its tc-BPF/nft program
-    // attached for the overlap Device's lifetime (dropping it would detach).
-    // Closes the default-deny-bypass-on-new-tun security gap: without this, a
-    // rotation's new-epoch tun carries traffic with NO policy hook at all.
-    let mut rotation_enforcers: std::collections::HashMap<String, GatewayEnforcer> =
-        std::collections::HashMap::new();
+    // Each transient rotation tun's (`wg0e<N>`) L4 enforcer is inserted into the
+    // shared `enforcers` map above, keyed by EPOCH — so `apply_state` reaches
+    // it on every policy update AND holding it in the map keeps its tc-BPF/nft
+    // program attached for the overlap Device's lifetime (dropping it would
+    // detach). Closes the default-deny-bypass-on-new-tun security gap: without
+    // this, a rotation's new-epoch tun carries traffic with NO policy hook at
+    // all.
     let rot = RotationShared {
         base_wg_port: cfg.wg_listen_port,
         base_tun: cfg.tun_ifname.clone(),
@@ -279,7 +302,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             let route_ifname = rot.active_tun.lock().unwrap().clone();
                             apply_state(
                                 &tunnel,
-                                &enforcer,
+                                &enforcers,
                                 applied.as_ref(),
                                 &ds,
                                 &route_ifname,
@@ -296,7 +319,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // can happen once that session is live. No-op for
                             // steady state (no rotating peers).
                             if let Err(e) =
-                                maybe_start_role_b(&mut tunnels, &mut rotation_enforcers, &rot, &ds)
+                                maybe_start_role_b(&mut tunnels, &enforcers, &rot, &ds).await
                             {
                                 eprintln!("wiremesh-gateway: Role B setup failed: {e}");
                             }
@@ -348,7 +371,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             if let Err(e) = handle_rotate(
                                 &mut epoch_keys,
                                 &mut tunnels,
-                                &mut rotation_enforcers,
+                                &enforcers,
                                 &rot,
                                 d.epoch,
                                 applied.as_ref(),
@@ -1187,7 +1210,7 @@ async fn apply_wg0_if_changed(
 /// routed follows the active tun.
 async fn apply_state(
     tunnel: &Tunnel,
-    enforcer: &Arc<Mutex<GatewayEnforcer>>,
+    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
     prev: Option<&DesiredState>,
     ds: &DesiredState,
     route_ifname: &str,
@@ -1203,7 +1226,17 @@ async fn apply_state(
         reconcile::device_config_pinned(ds, &tunnel.private_key_b64, tunnel.listen_port, KEEPALIVE, &pins)
     };
     apply_wg0_if_changed(&tunnel.ifname, &dev, applied_wg0).await?;
-    enforcer.lock().await.apply_if_changed(ds)?;
+    // Apply the current policy IR to EVERY live enforcer (boot tun + every
+    // rotation tun), not just `wg0` — a policy TIGHTENING during/after a
+    // rotation overlap must reach the tun actually carrying traffic (Role A's
+    // new tun; Role B's overlap tun). `apply_if_changed` is idempotent per
+    // policy_version, so applying to all entries each time is cheap and correct.
+    {
+        let mut map = enforcers.lock().await;
+        for e in map.values_mut() {
+            e.apply_if_changed(ds)?;
+        }
+    }
     let empty = DesiredState::default();
     let diff = reconcile::route_diff(prev.unwrap_or(&empty), ds);
     for cidr in &diff.to_add {
@@ -1213,6 +1246,24 @@ async fn apply_state(
         routes::del_route(cidr, route_ifname)?;
     }
     Ok(())
+}
+
+/// Fold each live enforcer's [`Counters`] into one aggregate for the metrics
+/// scrape: sum `default_deny` and merge `by_rule` (summing per-rule hits). In
+/// the steady state (no rotation) the map has a single entry, so the aggregate
+/// equals that one enforcer's counters — identical to the pre-Step-1 metric.
+/// Aggregating (rather than reading only epoch 0) means a deny recorded on a
+/// rotation's new-epoch tun is still counted post-cutover.
+fn aggregate_counters(all: impl IntoIterator<Item = Counters>) -> Counters {
+    let mut agg = Counters { by_rule: std::collections::BTreeMap::new(), default_deny: 0 };
+    for c in all {
+        agg.default_deny = agg.default_deny.saturating_add(c.default_deny);
+        for (rule, hits) in c.by_rule {
+            let e = agg.by_rule.entry(rule).or_insert(0);
+            *e = e.saturating_add(hits);
+        }
+    }
+    agg
 }
 
 // --- Key-rotation make-before-break wiring -----------------------------------
@@ -1290,7 +1341,7 @@ struct RoleB {
 async fn handle_rotate(
     epoch_keys: &mut EpochKeys,
     tunnels: &mut TunnelSet,
-    rotation_enforcers: &mut HashMap<String, GatewayEnforcer>,
+    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
     rot: &RotationShared,
     directive_epoch: u32,
     applied: Option<&DesiredState>,
@@ -1347,7 +1398,10 @@ async fn handle_rotate(
         let _ = tunnels.tear_down(n);
         return Err(e).with_context(|| format!("applying policy to rotation tun {new_tun}"));
     }
-    rotation_enforcers.insert(new_tun.clone(), ke);
+    // Insert into the SHARED enforcer map keyed by EPOCH (insert is last on this
+    // path, so the fail-closed teardown above never has to remove it), so every
+    // later `apply_state` reaches this new tun's enforcer.
+    enforcers.lock().await.insert(n, ke);
 
     let dev =
         reconcile::device_config_at_port(ds, &new_key.private_key_b64, new_port, ROTATION_KEEPALIVE);
@@ -1376,9 +1430,9 @@ async fn handle_rotate(
 /// overlapped, bring up a transient overlap Device toward the peer's pending
 /// key (this gateway's OWN active key on the offset port) and arm the tick to
 /// flip+ack once that session is live. No-op in steady state.
-fn maybe_start_role_b(
+async fn maybe_start_role_b(
     tunnels: &mut TunnelSet,
-    rotation_enforcers: &mut HashMap<String, GatewayEnforcer>,
+    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
     rot: &RotationShared,
     ds: &DesiredState,
 ) -> anyhow::Result<()> {
@@ -1434,7 +1488,11 @@ fn maybe_start_role_b(
             let _ = tunnels.tear_down(pending_epoch);
             return Err(e).with_context(|| format!("applying policy to rotation tun {new_tun}"));
         }
-        rotation_enforcers.insert(new_tun.clone(), ke);
+        // Insert into the SHARED enforcer map keyed by EPOCH (insert is last on
+        // this path, so the fail-closed teardown above never has to remove it),
+        // so every later `apply_state` reaches this overlap tun's enforcer. No
+        // `std::sync::Mutex` guard is held across this `.await`.
+        enforcers.lock().await.insert(pending_epoch, ke);
 
         uapi::apply(
             &new_tun,
