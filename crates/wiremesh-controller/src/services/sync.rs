@@ -18,11 +18,11 @@
 
 use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use base64::Engine as _;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::{Stream, StreamExt};
@@ -62,10 +62,21 @@ pub struct SyncSvc {
     /// its next `Report` call. `Arc` so every `SyncSvc` produced by cloning
     /// (if ever) — and, more immediately, every concurrent `report` call
     /// against the same shared service instance — sees and mutates the SAME
-    /// map rather than a private copy. A plain `std::sync::Mutex` is fine:
-    /// every critical section below is a short, synchronous map read/write
-    /// with no `.await` inside the locked region (the lock is dropped before
-    /// any DB call or broadcast send).
+    /// map rather than a private copy.
+    ///
+    /// This is a `tokio::sync::Mutex` (NOT `std::sync::Mutex`) DELIBERATELY:
+    /// the guard is held across the entire read-decide-write critical
+    /// section in `report()` below, including the `.await`s on
+    /// `relay_status`/`set_relay_status`/`emit_relays_changed`. Holding a
+    /// `std::sync::Mutex` guard across an `.await` would be both a bug (a
+    /// blocking lock parked across a suspension point) and exactly the
+    /// TOCTOU hazard this type was chosen to close: two concurrent `Report`
+    /// calls touching the same relay must never interleave their decisions,
+    /// or one can act on a vote aggregate that's already stale by the time
+    /// it writes the DB status, spuriously evicting a relay another gateway
+    /// concurrently vouches for. Serializing the whole read-decide-write
+    /// behind this async mutex makes each decision atomic with respect to
+    /// the live vote map.
     relay_health: Arc<Mutex<HashMap<i64, HashMap<i64, bool>>>>,
 }
 
@@ -347,48 +358,55 @@ impl Sync for SyncSvc {
             }
         }
 
-        // (Cycle-4c Task 6, R-3) Relay health pipeline: aggregate this
-        // gateway's votes into the shared `relay_id -> (gw_id -> healthy)`
-        // map, then for every relay THIS report touched, compare the fresh
-        // aggregate (healthy-override: a relay is unhealthy iff it has >=1
-        // vote on record and NONE of them is `true`) against its current DB
-        // status, flipping + tracking a change where they now differ. This
-        // runs synchronously on the `Report` call that tips the aggregate,
-        // so eviction/re-admission is trivially inside the 15s R-3 budget.
+        // (Cycle-4c Task 6, R-3; TOCTOU fix) Relay health pipeline: aggregate
+        // this gateway's votes into the shared `relay_id -> (gw_id ->
+        // healthy)` map, then for every relay THIS report touched, compare
+        // the fresh aggregate (healthy-override: a relay is unhealthy iff it
+        // has >=1 vote on record and NONE of them is `true`) against its
+        // current DB status, flipping + tracking a change where they now
+        // differ. This runs synchronously on the `Report` call that tips the
+        // aggregate, so eviction/re-admission is trivially inside the 15s
+        // R-3 budget.
+        //
+        // The `tokio::sync::Mutex` guard is acquired ONCE and held across
+        // this entire block — the vote-map mutation AND every touched
+        // relay's DB read-decide-write AND the final emit. This is
+        // deliberate: holding the lock only around the synchronous map
+        // update (as a `std::sync::Mutex` would force) leaves a window
+        // between "compute aggregate" and "write DB status" where a
+        // concurrent `Report` on the same relay could tip the true
+        // aggregate the other way, and the first call would still write its
+        // now-stale verdict — spuriously evicting a relay another gateway
+        // currently vouches for. Serializing the whole read-decide-write
+        // behind one held guard means no two `Report` calls can interleave
+        // their decisions for the same relay: each verdict is computed from
+        // the live map at the moment it's about to be written.
         if !req.relay_health.is_empty() {
-            let touched_aggregates: Vec<(i64, bool)> = {
-                // Held only across the map mutation + aggregate computation
-                // below — no `.await` inside this block, so the lock is
-                // dropped well before the DB reads/broadcast that follow.
-                let mut health = self
-                    .relay_health
-                    .lock()
-                    .expect("relay_health mutex poisoned");
-                let mut touched = Vec::with_capacity(req.relay_health.len());
-                for vote in &req.relay_health {
-                    let relay_id = vote.relay_id as i64;
-                    health
-                        .entry(relay_id)
-                        .or_default()
-                        .insert(gw.id, vote.healthy);
-                    if !touched.contains(&relay_id) {
-                        touched.push(relay_id);
-                    }
+            let mut health = self.relay_health.lock().await;
+
+            let mut touched = Vec::with_capacity(req.relay_health.len());
+            for vote in &req.relay_health {
+                let relay_id = vote.relay_id as i64;
+                health
+                    .entry(relay_id)
+                    .or_default()
+                    .insert(gw.id, vote.healthy);
+                if !touched.contains(&relay_id) {
+                    touched.push(relay_id);
                 }
-                touched
-                    .into_iter()
-                    .map(|relay_id| {
-                        let votes = health.get(&relay_id).expect(
-                            "relay_id just inserted above must have an entry in the map",
-                        );
-                        let healthy_agg = votes.values().any(|&h| h);
-                        (relay_id, healthy_agg)
-                    })
-                    .collect()
-            };
+            }
 
             let mut any_changed = false;
-            for (relay_id, healthy_agg) in touched_aggregates {
+            for relay_id in touched {
+                // Recomputed from the LIVE map at decision time (not a
+                // pre-snapshotted value) — the guard has been held
+                // continuously since the mutation above, so this is exactly
+                // the current aggregate.
+                let votes = health
+                    .get(&relay_id)
+                    .expect("relay_id just inserted above must have an entry in the map");
+                let healthy_agg = votes.values().any(|&h| h);
+
                 let current_status = self
                     .db
                     .relay_status(relay_id)
@@ -412,6 +430,9 @@ impl Sync for SyncSvc {
             if any_changed {
                 self.emit_relays_changed().await;
             }
+            // `health` (the guard) drops here, at the very end of the
+            // block — only now can another `Report` call's relay-health
+            // block proceed.
         }
 
         Ok(Response::new(ReportResponse {}))
