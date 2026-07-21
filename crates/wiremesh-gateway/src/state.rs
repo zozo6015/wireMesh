@@ -100,7 +100,12 @@ impl DesiredState {
             }
         }
         self.peers.retain(|p| !d.removed_peer_ids.contains(&p.gateway_id));
-        if !d.relay_infos.is_empty() {
+        // Replace whenever the delta signals a relay update — including
+        // clearing to empty (last-relay eviction). A sparse (non-relay)
+        // delta has `relays_updated: false` and must leave `self.relays`
+        // untouched; see `Delta.relays_updated`'s doc comment in
+        // `sync.proto` and `projection::delta_for_change`.
+        if d.relays_updated {
             self.relays = d.relay_infos.clone();
         }
         // Deltas are sparse: only PolicyUpdated carries policy fields (version >= 1);
@@ -231,7 +236,7 @@ mod tests {
             revision: 2,
             upserted_peers: vec![peer(2, "PUBA2", "a:9")],
             removed_peer_ids: vec![3],
-            deprecated_relays: vec![], relay_infos: vec![], policy_ir: b"NEW".to_vec(), policy_version: 4, revoked_serials: vec![],
+            deprecated_relays: vec![], relay_infos: vec![], relays_updated: false, policy_ir: b"NEW".to_vec(), policy_version: 4, revoked_serials: vec![],
         };
         ds.apply_delta(&delta);
         assert_eq!(ds.revision, 2);
@@ -278,6 +283,7 @@ mod tests {
             removed_peer_ids: vec![],
             deprecated_relays: vec![],
             relay_infos: vec![],
+            relays_updated: false,
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec![],
@@ -296,6 +302,7 @@ mod tests {
             removed_peer_ids: vec![],
             deprecated_relays: vec![],
             relay_infos: vec![],
+            relays_updated: false,
             policy_ir: b"NEW".to_vec(),
             policy_version: 6,
             revoked_serials: vec![],
@@ -392,6 +399,7 @@ mod tests {
             removed_peer_ids: vec![],
             deprecated_relays: vec![],
             relay_infos: vec![],
+            relays_updated: false,
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec!["B".into()],
@@ -405,6 +413,7 @@ mod tests {
             removed_peer_ids: vec![],
             deprecated_relays: vec![],
             relay_infos: vec![],
+            relays_updated: false,
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec!["B".into()],

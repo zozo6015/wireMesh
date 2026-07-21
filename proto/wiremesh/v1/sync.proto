@@ -55,6 +55,9 @@ message Delta {
   uint64 policy_version = 6;
   repeated string revoked_serials = 7;
   repeated RelayInfo relay_infos = 8;
+  // true iff this delta updates the relay set (relay_infos is authoritative,
+  // possibly empty); false = sparse delta, relays unchanged.
+  bool relays_updated = 9;
 }
 message ReportRequest {
   uint64 applied_version = 1;

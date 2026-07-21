@@ -154,6 +154,7 @@ mod tests {
             removed_peer_ids: vec![],
             deprecated_relays: vec![],
             relay_infos: vec![],
+            relays_updated: false,
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec![],

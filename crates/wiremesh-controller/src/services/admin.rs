@@ -361,25 +361,35 @@ impl Admin for AdminSvc {
             .await
             .map_err(|e| Status::already_exists(e.to_string()))?;
 
-        // Best-effort, same discipline as every other post-commit publish in
-        // this file (`RotateKey`/`Drain`/`RevokeCert`/`Apply`): the relay row
-        // and response are already durably committed regardless of whether
-        // this re-read/publish succeeds, so a transient failure here must
-        // never turn into an error response.
-        if let Ok(active) = self.db.active_relays().await {
-            if let Ok(revision) = self.db.current_revision().await {
-                let relay_infos = active
-                    .into_iter()
-                    .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
-                        relay_id: id as u64,
-                        endpoint,
-                    })
-                    .collect();
-                let _ = self
-                    .change_tx
-                    .send(ChangeEvent::RelaysChanged { relay_infos, revision });
-            }
-        }
+        // Propagates a post-commit re-read failure with `?` (`Status::internal`),
+        // same discipline as every other post-commit publish in this file
+        // (`RotateKey`/`Drain`/`RevokeCert`/`Apply`) — the relay row is
+        // already durably committed by this point, so a transient failure
+        // here surfaces as an error the caller can retry, rather than being
+        // silently dropped while still returning success.
+        let active = self
+            .db
+            .active_relays()
+            .await
+            .map_err(|e| Status::internal(format!("reading active relays: {e}")))?;
+        let revision = self
+            .db
+            .current_revision()
+            .await
+            .map_err(|e| Status::internal(format!("reading current revision: {e}")))?;
+        let relay_infos = active
+            .into_iter()
+            .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
+                relay_id: id as u64,
+                endpoint,
+            })
+            .collect();
+        // `send` errors only when there are currently no `Sync.Watch`
+        // subscribers — nobody to notify, which is not a failure (mirrors
+        // `RotateKey`/`Drain`/`RevokeCert`/`Apply`'s identical `let _ =`).
+        let _ = self
+            .change_tx
+            .send(ChangeEvent::RelaysChanged { relay_infos, revision });
 
         Ok(Response::new(Relay {
             id: relay_id as u64,

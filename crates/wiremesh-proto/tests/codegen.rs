@@ -127,6 +127,7 @@ fn delta_relay_infos_roundtrips_relay_info() {
         removed_peer_ids: vec![],
         deprecated_relays: vec![],
         relay_infos: vec![RelayInfo { relay_id: 3, endpoint: "relay-c.example:4443".into() }],
+        relays_updated: true,
         policy_ir: vec![],
         policy_version: 0,
         revoked_serials: vec![],
@@ -139,6 +140,25 @@ fn delta_relay_infos_roundtrips_relay_info() {
     assert_eq!(decoded.relay_infos[0].relay_id, 3);
     assert_eq!(decoded.relay_infos[0].endpoint, "relay-c.example:4443");
     assert!(decoded.deprecated_relays.is_empty());
+    assert!(decoded.relays_updated, "relays_updated=true must roundtrip");
+}
+
+#[test]
+fn delta_relays_updated_roundtrips_true_and_false() {
+    // (4c CR round 2) `Delta.relays_updated` (field 9) is the presence flag
+    // that lets `apply_delta` (gateway side) distinguish "this delta
+    // authoritatively updates the relay set, possibly to empty" from "this
+    // is a sparse, non-relay delta" — both values must survive the wire,
+    // not just default-false.
+    let with_update = Delta { relays_updated: true, ..Default::default() };
+    let decoded = Delta::decode(with_update.encode_to_vec().as_slice())
+        .expect("decoding the encoded Delta (relays_updated: true)");
+    assert!(decoded.relays_updated);
+
+    let sparse = Delta { relays_updated: false, ..Default::default() };
+    let decoded = Delta::decode(sparse.encode_to_vec().as_slice())
+        .expect("decoding the encoded Delta (relays_updated: false)");
+    assert!(!decoded.relays_updated);
 }
 
 #[test]

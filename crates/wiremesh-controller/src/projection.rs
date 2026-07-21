@@ -229,6 +229,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             removed_peer_ids: Vec::new(),
             deprecated_relays: Vec::new(),
             relay_infos: Vec::new(),
+            relays_updated: false,
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
@@ -258,6 +259,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             removed_peer_ids: Vec::new(),
             deprecated_relays: Vec::new(),
             relay_infos: Vec::new(),
+            relays_updated: false,
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
@@ -274,6 +276,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             removed_peer_ids: vec![gateway_id as u64],
             deprecated_relays: Vec::new(),
             relay_infos: Vec::new(),
+            relays_updated: false,
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials,
@@ -304,6 +307,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             removed_peer_ids: Vec::new(),
             deprecated_relays: Vec::new(),
             relay_infos: Vec::new(),
+            relays_updated: false,
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
@@ -315,6 +319,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             removed_peer_ids: Vec::new(),
             deprecated_relays: Vec::new(),
             relay_infos: Vec::new(),
+            relays_updated: false,
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: vec![serial],
@@ -327,6 +332,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             removed_peer_ids: Vec::new(),
             deprecated_relays: Vec::new(),
             relay_infos: Vec::new(),
+            relays_updated: false,
             policy_ir: ir,
             policy_version: version,
             revoked_serials: Vec::new(),
@@ -357,6 +363,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             removed_peer_ids: Vec::new(),
             deprecated_relays: Vec::new(),
             relay_infos: Vec::new(),
+            relays_updated: false,
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
@@ -364,11 +371,16 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
         ChangeEvent::RelaysChanged { relay_infos, revision } => Delta {
             revision,
             // No peer/revocation change — only `relay_infos` carries
-            // anything, per this variant's doc comment.
+            // anything, per this variant's doc comment. `relays_updated:
+            // true` is the whole point of this event/arm: it's what lets
+            // `apply_delta` (gateway side) replace the relay set even when
+            // `relay_infos` is empty (last-relay eviction) — see
+            // `Delta.relays_updated`'s doc comment in `sync.proto`.
             upserted_peers: Vec::new(),
             removed_peer_ids: Vec::new(),
             deprecated_relays: Vec::new(),
             relay_infos,
+            relays_updated: true,
             policy_ir: Vec::new(),
             policy_version: 0,
             revoked_serials: Vec::new(),
