@@ -260,4 +260,36 @@ mod tests {
             "retiring an active (not retiring) epoch must error"
         );
     }
+
+    #[test]
+    fn persist_enforces_0600_even_when_tmp_preexists_with_looser_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+
+        // Pre-create the tmp file `persist` writes to, with a looser
+        // (world-readable/writable) mode, simulating a leftover from a prior
+        // crashed write (or a misconfigured umask). `OpenOptions::mode(0o600)`
+        // only takes effect when the OS creates a *new* file — if the tmp
+        // file already exists, `create(true).truncate(true)` reuses its
+        // existing inode and mode, and the atomic rename below would carry
+        // that looser mode onto the final `epoch_keys.json`, which holds raw
+        // WireGuard PRIVATE keys.
+        let tmp = dir.path().join("epoch_keys.json.tmp");
+        std::fs::write(&tmp, b"stale").unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
+
+        let mut keys = EpochKeys::default();
+        keys.generate_next().unwrap();
+        keys.persist(dir.path()).unwrap();
+
+        let mode = std::fs::metadata(dir.path().join("epoch_keys.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "epoch_keys.json (holds PRIVATE keys) must be 0600 even when the tmp file pre-existed world-readable"
+        );
+    }
 }
