@@ -91,13 +91,159 @@ impl Enrollment for EnrollmentSvc {
                     .map_err(|e| Status::invalid_argument(format!("invalid IPv4 CIDR {c:?}: {e}")))
             })
             .collect::<Result<_, _>>()?;
-        if cidrs.is_empty() {
-            return Err(Status::invalid_argument("cidrs must not be empty"));
-        }
 
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
+
+        // (Cycle-4c Task 4) A relay has no segment/cidrs to declare — it's
+        // routed by request SHAPE instead of an explicit field: a non-empty
+        // `endpoint` selects the relay path; an empty one is the ordinary
+        // gateway path below, entirely unchanged. The DB remains the
+        // kind-authority either way — `Db::enroll_relay` only matches
+        // `kind = 'relay'` tokens (a gateway/rebind token here comes back
+        // `InvalidToken`, indistinguishable from a bad secret), and
+        // `Db::enroll_gateway` below already only matches
+        // `kind IN ('gateway', 'rebind')` (a relay token there is likewise
+        // `InvalidToken`) — so a mismatched token/path combination is
+        // rejected by the same non-disclosure posture as any other invalid
+        // token, never a distinct error that would help an attacker probe
+        // token kinds.
+        if !req.endpoint.is_empty() {
+            // (Cycle-4c Task 5) A relay's `endpoint` is what every gateway's
+            // relay transport will eventually dial (Task 7) — reject
+            // anything that doesn't even parse as `ip:port` up front, before
+            // signing or touching the DB, so a malformed value can never be
+            // enrolled (and therefore never advertised in a snapshot/delta).
+            // `SocketAddrV4` (not `SocketAddr`) enforces the project's
+            // IPv4-only v1 invariant (CLAUDE.md), consistent with the
+            // `Ipv4Net` CIDR validation on the gateway path.
+            if req.endpoint.parse::<std::net::SocketAddrV4>().is_err() {
+                return Err(Status::invalid_argument(
+                    "relay endpoint must be a valid IPv4 ip:port",
+                ));
+            }
+
+            let relay_name = format!("relay-{secret_hash_hex}");
+
+            // Signing (pure crypto, no DB dependency) happens before the
+            // single-use transaction, same rationale as the gateway path
+            // below: an invalid/spent token just means the freshly signed
+            // cert is discarded, never recorded or returned.
+            let issued = self
+                .trust
+                .sign(
+                    &req.csr_pem,
+                    CertProfile {
+                        subject_cn: relay_name.clone(),
+                        ttl: GATEWAY_CERT_TTL,
+                        // The relay's QUIC server cert MUST carry SAN
+                        // "relay" — every gateway's relay client dials it
+                        // with `wiremesh_relay::RELAY_SERVER_NAME` ("relay")
+                        // as both the QUIC SNI and the rustls
+                        // hostname-verification target (see
+                        // `wiremesh_relay::Client::connect_with_pems`); a
+                        // leaf with zero SANs fails that check outright, no
+                        // matter what CN it carries. This is CA-decided
+                        // (the relay's CSR is never consulted for it), so it
+                        // can't be smuggled by a non-relay token that
+                        // happens to hit this branch.
+                        subject_alt_names: vec!["relay".to_string()],
+                        serial: None,
+                    },
+                )
+                .await
+                .map_err(|e| Status::invalid_argument(format!("signing CSR failed: {e}")))?;
+
+            let not_after = issued
+                .not_after
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(|e| Status::internal(format!("formatting cert not_after: {e}")))?;
+
+            let ca_bundle_pem = self
+                .trust
+                .trust_bundle()
+                .await
+                .map_err(|e| Status::internal(format!("reading trust bundle: {e}")))?;
+
+            let relay_id = match self
+                .db
+                .enroll_relay(
+                    secret_hash_hex,
+                    relay_name,
+                    req.endpoint.clone(),
+                    issued.serial.clone(),
+                    issued.handle.clone(),
+                    not_after,
+                    now,
+                )
+                .await
+            {
+                Ok(id) => id,
+                Err(EnrollError::InvalidToken) => {
+                    return Err(Status::permission_denied(
+                        "enrollment token is invalid, expired, wrong kind, or already used",
+                    ));
+                }
+                Err(EnrollError::Other(e)) => {
+                    return Err(Status::internal(format!("relay enrollment failed: {e}")));
+                }
+                Err(other) => {
+                    return Err(Status::internal(format!("relay enrollment failed: {other:?}")));
+                }
+            };
+
+            // Projection-affecting mutation succeeded (and its transaction
+            // already bumped the persisted revision — see
+            // `Db::enroll_relay`'s doc comment) and the single-use token is
+            // now spent. From here on this is best-effort, same discipline
+            // as the gateway path below: a failure re-reading the revision
+            // or active-relay set must never turn into an error response —
+            // the relay row, cert, and response are already durably
+            // committed/ready regardless.
+            // (CodeRabbit round 3, Major) Reads the active-relay set AND the
+            // revision as ONE atomic pair via `relays_snapshot` (single lock
+            // hold) rather than two separate `active_relays()` +
+            // `current_revision()` calls — this guarantees the revision
+            // attached to this delta is consistent with the advertised
+            // `relay_infos`, closing a race where a concurrent relay
+            // mutation committing between two separate reads could
+            // broadcast a stale relay set tagged with a newer revision (see
+            // `Db::relays_snapshot`'s doc comment). An open `Sync.Watch`
+            // stream must never see the revision regress relative to the
+            // relay set it just applied (see projection.rs).
+            if let Ok((active, revision)) = self.db.relays_snapshot().await {
+                let relay_infos = active
+                    .into_iter()
+                    .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
+                        relay_id: id as u64,
+                        endpoint,
+                    })
+                    .collect();
+                // `send` errors only when there are currently no
+                // `Sync.Watch` subscribers — nobody to notify, which is
+                // not a failure (mirrors the gateway path's identical
+                // rationale below).
+                let _ = self
+                    .change_tx
+                    .send(ChangeEvent::RelaysChanged { relay_infos, revision });
+            }
+
+            return Ok(Response::new(EnrollResponse {
+                cert_pem: issued.cert_pem,
+                ca_bundle_pem,
+                // Not a gateway id at all — the field is reused to carry the
+                // newly enrolled relay's row id (the "id the controller
+                // assigned", same as the gateway path). Documented here since
+                // the proto field name doesn't say so itself.
+                gateway_id: relay_id as u64,
+                observe_key: String::new(),
+            }));
+        }
+
+        if cidrs.is_empty() {
+            return Err(Status::invalid_argument("cidrs must not be empty"));
+        }
 
         // The gateway's name/CN is derived from the token's secret hash
         // (already computed above) rather than parsed out of the CSR: it is
@@ -109,24 +255,45 @@ impl Enrollment for EnrollmentSvc {
         // entirely and letting the CA decide the subject CN.
         let gateway_name = format!("gw-{secret_hash_hex}");
 
-        // Signing is pure crypto with no DB dependency, so it happens
-        // BEFORE the single-use transaction below — if the token turns out
-        // to be invalid/spent, the freshly signed (but never recorded or
-        // returned) cert is simply discarded.
-        let issued = self
-            .trust
-            .sign(
-                &req.csr_pem,
-                CertProfile {
-                    subject_cn: gateway_name.clone(),
-                    ttl: GATEWAY_CERT_TTL,
-                },
-            )
-            .await
+        // SECURITY (Cycle 4c relay-registration binding): a gateway's leaf
+        // now carries a CA-decided SAN `gw-<gateway_id>` so the relay can
+        // bind a relay registration to the authenticated client cert (a
+        // gateway can only register/receive relay traffic under an id derived
+        // from ITS OWN cert-embedded gateway_id, not another pair's). That
+        // creates a chicken/egg: the gateway_id is assigned by
+        // `enroll_gateway`'s single-use transaction, but it must be inside the
+        // leaf we sign. We resolve it by SIGNING AFTER the transaction, while
+        // still recording the certificate row atomically with the token spend
+        // (so the cert stays revocable) — by pre-generating the serial here
+        // and stamping that SAME serial onto both the DB row and the leaf.
+        //
+        // `validate_csr_pem` up front preserves the pre-reorder invariant that
+        // a MALFORMED CSR is rejected WITHOUT consuming the single-use token
+        // (previously free, because signing — which parses the CSR — happened
+        // before the transaction). A valid CSR + a pre-generated serial makes
+        // the post-commit `sign` below effectively infallible.
+        wiremesh_trust::validate_csr_pem(&req.csr_pem)
             .map_err(|e| Status::invalid_argument(format!("signing CSR failed: {e}")))?;
 
-        let not_after = issued
-            .not_after
+        // Pre-generate the leaf's serial (same CSPRNG/width the issuer uses)
+        // so the certificate row can be committed inside the single-use-token
+        // transaction below, before the leaf itself is signed. NOTE: the
+        // `issuer_handle` recorded alongside it is this same serial hex —
+        // correct for the embedded issuer (whose handle IS the serial, see
+        // `EmbeddedTrust::sign`); a future non-embedded issuer with opaque
+        // post-sign handles would need to revisit this ordering.
+        let serial = wiremesh_trust::random_serial();
+        let serial_hex = hex_encode(&serial);
+
+        // not_after is computed here (at reserve time) rather than read back
+        // from the signed leaf, since we sign after this transaction. The
+        // leaf's own not_after (set by the issuer at sign time) differs only
+        // by the signing latency — immaterial against a 90-day TTL, and
+        // nothing compares the two.
+        let not_after_dt = OffsetDateTime::now_utc()
+            + time::Duration::try_from(GATEWAY_CERT_TTL)
+                .map_err(|e| Status::internal(format!("gateway cert TTL out of range: {e}")))?;
+        let not_after = not_after_dt
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting cert not_after: {e}")))?;
 
@@ -152,8 +319,8 @@ impl Enrollment for EnrollmentSvc {
                 cidrs,
                 gateway_name.clone(),
                 req.wg_pubkey.clone(),
-                issued.serial.clone(),
-                issued.handle.clone(),
+                serial_hex.clone(),
+                serial_hex.clone(),
                 not_after,
                 now,
             )
@@ -179,6 +346,30 @@ impl Enrollment for EnrollmentSvc {
                 });
             }
         };
+
+        // The token is now spent and the certificate row is durably
+        // committed (with `serial_hex`). Sign the leaf NOW that we know the
+        // gateway_id, stamping the pre-generated serial and the CA-decided
+        // `gw-<gateway_id>` SAN. With a validated CSR and a fixed serial this
+        // is effectively infallible; a failure here means the token is
+        // already spent (documented above), so it surfaces as Internal.
+        let issued = self
+            .trust
+            .sign(
+                &req.csr_pem,
+                CertProfile {
+                    subject_cn: gateway_name.clone(),
+                    ttl: GATEWAY_CERT_TTL,
+                    // SECURITY: the relay-registration identity binding. The
+                    // CA (not the CSR) stamps this SAN, so a gateway cannot
+                    // choose its own gateway_id — see the relay's
+                    // `identity_from_client_cert`.
+                    subject_alt_names: vec![format!("gw-{}", outcome.gateway_id)],
+                    serial: Some(serial),
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("signing gateway leaf failed: {e}")))?;
 
         // (Task 10) If this was a `rebind`, `Db::enroll_gateway` already
         // committed the replaced gateway's cert(s) as `revoked_at` in the DB

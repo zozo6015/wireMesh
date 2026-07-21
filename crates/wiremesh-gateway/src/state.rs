@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
-use wiremesh_proto::v1::{Delta, Peer, StateSnapshot};
+use wiremesh_proto::v1::{Delta, Peer, RelayInfo, StateSnapshot};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerState {
@@ -63,7 +63,13 @@ pub struct DesiredState {
     pub peers: Vec<PeerState>,
     pub policy_ir: Vec<u8>,
     pub policy_version: u64,
-    pub relays: Vec<String>,
+    /// (4c review fix) `#[serde(default)]` so a `state.json` written before
+    /// this field existed — or one written by a version of this binary that
+    /// last saw an empty relay set — still deserializes cleanly on boot
+    /// (fail-static: booting from stale/older persisted state must never
+    /// fail just because a newer field is missing from the JSON).
+    #[serde(default)]
+    pub relays: Vec<RelayInfo>,
     pub revoked_serials: Vec<String>,
 }
 
@@ -74,7 +80,12 @@ impl DesiredState {
             peers: s.peers.iter().map(PeerState::from_proto).collect(),
             policy_ir: s.policy_ir.clone(),
             policy_version: s.policy_version,
-            relays: s.relays.clone(),
+            // (4c review fix) Sourced from the proto's `relay_infos` (field
+            // 8) — the structured relay data moved there rather than
+            // repurposing `deprecated_relays` (field 4, kept at its
+            // original `repeated string` type; see `sync.proto`). This
+            // domain field keeps its own name (`DesiredState.relays`).
+            relays: s.relay_infos.clone(),
             revoked_serials: s.revoked_serials.clone(),
         }
     }
@@ -89,8 +100,13 @@ impl DesiredState {
             }
         }
         self.peers.retain(|p| !d.removed_peer_ids.contains(&p.gateway_id));
-        if !d.relays.is_empty() {
-            self.relays = d.relays.clone();
+        // Replace whenever the delta signals a relay update — including
+        // clearing to empty (last-relay eviction). A sparse (non-relay)
+        // delta has `relays_updated: false` and must leave `self.relays`
+        // untouched; see `Delta.relays_updated`'s doc comment in
+        // `sync.proto` and `projection::delta_for_change`.
+        if d.relays_updated {
+            self.relays = d.relay_infos.clone();
         }
         // Deltas are sparse: only PolicyUpdated carries policy fields (version >= 1);
         // every other change type sends policy_version=0 / empty IR. Guard so a
@@ -144,6 +160,7 @@ impl DesiredState {
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // constructing StateSnapshot/Delta requires setting deprecated_relays (field 4)
 mod tests {
     use super::*;
     use wiremesh_proto::v1::{Delta, Peer, PeerKey, StateSnapshot};
@@ -167,7 +184,8 @@ mod tests {
             revision: 5,
             self_cert_pem: "C".into(),
             peers: vec![peer(2, "PUBA", "203.0.113.2:51820")],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
             policy_ir: b"{\"schema\":1}".to_vec(),
             policy_version: 3,
             revoked_serials: vec![],
@@ -212,13 +230,13 @@ mod tests {
         let mut ds = DesiredState::from_snapshot(&StateSnapshot {
             revision: 1, self_cert_pem: "C".into(),
             peers: vec![peer(2, "PUBA", "a:1"), peer(3, "PUBB", "b:2")],
-            relays: vec![], policy_ir: vec![], policy_version: 0, revoked_serials: vec![],
+            deprecated_relays: vec![], relay_infos: vec![], policy_ir: vec![], policy_version: 0, revoked_serials: vec![],
         });
         let delta = Delta {
             revision: 2,
             upserted_peers: vec![peer(2, "PUBA2", "a:9")],
             removed_peer_ids: vec![3],
-            relays: vec![], policy_ir: b"NEW".to_vec(), policy_version: 4, revoked_serials: vec![],
+            deprecated_relays: vec![], relay_infos: vec![], relays_updated: false, policy_ir: b"NEW".to_vec(), policy_version: 4, revoked_serials: vec![],
         };
         ds.apply_delta(&delta);
         assert_eq!(ds.revision, 2);
@@ -263,7 +281,9 @@ mod tests {
             revision: 2,
             upserted_peers: vec![peer(7, "PUBX", "c:3")],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: false,
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec![],
@@ -280,7 +300,9 @@ mod tests {
             revision: 2,
             upserted_peers: vec![],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: false,
             policy_ir: b"NEW".to_vec(),
             policy_version: 6,
             revoked_serials: vec![],
@@ -288,6 +310,81 @@ mod tests {
         ds.apply_delta(&delta);
         assert_eq!(ds.policy_ir, b"NEW");
         assert_eq!(ds.policy_version, 6);
+    }
+
+    #[test]
+    fn apply_delta_relays_updated_true_replaces_relays() {
+        let mut ds = DesiredState {
+            relays: vec![RelayInfo { relay_id: 1, endpoint: "9.9.9.9:1".into() }],
+            ..Default::default()
+        };
+        let delta = Delta {
+            revision: 2,
+            upserted_peers: vec![],
+            removed_peer_ids: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![RelayInfo { relay_id: 7, endpoint: "1.2.3.4:4443".into() }],
+            relays_updated: true,
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec![],
+        };
+        ds.apply_delta(&delta);
+        assert_eq!(
+            ds.relays,
+            vec![RelayInfo { relay_id: 7, endpoint: "1.2.3.4:4443".into() }]
+        );
+    }
+
+    #[test]
+    fn apply_delta_relays_updated_true_and_empty_clears_relays() {
+        // Starting state HAS a relay: this is the last-relay-eviction case the
+        // fix enables. The old `if !d.relay_infos.is_empty()` guard could
+        // never clear `self.relays` to empty — this test would fail under it.
+        let mut ds = DesiredState {
+            relays: vec![RelayInfo { relay_id: 3, endpoint: "5.6.7.8:4443".into() }],
+            ..Default::default()
+        };
+        let delta = Delta {
+            revision: 2,
+            upserted_peers: vec![],
+            removed_peer_ids: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: true,
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec![],
+        };
+        ds.apply_delta(&delta);
+        assert_eq!(ds.relays, Vec::<RelayInfo>::new());
+    }
+
+    #[test]
+    fn apply_delta_relays_updated_false_leaves_relays_unchanged() {
+        // A sparse, non-relay delta (relays_updated: false, empty relay_infos)
+        // must not wipe an existing relay set — the reason the old guard
+        // existed in the first place.
+        let mut ds = DesiredState {
+            relays: vec![RelayInfo { relay_id: 4, endpoint: "2.2.2.2:4443".into() }],
+            ..Default::default()
+        };
+        let delta = Delta {
+            revision: 2,
+            upserted_peers: vec![peer(7, "PUBX", "c:3")],
+            removed_peer_ids: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: false,
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec![],
+        };
+        ds.apply_delta(&delta);
+        assert_eq!(
+            ds.relays,
+            vec![RelayInfo { relay_id: 4, endpoint: "2.2.2.2:4443".into() }]
+        );
     }
 
     #[test]
@@ -300,7 +397,9 @@ mod tests {
             revision: 2,
             upserted_peers: vec![],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: false,
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec!["B".into()],
@@ -312,7 +411,9 @@ mod tests {
             revision: 3,
             upserted_peers: vec![],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: false,
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec!["B".into()],

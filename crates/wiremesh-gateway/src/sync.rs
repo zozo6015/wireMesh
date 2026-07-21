@@ -6,7 +6,9 @@ use std::net::SocketAddr;
 use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity as TlsIdentity};
 use wiremesh_proto::v1::sync_client::SyncClient;
-use wiremesh_proto::v1::{sync_message::Body, PunchDirective, ReportRequest, SyncMessage, WatchRequest};
+use wiremesh_proto::v1::{
+    sync_message::Body, PunchDirective, RelayHealth, ReportRequest, SyncMessage, WatchRequest,
+};
 
 /// One decoded Sync message, surfaced to the gateway boot loop. `Snapshot`/
 /// `Delta` fold into the running [`DesiredState`] and arrive as
@@ -45,13 +47,21 @@ pub async fn watch(client: &mut SyncClient<Channel>) -> anyhow::Result<tonic::St
 /// empty list here is a genuine, meaningful "I currently have no routable
 /// local addresses" and the controller applies it as a full REPLACE
 /// (`Db::set_local_candidates`), clearing any previously reported set.
+///
+/// `relay_health` (cycle4c §8) is likewise the gateway's complete current
+/// per-relay health snapshot (one entry per advertised relay this gateway
+/// currently has a `RelayTransport` open to — see `main.rs`'s path-tick
+/// driver), sent fresh every `Report` call; an empty list is the equally
+/// meaningful "no relay transports open right now" (e.g. every peer is
+/// `Direct`), not "leave the previous snapshot alone".
 pub async fn report(
     client: &mut SyncClient<Channel>,
     applied_version: u64,
     local_endpoints: Vec<String>,
+    relay_health: Vec<RelayHealth>,
 ) -> anyhow::Result<()> {
     client
-        .report(ReportRequest { applied_version, local_endpoints })
+        .report(ReportRequest { applied_version, local_endpoints, relay_health })
         .await
         .map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
     Ok(())
@@ -92,6 +102,7 @@ fn classify(body: Option<Body>, current: &mut Option<DesiredState>) -> anyhow::R
 }
 
 #[cfg(test)]
+#[allow(deprecated)] // constructing StateSnapshot/Delta requires setting deprecated_relays (field 4)
 mod tests {
     use super::*;
     use wiremesh_proto::v1::{Delta, StateSnapshot};
@@ -103,7 +114,8 @@ mod tests {
             revision: 7,
             self_cert_pem: "C".into(),
             peers: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
             policy_ir: vec![],
             policy_version: 2,
             revoked_serials: vec![],
@@ -140,7 +152,9 @@ mod tests {
             revision: 1,
             upserted_peers: vec![],
             removed_peer_ids: vec![],
-            relays: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: false,
             policy_ir: vec![],
             policy_version: 0,
             revoked_serials: vec![],

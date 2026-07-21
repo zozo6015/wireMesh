@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/wiremesh-proto", "crates/wiremesh-trust", "crates/wiremesh-controller", "crates/fabricctl", "crates/wiremesh-testkit", "crates/wiremesh-policy", "crates/wiremesh-enforcer", "crates/wiremesh-gateway"]
+members = ["crates/wiremesh-proto", "crates/wiremesh-trust", "crates/wiremesh-controller", "crates/fabricctl", "crates/wiremesh-testkit", "crates/wiremesh-policy", "crates/wiremesh-enforcer", "crates/wiremesh-gateway", "crates/wiremesh-relay"]
 # `crates/wiremesh-enforcer-ebpf` (Task 7 Step 3) is its own standalone
 # aya-template workspace (ships its own `[workspace]`, must not be nested --
 # same reason every `spike/*` crate is standalone, see CLAUDE.md's
@@ -11,7 +11,29 @@ exclude = ["crates/wiremesh-enforcer-ebpf", "spike"]
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.12", features = ["tls"] }
 prost = "0.13"
-rustls = "0.23"
+# `default-features = false` + an explicit feature list (Cycle 4c Task 8):
+# rustls 0.23's OWN default features are `["aws_lc_rs", "logging",
+# "prefer-post-quantum", "std", "tls12"]` — `prefer-post-quantum` in turn
+# hard-requires `aws_lc_rs` — so leaving this at plain `"0.23"` pulls the
+# `aws-lc-rs` crypto backend into EVERY consumer of this workspace
+# dependency, including `wiremesh-relay` (whose own code explicitly wants
+# the `ring` backend, via `rustls::crypto::ring::default_provider()`).
+# Cargo unifies features for a single dependency version across an entire
+# build, so once `aws-lc-rs` and `ring` are BOTH linked into one process —
+# exactly what happens in any `wiremesh-gateway` test binary that pulls in
+# `wiremesh-relay` (quinn, `ring`-only) as a normal dependency AND
+# `wiremesh-testkit`/`wiremesh-controller` (tonic, also `ring`-based) as a
+# dev-dependency — `rustls`'s own default-provider auto-detection becomes
+# ambiguous and panics the first time ANY code in that process builds a
+# `rustls::ClientConfig`/`ServerConfig` without first calling
+# `CryptoProvider::install_default()` explicitly (which nothing on the
+# `wiremesh-controller`/tonic side ever does). Pinning to `ring` only —
+# dropping `aws_lc_rs`/`prefer-post-quantum` — keeps exactly one crypto
+# backend linked workspace-wide, matching what every consumer (tonic's
+# `tokio-rustls` and `wiremesh-relay`'s `ensure_crypto_provider`) already
+# uses, and removes the ambiguity at its root (a build-graph fix) instead of
+# papering over one call site.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rcgen = "0.13"
 rusqlite = { version = "0.32", features = ["bundled"] }
 anyhow = "1"

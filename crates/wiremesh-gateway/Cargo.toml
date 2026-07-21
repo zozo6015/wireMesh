@@ -16,6 +16,7 @@ wiremesh-proto = { path = "../wiremesh-proto" }
 wiremesh-policy = { path = "../wiremesh-policy" }
 wiremesh-enforcer = { path = "../wiremesh-enforcer" }
 wiremesh-trust = { path = "../wiremesh-trust" }
+wiremesh-relay = { path = "../wiremesh-relay" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
@@ -33,6 +34,17 @@ tokio-stream = "0.1"
 [dev-dependencies]
 wiremesh-testkit = { path = "../wiremesh-testkit", features = ["netns"] }
 tempfile = "3"
+# Cycle 4c Task 10 (`relay_matrix.rs` case 3, relay eviction/re-path): the
+# test needs to force-close a relay's QUIC endpoint out from under two live
+# gateway connections (`quinn::Endpoint::close`) to prove the pair re-paths
+# onto a second relay — `wiremesh_relay::spawn_server`'s public API doesn't
+# expose the `Endpoint` it binds, so the test builds its own via the same
+# public `wiremesh_relay::server_config`/`wiremesh_relay::serve` functions
+# `spawn_server` itself uses, which requires naming `quinn::Endpoint`
+# directly. No production code depends on this — dev-only. Version pinned to
+# match `wiremesh-relay`'s own (plain, unpinned-feature) `quinn = "0.11"` so
+# Cargo unifies to one resolved version workspace-wide.
+quinn = "0.11"
 
 [features]
 netns-tests = []

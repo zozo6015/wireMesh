@@ -16,12 +16,13 @@
 //! field in `WatchRequest`) is trusted as identity — `WatchRequest` is
 //! (deliberately) an empty message.
 
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use base64::Engine as _;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Mutex};
 use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::{Stream, StreamExt};
@@ -51,6 +52,32 @@ pub struct SyncSvc {
     /// `PunchDirective` explicitly to BOTH members of a pair — deliberately
     /// NOT the `subject_gateway_id()` self-skip path the deltas below use.
     broker: Arc<Broker>,
+    /// (Cycle-4c Task 6) In-memory relay health votes: `relay_id -> (gw_id ->
+    /// healthy)`. Populated exclusively by `report`'s `req.relay_health`
+    /// handling below. Deliberately NOT persisted — lost on controller
+    /// restart is an accepted tradeoff (see the design notes' "known
+    /// limitation" section): a relay defaults back to whatever its DB
+    /// `status` already was (unaffected by this map resetting), and any
+    /// gateway that still considers a relay live/dead simply re-reports on
+    /// its next `Report` call. `Arc` so every `SyncSvc` produced by cloning
+    /// (if ever) — and, more immediately, every concurrent `report` call
+    /// against the same shared service instance — sees and mutates the SAME
+    /// map rather than a private copy.
+    ///
+    /// This is a `tokio::sync::Mutex` (NOT `std::sync::Mutex`) DELIBERATELY:
+    /// the guard is held across the entire read-decide-write critical
+    /// section in `report()` below, including the `.await`s on
+    /// `relay_status`/`set_relay_status`/`emit_relays_changed`. Holding a
+    /// `std::sync::Mutex` guard across an `.await` would be both a bug (a
+    /// blocking lock parked across a suspension point) and exactly the
+    /// TOCTOU hazard this type was chosen to close: two concurrent `Report`
+    /// calls touching the same relay must never interleave their decisions,
+    /// or one can act on a vote aggregate that's already stale by the time
+    /// it writes the DB status, spuriously evicting a relay another gateway
+    /// concurrently vouches for. Serializing the whole read-decide-write
+    /// behind this async mutex makes each decision atomic with respect to
+    /// the live vote map.
+    relay_health: Arc<Mutex<HashMap<i64, HashMap<i64, bool>>>>,
 }
 
 impl SyncSvc {
@@ -63,6 +90,43 @@ impl SyncSvc {
             db,
             change_tx,
             broker,
+            relay_health: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// (Cycle-4c Task 6; CodeRabbit round 3) Re-reads the current
+    /// active-relay set + persisted revision as ONE atomic pair
+    /// (`Db::relays_snapshot`, single lock hold) and publishes ONE
+    /// `ChangeEvent::RelaysChanged` — the shared tail end of both the
+    /// enrollment path (`EnrollmentSvc::enroll`'s relay-enrollment branch)
+    /// and this file's health-driven eviction/re-admission path. Reading
+    /// both fields under one lock hold (rather than two separate
+    /// `active_relays()` + `current_revision()` calls, per the Cycle-4c
+    /// Task 5 review fix) guarantees the revision attached to the emitted
+    /// delta is consistent with the advertised `relays` — closing a race
+    /// where a concurrent relay mutation committing between two separate
+    /// reads could broadcast a stale relay set tagged with a newer revision
+    /// (see `Db::relays_snapshot`'s doc comment) — so an open `Sync.Watch`
+    /// stream never sees the revision regress relative to the relay set it
+    /// just applied (see `projection.rs`). Best-effort: a failure reading
+    /// the snapshot is silently swallowed (mirrors every other best-effort
+    /// `change_tx.send` call in this crate — a transient DB read failure
+    /// here must never turn an otherwise-successful `Report`/`Enroll` call
+    /// into an error response), and `send` itself only ever errors when
+    /// there are currently no `Sync.Watch` subscribers, which is not a
+    /// failure either.
+    async fn emit_relays_changed(&self) {
+        if let Ok((active, revision)) = self.db.relays_snapshot().await {
+            let relay_infos = active
+                .into_iter()
+                .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
+                    relay_id: id as u64,
+                    endpoint,
+                })
+                .collect();
+            let _ = self
+                .change_tx
+                .send(ChangeEvent::RelaysChanged { relay_infos, revision });
         }
     }
 }
@@ -296,6 +360,83 @@ impl Sync for SyncSvc {
                     });
                 }
             }
+        }
+
+        // (Cycle-4c Task 6, R-3; TOCTOU fix) Relay health pipeline: aggregate
+        // this gateway's votes into the shared `relay_id -> (gw_id ->
+        // healthy)` map, then for every relay THIS report touched, compare
+        // the fresh aggregate (healthy-override: a relay is unhealthy iff it
+        // has >=1 vote on record and NONE of them is `true`) against its
+        // current DB status, flipping + tracking a change where they now
+        // differ. This runs synchronously on the `Report` call that tips the
+        // aggregate, so eviction/re-admission is trivially inside the 15s
+        // R-3 budget.
+        //
+        // The `tokio::sync::Mutex` guard is acquired ONCE and held across
+        // this entire block — the vote-map mutation AND every touched
+        // relay's DB read-decide-write AND the final emit. This is
+        // deliberate: holding the lock only around the synchronous map
+        // update (as a `std::sync::Mutex` would force) leaves a window
+        // between "compute aggregate" and "write DB status" where a
+        // concurrent `Report` on the same relay could tip the true
+        // aggregate the other way, and the first call would still write its
+        // now-stale verdict — spuriously evicting a relay another gateway
+        // currently vouches for. Serializing the whole read-decide-write
+        // behind one held guard means no two `Report` calls can interleave
+        // their decisions for the same relay: each verdict is computed from
+        // the live map at the moment it's about to be written.
+        if !req.relay_health.is_empty() {
+            let mut health = self.relay_health.lock().await;
+
+            let mut touched = Vec::with_capacity(req.relay_health.len());
+            for vote in &req.relay_health {
+                let relay_id = vote.relay_id as i64;
+                health
+                    .entry(relay_id)
+                    .or_default()
+                    .insert(gw.id, vote.healthy);
+                if !touched.contains(&relay_id) {
+                    touched.push(relay_id);
+                }
+            }
+
+            let mut any_changed = false;
+            for relay_id in touched {
+                // Recomputed from the LIVE map at decision time (not a
+                // pre-snapshotted value) — the guard has been held
+                // continuously since the mutation above, so this is exactly
+                // the current aggregate.
+                let votes = health
+                    .get(&relay_id)
+                    .expect("relay_id just inserted above must have an entry in the map");
+                let healthy_agg = votes.values().any(|&h| h);
+
+                let current_status = self
+                    .db
+                    .relay_status(relay_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("reading relay status: {e}")))?;
+                let Some(current_status) = current_status else {
+                    // Unknown relay id (e.g. a stale report about a relay
+                    // row that no longer exists) — nothing to flip.
+                    continue;
+                };
+                let desired_status = if healthy_agg { "active" } else { "inactive" };
+                if current_status != desired_status {
+                    self.db
+                        .set_relay_status(relay_id, desired_status.to_string())
+                        .await
+                        .map_err(|e| Status::internal(format!("flipping relay status: {e}")))?;
+                    any_changed = true;
+                }
+            }
+
+            if any_changed {
+                self.emit_relays_changed().await;
+            }
+            // `health` (the guard) drops here, at the very end of the
+            // block — only now can another `Report` call's relay-health
+            // block proceed.
         }
 
         Ok(Response::new(ReportResponse {}))

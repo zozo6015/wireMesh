@@ -1,0 +1,43 @@
+[package]
+name = "wiremesh-relay"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "wiremesh_relay"
+path = "src/lib.rs"
+
+[[bin]]
+name = "relay"
+path = "src/bin/relay.rs"
+
+[[bin]]
+name = "mkcerts"
+path = "src/bin/mkcerts.rs"
+
+[dependencies]
+quinn = "0.11"
+# Not in the 4c relay crate's original dep list; added because mkcerts/relay/lib
+# all exchange certs as PEM files on disk (across process boundaries) and rustls
+# 0.23 no longer ships its own PEM parser — rustls-pemfile is the standard
+# complement for turning `ca.pem`/`relay.pem`/`gw-*.pem` back into the
+# `CertificateDer`/`PrivateKeyDer` types rustls::ServerConfig/ClientConfig want.
+rustls-pemfile = "2"
+clap = { version = "4", features = ["derive"] }
+rustls = { workspace = true }
+rcgen = { workspace = true }
+tokio = { workspace = true }
+anyhow = { workspace = true }
+# Task 3 (4c): parses the end-entity client cert's DER to extract its raw
+# serial for the offline-revocation-denylist check (see lib.rs's
+# `DenyingVerifier`) — matched against `wiremesh-trust`'s hex serial encoding.
+x509-parser = "0.16"
+# SECURITY (4c relay-registration binding): SHA-256 derives the 8-byte
+# registry key from the (my_identity, peer_identity) pair — the shared
+# derivation the gateway addresses peers with (see `registration_key`).
+sha2 = { workspace = true }
+serde_json = { workspace = true }
+tonic = { workspace = true }
+wiremesh-proto = { path = "../wiremesh-proto" }
+tokio-stream = "0.1"
+prost = { workspace = true }

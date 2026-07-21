@@ -27,16 +27,38 @@ message Peer {
   repeated string candidate_endpoints = 4;
   repeated string allowed_ips = 5;      // peer segment CIDRs
 }
+message RelayInfo { uint64 relay_id = 1; string endpoint = 2; }
+message RelayHealth { uint64 relay_id = 1; bool healthy = 2; }
 message StateSnapshot {
   uint64 revision = 1;
   string self_cert_pem = 2;
   repeated Peer peers = 3;
-  repeated string relays = 4;
+  // (4c review fix) Field 4 was briefly `repeated RelayInfo` on this branch
+  // before landing on main — changing an EXISTING field's wire type is a
+  // hazard (both for the wire and for a persisted `state.json`), so it is
+  // kept as its original `repeated string` type here, deprecated and
+  // unused; the structured relay data lives in `relay_infos` (field 8,
+  // below) instead. Never populated by this controller.
+  repeated string deprecated_relays = 4 [deprecated = true];
   bytes policy_ir = 5;                    // empty IR v0 in cycle 2
   uint64 policy_version = 6;
   repeated string revoked_serials = 7;
+  repeated RelayInfo relay_infos = 8;
 }
-message Delta { uint64 revision = 1; repeated Peer upserted_peers = 2; repeated uint64 removed_peer_ids = 3; repeated string relays = 4; bytes policy_ir = 5; uint64 policy_version = 6; repeated string revoked_serials = 7; }
+message Delta {
+  uint64 revision = 1;
+  repeated Peer upserted_peers = 2;
+  repeated uint64 removed_peer_ids = 3;
+  // See `StateSnapshot.deprecated_relays`'s doc comment — same rationale.
+  repeated string deprecated_relays = 4 [deprecated = true];
+  bytes policy_ir = 5;
+  uint64 policy_version = 6;
+  repeated string revoked_serials = 7;
+  repeated RelayInfo relay_infos = 8;
+  // true iff this delta updates the relay set (relay_infos is authoritative,
+  // possibly empty); false = sparse delta, relays unchanged.
+  bool relays_updated = 9;
+}
 message ReportRequest {
   uint64 applied_version = 1;
   repeated string local_endpoints = 2;  // gateway's own routable local ip:wg_port
@@ -44,5 +66,7 @@ message ReportRequest {
                                          // local-source candidates for LAN/hairpin
                                          // reachability. Additive field; empty = old
                                          // (pre-4b) client behavior.
+  repeated RelayHealth relay_health = 3; // additive; gateway per-relay health
+                                          // reports (4c).
 }
 message ReportResponse {}

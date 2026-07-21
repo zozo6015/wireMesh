@@ -131,6 +131,40 @@ impl DbHandle {
         }
     }
 
+    /// See [`Db::enroll_relay`]. Returns [`EnrollError`] for the same
+    /// reason [`Self::enroll_gateway`] does.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn enroll_relay(
+        &self,
+        secret_hash: String,
+        relay_name: String,
+        endpoint: String,
+        cert_serial: String,
+        issuer_handle: String,
+        cert_not_after: String,
+        now: String,
+    ) -> Result<i64, EnrollError> {
+        let db = self.inner.clone();
+        match tokio::task::spawn_blocking(move || {
+            db.enroll_relay(
+                &secret_hash,
+                &relay_name,
+                &endpoint,
+                &cert_serial,
+                &issuer_handle,
+                &cert_not_after,
+                &now,
+            )
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(join_err) => Err(EnrollError::Other(anyhow::anyhow!(
+                "enroll_relay blocking task panicked: {join_err}"
+            ))),
+        }
+    }
+
     /// See [`Db::list_other_gateways`].
     pub async fn list_other_gateways(&self, exclude_gateway_id: i64) -> Result<Vec<GatewayRow>> {
         let db = self.inner.clone();
@@ -248,6 +282,32 @@ impl DbHandle {
     pub async fn list_relays(&self) -> Result<Vec<(i64, String, String, String)>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.list_relays()).await?
+    }
+
+    /// See [`Db::active_relays`].
+    pub async fn active_relays(&self) -> Result<Vec<(i64, String)>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.active_relays()).await?
+    }
+
+    /// See [`Db::relays_snapshot`]. Reads the active-relay set and the
+    /// persisted revision as ONE atomic pair (single lock hold), for every
+    /// `RelaysChanged`-emitting call site.
+    pub async fn relays_snapshot(&self) -> Result<(Vec<(i64, String)>, u64)> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.relays_snapshot()).await?
+    }
+
+    /// See [`Db::relay_status`].
+    pub async fn relay_status(&self, relay_id: i64) -> Result<Option<String>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.relay_status(relay_id)).await?
+    }
+
+    /// See [`Db::set_relay_status`].
+    pub async fn set_relay_status(&self, relay_id: i64, status: String) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.set_relay_status(relay_id, &status)).await?
     }
 
     /// See [`Db::insert_api_token`].

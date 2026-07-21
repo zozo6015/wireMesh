@@ -324,9 +324,26 @@ impl Admin for AdminSvc {
         Ok(Response::new(DeleteSegmentResponse {}))
     }
 
-    /// (Task 13) Registers a relay — cycle-2 bookkeeping only (no real relay
-    /// data-plane wiring yet, mirroring `RotateKey`'s placeholder-pubkey
-    /// posture).
+    /// (Task 13; Cycle-4c review fix; CodeRabbit round 3) Registers a
+    /// relay — `endpoint` must parse as `std::net::SocketAddrV4` (v1 is
+    /// IPv4-only end to end; mirrors the enrollment relay path's identical
+    /// check) before anything is persisted. The insert + audit commit
+    /// atomically in one DB transaction (`Db::insert_relay`, which also
+    /// bumps the persisted revision in that same transaction, mirroring
+    /// `Db::set_relay_status`). AFTER that commits, this re-reads the
+    /// active-relay set and current revision as ONE atomic pair
+    /// (`Db::relays_snapshot`) and publishes a [`ChangeEvent::RelaysChanged`]
+    /// on the same `change_tx` fan-out `EnrollmentSvc::enroll`'s
+    /// relay-enrollment branch and `SyncSvc::emit_relays_changed` use —
+    /// without this, a gateway enrolled via `fabricctl relay register` (as
+    /// opposed to relay self-enrollment) would never reach an
+    /// already-connected gateway's open `Sync.Watch` stream until it
+    /// happened to reconnect. Reading both fields under `relays_snapshot`'s
+    /// single lock hold (rather than two separate `active_relays()` +
+    /// `current_revision()` calls) is what guarantees the emitted delta's
+    /// revision is consistent with the advertised `relay_infos` — see that
+    /// method's doc comment for the stale-overwrite race two separate reads
+    /// could otherwise produce.
     async fn register_relay(
         &self,
         request: Request<RegisterRelayRequest>,
@@ -339,6 +356,16 @@ impl Admin for AdminSvc {
         if req.endpoint.is_empty() {
             return Err(Status::invalid_argument("relay endpoint must not be empty"));
         }
+        // (CodeRabbit round 3, Major) v1 is IPv4-only end to end (CLAUDE.md) —
+        // mirror the enrollment relay path's identical `SocketAddrV4` check
+        // (`services::enrollment::enroll`) so this second way to register a
+        // relay can't accept (and advertise) an IPv6 or wholly malformed
+        // endpoint that the enrollment path already rejects.
+        if req.endpoint.parse::<std::net::SocketAddrV4>().is_err() {
+            return Err(Status::invalid_argument(
+                "relay endpoint must be a valid IPv4 ip:port",
+            ));
+        }
 
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -350,6 +377,38 @@ impl Admin for AdminSvc {
             .insert_relay(req.name.clone(), req.endpoint.clone(), actor, now)
             .await
             .map_err(|e| Status::already_exists(e.to_string()))?;
+
+        // Propagates a post-commit re-read failure with `?` (`Status::internal`),
+        // same discipline as every other post-commit publish in this file
+        // (`RotateKey`/`Drain`/`RevokeCert`/`Apply`) — the relay row is
+        // already durably committed by this point, so a transient failure
+        // here surfaces as an error the caller can retry, rather than being
+        // silently dropped while still returning success.
+        //
+        // (CodeRabbit round 3, Major) Reads the active-relay set AND the
+        // current revision as ONE atomic pair via `relays_snapshot` (single
+        // lock hold), not two separate `active_relays()` + `current_revision()`
+        // calls — see that method's doc comment for why the previous
+        // two-read version could broadcast a stale relay list tagged with a
+        // newer revision if a concurrent relay mutation committed in between.
+        let (active, revision) = self
+            .db
+            .relays_snapshot()
+            .await
+            .map_err(|e| Status::internal(format!("reading relays snapshot: {e}")))?;
+        let relay_infos = active
+            .into_iter()
+            .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
+                relay_id: id as u64,
+                endpoint,
+            })
+            .collect();
+        // `send` errors only when there are currently no `Sync.Watch`
+        // subscribers — nobody to notify, which is not a failure (mirrors
+        // `RotateKey`/`Drain`/`RevokeCert`/`Apply`'s identical `let _ =`).
+        let _ = self
+            .change_tx
+            .send(ChangeEvent::RelaysChanged { relay_infos, revision });
 
         Ok(Response::new(Relay {
             id: relay_id as u64,

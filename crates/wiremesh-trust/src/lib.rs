@@ -57,6 +57,30 @@ pub struct CertProfile {
     pub subject_cn: String,
     /// Requested lifetime of the leaf, from the moment of issuance.
     pub ttl: StdDuration,
+    /// Subject Alternative Names the CA has decided to stamp onto the issued
+    /// leaf — e.g. `["relay"]` for a relay's QUIC server cert, so that
+    /// rustls hostname verification (`wiremesh_relay::RELAY_SERVER_NAME`)
+    /// succeeds against it. **The caller (controller service code), not the
+    /// CSR, decides this list** — [`EmbeddedTrust::sign`] never reads SANs
+    /// out of the CSR itself (see that method's doc comment); this field is
+    /// the one and only source of truth for a leaf's SANs. An ordinary
+    /// gateway cert has no need of a SAN (gateways are mTLS *clients*,
+    /// verified by chain, not by hostname) and passes an empty `Vec` here.
+    pub subject_alt_names: Vec<String>,
+    /// A caller-chosen serial number to stamp onto the leaf, or `None` to let
+    /// the issuer mint a fresh random one (the default for essentially every
+    /// caller).
+    ///
+    /// This exists for exactly one caller: gateway enrollment
+    /// (`services::enrollment`), which must record the cert's serial into its
+    /// single-use-token transaction *before* it knows the gateway_id it needs
+    /// to embed in the leaf's `gw-<gateway_id>` SAN (the relay's registration
+    /// binding — Cycle 4c). Pre-generating the serial (via
+    /// [`random_serial`]) lets that transaction commit the certificate row
+    /// atomically with the token spend (so the cert stays revocable), and the
+    /// SAME serial is then stamped onto the leaf signed afterwards. `None`
+    /// preserves the historic behavior for all other callers.
+    pub serial: Option<[u8; 16]>,
 }
 
 /// A byte value paired with a monotonically increasing version number, as
@@ -235,14 +259,19 @@ impl CertificateIssuer for EmbeddedTrust {
         // key from the CSR and rebuild the leaf's parameters from scratch.
         // Any subject DN entries, SANs, key-usages, or extensions the CSR
         // requested are discarded — a gateway cannot smuggle a CN, SAN, or
-        // extension of its choosing into the issued cert.
+        // extension of its choosing into the issued cert. The ONLY SANs that
+        // ever land on the leaf are `profile.subject_alt_names` — chosen by
+        // the CALLER (controller service code), never read from the CSR
+        // itself. This is how a relay's QUIC server cert gets its required
+        // `"relay"` SAN (see `services::enrollment`'s relay branch) while an
+        // ordinary gateway cert (an mTLS client cert, verified by chain, not
+        // hostname) still gets none.
         let public_key = csr.public_key;
-        let mut params = CertificateParams::new(Vec::<String>::new())
+        let mut params = CertificateParams::new(profile.subject_alt_names.clone())
             .context("building leaf certificate params")?;
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, profile.subject_cn.as_str());
         params.distinguished_name = dn;
-        params.subject_alt_names.clear();
         params.key_usages.clear();
         params.extended_key_usages.clear();
         params.custom_extensions.clear();
@@ -254,7 +283,11 @@ impl CertificateIssuer for EmbeddedTrust {
         params.not_before = not_before;
         params.not_after = not_after;
 
-        let serial = random_serial();
+        // Use the caller-supplied serial when present (gateway enrollment
+        // pre-generates it so it can record the cert row atomically with the
+        // single-use token spend before the leaf is signed — see
+        // `CertProfile::serial`); otherwise mint a fresh random one.
+        let serial = profile.serial.unwrap_or_else(random_serial);
         params.serial_number = Some(rcgen::SerialNumber::from_slice(&serial));
         let serial_hex = hex_encode(&serial);
 
@@ -418,11 +451,29 @@ fn load_or_create_ca(data_dir: &Path) -> Result<(rcgen::Certificate, KeyPair, St
 /// returned to callers). Uses the OS CSPRNG directly (`OsRng`) rather than
 /// the thread-local `rand::thread_rng()` — this value ends up in
 /// certificate metadata, so it's crypto-adjacent key material (#8).
-fn random_serial() -> [u8; 16] {
+///
+/// Exposed (`pub`) so a caller that needs to pre-commit a certificate's
+/// serial before signing the leaf (gateway enrollment — see
+/// [`CertProfile::serial`]) generates it with exactly the same CSPRNG and
+/// width the issuer would have used, then passes it back in via
+/// `CertProfile::serial`.
+pub fn random_serial() -> [u8; 16] {
     use rand::{rngs::OsRng, RngCore};
     let mut bytes = [0u8; 16];
     OsRng.fill_bytes(&mut bytes);
     bytes
+}
+
+/// Validates that `csr_pem` parses as a PEM-encoded PKCS#10 CSR, without
+/// signing anything. Gateway enrollment (Cycle 4c) signs the leaf *after* its
+/// single-use-token transaction commits — so it calls this up front to reject
+/// a malformed CSR (`Err`) *before* the token is spent, preserving the
+/// invariant that a bad request never consumes a single-use token (the
+/// historic sign-before-commit order gave this for free).
+pub fn validate_csr_pem(csr_pem: &str) -> Result<()> {
+    CertificateSigningRequestParams::from_pem(csr_pem)
+        .map(|_| ())
+        .context("parsing CSR PEM")
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
