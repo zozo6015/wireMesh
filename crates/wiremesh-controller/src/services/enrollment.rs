@@ -115,9 +115,12 @@ impl Enrollment for EnrollmentSvc {
             // anything that doesn't even parse as `ip:port` up front, before
             // signing or touching the DB, so a malformed value can never be
             // enrolled (and therefore never advertised in a snapshot/delta).
-            if req.endpoint.parse::<std::net::SocketAddr>().is_err() {
+            // `SocketAddrV4` (not `SocketAddr`) enforces the project's
+            // IPv4-only v1 invariant (CLAUDE.md), consistent with the
+            // `Ipv4Net` CIDR validation on the gateway path.
+            if req.endpoint.parse::<std::net::SocketAddrV4>().is_err() {
                 return Err(Status::invalid_argument(
-                    "relay endpoint must be a valid ip:port",
+                    "relay endpoint must be a valid IPv4 ip:port",
                 ));
             }
 
@@ -185,8 +188,13 @@ impl Enrollment for EnrollmentSvc {
             // or active-relay set must never turn into an error response —
             // the relay row, cert, and response are already durably
             // committed/ready regardless.
-            if let Ok(revision) = self.db.current_revision().await {
-                if let Ok(active) = self.db.active_relays().await {
+            // Read the active-relay set FIRST, then the revision LAST —
+            // mirroring the gateway path's convention so the revision attached
+            // to this delta is >= the state the advertised `relays` reflect. An
+            // open `Sync.Watch` stream must never see the revision regress
+            // relative to the relay set it just applied (see projection.rs).
+            if let Ok(active) = self.db.active_relays().await {
+                if let Ok(revision) = self.db.current_revision().await {
                     let relays = active
                         .into_iter()
                         .map(|(id, endpoint)| wiremesh_proto::v1::RelayInfo {
