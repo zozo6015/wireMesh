@@ -445,15 +445,56 @@ impl Sync for SyncSvc {
         Ok(Response::new(ReportResponse {}))
     }
 
-    // (Key-rotation Task 1) Proto surface only — Task 2 fills in the actual
-    // persistence of the gateway-generated per-epoch WG public key. Stubbed
-    // here so the generated `Sync` server trait has a concrete impl and the
-    // workspace compiles.
+    /// (Key-rotation Task 2) A gateway submits the REAL WireGuard public key
+    /// it generated for a pending rotation epoch — the private key never
+    /// leaves the gateway, only the pubkey travels on the wire. Identity is
+    /// resolved exactly as `report`/`watch` do: the mTLS peer certificate's
+    /// subject CN, looked up against `gateway.name`, never anything
+    /// client-supplied in the request body.
+    ///
+    /// [`crate::db::Db::set_epoch_pubkey`] does the actual overwrite (and
+    /// only succeeds for a genuinely pending, sentinel-holding epoch row —
+    /// see its doc comment); its "no pending epoch" failure is mapped to
+    /// `FailedPrecondition` (the caller asked for something that isn't
+    /// true right now, not a caller-identity or internal-server problem),
+    /// any other DB error to `Internal`. On success, the shared
+    /// `emit_key_rotated` helper (also used by `AdminSvc::rotate_key`)
+    /// re-reads the gateway's full key set and fans out a
+    /// `ChangeEvent::KeyRotated` so already-connected peers immediately see
+    /// the now-real key instead of the sentinel.
     async fn submit_epoch_key(
         &self,
-        _request: Request<SubmitEpochKeyRequest>,
+        request: Request<SubmitEpochKeyRequest>,
     ) -> Result<Response<SubmitEpochKeyResponse>, Status> {
-        Err(Status::unimplemented("SubmitEpochKey lands in Task 2"))
+        let (gateway_name, _self_cert_pem) = peer_identity(&request)?;
+
+        let gw = self
+            .db
+            .find_gateway_by_name(gateway_name)
+            .await
+            .map_err(|e| Status::internal(format!("looking up gateway by cert CN: {e}")))?
+            .ok_or_else(|| {
+                Status::permission_denied(
+                    "client certificate's CN does not match any enrolled gateway",
+                )
+            })?;
+
+        let req = request.into_inner();
+        self.db
+            .set_epoch_pubkey(gw.id, req.epoch, req.pubkey)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("no pending epoch") {
+                    Status::failed_precondition(msg)
+                } else {
+                    Status::internal(format!("submitting epoch key: {e}"))
+                }
+            })?;
+
+        projection::emit_key_rotated(&self.db, &self.change_tx, gw.id).await?;
+
+        Ok(Response::new(SubmitEpochKeyResponse {}))
     }
 }
 

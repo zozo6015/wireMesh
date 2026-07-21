@@ -44,7 +44,7 @@ use wiremesh_proto::v1::enrollment_client::EnrollmentClient;
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{
     ApplyDiff, ApplyRequest, CreateSegmentRequest, MintApiTokenRequest, MintTokenRequest,
-    ReportRequest, SyncMessage, WatchRequest,
+    ReportRequest, SubmitEpochKeyRequest, SyncMessage, WatchRequest,
 };
 
 /// (Task 13) Client-side counterpart to `crate::auth`'s bearer-auth
@@ -396,14 +396,15 @@ impl TestController {
         AdminClient::new(channel)
     }
 
-    /// (Task 11) Debug/test accessor: every `GATEWAY_KEY` row (any state —
-    /// `pending`, `active`, `retiring`) for `gateway_id`, as `(epoch, state)`
-    /// pairs — read via `Admin.DebugKeyStates` over the controller's Unix
-    /// socket (not a direct file-level DB read), so it exercises the same
+    /// (Task 11; pubkey added key-rotation Task 2) Debug/test accessor:
+    /// every `GATEWAY_KEY` row (any state — `pending`, `active`,
+    /// `retiring`) for `gateway_id`, as `(epoch, pubkey, state)` triples —
+    /// read via `Admin.DebugKeyStates` over the controller's Unix socket
+    /// (not a direct file-level DB read), so it exercises the same
     /// running-controller path a real debug/ops surface would, and works
     /// unchanged after `restart()` swaps in a new `RunningController` over
     /// the same on-disk DB.
-    pub async fn debug_key_states(&self, gateway_id: u64) -> Vec<(u32, String)> {
+    pub async fn debug_key_states(&self, gateway_id: u64) -> Vec<(u32, String, String)> {
         let resp = self
             .admin_client()
             .await
@@ -411,7 +412,10 @@ impl TestController {
             .await
             .expect("Admin.DebugKeyStates")
             .into_inner();
-        resp.keys.into_iter().map(|k| (k.epoch, k.state)).collect()
+        resp.keys
+            .into_iter()
+            .map(|k| (k.epoch, k.pubkey, k.state))
+            .collect()
     }
 
     /// (Task 12) `true` iff `gateway_id` is currently an existing, active
@@ -846,6 +850,41 @@ impl StubGateway {
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report failed: {status}"))?;
+        Ok(())
+    }
+
+    /// (Key-rotation Task 2) Submits this gateway's REAL WireGuard public
+    /// key for a pending rotation `epoch` via `Sync.SubmitEpochKey`, over a
+    /// fresh mTLS channel using this gateway's own identity — mirrors
+    /// [`Self::report`]'s connection setup exactly.
+    pub async fn submit_epoch_key(&self, epoch: u32, pubkey: &str) -> anyhow::Result<()> {
+        let uri = format!("https://{}", self.sync_addr);
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
+            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
+            .tls_config(tls)
+            .map_err(|e| {
+                anyhow::anyhow!("configuring StubGateway mTLS for Sync.SubmitEpochKey: {e}")
+            })?
+            .connect()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "connecting to the controller's Sync (mTLS) TCP port for \
+                     Sync.SubmitEpochKey: {e}"
+                )
+            })?;
+
+        SyncClient::new(channel)
+            .submit_epoch_key(SubmitEpochKeyRequest {
+                epoch,
+                pubkey: pubkey.to_string(),
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("Sync.SubmitEpochKey failed: {status}"))?;
         Ok(())
     }
 

@@ -206,6 +206,12 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.rotate_key(gateway_id, &actor, &now)).await?
     }
 
+    /// See [`Db::set_epoch_pubkey`].
+    pub async fn set_epoch_pubkey(&self, gateway_id: i64, epoch: u32, pubkey: String) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.set_epoch_pubkey(gateway_id, epoch, &pubkey)).await?
+    }
+
     /// See [`Db::gateway_identity_by_id`].
     pub async fn gateway_identity_by_id(&self, gateway_id: i64) -> Result<Option<GatewayIdentity>> {
         let db = self.inner.clone();

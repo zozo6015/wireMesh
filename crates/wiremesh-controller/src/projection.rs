@@ -18,6 +18,8 @@
 //! backwards (which would break T8 delta comparison / T9 fail-static
 //! resync).
 
+use tokio::sync::broadcast;
+use tonic::Status;
 use wiremesh_proto::v1::{Delta, Peer, PeerKey, RelayInfo, StateSnapshot};
 
 use crate::db_async::DbHandle;
@@ -464,4 +466,59 @@ pub async fn build_snapshot(
         policy_version,
         revoked_serials,
     })
+}
+
+/// (Key-rotation Task 2; DRY extraction) Re-reads `gateway_id`'s current
+/// segment identity, `allowed_ips`, and FULL current key set (all
+/// epochs/states), then publishes a [`ChangeEvent::KeyRotated`] — the shared
+/// "re-read and fan out" tail end of anything that changes a gateway's key
+/// set: originally `AdminSvc::rotate_key` (which still calls this after
+/// `Db::rotate_key` commits) and now also `SyncSvc::submit_epoch_key` (after
+/// `Db::set_epoch_pubkey` overwrites the pending epoch's sentinel with the
+/// gateway's real pubkey) — both need every OTHER already-connected
+/// gateway's peer view of `gateway_id` upserted, same as a fresh snapshot
+/// would show.
+///
+/// A missing identity here means `gateway_id` vanished between the caller's
+/// mutation and this re-read — treated as an internal error (shouldn't
+/// happen: nothing in the controller deletes `gateway` rows outright).
+/// `change_tx.send`'s only error case (no current `Sync.Watch` subscribers)
+/// is not a failure and is silently ignored, mirroring every other
+/// best-effort publish in this crate.
+pub(crate) async fn emit_key_rotated(
+    db: &DbHandle,
+    change_tx: &broadcast::Sender<ChangeEvent>,
+    gateway_id: i64,
+) -> Result<(), Status> {
+    let identity = db
+        .gateway_identity_by_id(gateway_id)
+        .await
+        .map_err(|e| Status::internal(format!("re-reading gateway after key change: {e}")))?
+        .ok_or_else(|| {
+            Status::internal(format!(
+                "gateway {gateway_id} vanished immediately after a key-rotation mutation committed"
+            ))
+        })?;
+    let allowed_ips = db
+        .cidrs_for_segment(identity.segment_id)
+        .await
+        .map_err(|e| Status::internal(format!("reading segment cidrs after key change: {e}")))?;
+    let keys = db
+        .all_keys_for_gateway(gateway_id)
+        .await
+        .map_err(|e| Status::internal(format!("reading gateway keys after key change: {e}")))?;
+    let revision = db
+        .current_revision()
+        .await
+        .map_err(|e| Status::internal(format!("reading revision after key change: {e}")))?;
+
+    let _ = change_tx.send(ChangeEvent::KeyRotated {
+        gateway_id,
+        segment_name: identity.segment_name,
+        allowed_ips,
+        keys,
+        revision,
+    });
+
+    Ok(())
 }

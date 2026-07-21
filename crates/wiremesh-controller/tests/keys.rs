@@ -143,7 +143,7 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
     assert!(
         states
             .iter()
-            .any(|(epoch, st)| *epoch == pending_key.epoch && st == "pending"),
+            .any(|(epoch, _pubkey, st)| *epoch == pending_key.epoch && st == "pending"),
         "expected pending GATEWAY_KEY epoch {} for gateway A to survive the controller \
          restart, got states: {states:?}",
         pending_key.epoch
@@ -153,7 +153,7 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
             assert!(
                 states
                     .iter()
-                    .any(|(e, st)| e == epoch && st == "active"),
+                    .any(|(e, _pubkey, st)| e == epoch && st == "active"),
                 "expected the original active epoch {epoch} to also survive the \
                  controller restart, got states: {states:?}"
             );

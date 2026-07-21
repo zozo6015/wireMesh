@@ -1722,19 +1722,23 @@ impl Db {
         Ok(rows)
     }
 
-    /// (Task 11) Starts a make-before-break key-epoch rotation for
-    /// `gateway_id`: finds the gateway's current highest `gateway_key`
-    /// epoch (every enrolled gateway has at least an epoch-0 `active` row —
-    /// see `enroll_gateway`'s bookkeeping baseline — but this defensively
+    /// (Task 11; sentinel pubkey since key-rotation Task 2) Starts a
+    /// make-before-break key-epoch rotation for `gateway_id`: finds the
+    /// gateway's current highest `gateway_key` epoch (every enrolled
+    /// gateway has at least an epoch-0 `active` row — see
+    /// `enroll_gateway`'s bookkeeping baseline — but this defensively
     /// tolerates a gap/legacy row set by falling back to epoch 0 if none
     /// exists yet), inserts a NEW row at `epoch = max + 1` with
-    /// `state = 'pending'` and a placeholder pubkey (a real gateway-supplied
-    /// pubkey is cycle 4's scope — see the module doc comment), appends an
-    /// audit entry, and bumps the persisted revision — all in ONE
-    /// transaction, so a caller observing success can rely on every side
-    /// effect (including the revision bump the Sync projection depends on)
-    /// having landed together, and a crash mid-rotation can't leave a
-    /// pending epoch un-audited or un-revisioned.
+    /// `state = 'pending'` and the `"awaiting-submission"` sentinel pubkey
+    /// (NOT a real key — the gateway hasn't generated/submitted one yet;
+    /// see [`Db::set_epoch_pubkey`], which `Sync.SubmitEpochKey` calls to
+    /// overwrite this sentinel with the gateway's real WireGuard public key
+    /// once it does), appends an audit entry, and bumps the persisted
+    /// revision — all in ONE transaction, so a caller observing success can
+    /// rely on every side effect (including the revision bump the Sync
+    /// projection depends on) having landed together, and a crash
+    /// mid-rotation can't leave a pending epoch un-audited or
+    /// un-revisioned.
     ///
     /// Full make-before-break completion (an ack from the gateway advancing
     /// `n+1` to `active` and `n` to `retiring`, then removing `n`) is NOT
@@ -1769,7 +1773,7 @@ impl Db {
             |row| row.get(0),
         )?;
         let new_epoch = max_epoch.map(|e| e + 1).unwrap_or(0);
-        let pubkey = format!("placeholder-pubkey-gw{gateway_id}-epoch{new_epoch}");
+        let pubkey = "awaiting-submission".to_string();
 
         tx.execute(
             "INSERT INTO gateway_key (gateway_id, epoch, pubkey, state) \
@@ -1796,6 +1800,53 @@ impl Db {
 
         tx.commit()?;
         Ok(RotateKeyOutcome { epoch: new_epoch, pubkey })
+    }
+
+    /// (Key-rotation Task 2) Overwrites the `"awaiting-submission"` sentinel
+    /// [`Db::rotate_key`] inserted for `(gateway_id, epoch)` with the
+    /// gateway's REAL WireGuard public key, submitted over its own mTLS
+    /// identity via `Sync.SubmitEpochKey`. The private key never leaves the
+    /// gateway — only the pubkey travels.
+    ///
+    /// The `UPDATE`'s `WHERE` clause requires the row to be `state =
+    /// 'pending' AND pubkey = 'awaiting-submission'` — i.e. a genuinely
+    /// pending epoch that hasn't already received a real key — so this is
+    /// NOT a general-purpose "set any epoch's pubkey" method: it only ever
+    /// fills in the one sentinel a rotation left behind, exactly once. If
+    /// no row matches (wrong epoch, wrong gateway, already-promoted/
+    /// already-submitted epoch), `changes()` is 0 and this rolls back and
+    /// errors rather than silently no-op'ing, so the caller
+    /// (`SyncSvc::submit_epoch_key`) can map that to a clear RPC failure
+    /// instead of a gateway believing its submission landed when it didn't.
+    ///
+    /// On success, bumps the persisted revision in the SAME transaction:
+    /// the real pubkey is exactly what a peer's `keys` list needs to
+    /// eventually dial this gateway on the new epoch, so this is a
+    /// projection-affecting mutation like `rotate_key`'s (see
+    /// `bump_revision_tx`'s doc comment). This does NOT promote the epoch
+    /// out of `pending` — that's Task 3's job (the epoch only becomes
+    /// `active` once make-before-break completes), not this RPC's.
+    pub fn set_epoch_pubkey(&self, gateway_id: i64, epoch: u32, pubkey: &str) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+
+        let changed = tx.execute(
+            "UPDATE gateway_key SET pubkey = ?1 \
+             WHERE gateway_id = ?2 AND epoch = ?3 AND state = 'pending' \
+               AND pubkey = 'awaiting-submission'",
+            params![pubkey, gateway_id, epoch],
+        )?;
+        if changed == 0 {
+            tx.rollback()?;
+            anyhow::bail!(
+                "SubmitEpochKey: no pending epoch {epoch} awaiting a key submission for \
+                 gateway {gateway_id}"
+            );
+        }
+
+        bump_revision_tx(&tx)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// (Task 12, G-7) Drains `gateway_id`: revokes every still-unrevoked
