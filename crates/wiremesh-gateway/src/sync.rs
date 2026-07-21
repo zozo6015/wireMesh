@@ -61,7 +61,7 @@ pub async fn report(
     relay_health: Vec<RelayHealth>,
 ) -> anyhow::Result<()> {
     client
-        .report(ReportRequest { applied_version, local_endpoints, relay_health })
+        .report(ReportRequest { applied_version, local_endpoints, relay_health, epoch_acks: vec![] })
         .await
         .map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
     Ok(())
@@ -97,6 +97,13 @@ fn classify(body: Option<Body>, current: &mut Option<DesiredState>) -> anyhow::R
             Ok(SyncEvent::State(cur.clone()))
         }
         Some(Body::Punch(d)) => Ok(SyncEvent::Punch(d)),
+        // RotateDirective handling (mint new epoch key, begin
+        // make-before-break) lands in a later key-rotation task; Task 1
+        // only adds the proto surface. Fail loudly rather than silently
+        // dropping the directive.
+        Some(Body::Rotate(_)) => Err(anyhow!(
+            "RotateDirective handling is not yet implemented (key-rotation Task 2+)"
+        )),
         None => Err(anyhow!("empty SyncMessage body")),
     }
 }

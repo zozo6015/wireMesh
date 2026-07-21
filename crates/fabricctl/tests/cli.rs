@@ -86,6 +86,7 @@ async fn report_applied_version(gw: &StubGateway, sync_addr: SocketAddr, version
             applied_version: version,
             local_endpoints: vec![],
             relay_health: vec![],
+            epoch_acks: vec![],
         })
         .await
         .expect("Sync.Report");

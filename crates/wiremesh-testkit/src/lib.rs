@@ -842,6 +842,7 @@ impl StubGateway {
                 applied_version,
                 local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
                 relay_health: vec![],
+                epoch_acks: vec![],
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report failed: {status}"))?;
@@ -899,6 +900,7 @@ impl StubGateway {
                         healthy: *healthy,
                     })
                     .collect(),
+                epoch_acks: vec![],
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report (relay health) failed: {status}"))?;

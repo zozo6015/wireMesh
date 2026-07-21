@@ -30,7 +30,10 @@ use tonic::{Request, Response, Status};
 
 use wiremesh_proto::v1::sync_server::Sync;
 use wiremesh_proto::v1::sync_message::Body;
-use wiremesh_proto::v1::{ReportRequest, ReportResponse, SyncMessage, WatchRequest};
+use wiremesh_proto::v1::{
+    ReportRequest, ReportResponse, SubmitEpochKeyRequest, SubmitEpochKeyResponse, SyncMessage,
+    WatchRequest,
+};
 
 use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
 use crate::db_async::DbHandle;
@@ -440,6 +443,17 @@ impl Sync for SyncSvc {
         }
 
         Ok(Response::new(ReportResponse {}))
+    }
+
+    // (Key-rotation Task 1) Proto surface only — Task 2 fills in the actual
+    // persistence of the gateway-generated per-epoch WG public key. Stubbed
+    // here so the generated `Sync` server trait has a concrete impl and the
+    // workspace compiles.
+    async fn submit_epoch_key(
+        &self,
+        _request: Request<SubmitEpochKeyRequest>,
+    ) -> Result<Response<SubmitEpochKeyResponse>, Status> {
+        Err(Status::unimplemented("SubmitEpochKey lands in Task 2"))
     }
 }
 
