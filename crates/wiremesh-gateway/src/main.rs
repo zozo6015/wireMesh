@@ -215,6 +215,12 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 ),
                             }
                         }
+                        Ok(Some(sync::SyncEvent::Rotate(_))) => {
+                            eprintln!(
+                                "wiremesh-gateway: RotateDirective received (rotation wiring \
+                                 lands in the netns-integration task)"
+                            );
+                        }
                         Ok(None) => {
                             eprintln!("sync stream closed; reconnecting");
                             break;

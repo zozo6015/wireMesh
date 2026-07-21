@@ -7,18 +7,24 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity as TlsIdentity};
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{
-    sync_message::Body, PunchDirective, RelayHealth, ReportRequest, SyncMessage, WatchRequest,
+    sync_message::Body, PunchDirective, RelayHealth, ReportRequest, RotateDirective, SyncMessage,
+    WatchRequest,
 };
 
 /// One decoded Sync message, surfaced to the gateway boot loop. `Snapshot`/
 /// `Delta` fold into the running [`DesiredState`] and arrive as
 /// [`SyncEvent::State`]; a NAT-traversal [`PunchDirective`] (cycle4b §4) is
 /// NOT a desired-state change and arrives as [`SyncEvent::Punch`] for the
-/// boot loop to route to the hole puncher + path state machine (Task 10).
+/// boot loop to route to the hole puncher + path state machine (Task 10); a
+/// key-rotation [`RotateDirective`] is likewise not a desired-state change
+/// and arrives as [`SyncEvent::Rotate`] for the boot loop to route to the
+/// per-gateway [`crate::rotation::Rotation`] state machine (wiring lands in
+/// the netns-integration task; this variant only carries the directive).
 #[derive(Debug, Clone)]
 pub enum SyncEvent {
     State(DesiredState),
     Punch(PunchDirective),
+    Rotate(RotateDirective),
 }
 
 pub async fn connect(sync_addr: SocketAddr, id: &Identity) -> anyhow::Result<SyncClient<Channel>> {
@@ -97,13 +103,9 @@ fn classify(body: Option<Body>, current: &mut Option<DesiredState>) -> anyhow::R
             Ok(SyncEvent::State(cur.clone()))
         }
         Some(Body::Punch(d)) => Ok(SyncEvent::Punch(d)),
-        // RotateDirective handling (mint new epoch key, begin
-        // make-before-break) lands in a later key-rotation task; Task 1
-        // only adds the proto surface. Fail loudly rather than silently
-        // dropping the directive.
-        Some(Body::Rotate(_)) => Err(anyhow!(
-            "RotateDirective handling is not yet implemented (key-rotation Task 2+)"
-        )),
+        // RotateDirective is surfaced verbatim; the boot loop routes it to
+        // the per-gateway Rotation state machine (netns-integration task).
+        Some(Body::Rotate(d)) => Ok(SyncEvent::Rotate(d)),
         None => Err(anyhow!("empty SyncMessage body")),
     }
 }
