@@ -34,6 +34,14 @@ fn generate_observe_key() -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// (Key-rotation Task 8a) The placeholder pubkey [`Db::rotate_key`] inserts
+/// for a freshly created `pending` epoch, before the rotating gateway has
+/// submitted its real key via `Sync.SubmitEpochKey` ([`Db::set_epoch_pubkey`]
+/// overwrites it). Shared with `crate::projection`'s advertisement guard so
+/// the "is this still the sentinel?" check can never drift from the value
+/// actually inserted here.
+pub(crate) const AWAITING_SUBMISSION_SENTINEL: &str = "awaiting-submission";
+
 fn bump_revision_tx(tx: &Transaction<'_>) -> rusqlite::Result<u64> {
     tx.execute(
         "UPDATE state_revision SET revision = revision + 1 WHERE id = 0",
@@ -1810,7 +1818,7 @@ impl Db {
             |row| row.get(0),
         )?;
         let new_epoch = max_epoch.map(|e| e + 1).unwrap_or(0);
-        let pubkey = "awaiting-submission".to_string();
+        let pubkey = AWAITING_SUBMISSION_SENTINEL.to_string();
 
         tx.execute(
             "INSERT INTO gateway_key (gateway_id, epoch, pubkey, state) \

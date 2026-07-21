@@ -10,9 +10,9 @@ Baseline: 50fa06d (plan committed)
 - [x] Task 2: controller — real epoch key via SubmitEpochKey (sentinel)
 - [x] Task 3: controller — ack-driven promote/retire state machine
 - [x] Task 4: controller — 30-day rotation timer
-- [ ] Task 5: gateway — multi-epoch key store + state.json persistence
-- [ ] Task 6: gateway — EpochTunnel/TunnelSet (two Devices, overlay IP on lo)
-- [ ] Task 7: gateway — PeerState multi-key + transient peer Device
+- [x] Task 5: gateway — multi-epoch key store + state.json persistence
+- [x] Task 6: gateway — EpochTunnel/TunnelSet (two Devices, overlay IP on lo)
+- [x] Task 7: gateway — PeerState multi-key + transient peer Device
 - [ ] Task 8: gateway — rotation driver + projection guard
 - [ ] Task 9: testkit — rotate-under-load harness
 - [ ] Task 10: netns done-bar + docs
@@ -30,3 +30,8 @@ Task 4: complete (commits 593c63b..a72b4cf, review clean — timer + sweep; make
    - M2: orphaned-retiring check is per-gateway not per-epoch; a manual RotateKey racing into the crash window can leak the old retiring row (safe side: old key kept too long). Per-epoch tracker match closes it.
    - M3: initiate_due_rotations two-read TOCTOU (gateways_with_rotation_state + active_gateway_ids not atomic); negligible at 30d cadence.
    - M4: nit — RFC3339 format-err uses return (aborts tick) vs continue; all_keys_for_gateway read up to 3x/gateway/sweep.
+Task 5: complete (commits 26253f5..0e7beb0, review found 1 CRITICAL — persist 0600 not enforced on pre-existing tmp inode (private-key file) — FIXED with unconditional chmod mirroring identity.rs::write_0600 + RED→GREEN regression test; epochkeys 7/7, gateway lib green, workspace builds).
+Task 6: complete (commits e3fe666..46f8dc6, review clean — additive TunnelSet (no main.rs/overlay change; integration deferred to Task 8); tunnelset_netns 1/1, tunnel_netns non-regression 1/1, unit 1/1, build).
+  FINDING (documented, ratified divergence): boringtun 0.6.0 UAPI get=1 reports own key as `own_public_key=<hex>` (non-standard) → real `wg show` can't display a boringtun device's own pubkey. See docs/research/keyrot-task6-uapi-pubkey-note.md. Test verifies self-pubkey via raw UAPI instead.
+  Minor carry→Task8: bring_up leaks the tun if uapi::apply fails after Tunnel::up (no cleanup/insert); matters for rotation-retry. (mirrors pre-existing Tunnel::up gap.)
+Task 7: complete (commits 7358aa2..a353b9a, review clean — PeerState.keys + active_key/pending_key (sentinel-skip) + pending_peer_configs with relative port offset (ep-ea), checked/panic-free; active_pubkey_b64 non-regression; gateway lib 68/68, netns-tests build compiles).

@@ -22,8 +22,35 @@ use tokio::sync::broadcast;
 use tonic::Status;
 use wiremesh_proto::v1::{Delta, Peer, PeerKey, RelayInfo, StateSnapshot};
 
+use crate::db::AWAITING_SUBMISSION_SENTINEL;
 use crate::db_async::DbHandle;
 use crate::routes;
+
+/// (Key-rotation Task 8a) Maps a gateway's FULL raw `(epoch, pubkey, state)`
+/// key rows (straight off [`crate::db::Db::all_keys_for_gateway`]/
+/// [`crate::db::Db::keys_snapshot`]/`routes::peers_of`) to the wire
+/// [`PeerKey`] shape, WITHHOLDING any row that's still carrying
+/// [`AWAITING_SUBMISSION_SENTINEL`] — a `pending` epoch [`crate::db::Db::rotate_key`]
+/// just created but the rotating gateway hasn't yet replaced with its real
+/// pubkey via `Sync.SubmitEpochKey` (`crate::db::Db::set_epoch_pubkey`). A
+/// peer has no use for a key that doesn't exist yet, and a gateway that
+/// actually tried to configure a WireGuard peer entry with that literal
+/// string as a pubkey would fail outright. This is the single choke point
+/// every site that builds a peer's advertised `keys` (both `build_snapshot`
+/// and every `delta_for_change` arm below) must route through, so a fresh
+/// snapshot and every delta withhold the sentinel consistently.
+fn advertisable_peer_keys(keys: Vec<(i64, String, String)>) -> Vec<PeerKey> {
+    keys.into_iter()
+        .filter(|(_, pubkey, state)| {
+            !(state == "pending" && pubkey == AWAITING_SUBMISSION_SENTINEL)
+        })
+        .map(|(epoch, pubkey, state)| PeerKey {
+            epoch: epoch as u32,
+            pubkey,
+            state,
+        })
+        .collect()
+}
 
 /// A projection-affecting mutation, broadcast (via a
 /// `tokio::sync::broadcast::Sender<ChangeEvent>` shared by every service
@@ -64,6 +91,13 @@ pub enum ChangeEvent {
         /// `gateway_id`, straight off [`crate::db::Db::all_keys_for_gateway`]
         /// — includes the just-inserted `pending` row.
         keys: Vec<(i64, String, String)>,
+        /// (Key-rotation Task 8a) `gateway_id`'s FULL current candidate set
+        /// (observed + locals, deduplicated, observed first) — straight off
+        /// [`crate::db::Db::candidates_for`], mirroring `EndpointObserved`/
+        /// `SegmentCidrsChanged`'s identical widening: a rotation must not
+        /// make an already-open `Sync.Watch` stream forget a peer's
+        /// previously reported/observed candidate endpoint.
+        candidate_endpoints: Vec<String>,
         revision: u64,
     },
     /// (Task 12, G-7) `Admin.Drain` removed `gateway_id` and revoked its
@@ -241,21 +275,15 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             segment_name,
             allowed_ips,
             keys,
+            candidate_endpoints,
             revision,
         } => Delta {
             revision,
             upserted_peers: vec![Peer {
                 gateway_id: gateway_id as u64,
                 segment_name,
-                keys: keys
-                    .into_iter()
-                    .map(|(epoch, pubkey, state)| PeerKey {
-                        epoch: epoch as u32,
-                        pubkey,
-                        state,
-                    })
-                    .collect(),
-                candidate_endpoints: Vec::new(),
+                keys: advertisable_peer_keys(keys),
+                candidate_endpoints,
                 allowed_ips,
             }],
             removed_peer_ids: Vec::new(),
@@ -295,14 +323,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             upserted_peers: vec![Peer {
                 gateway_id: gateway_id as u64,
                 segment_name,
-                keys: keys
-                    .into_iter()
-                    .map(|(epoch, pubkey, state)| PeerKey {
-                        epoch: epoch as u32,
-                        pubkey,
-                        state,
-                    })
-                    .collect(),
+                keys: advertisable_peer_keys(keys),
                 candidate_endpoints,
                 allowed_ips,
             }],
@@ -351,14 +372,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             upserted_peers: vec![Peer {
                 gateway_id: gateway_id as u64,
                 segment_name,
-                keys: keys
-                    .into_iter()
-                    .map(|(epoch, pubkey, state)| PeerKey {
-                        epoch: epoch as u32,
-                        pubkey,
-                        state,
-                    })
-                    .collect(),
+                keys: advertisable_peer_keys(keys),
                 candidate_endpoints,
                 allowed_ips,
             }],
@@ -415,15 +429,11 @@ pub async fn build_snapshot(
         .map(|p| Peer {
             gateway_id: p.gateway_id as u64,
             segment_name: p.segment_name,
-            keys: p
-                .keys
-                .into_iter()
-                .map(|(epoch, pubkey, state)| PeerKey {
-                    epoch: epoch as u32,
-                    pubkey,
-                    state,
-                })
-                .collect(),
+            // (Key-rotation Task 8a) Same sentinel-withholding guard every
+            // `delta_for_change` arm uses, applied here too so a FRESH
+            // snapshot never advertises a pending epoch that's still
+            // carrying the "awaiting-submission" placeholder pubkey.
+            keys: advertisable_peer_keys(p.keys),
             // (Task 15; cycle-4b Task 3 widened this to the full set —
             // observed + locally-reported addresses, deduplicated, observed
             // first) See `crate::routes::PeerRoute::candidate_endpoints`'s
@@ -517,12 +527,22 @@ pub(crate) async fn emit_key_rotated(
         .keys_snapshot(gateway_id)
         .await
         .map_err(|e| Status::internal(format!("reading gateway keys after key change: {e}")))?;
+    // (Key-rotation Task 8a) `gateway_id`'s FULL current candidate set —
+    // preserved on the KeyRotated delta so a rotation doesn't clobber an
+    // already-open Sync.Watch stream's view of a previously reported/
+    // observed candidate endpoint (mirroring EndpointObserved/
+    // SegmentCidrsChanged's identical widening).
+    let candidate_endpoints = db
+        .candidates_for(gateway_id)
+        .await
+        .map_err(|e| Status::internal(format!("reading gateway candidates after key change: {e}")))?;
 
     let _ = change_tx.send(ChangeEvent::KeyRotated {
         gateway_id,
         segment_name: identity.segment_name,
         allowed_ips,
         keys,
+        candidate_endpoints,
         revision,
     });
 
