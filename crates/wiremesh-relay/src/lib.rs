@@ -654,18 +654,23 @@ impl Denylist {
 /// `wiremesh-trust` would have produced when it issued that cert (see
 /// `wiremesh_trust::hex_encode`/`random_serial`).
 ///
-/// `x509-parser`'s `raw_serial()` returns the DER INTEGER content bytes,
-/// which per the DER positive-integer encoding rule get a leading `0x00`
-/// prepended whenever the serial's high bit is set (otherwise the value
-/// would be misread as negative). `rcgen::SerialNumber::from_slice` is given
-/// the original 16 raw bytes and does not itself add that padding — it is
-/// `rcgen`'s DER writer, applying the same encoding rule, that introduces
-/// the extra leading byte on the wire for exactly the serials whose first
-/// byte is >= 0x80. `wiremesh-trust`'s `IssuedCert.serial` is the hex of the
-/// original 16 bytes, with no such padding. So a single leading `0x00`, and
-/// ONLY a single leading `0x00`, must be stripped here before hex-encoding —
-/// otherwise every serial with a high first bit (roughly half of all random
-/// serials) would silently fail to match the denylist.
+/// `x509-parser`'s `raw_serial()` returns the DER INTEGER *content* bytes.
+/// DER minimal-integer encoding does TWO things to the original 16-byte
+/// serial: it (1) strips ALL leading `0x00` bytes, then (2) re-adds exactly
+/// one `0x00` sign-pad iff the resulting first byte's high bit is set (so the
+/// value isn't misread as negative). So `raw_serial()` can be SHORTER than 16
+/// bytes (original had genuine leading zeros) OR 17 bytes (sign-pad case) —
+/// it is NOT simply "16 bytes with maybe one extra leading 0x00".
+///
+/// `wiremesh-trust`'s `IssuedCert.serial` is the hex of the ORIGINAL 16 bytes
+/// (leading zeros included), so we RECONSTRUCT that fixed width: undo the
+/// sign-pad (drop one leading `0x00` only when the content is 17 bytes), then
+/// LEFT-PAD the remainder back to 16 bytes. SECURITY-CRITICAL: do NOT
+/// "simplify" this to a single-`0x00`-strip + hex of the variable-length
+/// remainder — that silently corrupts the hex for any serial beginning with
+/// `0x00` (~0.4% of random serials), so a correctly-revoked cert would never
+/// match the denylist and would be ADMITTED. Regression guard:
+/// `denylist_tests::extract_serial_hex_reconstructs_full_16_byte_serial`.
 fn extract_serial_hex(end_entity: &CertificateDer<'_>) -> Result<String> {
     let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
         .map_err(|e| anyhow::anyhow!("parsing end-entity cert DER for serial: {e}"))?;

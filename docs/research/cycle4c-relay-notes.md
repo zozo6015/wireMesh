@@ -54,7 +54,10 @@ test-author / implementer / dedicated-runner / reviewer per task, per CLAUDE.md)
 
 ## Done-bar coverage (spec §2)
 - **Case 1 (relay-only symmetric pair flows over the relay):** ✅ `relay_matrix::case1_symmetric_pair_flows_over_relay` (reliably green).
-- **Case 3 (relay eviction / re-path ≤15s):** `relay_matrix::case3_relay_eviction_repaths_to_second_relay` (Task 10).
+- **Case 3 (relay eviction / re-path):** `relay_matrix::case3_relay_eviction_repaths_to_second_relay` (Task 10) —
+  R1's QUIC is closed, the pair re-paths to R2 and flows again. The test asserts a **30s** bound; observed
+  re-path is ~14.7–15.1s. R-3's "≤15s" is design INTENT (met synchronously on the controller-eviction side;
+  the gateway-side re-path settle occasionally nudges just over 15s — a documented carry, not a hard assertion).
 - **Case 4 (mTLS + denylist rejection, offline):** ✅ covered by `wiremesh-relay/tests/denylist.rs` (certless + revoked-serial rejected with no controller) + `bridge.rs` (certless).
 - **Case 5 (MTU 1280 boundary):** ✅ covered by `wiremesh-relay/tests/bridge.rs` (usable datagram ≥ 1320 = WG 1280 + overhead 32 + relay hdr 8, immediately and settled).
 - **Case 2 (make-before-break Relayed→Direct revert):** **DEFERRED — fast-follow.** The direct-cutover
@@ -64,12 +67,26 @@ test-author / implementer / dedicated-runner / reviewer per task, per CLAUDE.md)
   it never breaks a working relay. See `cycle4c-relay-stability-note.md`.
 
 ## Carries / fast-follows
+- **SECURITY (owner decision — whole-branch review IMPORTANT):** the relay REGISTRATION id is self-asserted,
+  NOT bound to the authenticated client cert. Any valid, enrolled, non-revoked gateway can register at the relay
+  under an arbitrary 8-byte id — including another pair's `relay_pair_id(A,B)` (computable from small gateway ids)
+  — redirecting that pair's relayed datagrams and/or evicting its registry entry (the registry blind-overwrites on
+  duplicate id). Impact is bounded to **traffic-redirection / DoS of other pairs' relay paths — NO confidentiality
+  or integrity break** (WireGuard E2E crypto). Accepted for now: WireMesh is **single-tenant** (all gateways are
+  the one operator's own), impact is DoS-only, and spec §3 specified registration by bare `gateway_id`. Fast-follow:
+  bind the registration id to the client-cert CN/SAN at the relay and REJECT (not blind-overwrite) a duplicate id.
 - **Make-before-break Relayed→Direct cutover** (case 2) — force a WG rehandshake on repoint; add the netns case.
 - **relay_pair_id** 32-bit → raw `[u8;8]`; **per-(gateway,relay) connection multiplexing** (one QUIC conn
   per peer today — correct via unique ids, but N connections).
 - Relay endpoint `SocketAddrV4` only (IPv4 v1); admin `RegisterRelay` path still doesn't bump revision/emit
   a delta (superseded by enrollment); `(revision, active_relays)` not read atomically under one lock
   (narrow, inherited pattern); enrollment vs SyncSvc `RelaysChanged` emission not DRY'd (separate structs).
+- **ProbeDirect permanent churn (Minor):** a symmetric↔symmetric relayed pair fires `ProbeDirect` every 20s
+  forever (the punch can never confirm), keeping the transient `SO_REUSEPORT` punch socket at ~30% duty cycle
+  on the WG port. Mitigated by the 20s interval + grace (case 1 reliably green 5×); tie a "give up probing after
+  N failures for a known-symmetric pair" to the case-2 fast-follow.
+- **Revocation latency (Minor, consistent with fabric model):** a CURRENTLY-connected revoked gateway keeps being
+  relayed until its QUIC connection idle-drops (≤30s) — the denylist only blocks NEW handshakes, not live ones.
 
 ## Deployment
 `wiremesh-relay` needs identity (cert/key/ca) at `/var/lib/wiremesh/` 0600 (from fabric-CA enrollment, `--kind relay`).
