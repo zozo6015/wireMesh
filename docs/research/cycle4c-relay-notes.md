@@ -66,18 +66,39 @@ test-author / implementer / dedicated-runner / reviewer per task, per CLAUDE.md)
   The relay path itself is stable and non-disruptive (case 1); the direct probe is gated + rate-limited so
   it never breaks a working relay. See `cycle4c-relay-stability-note.md`.
 
+## Security fix — relay registration is now bound to the client cert (post-review)
+
+The pre-review carry below is **FIXED** (design A — the localized option). The relay REGISTRATION id was
+self-asserted and blind-overwritten; any enrolled, non-revoked gateway could register under another pair's
+`relay_pair_id(A,B)` (computable from small gateway ids), redirecting that pair's relayed datagrams and/or
+evicting its registry entry. Impact was bounded to traffic-redirection / DoS (WireGuard E2E crypto keeps
+confidentiality/integrity), but it is a real cross-gateway authorization gap and is now closed:
+
+- **gateway_id in the cert (design A).** Gateway enrollment now stamps a CA-decided SAN `gw-<gateway_id>` onto
+  every gateway leaf (reusing `CertProfile.subject_alt_names`, the same mechanism the relay's `"relay"` SAN uses).
+  The sign-after-id ordering is resolved WITHOUT weakening the atomic single-use flow: the leaf's serial is
+  pre-generated (`wiremesh_trust::random_serial` → `CertProfile.serial`) so the certificate row is still recorded
+  atomically with the token spend (revocability preserved), and the leaf is signed AFTER the transaction returns
+  the gateway_id. `validate_csr_pem` up front preserves "a malformed CSR never burns the token". (Handle==serial
+  coupling holds for the embedded issuer — noted for a future non-embedded issuer.)
+- **Relay binds registration to the authenticated cert.** `wiremesh_relay::serve` reads the registering gateway's
+  TRUE identity from its mTLS client cert (`identity_from_client_cert` → the `gw-<id>` DNS SAN), REQUIRES the
+  self-asserted `my_identity` to equal it (else it CLOSES the connection — fail-closed), and keys the registry by
+  `registration_key(my_identity, peer_identity)`. A slot already held by a DIFFERENT cert is **rejected, never
+  blind-overwritten** (eviction DoS closed); a same-cert reconnect replaces its own slot (removal is
+  stable-id-guarded so a replaced connection's later teardown can't evict the reconnect).
+- **Registration remains peer-computable.** The addressing peer targets `registration_key(peer, my)` — exactly the
+  id the other side registered under — so routing is unchanged; only the *ownership* of a slot is now cert-bound.
+- **Tests:** `wiremesh-relay/tests/impersonation.rs` (a gw-A cert asserting `my_identity=gw-B` is refused while the
+  legit gw-B holder works and its slot survives intact); `registration_tests` unit tests (directional/distinct/
+  stable/rendezvous key + framing); `bridge.rs`/`denylist.rs` updated to the peer-bound `Client` API and stay green;
+  `relay_matrix` case1+case3 (real controller enrollment + real relay) stay green.
+
 ## Carries / fast-follows
-- **SECURITY (owner decision — whole-branch review IMPORTANT):** the relay REGISTRATION id is self-asserted,
-  NOT bound to the authenticated client cert. Any valid, enrolled, non-revoked gateway can register at the relay
-  under an arbitrary 8-byte id — including another pair's `relay_pair_id(A,B)` (computable from small gateway ids)
-  — redirecting that pair's relayed datagrams and/or evicting its registry entry (the registry blind-overwrites on
-  duplicate id). Impact is bounded to **traffic-redirection / DoS of other pairs' relay paths — NO confidentiality
-  or integrity break** (WireGuard E2E crypto). Accepted for now: WireMesh is **single-tenant** (all gateways are
-  the one operator's own), impact is DoS-only, and spec §3 specified registration by bare `gateway_id`. Fast-follow:
-  bind the registration id to the client-cert CN/SAN at the relay and REJECT (not blind-overwrite) a duplicate id.
 - **Make-before-break Relayed→Direct cutover** (case 2) — force a WG rehandshake on repoint; add the netns case.
-- **relay_pair_id** 32-bit → raw `[u8;8]`; **per-(gateway,relay) connection multiplexing** (one QUIC conn
-  per peer today — correct via unique ids, but N connections).
+- **registration_key** 32-bit → raw `[u8;8]`; **per-(gateway,relay) connection multiplexing** (one QUIC conn
+  per peer today — correct via unique cert-bound ids, but N connections). The cert-binding fix keeps the one-conn-
+  per-pair model (design A); the multiplexing carry (design B) is orthogonal and still open.
 - Relay endpoint `SocketAddrV4` only (IPv4 v1); admin `RegisterRelay` path still doesn't bump revision/emit
   a delta (superseded by enrollment); `(revision, active_relays)` not read atomically under one lock
   (narrow, inherited pattern); enrollment vs SyncSvc `RelaysChanged` emission not DRY'd (separate structs).

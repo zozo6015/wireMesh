@@ -51,6 +51,7 @@ async fn run_conformance<C: CertificateIssuer + SecretStore>(p: &C) {
             subject_cn: "conformance-ttl-90d".into(),
             ttl: ttl_90d,
             subject_alt_names: vec![],
+            serial: None,
         })
         .await
         .expect("renewal-follows-ttl: a 90-day TTL must be accepted");
@@ -76,6 +77,7 @@ async fn run_conformance<C: CertificateIssuer + SecretStore>(p: &C) {
             subject_cn: "conformance-ttl-too-short".into(),
             ttl: sub_floor_ttl,
             subject_alt_names: vec![],
+            serial: None,
         })
         .await;
     assert!(
@@ -151,6 +153,7 @@ fn profile_with_ttl(ttl_secs: i64) -> CertProfile {
         subject_cn: "conformance".into(),
         ttl: Duration::from_secs(ttl_secs as u64),
         subject_alt_names: vec![],
+        serial: None,
     }
 }
 

@@ -151,17 +151,22 @@ async fn offline_denylist_rejects_revoked_serial_but_keeps_mutual_tls_and_good_c
     // connection. This lets us bridge a datagram end-to-end using only the
     // one non-revoked identity mkcerts produced for this test, mirroring
     // `tests/bridge.rs`'s Property 1 without needing a third gw id.
-    let good_a = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-good")
+    // Both connections register the SAME (my=gw-good, peer=gw-good) pair with
+    // the SAME cert — so the second is a same-owner reconnect that REPLACES
+    // the first in the registry (allowed; the cert-binding fix only rejects a
+    // duplicate from a DIFFERENT cert). `good_a`'s uplink still works, and its
+    // datagram to the shared key is delivered to the current holder (good_b).
+    let good_a = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-good", "gw-good")
         .await
         .expect("gw-good (1st connection) must connect: valid chain, not on the denylist");
-    let good_b = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-good")
+    let good_b = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-good", "gw-good")
         .await
         .expect("gw-good (2nd connection) must also connect: same non-revoked identity");
 
     good_a
-        .send_to("gw-good", b"still-good")
+        .send(b"still-good")
         .await
-        .expect("send_to gw-good");
+        .expect("send to gw-good");
     let (src, data) = tokio::time::timeout(Duration::from_secs(3), good_b.recv())
         .await
         .expect("recv timed out")
@@ -171,7 +176,7 @@ async fn offline_denylist_rejects_revoked_serial_but_keeps_mutual_tls_and_good_c
         b"still-good".to_vec(),
         "a non-revoked client's traffic must still bridge unmodified"
     );
-    assert_eq!(src, "gw-good");
+    assert_eq!(src, wiremesh_relay::registration_key("gw-good", "gw-good"));
 
     // --- (b) the revoked serial is rejected, for the RIGHT reason -------
     // gw-bad has a chain that validates cleanly against ca.pem (mkcerts
@@ -188,7 +193,7 @@ async fn offline_denylist_rejects_revoked_serial_but_keeps_mutual_tls_and_good_c
     // asserting on the whole wrapped `Client::connect(..., "gw-bad")` future
     // (not a bypassed raw handshake future) is the reliable place to check
     // this — same reasoning as the certless-client property below.
-    let bad_result = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-bad").await;
+    let bad_result = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-bad", "gw-good").await;
     eprintln!("gw-bad connect is_ok = {}", bad_result.is_ok());
     match &bad_result {
         Err(e) => eprintln!("revoked client correctly rejected: {e:#}"),

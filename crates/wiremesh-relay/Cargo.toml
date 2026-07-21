@@ -32,6 +32,10 @@ anyhow = { workspace = true }
 # serial for the offline-revocation-denylist check (see lib.rs's
 # `DenyingVerifier`) — matched against `wiremesh-trust`'s hex serial encoding.
 x509-parser = "0.16"
+# SECURITY (4c relay-registration binding): SHA-256 derives the 8-byte
+# registry key from the (my_identity, peer_identity) pair — the shared
+# derivation the gateway addresses peers with (see `registration_key`).
+sha2 = { workspace = true }
 serde_json = { workspace = true }
 tonic = { workspace = true }
 wiremesh-proto = { path = "../wiremesh-proto" }

@@ -13,7 +13,7 @@ use wiremesh_gateway::enforce::GatewayEnforcer;
 use wiremesh_gateway::identity::Identity;
 use wiremesh_gateway::metrics;
 use wiremesh_gateway::path::{Path, PathAction, PathState};
-use wiremesh_gateway::relay::{relay_pair_id, RelayTransport};
+use wiremesh_gateway::relay::RelayTransport;
 use wiremesh_gateway::state::DesiredState;
 use wiremesh_gateway::tunnel::Tunnel;
 use wiremesh_gateway::{netif, observe, punch, reconcile, routes, sync, uapi};
@@ -621,15 +621,15 @@ async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_pro
     };
 
     let identity = ctx.identity.clone();
-    // Review fix (4c Task 8, CRITICAL): register under a directional,
-    // per-pair id rather than this gateway's raw `gateway_id` — otherwise
-    // relaying 2+ peers through one relay collides in the relay's registry
-    // (see `relay_pair_id`'s doc). This gateway's transport-for-`gid`
-    // registers as `relay_pair_id(mine, gid)` and targets `relay_pair_id(gid,
-    // mine)`, which is exactly the id `gid`'s own transport-for-us registers
-    // under, so the two sides rendezvous.
-    let my_id = relay_pair_id(identity.gateway_id, gid);
-    let peer_id = relay_pair_id(gid, identity.gateway_id);
+    // SECURITY (Cycle 4c): register under this gateway's cert-embedded
+    // identity (`gw-<gateway_id>`), which the relay verifies against the
+    // authenticated client cert — a gateway can only register a key it owns.
+    // `RelayTransport`/`wiremesh_relay::Client` derive the directional 8-byte
+    // registry key from the ordered (my_identity, peer_identity) pair, so this
+    // gateway's transport-for-`gid` and `gid`'s transport-for-us still
+    // rendezvous (each passes the identities swapped).
+    let my_identity = format!("gw-{}", identity.gateway_id);
+    let peer_identity = format!("gw-{gid}");
     // The only thing that will ever talk to this transport's local socket is
     // THIS gateway's own boringtun process, always from its fixed, already-
     // known listen port — seed the downlink's `last_seen` with it up front
@@ -642,8 +642,8 @@ async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_pro
         &identity.cert_pem,
         &identity.key_pem,
         &identity.ca_bundle_pem,
-        &my_id,
-        &peer_id,
+        &my_identity,
+        &peer_identity,
         Some(local_peer_hint),
     )
     .await

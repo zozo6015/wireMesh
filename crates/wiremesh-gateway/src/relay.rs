@@ -73,8 +73,8 @@ impl RelayTransport {
         cert_pem: &str,
         key_pem: &str,
         ca_pem: &str,
-        my_id: &str,
-        peer_id: &str,
+        my_identity: &str,
+        peer_identity: &str,
         local_peer_hint: Option<SocketAddr>,
     ) -> Result<RelayTransport> {
         let sock = Arc::new(
@@ -84,9 +84,18 @@ impl RelayTransport {
         );
         let local_addr = sock.local_addr().context("read bound local UDP addr")?;
 
-        let client = Client::connect_with_pems(relay_addr, cert_pem, key_pem, ca_pem, my_id)
-            .await
-            .with_context(|| format!("connect+register {my_id:?} with relay {relay_addr}"))?;
+        // SECURITY (Cycle 4c): `my_identity`/`peer_identity` are the gateways'
+        // cert-embedded `gw-<id>` identities. The relay REQUIRES `my_identity`
+        // to match this connection's client cert (see
+        // `wiremesh_relay::identity_from_client_cert`) and derives the 8-byte
+        // registry key from the pair itself — a gateway can no longer register
+        // under an id it doesn't own.
+        let client =
+            Client::connect_with_pems(relay_addr, cert_pem, key_pem, ca_pem, my_identity, peer_identity)
+                .await
+                .with_context(|| {
+                    format!("connect+register {my_identity:?}->{peer_identity:?} with relay {relay_addr}")
+                })?;
 
         let last_seen: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(local_peer_hint));
 
@@ -95,7 +104,6 @@ impl RelayTransport {
             let sock = sock.clone();
             let last_seen = last_seen.clone();
             let client = client.clone();
-            let peer_id = peer_id.to_string();
             tokio::spawn(async move {
                 let mut buf = [0u8; 2048];
                 loop {
@@ -107,8 +115,10 @@ impl RelayTransport {
                         }
                     };
                     *last_seen.lock().await = Some(from);
-                    if let Err(e) = client.send_to(&peer_id, &buf[..n]).await {
-                        eprintln!("relay transport: relay send_to {peer_id:?} failed: {e}");
+                    // The `Client` is bound to this peer; `send` addresses the
+                    // datagram at the id the peer registered under.
+                    if let Err(e) = client.send(&buf[..n]).await {
+                        eprintln!("relay transport: relay send failed: {e}");
                     }
                 }
             })
@@ -184,64 +194,11 @@ impl Drop for RelayTransport {
     }
 }
 
-/// Directional, deterministic per-(gateway,peer) relay registration id.
-///
-/// Review fix (4c Task 8, CRITICAL): every peer's `RelayTransport` used to
-/// register at the relay under this gateway's raw `gateway_id`, so a gateway
-/// relaying 2+ peers through one relay collided in the relay's
-/// `HashMap<[u8; 8], Connection>` registry and one peer's downlink silently
-/// died. Hashing `(my_gateway_id, peer_gateway_id)` in that order gives each
-/// ordered pair its own id, so gateway A's transport-for-B and A's
-/// transport-for-C never collide, while A's transport-for-B and B's
-/// transport-for-A still rendezvous at the relay by design (main.rs calls
-/// this with the arguments swapped on each side).
-///
-/// 32-bit id space (first 4 bytes of a SHA-256 digest, hex-encoded to 8 ASCII
-/// bytes to fit the relay's 8-byte truncated registration id): collision-safe
-/// at v1's ≤50-segment/~1225-pair scale; a wider raw-`[u8; 8]` id or a single
-/// per-(gateway,relay) multiplexed connection is a documented fast-follow.
-pub fn relay_pair_id(my_gateway_id: u64, peer_gateway_id: u64) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(my_gateway_id.to_be_bytes());
-    hasher.update(peer_gateway_id.to_be_bytes());
-    let digest = hasher.finalize();
-    digest[..4].iter().map(|b| format!("{b:02x}")).collect()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Review fix (4c Task 8, CRITICAL): every peer's `RelayTransport` used
-    /// to register at the relay under the same `gateway_id`, so a gateway
-    /// relaying 2+ peers through one relay would collide in the relay's
-    /// registry and one peer's downlink would go dark. `relay_pair_id` must
-    /// give each ordered (my, peer) pair its own id, deterministically, and
-    /// fit within the relay's 8-byte truncated registration id.
-    #[test]
-    fn relay_pair_id_is_directional_distinct_and_bounded() {
-        // Directional: A's registration id (for the A->B pair) must differ
-        // from B's registration id (for the B->A pair), or the two peers'
-        // registrations collide at the relay.
-        assert_ne!(relay_pair_id(1, 2), relay_pair_id(2, 1));
-
-        // Distinct per peer: one gateway's ids for two different peers must
-        // never collide — this is the whole point of the fix.
-        assert_ne!(relay_pair_id(1, 2), relay_pair_id(1, 3));
-
-        // Deterministic: same inputs, same id, every time.
-        assert_eq!(relay_pair_id(1, 2), relay_pair_id(1, 2));
-
-        // Bounded: must fit the relay's 8-byte truncated registration id,
-        // even for large gateway ids.
-        assert!(relay_pair_id(1, 2).len() <= 8, "must fit the relay's 8-byte id");
-        assert!(
-            relay_pair_id(u64::MAX, u64::MAX - 1).len() <= 8,
-            "must fit the relay's 8-byte id even for large ids"
-        );
-
-        // ASCII: must survive the relay's byte-truncation as a valid string.
-        assert!(relay_pair_id(1, 2).is_ascii());
-    }
-}
+// The per-(gateway,peer) relay registration id derivation moved to
+// `wiremesh_relay::registration_key` (Cycle 4c security fix): it is now keyed
+// on the gateways' cert-embedded `gw-<id>` IDENTITY strings (not raw numeric
+// gateway_ids), because the relay derives the same key from the authenticated
+// client cert to bind a registration to its owner. `main.rs` passes the
+// identity strings (`gw-<gateway_id>`) to `RelayTransport::start`, which hands
+// them to `wiremesh_relay::Client`; the directionality/distinctness/bounded
+// properties are now proven by that crate's `registration_key` unit test.

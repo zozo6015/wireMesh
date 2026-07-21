@@ -105,23 +105,33 @@ async fn bridges_datagrams_and_rejects_certless_clients() {
     let relay_addr: std::net::SocketAddr = bind_addr.parse().unwrap();
 
     // --- Property 1: bridging ---------------------------------------
-    let a = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-A")
+    // Each client is peer-bound: gw-A registers (my=gw-A, peer=gw-B); gw-B
+    // registers (my=gw-B, peer=gw-A). The relay verifies each `my_identity`
+    // against the presented client cert's `gw-<id>` SAN (mkcerts stamps SAN =
+    // the id name) and rendezvous the two directional keys.
+    let a = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-A", "gw-B")
         .await
         .expect("gw-A connect+register");
-    let b = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-B")
+    let b = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-B", "gw-A")
         .await
         .expect("gw-B connect+register");
 
     // `Client::connect` only returns after the relay has acked gw-B's
     // registration (see lib.rs's finish_connect doc comment), so this
-    // send_to cannot race the registry insert.
-    a.send_to("gw-B", b"hello").await.expect("send_to gw-B");
+    // send cannot race the registry insert.
+    a.send(b"hello").await.expect("send to gw-B");
     let (src, data) = tokio::time::timeout(Duration::from_secs(3), b.recv())
         .await
         .expect("recv timed out")
         .expect("recv errored");
     assert_eq!(data, b"hello".to_vec(), "payload must survive the bridge unmodified");
-    assert_eq!(src, "gw-A", "forwarded datagram must carry the true sender's id, not the relay's");
+    // The forwarded datagram carries the TRUE sender's registration key
+    // (gw-A's own registered id), not the relay's or a spoofable value.
+    assert_eq!(
+        src,
+        wiremesh_relay::registration_key("gw-A", "gw-B"),
+        "forwarded datagram must carry the true sender's registration key"
+    );
 
     // --- Property 2: datagram size ------------------------------------
     // spec §6.1 floor: WG tunnel MTU 1280 + WireGuard overhead 32 + this

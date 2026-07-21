@@ -149,6 +149,7 @@ impl Enrollment for EnrollmentSvc {
                         // can't be smuggled by a non-relay token that
                         // happens to hit this branch.
                         subject_alt_names: vec!["relay".to_string()],
+                        serial: None,
                     },
                 )
                 .await
@@ -250,27 +251,45 @@ impl Enrollment for EnrollmentSvc {
         // entirely and letting the CA decide the subject CN.
         let gateway_name = format!("gw-{secret_hash_hex}");
 
-        // Signing is pure crypto with no DB dependency, so it happens
-        // BEFORE the single-use transaction below — if the token turns out
-        // to be invalid/spent, the freshly signed (but never recorded or
-        // returned) cert is simply discarded.
-        let issued = self
-            .trust
-            .sign(
-                &req.csr_pem,
-                CertProfile {
-                    subject_cn: gateway_name.clone(),
-                    ttl: GATEWAY_CERT_TTL,
-                    // Unchanged behavior: gateway certs are mTLS CLIENTS,
-                    // verified by chain, not by hostname — no SAN needed.
-                    subject_alt_names: vec![],
-                },
-            )
-            .await
+        // SECURITY (Cycle 4c relay-registration binding): a gateway's leaf
+        // now carries a CA-decided SAN `gw-<gateway_id>` so the relay can
+        // bind a relay registration to the authenticated client cert (a
+        // gateway can only register/receive relay traffic under an id derived
+        // from ITS OWN cert-embedded gateway_id, not another pair's). That
+        // creates a chicken/egg: the gateway_id is assigned by
+        // `enroll_gateway`'s single-use transaction, but it must be inside the
+        // leaf we sign. We resolve it by SIGNING AFTER the transaction, while
+        // still recording the certificate row atomically with the token spend
+        // (so the cert stays revocable) — by pre-generating the serial here
+        // and stamping that SAME serial onto both the DB row and the leaf.
+        //
+        // `validate_csr_pem` up front preserves the pre-reorder invariant that
+        // a MALFORMED CSR is rejected WITHOUT consuming the single-use token
+        // (previously free, because signing — which parses the CSR — happened
+        // before the transaction). A valid CSR + a pre-generated serial makes
+        // the post-commit `sign` below effectively infallible.
+        wiremesh_trust::validate_csr_pem(&req.csr_pem)
             .map_err(|e| Status::invalid_argument(format!("signing CSR failed: {e}")))?;
 
-        let not_after = issued
-            .not_after
+        // Pre-generate the leaf's serial (same CSPRNG/width the issuer uses)
+        // so the certificate row can be committed inside the single-use-token
+        // transaction below, before the leaf itself is signed. NOTE: the
+        // `issuer_handle` recorded alongside it is this same serial hex —
+        // correct for the embedded issuer (whose handle IS the serial, see
+        // `EmbeddedTrust::sign`); a future non-embedded issuer with opaque
+        // post-sign handles would need to revisit this ordering.
+        let serial = wiremesh_trust::random_serial();
+        let serial_hex = hex_encode(&serial);
+
+        // not_after is computed here (at reserve time) rather than read back
+        // from the signed leaf, since we sign after this transaction. The
+        // leaf's own not_after (set by the issuer at sign time) differs only
+        // by the signing latency — immaterial against a 90-day TTL, and
+        // nothing compares the two.
+        let not_after_dt = OffsetDateTime::now_utc()
+            + time::Duration::try_from(GATEWAY_CERT_TTL)
+                .map_err(|e| Status::internal(format!("gateway cert TTL out of range: {e}")))?;
+        let not_after = not_after_dt
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting cert not_after: {e}")))?;
 
@@ -296,8 +315,8 @@ impl Enrollment for EnrollmentSvc {
                 cidrs,
                 gateway_name.clone(),
                 req.wg_pubkey.clone(),
-                issued.serial.clone(),
-                issued.handle.clone(),
+                serial_hex.clone(),
+                serial_hex.clone(),
                 not_after,
                 now,
             )
@@ -323,6 +342,30 @@ impl Enrollment for EnrollmentSvc {
                 });
             }
         };
+
+        // The token is now spent and the certificate row is durably
+        // committed (with `serial_hex`). Sign the leaf NOW that we know the
+        // gateway_id, stamping the pre-generated serial and the CA-decided
+        // `gw-<gateway_id>` SAN. With a validated CSR and a fixed serial this
+        // is effectively infallible; a failure here means the token is
+        // already spent (documented above), so it surfaces as Internal.
+        let issued = self
+            .trust
+            .sign(
+                &req.csr_pem,
+                CertProfile {
+                    subject_cn: gateway_name.clone(),
+                    ttl: GATEWAY_CERT_TTL,
+                    // SECURITY: the relay-registration identity binding. The
+                    // CA (not the CSR) stamps this SAN, so a gateway cannot
+                    // choose its own gateway_id — see the relay's
+                    // `identity_from_client_cert`.
+                    subject_alt_names: vec![format!("gw-{}", outcome.gateway_id)],
+                    serial: Some(serial),
+                },
+            )
+            .await
+            .map_err(|e| Status::internal(format!("signing gateway leaf failed: {e}")))?;
 
         // (Task 10) If this was a `rebind`, `Db::enroll_gateway` already
         // committed the replaced gateway's cert(s) as `revoked_at` in the DB

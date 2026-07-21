@@ -37,6 +37,7 @@ async fn embedded_ca_signs_a_csr_that_chains_to_the_bundle() {
                 subject_cn: "gw-aws".into(),
                 ttl: Duration::from_secs(90 * 24 * 3600),
                 subject_alt_names: vec![],
+                serial: None,
             },
         )
         .await
@@ -132,6 +133,7 @@ fn profile(cn: &str) -> CertProfile {
         subject_cn: cn.into(),
         ttl: Duration::from_secs(90 * 24 * 3600),
         subject_alt_names: vec![],
+        serial: None,
     }
 }
 

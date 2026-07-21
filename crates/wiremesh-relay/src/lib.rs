@@ -2,11 +2,24 @@
 //
 // Wire format:
 //   - Registration: each client's first (and only) bidirectional stream
-//     carries its 8-byte, NUL-padded id; the relay replies with a 1-byte
-//     ack once the id is in its registry.
-//   - Datagrams sent to the relay: `[8B dest_id][payload]`.
-//   - Datagrams the relay forwards to the destination: `[8B src_id][payload]`.
-use anyhow::{bail, Context, Result};
+//     carries `[2B my_len][my_identity][peer_identity]` (both UTF-8). The
+//     relay derives the client's TRUE identity from its authenticated client
+//     certificate (a `gw-<id>` SAN), REQUIRES the self-asserted `my_identity`
+//     to equal it (else it closes the connection), and keys the registry by
+//     `registration_key(my_identity, peer_identity)` — an 8-byte id nobody
+//     but the cert holder can register under. It replies with a 1-byte ack
+//     once the entry is in its registry.
+//   - Datagrams sent to the relay: `[8B dest_key][payload]`.
+//   - Datagrams the relay forwards to the destination: `[8B src_key][payload]`.
+//
+// SECURITY (Cycle 4c): the registration id used to be an opaque, self-asserted
+// 8-byte value — any enrolled gateway could register under (and thereby
+// intercept datagrams for, or evict) ANOTHER pair's slot. It is now bound to
+// the authenticated client certificate: a gateway can only ever register a
+// key whose `my_identity` half equals its own cert-embedded `gw-<id>`, and a
+// slot already held by a DIFFERENT cert is never blind-overwritten. See
+// `serve`, `identity_from_client_cert`, and `registration_key`.
+use anyhow::{anyhow, bail, Context, Result};
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
     ClientConfig as QuinnClientConfig, Connection, Endpoint, MtuDiscoveryConfig,
@@ -29,12 +42,73 @@ use std::{
 /// of what IP address the relay is actually reachable at.
 const RELAY_SERVER_NAME: &str = "relay";
 
-fn pad_id(id: &str) -> [u8; 8] {
-    let mut buf = [0u8; 8];
-    let bytes = id.as_bytes();
-    let n = bytes.len().min(8);
-    buf[..n].copy_from_slice(&bytes[..n]);
+/// Upper bound on a registration payload we will read off the wire. Identity
+/// strings are short (`gw-<id>`), so this generous cap simply stops a
+/// misbehaving/hostile peer from streaming an unbounded registration.
+const MAX_REGISTRATION_BYTES: usize = 1024;
+
+/// Deterministic 8-byte relay-registry id for the ordered
+/// `(my_identity, peer_identity)` pair. This is the ONE derivation shared by
+/// both sides: the relay keys its registry with `registration_key(my, peer)`
+/// (my taken from the authenticated cert), and the addressing peer targets a
+/// datagram at `registration_key(peer, my)` — i.e. the id the OTHER side
+/// registered under — so the two ends rendezvous.
+///
+/// The identity strings are length-prefixed before hashing so that
+/// `("gwa","b")` and `("gw","ab")` can never collide by concatenation. Only
+/// the first 4 SHA-256 bytes are used, hex-encoded to 8 ASCII bytes to fit the
+/// relay's fixed 8-byte key/datagram-header width — a 32-bit id space,
+/// collision-safe at v1's ≤50-segment scale (a wider raw `[u8;8]` id is a
+/// documented fast-follow, unchanged from the previous `relay_pair_id`).
+pub fn registration_key(my_identity: &str, peer_identity: &str) -> [u8; 8] {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update((my_identity.len() as u64).to_be_bytes());
+    hasher.update(my_identity.as_bytes());
+    hasher.update(peer_identity.as_bytes());
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    for (i, b) in digest[..4].iter().enumerate() {
+        let hex = [HEX[(b >> 4) as usize], HEX[(b & 0x0f) as usize]];
+        out[i * 2] = hex[0];
+        out[i * 2 + 1] = hex[1];
+    }
+    out
+}
+
+const HEX: [u8; 16] = *b"0123456789abcdef";
+
+/// Encodes a registration payload: `[2B my_len BE][my_identity][peer_identity]`.
+fn encode_registration(my_identity: &str, peer_identity: &str) -> Vec<u8> {
+    let my = my_identity.as_bytes();
+    let mut buf = Vec::with_capacity(2 + my.len() + peer_identity.len());
+    buf.extend_from_slice(&(my.len() as u16).to_be_bytes());
+    buf.extend_from_slice(my);
+    buf.extend_from_slice(peer_identity.as_bytes());
     buf
+}
+
+/// Decodes a registration payload written by [`encode_registration`].
+/// Fail-closed: any framing/UTF-8/empty-identity error is an `Err` the caller
+/// turns into a connection close, never a permissive default.
+fn decode_registration(buf: &[u8]) -> Result<(String, String)> {
+    if buf.len() < 2 {
+        bail!("registration payload too short: {} bytes", buf.len());
+    }
+    let my_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    if buf.len() < 2 + my_len {
+        bail!("registration payload truncated: my_len={my_len}, have {} bytes", buf.len() - 2);
+    }
+    let my = std::str::from_utf8(&buf[2..2 + my_len])
+        .context("registration my_identity is not valid UTF-8")?
+        .to_string();
+    let peer = std::str::from_utf8(&buf[2 + my_len..])
+        .context("registration peer_identity is not valid UTF-8")?
+        .to_string();
+    if my.is_empty() || peer.is_empty() {
+        bail!("registration identities must both be non-empty (my={my:?}, peer={peer:?})");
+    }
+    Ok((my, peer))
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
@@ -184,31 +258,43 @@ fn client_endpoint_from_pems(cert_pem: &str, key_pem: &str, ca_pem: &str) -> Res
     build_client_endpoint(roots, Some((certs, key)))
 }
 
-/// A connected, authenticated relay client. Cheap to clone: `quinn::Connection`
-/// is itself an internally-refcounted handle, so `Client` just wraps one.
+/// A connected, authenticated relay client, bound to ONE peer. Cheap to
+/// clone: `quinn::Connection` is itself an internally-refcounted handle, so
+/// `Client` just wraps one plus the precomputed 8-byte key its datagrams are
+/// addressed to (the id its peer registered under).
 #[derive(Clone)]
 pub struct Client {
     conn: Connection,
+    /// The registry id this client's datagrams are addressed to:
+    /// `registration_key(peer_identity, my_identity)` — i.e. exactly the id
+    /// the peer registered its own side under.
+    dest_key: [u8; 8],
 }
 
 impl Client {
     /// Connect to the relay with mutual TLS: root = ca.pem, client cert =
-    /// `gw-<my_id>.pem/key`. Registers `my_id` with the relay over the
-    /// connection's first bidirectional stream (and waits for the relay's
-    /// registration ack) before returning.
-    pub async fn connect(relay_addr: SocketAddr, certdir: &Path, my_id: &str) -> Result<Client> {
-        let endpoint = client_endpoint(certdir, Some(my_id))?;
-        Self::finish_connect(endpoint, relay_addr, my_id).await
+    /// `<my_identity>.pem/key`. Registers the `(my_identity, peer_identity)`
+    /// pair with the relay over the connection's first bidirectional stream
+    /// (and waits for the relay's registration ack) before returning. The
+    /// relay REQUIRES `my_identity` to equal the identity in this client's
+    /// certificate (a `gw-<id>` SAN); a mismatch closes the connection and
+    /// this call returns `Err`.
+    pub async fn connect(
+        relay_addr: SocketAddr,
+        certdir: &Path,
+        my_identity: &str,
+        peer_identity: &str,
+    ) -> Result<Client> {
+        let endpoint = client_endpoint(certdir, Some(my_identity))?;
+        Self::finish_connect(endpoint, relay_addr, my_identity, peer_identity).await
     }
 
     /// Same as `connect`, but presents no client certificate at all. Used to
-    /// prove the relay actually enforces mutual TLS: this must fail.
+    /// prove the relay actually enforces mutual TLS: this must fail. The
+    /// identities are placeholders — the handshake fails before they matter.
     pub async fn connect_no_cert(relay_addr: SocketAddr, certdir: &Path) -> Result<Client> {
         let endpoint = client_endpoint(certdir, None)?;
-        // A certless connection has nothing to register as, but we still
-        // need *some* id to open the registration stream with; the handshake
-        // itself is expected to fail before this matters.
-        Self::finish_connect(endpoint, relay_addr, "").await
+        Self::finish_connect(endpoint, relay_addr, "gw-nocert", "gw-nocert").await
     }
 
     /// Same as `connect`, but takes cert/key/ca as in-memory PEM strings
@@ -221,13 +307,19 @@ impl Client {
         cert_pem: &str,
         key_pem: &str,
         ca_pem: &str,
-        my_id: &str,
+        my_identity: &str,
+        peer_identity: &str,
     ) -> Result<Client> {
         let endpoint = client_endpoint_from_pems(cert_pem, key_pem, ca_pem)?;
-        Self::finish_connect(endpoint, relay_addr, my_id).await
+        Self::finish_connect(endpoint, relay_addr, my_identity, peer_identity).await
     }
 
-    async fn finish_connect(endpoint: Endpoint, relay_addr: SocketAddr, my_id: &str) -> Result<Client> {
+    async fn finish_connect(
+        endpoint: Endpoint,
+        relay_addr: SocketAddr,
+        my_identity: &str,
+        peer_identity: &str,
+    ) -> Result<Client> {
         let conn = endpoint
             .connect(relay_addr, RELAY_SERVER_NAME)?
             .await
@@ -236,49 +328,55 @@ impl Client {
         // Registration uses a *bidirectional* stream, not a bare uni stream:
         // `send.finish()` only flushes locally and returns as soon as the
         // client's send buffer is handed off, well before the relay has
-        // necessarily called `accept_uni`/read the id/inserted it into its
+        // necessarily accepted the stream/read the id/inserted it into its
         // registry. Without a round trip here, `Client::connect` can return
-        // before the peer is actually registered, so a `send_to` issued
+        // before the peer is actually registered, so a `send` issued
         // immediately afterwards (as the bridge test does, with no extra
         // delay) can race the relay's registry insert and silently drop as
         // "unknown dest". Reading a 1-byte ack back forces this function to
-        // wait until the relay has processed the registration.
+        // wait until the relay has processed (and ACCEPTED) the registration
+        // — an identity-mismatch/duplicate rejection instead closes the
+        // connection, surfacing here as an `Err` on the ack read.
         let (mut send, mut recv) = conn
             .open_bi()
             .await
             .context("open registration stream")?;
-        send.write_all(&pad_id(my_id))
+        send.write_all(&encode_registration(my_identity, peer_identity))
             .await
-            .context("write registration id")?;
+            .context("write registration")?;
         send.finish().context("finish registration stream")?;
         recv.read_to_end(1)
             .await
             .context("await registration ack")?;
 
-        Ok(Client { conn })
+        Ok(Client {
+            conn,
+            dest_key: registration_key(peer_identity, my_identity),
+        })
     }
 
-    /// Send `data` to `dest` (an id, NUL-padded/truncated to 8 bytes) as one
-    /// QUIC datagram: `[8B dest_id][data]`.
-    pub async fn send_to(&self, dest: &str, data: &[u8]) -> Result<()> {
+    /// Send `data` to this client's bound peer as one QUIC datagram:
+    /// `[8B dest_key][data]`, where `dest_key` is the id the peer registered
+    /// under.
+    pub async fn send(&self, data: &[u8]) -> Result<()> {
         let mut buf = Vec::with_capacity(8 + data.len());
-        buf.extend_from_slice(&pad_id(dest));
+        buf.extend_from_slice(&self.dest_key);
         buf.extend_from_slice(data);
         self.conn.send_datagram(buf.into())?;
         Ok(())
     }
 
-    /// Receive the next forwarded datagram, returning `(src_id, payload)`
-    /// with the 8-byte source-id header stripped. `src_id` has trailing NUL
-    /// padding trimmed.
-    pub async fn recv(&self) -> Result<(String, Vec<u8>)> {
+    /// Receive the next forwarded datagram, returning `(src_key, payload)`
+    /// with the 8-byte source-key header stripped. `src_key` is the sender's
+    /// registration id (the gateway's downlink ignores it — see
+    /// `RelayTransport`).
+    pub async fn recv(&self) -> Result<([u8; 8], Vec<u8>)> {
         let dgram = self.conn.read_datagram().await?;
         if dgram.len() < 8 {
             bail!("datagram too short: {} bytes", dgram.len());
         }
-        let src = String::from_utf8_lossy(&dgram[..8])
-            .trim_end_matches('\0')
-            .to_string();
+        let mut src = [0u8; 8];
+        src.copy_from_slice(&dgram[..8]);
         Ok((src, dgram[8..].to_vec()))
     }
 
@@ -314,29 +412,75 @@ impl Client {
     }
 }
 
-/// In-memory registry the relay binary uses to map a registered id to its
-/// live connection. Exposed here so `src/bin/relay.rs` shares the type
-/// instead of redeclaring it.
-pub type Registry = Arc<tokio::sync::Mutex<std::collections::HashMap<[u8; 8], Connection>>>;
-
-/// Read exactly one registration id (8 bytes) off a freshly-accepted
-/// connection's first bidirectional stream. Returns the id plus the send
-/// half of that stream so the caller can insert the id into its registry
-/// *before* calling [`ack_registration`] — sending the ack any earlier would
-/// reopen the race `ack_registration`'s doc comment describes, just shifted
-/// to the server side (client would proceed on ack before the registry
-/// insert actually happened).
-pub async fn read_registration_id(conn: &Connection) -> Result<(quinn::SendStream, [u8; 8])> {
-    let (send, mut recv) = conn.accept_bi().await.context("accept registration stream")?;
-    let buf = recv.read_to_end(8).await.context("read registration id")?;
-    let mut id = [0u8; 8];
-    let n = buf.len().min(8);
-    id[..n].copy_from_slice(&buf[..n]);
-    Ok((send, id))
+/// One registry slot: the live connection plus the cert-bound identity that
+/// owns it. `owner` is what makes duplicate registrations safe — a second
+/// registration for the same key is only allowed to REPLACE the slot when it
+/// comes from the SAME cert identity (a reconnect), never a different one (an
+/// eviction/redirection attempt).
+#[derive(Clone)]
+struct RegEntry {
+    conn: Connection,
+    owner: String,
 }
 
-/// Write back the registration ack. Call only after the id has been inserted
-/// into the registry — see [`read_registration_id`] and the comment on
+/// In-memory registry mapping a registration key to its owning connection.
+type Registry = Arc<tokio::sync::Mutex<std::collections::HashMap<[u8; 8], RegEntry>>>;
+
+/// Extracts the registering gateway's TRUE identity from its authenticated
+/// client certificate: the `gw-<id>` DNS SAN the CA stamps onto every gateway
+/// leaf (see `services::enrollment`). This — not anything the client asserts
+/// on the wire — is the unforgeable anchor the relay binds a registration to.
+///
+/// Fail-closed: no client identity, a non-cert identity, an unparseable cert,
+/// or the absence of a `gw-*` SAN all return `Err`, which the caller turns
+/// into a connection close. There is no permissive fallthrough.
+fn identity_from_client_cert(conn: &Connection) -> Result<String> {
+    let identity = conn
+        .peer_identity()
+        .context("no client identity (mandatory mutual TLS should have supplied one)")?;
+    let certs = identity
+        .downcast::<Vec<CertificateDer<'static>>>()
+        .map_err(|_| anyhow!("client identity was not an X.509 certificate chain"))?;
+    let end_entity = certs
+        .first()
+        .context("client certificate chain was empty")?;
+    let (_, cert) = x509_parser::parse_x509_certificate(end_entity.as_ref())
+        .map_err(|e| anyhow!("parsing client cert DER: {e}"))?;
+    let san = cert
+        .subject_alternative_name()
+        .map_err(|e| anyhow!("reading client cert SAN extension: {e}"))?
+        .context("client cert has no SAN extension (no gw-<id> to bind to)")?;
+    for gn in &san.value.general_names {
+        if let x509_parser::extensions::GeneralName::DNSName(name) = gn {
+            if name.strip_prefix("gw-").is_some_and(|rest| !rest.is_empty()) {
+                return Ok((*name).to_string());
+            }
+        }
+    }
+    bail!("client cert has no gw-<id> DNS SAN to bind the registration to")
+}
+
+/// Read one registration payload (`[2B my_len][my_identity][peer_identity]`)
+/// off a freshly-accepted connection's first bidirectional stream. Returns
+/// the two identities plus the send half of that stream so the caller can
+/// insert the entry into its registry *before* calling [`ack_registration`]
+/// — sending the ack any earlier would reopen the race `ack_registration`'s
+/// doc comment describes (client proceeds on ack before the registry insert
+/// actually happened).
+async fn read_registration(
+    conn: &Connection,
+) -> Result<(quinn::SendStream, String, String)> {
+    let (send, mut recv) = conn.accept_bi().await.context("accept registration stream")?;
+    let buf = recv
+        .read_to_end(MAX_REGISTRATION_BYTES)
+        .await
+        .context("read registration payload")?;
+    let (my_identity, peer_identity) = decode_registration(&buf)?;
+    Ok((send, my_identity, peer_identity))
+}
+
+/// Write back the registration ack. Call only after the entry has been
+/// inserted into the registry — see [`read_registration`] and the comment on
 /// `Client::finish_connect` for why the ack ordering matters.
 pub async fn ack_registration(mut send: quinn::SendStream) -> Result<()> {
     send.write_all(&[1]).await.context("write registration ack")?;
@@ -344,13 +488,30 @@ pub async fn ack_registration(mut send: quinn::SendStream) -> Result<()> {
     Ok(())
 }
 
-/// The relay's accept -> handshake -> register -> datagram-forward loop,
-/// graduated verbatim (Cycle 4c Task 7) from `src/bin/relay.rs`'s `main` so
-/// it can be driven either by the standalone `relay` binary or embedded
-/// in-process (see [`spawn_server`], used by the gateway's loopback relay
-/// tests and any future in-process relay embedding). Runs until
+/// Removes `key` from the registry ONLY if it is still owned by `conn`. A
+/// connection that was already REPLACED by a same-owner reconnect must not,
+/// on its own later teardown, evict the reconnect's live entry — so compare
+/// quinn's stable connection id before removing.
+async fn remove_if_owner(registry: &Registry, key: &[u8; 8], conn: &Connection) {
+    let mut reg = registry.lock().await;
+    if reg
+        .get(key)
+        .is_some_and(|e| e.conn.stable_id() == conn.stable_id())
+    {
+        reg.remove(key);
+    }
+}
+
+/// The relay's accept -> handshake -> register -> datagram-forward loop
+/// (embeddable via [`spawn_server`], used by the gateway's loopback relay
+/// tests, and driven by the standalone `relay` binary). Runs until
 /// `endpoint.accept()` returns `None` (the endpoint was closed) — it never
 /// returns otherwise.
+///
+/// SECURITY (Cycle 4c): every registration is bound to the authenticated
+/// client certificate. The self-asserted `my_identity` must equal the cert's
+/// `gw-<id>` SAN, and a key already held by a different cert is never
+/// blind-overwritten — both rejections close the connection (fail-closed).
 pub async fn serve(endpoint: Endpoint) {
     let registry: Registry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
 
@@ -367,26 +528,79 @@ pub async fn serve(endpoint: Endpoint) {
                 }
             };
 
-            let (ack_stream, id) = match read_registration_id(&conn).await {
-                Ok(pair) => pair,
+            // The unforgeable identity: read straight off the authenticated
+            // client certificate, never from the wire.
+            let cert_identity = match identity_from_client_cert(&conn) {
+                Ok(id) => id,
                 Err(e) => {
-                    eprintln!("relay: registration failed: {e}");
+                    eprintln!("relay: rejecting connection, no bindable cert identity: {e}");
+                    conn.close(1u32.into(), b"no cert identity");
                     return;
                 }
             };
-            // Insert into the registry *before* acking: the client blocks on
-            // the ack before it does anything else, so this ordering is what
-            // guarantees a subsequent send_to from a peer can already find
-            // this connection registered.
-            registry.lock().await.insert(id, conn.clone());
+
+            let (ack_stream, my_identity, peer_identity) = match read_registration(&conn).await {
+                Ok(t) => t,
+                Err(e) => {
+                    eprintln!("relay: registration read failed: {e}");
+                    conn.close(1u32.into(), b"bad registration");
+                    return;
+                }
+            };
+
+            // SECURITY: the client-asserted `my_identity` MUST match the
+            // identity bound into its cert. Otherwise a gateway could register
+            // under (and receive datagrams destined for) another pair's slot.
+            if my_identity != cert_identity {
+                eprintln!(
+                    "relay: rejecting registration: asserted my_identity {my_identity:?} \
+                     != cert identity {cert_identity:?}"
+                );
+                conn.close(2u32.into(), b"identity mismatch");
+                return;
+            }
+
+            let key = registration_key(&my_identity, &peer_identity);
+
+            // SECURITY: never blind-overwrite a slot owned by a DIFFERENT cert
+            // (that was the eviction/redirection DoS). A same-owner reconnect
+            // is fine — it replaces its own slot.
+            {
+                let mut reg = registry.lock().await;
+                if let Some(existing) = reg.get(&key) {
+                    if existing.owner != cert_identity {
+                        eprintln!(
+                            "relay: rejecting registration for key {:?}: already held by {:?}, \
+                             refusing overwrite by {:?}",
+                            String::from_utf8_lossy(&key),
+                            existing.owner,
+                            cert_identity
+                        );
+                        drop(reg);
+                        conn.close(3u32.into(), b"registration id in use");
+                        return;
+                    }
+                }
+                // Insert *before* acking: the client blocks on the ack before
+                // it does anything else, so this ordering guarantees a
+                // subsequent datagram from a peer can already find this entry.
+                reg.insert(
+                    key,
+                    RegEntry {
+                        conn: conn.clone(),
+                        owner: cert_identity.clone(),
+                    },
+                );
+            }
+
             if let Err(e) = ack_registration(ack_stream).await {
                 eprintln!("relay: registration ack failed: {e}");
-                registry.lock().await.remove(&id);
+                remove_if_owner(&registry, &key, &conn).await;
                 return;
             }
             eprintln!(
-                "relay: registered {:?} from {}",
-                String::from_utf8_lossy(&id).trim_end_matches('\0'),
+                "relay: registered key={:?} owner={cert_identity:?} peer={peer_identity:?} from {}",
+                String::from_utf8_lossy(&key),
                 conn.remote_address()
             );
 
@@ -394,7 +608,10 @@ pub async fn serve(endpoint: Endpoint) {
                 let dgram = match conn.read_datagram().await {
                     Ok(dgram) => dgram,
                     Err(e) => {
-                        eprintln!("relay: connection {:?} closed: {e}", String::from_utf8_lossy(&id));
+                        eprintln!(
+                            "relay: connection for key {:?} closed: {e}",
+                            String::from_utf8_lossy(&key)
+                        );
                         break;
                     }
                 };
@@ -404,10 +621,10 @@ pub async fn serve(endpoint: Endpoint) {
                 let mut dest = [0u8; 8];
                 dest.copy_from_slice(&dgram[..8]);
 
-                let peer = registry.lock().await.get(&dest).cloned();
+                let peer = registry.lock().await.get(&dest).map(|e| e.conn.clone());
                 if let Some(peer) = peer {
                     let mut fwd = Vec::with_capacity(dgram.len());
-                    fwd.extend_from_slice(&id); // src id header
+                    fwd.extend_from_slice(&key); // src key header
                     fwd.extend_from_slice(&dgram[8..]);
                     if let Err(e) = peer.send_datagram(fwd.into()) {
                         eprintln!("relay: forward to {:?} failed: {e}", String::from_utf8_lossy(&dest));
@@ -417,7 +634,7 @@ pub async fn serve(endpoint: Endpoint) {
                 }
             }
 
-            registry.lock().await.remove(&id);
+            remove_if_owner(&registry, &key, &conn).await;
         });
     }
 }
@@ -1033,5 +1250,77 @@ mod denylist_tests {
                  (including any leading 0x00 bytes), case serial={expected}"
             );
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cycle 4c: registration-key derivation + registration framing (the shared
+// wire contract the cert-binding security fix rests on).
+#[cfg(test)]
+mod registration_tests {
+    use super::{decode_registration, encode_registration, registration_key};
+
+    /// The registry key must be directional, distinct per (my, peer), stable,
+    /// ASCII, and exactly 8 bytes — the same properties the previous
+    /// `relay_pair_id` guaranteed, now keyed on identity strings.
+    #[test]
+    fn registration_key_is_directional_distinct_stable_and_8_bytes() {
+        // Directional: A's id (A->B) must differ from B's id (B->A), or the
+        // two peers' registrations would collide at the relay.
+        assert_ne!(
+            registration_key("gw-1", "gw-2"),
+            registration_key("gw-2", "gw-1")
+        );
+        // Distinct per peer: one gateway's ids for two different peers must
+        // never collide.
+        assert_ne!(
+            registration_key("gw-1", "gw-2"),
+            registration_key("gw-1", "gw-3")
+        );
+        // Length-prefix hygiene: concatenation-ambiguous inputs must not
+        // collide.
+        assert_ne!(
+            registration_key("gwa", "b"),
+            registration_key("gw", "ab")
+        );
+        // Deterministic.
+        assert_eq!(
+            registration_key("gw-1", "gw-2"),
+            registration_key("gw-1", "gw-2")
+        );
+        // Always 8 ASCII hex bytes.
+        let k = registration_key("gw-123456789", "gw-987654321");
+        assert_eq!(k.len(), 8);
+        assert!(k.iter().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    /// The rendezvous invariant the whole relay path depends on: the key A
+    /// registers under for peer B equals the key B ADDRESSES A with.
+    #[test]
+    fn registration_key_rendezvous() {
+        // A registers (my=gw-A, peer=gw-B) -> registration_key("gw-A","gw-B").
+        // B addresses A via registration_key(peer=gw-A, my=gw-B) -- i.e. with
+        // (my_for_the_key, peer_for_the_key) = ("gw-A","gw-B"). Same bytes.
+        let a_registers = registration_key("gw-A", "gw-B");
+        let b_addresses_a = registration_key("gw-A", "gw-B");
+        assert_eq!(a_registers, b_addresses_a);
+    }
+
+    #[test]
+    fn registration_framing_round_trips() {
+        let (my, peer) = decode_registration(&encode_registration("gw-42", "gw-7")).unwrap();
+        assert_eq!(my, "gw-42");
+        assert_eq!(peer, "gw-7");
+    }
+
+    #[test]
+    fn registration_decode_rejects_malformed() {
+        // Too short.
+        assert!(decode_registration(&[0x00]).is_err());
+        // my_len overruns the buffer.
+        assert!(decode_registration(&[0x00, 0xff, b'x']).is_err());
+        // Empty identities.
+        assert!(decode_registration(&encode_registration("", "gw-1")).is_err());
+        assert!(decode_registration(&encode_registration("gw-1", "")).is_err());
     }
 }
