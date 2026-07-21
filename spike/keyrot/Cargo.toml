@@ -1,0 +1,20 @@
+[package]
+name = "keyrot"
+version = "0.1.0"
+edition = "2021"
+
+# Key-rotation fast-follow DE-RISK spike (linchpin for spec §4.4 make-before-break):
+# prove a gateway can rotate its OWN WireGuard key with continuous traffic flowing
+# and ~ZERO packet loss across the cutover. Standalone crate (CLAUDE.md: spike/*
+# crates are NOT in the root workspace). See docs/research/keyrot-spike-note.md.
+
+[[bin]]
+name = "keyrot-dev"
+path = "src/main.rs"
+
+[dependencies]
+boringtun = { version = "0.6", features = ["device"] }
+anyhow = "1"
+
+[dev-dependencies]
+natlab = { path = "../natlab" }
