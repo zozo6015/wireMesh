@@ -11,9 +11,13 @@
 // leaf's exact serial on a `wiremesh_relay::Denylist` and expect it to match
 // what `wiremesh_relay::server_config_with_denylist`'s verifier extracts
 // from the live connection's client cert (Cycle 4c Task 3).
+//
+// The actual cert-generation logic lives in `wiremesh_relay::test_certs`
+// (Cycle 4c Task 7 — graduated so it can be called in-process by, e.g., the
+// gateway's loopback relay tests without shelling out to this binary); this
+// bin is just the CLI wrapper that supplies the default gw-A/gw-B ids.
 use anyhow::Result;
 use clap::Parser;
-use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SerialNumber};
 
 #[derive(Parser)]
 struct Args {
@@ -24,69 +28,17 @@ struct Args {
     gw_ids: Vec<String>,
 }
 
-/// A fresh, random 16-byte serial — same width as
-/// `wiremesh-trust::random_serial`. Not cryptographically tied to that
-/// function (this is test tooling, not the real CA), but deliberately the
-/// same byte length so serial encoding/normalization behaves identically.
-fn random_serial_bytes() -> [u8; 16] {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    // No `rand` dependency in this crate; a simple splitmix64-style mix
-    // seeded from wall-clock time plus PID is more than sufficient entropy
-    // for test-only, non-security-sensitive serial uniqueness.
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0)
-        ^ (std::process::id() as u128) << 64;
-    let mut state = seed as u64 ^ 0x9E3779B97F4A7C15;
-    let mut bytes = [0u8; 16];
-    for chunk in bytes.chunks_mut(8) {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
-    }
-    bytes
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
-    std::fs::create_dir_all(&args.dir)?;
-
-    let ca_key = KeyPair::generate()?;
-    let mut ca_params = CertificateParams::new(vec![])?;
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_cert = ca_params.self_signed(&ca_key)?;
-    std::fs::write(args.dir.join("ca.pem"), ca_cert.pem())?;
 
     let gw_ids: Vec<String> = if args.gw_ids.is_empty() {
         vec!["gw-A".to_string(), "gw-B".to_string()]
     } else {
         args.gw_ids.clone()
     };
+    let gw_id_refs: Vec<&str> = gw_ids.iter().map(String::as_str).collect();
 
-    // SANs include the loopback-adjacent test addresses used by natlab labs
-    // (203.0.113.1 / 198.51.100.1, TEST-NET-3/TEST-NET-2) so the same certs
-    // work whether a test dials 127.0.0.1 (server_name = the leaf's CN, e.g.
-    // "relay") or a future netns-based test dials one of these IPs directly.
-    let mut names: Vec<String> = vec!["relay".to_string()];
-    names.extend(gw_ids.iter().cloned());
-    for name in &names {
-        let key = KeyPair::generate()?;
-        let mut params = CertificateParams::new(vec![
-            name.to_string(),
-            "203.0.113.1".to_string(),
-            "198.51.100.1".to_string(),
-        ])?;
-        params.distinguished_name.push(DnType::CommonName, name.as_str());
-        let serial = random_serial_bytes();
-        params.serial_number = Some(SerialNumber::from_slice(&serial));
-        let cert = params.signed_by(&key, &ca_cert, &ca_key)?;
-        std::fs::write(args.dir.join(format!("{name}.pem")), cert.pem())?;
-        std::fs::write(args.dir.join(format!("{name}.key")), key.serialize_pem())?;
-        let serial_hex: String = serial.iter().map(|b| format!("{b:02x}")).collect();
-        std::fs::write(args.dir.join(format!("{name}.serial")), &serial_hex)?;
-    }
+    wiremesh_relay::test_certs(&args.dir, &gw_id_refs)?;
 
     eprintln!(
         "mkcerts: wrote ca + relay + {} into {}",

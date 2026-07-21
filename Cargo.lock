@@ -2950,6 +2950,7 @@ dependencies = [
  "wiremesh-enforcer",
  "wiremesh-policy",
  "wiremesh-proto",
+ "wiremesh-relay",
  "wiremesh-testkit",
  "wiremesh-trust",
 ]

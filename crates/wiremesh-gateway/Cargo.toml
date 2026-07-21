@@ -16,6 +16,7 @@ wiremesh-proto = { path = "../wiremesh-proto" }
 wiremesh-policy = { path = "../wiremesh-policy" }
 wiremesh-enforcer = { path = "../wiremesh-enforcer" }
 wiremesh-trust = { path = "../wiremesh-trust" }
+wiremesh-relay = { path = "../wiremesh-relay" }
 tokio = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }

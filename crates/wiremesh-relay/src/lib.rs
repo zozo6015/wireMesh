@@ -12,6 +12,7 @@ use quinn::{
     ClientConfig as QuinnClientConfig, Connection, Endpoint, MtuDiscoveryConfig,
     ServerConfig as QuinnServerConfig, TransportConfig,
 };
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair, SerialNumber};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
@@ -51,6 +52,27 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
     rustls_pemfile::private_key(&mut data.as_slice())
         .with_context(|| format!("parse key PEM {}", path.display()))?
         .with_context(|| format!("no private key found in {}", path.display()))
+}
+
+/// Same as [`load_certs`], but parses an in-memory PEM string instead of
+/// reading a file — used by [`Client::connect_with_pems`], whose caller (the
+/// gateway) holds its cert/key/ca as PEM strings in `Identity`, not as files
+/// in a certdir.
+fn parse_certs_pem(pem: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let certs: Result<Vec<_>, _> = rustls_pemfile::certs(&mut pem.as_bytes()).collect();
+    let certs = certs.context("parse cert PEM string")?;
+    if certs.is_empty() {
+        bail!("no certificates found in PEM string");
+    }
+    Ok(certs)
+}
+
+/// Same as [`load_key`], but parses an in-memory PEM string instead of
+/// reading a file.
+fn parse_key_pem(pem: &str) -> Result<PrivateKeyDer<'static>> {
+    rustls_pemfile::private_key(&mut pem.as_bytes())
+        .context("parse key PEM string")?
+        .context("no private key found in PEM string")
 }
 
 /// Ensure a default `rustls` CryptoProvider is installed. Idempotent: quinn
@@ -107,21 +129,20 @@ pub fn server_config(certdir: &Path) -> Result<QuinnServerConfig> {
     Ok(server_config)
 }
 
-fn client_endpoint(certdir: &Path, my_id: Option<&str>) -> Result<Endpoint> {
+/// Shared by the file-based (`client_endpoint`) and in-memory-PEM-based
+/// (`client_endpoint_from_pems`) endpoint builders: given already-loaded
+/// trust roots and an optional (cert chain, key) pair for mTLS client auth,
+/// build the quinn client `Endpoint` with this crate's fixed transport
+/// settings and ALPN.
+fn build_client_endpoint(
+    roots: RootCertStore,
+    client_auth: Option<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>,
+) -> Result<Endpoint> {
     ensure_crypto_provider();
 
-    let mut roots = RootCertStore::empty();
-    for ca_cert in load_certs(&certdir.join("ca.pem"))? {
-        roots.add(ca_cert)?;
-    }
-
     let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
-    let mut tls = match my_id {
-        Some(id) => {
-            let certs = load_certs(&certdir.join(format!("{id}.pem")))?;
-            let key = load_key(&certdir.join(format!("{id}.key")))?;
-            builder.with_client_auth_cert(certs, key)?
-        }
+    let mut tls = match client_auth {
+        Some((certs, key)) => builder.with_client_auth_cert(certs, key)?,
         None => builder.with_no_client_auth(),
     };
     tls.alpn_protocols = vec![b"wiremesh-relay/0".to_vec()];
@@ -133,6 +154,34 @@ fn client_endpoint(certdir: &Path, my_id: Option<&str>) -> Result<Endpoint> {
     let mut endpoint = Endpoint::client((std::net::Ipv4Addr::UNSPECIFIED, 0).into())?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
+}
+
+fn client_endpoint(certdir: &Path, my_id: Option<&str>) -> Result<Endpoint> {
+    let mut roots = RootCertStore::empty();
+    for ca_cert in load_certs(&certdir.join("ca.pem"))? {
+        roots.add(ca_cert)?;
+    }
+
+    let client_auth = match my_id {
+        Some(id) => {
+            let certs = load_certs(&certdir.join(format!("{id}.pem")))?;
+            let key = load_key(&certdir.join(format!("{id}.key")))?;
+            Some((certs, key))
+        }
+        None => None,
+    };
+    build_client_endpoint(roots, client_auth)
+}
+
+fn client_endpoint_from_pems(cert_pem: &str, key_pem: &str, ca_pem: &str) -> Result<Endpoint> {
+    let mut roots = RootCertStore::empty();
+    for ca_cert in parse_certs_pem(ca_pem)? {
+        roots.add(ca_cert)?;
+    }
+
+    let certs = parse_certs_pem(cert_pem)?;
+    let key = parse_key_pem(key_pem)?;
+    build_client_endpoint(roots, Some((certs, key)))
 }
 
 /// A connected, authenticated relay client. Cheap to clone: `quinn::Connection`
@@ -160,6 +209,22 @@ impl Client {
         // need *some* id to open the registration stream with; the handshake
         // itself is expected to fail before this matters.
         Self::finish_connect(endpoint, relay_addr, "").await
+    }
+
+    /// Same as `connect`, but takes cert/key/ca as in-memory PEM strings
+    /// instead of a certdir — for a caller (the gateway) that holds its
+    /// identity as PEM strings (`wiremesh_gateway::identity::Identity`), not
+    /// as files on disk. `server_name` is always [`RELAY_SERVER_NAME`], same
+    /// as the file-based `connect`.
+    pub async fn connect_with_pems(
+        relay_addr: SocketAddr,
+        cert_pem: &str,
+        key_pem: &str,
+        ca_pem: &str,
+        my_id: &str,
+    ) -> Result<Client> {
+        let endpoint = client_endpoint_from_pems(cert_pem, key_pem, ca_pem)?;
+        Self::finish_connect(endpoint, relay_addr, my_id).await
     }
 
     async fn finish_connect(endpoint: Endpoint, relay_addr: SocketAddr, my_id: &str) -> Result<Client> {
@@ -223,6 +288,15 @@ impl Client {
     pub fn max_datagram_size(&self) -> Option<usize> {
         self.conn.max_datagram_size()
     }
+
+    /// Whether the underlying QUIC connection is still open (no
+    /// `CONNECTION_CLOSE` sent or received yet). The minimal liveness signal:
+    /// a closed connection can never again forward datagrams, so `false`
+    /// here means this `Client` is dead and must be replaced, not just
+    /// degraded.
+    pub fn is_alive(&self) -> bool {
+        self.conn.close_reason().is_none()
+    }
 }
 
 /// In-memory registry the relay binary uses to map a registered id to its
@@ -252,6 +326,189 @@ pub async fn read_registration_id(conn: &Connection) -> Result<(quinn::SendStrea
 pub async fn ack_registration(mut send: quinn::SendStream) -> Result<()> {
     send.write_all(&[1]).await.context("write registration ack")?;
     send.finish().context("finish registration ack stream")?;
+    Ok(())
+}
+
+/// The relay's accept -> handshake -> register -> datagram-forward loop,
+/// graduated verbatim (Cycle 4c Task 7) from `src/bin/relay.rs`'s `main` so
+/// it can be driven either by the standalone `relay` binary or embedded
+/// in-process (see [`spawn_server`], used by the gateway's loopback relay
+/// tests and any future in-process relay embedding). Runs until
+/// `endpoint.accept()` returns `None` (the endpoint was closed) — it never
+/// returns otherwise.
+pub async fn serve(endpoint: Endpoint) {
+    let registry: Registry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+
+    while let Some(incoming) = endpoint.accept().await {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            let conn = match incoming.await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    // Mandatory client-cert handshake failures land here —
+                    // e.g. a certless client (Client::connect_no_cert).
+                    eprintln!("relay: handshake failed: {e}");
+                    return;
+                }
+            };
+
+            let (ack_stream, id) = match read_registration_id(&conn).await {
+                Ok(pair) => pair,
+                Err(e) => {
+                    eprintln!("relay: registration failed: {e}");
+                    return;
+                }
+            };
+            // Insert into the registry *before* acking: the client blocks on
+            // the ack before it does anything else, so this ordering is what
+            // guarantees a subsequent send_to from a peer can already find
+            // this connection registered.
+            registry.lock().await.insert(id, conn.clone());
+            if let Err(e) = ack_registration(ack_stream).await {
+                eprintln!("relay: registration ack failed: {e}");
+                registry.lock().await.remove(&id);
+                return;
+            }
+            eprintln!(
+                "relay: registered {:?} from {}",
+                String::from_utf8_lossy(&id).trim_end_matches('\0'),
+                conn.remote_address()
+            );
+
+            loop {
+                let dgram = match conn.read_datagram().await {
+                    Ok(dgram) => dgram,
+                    Err(e) => {
+                        eprintln!("relay: connection {:?} closed: {e}", String::from_utf8_lossy(&id));
+                        break;
+                    }
+                };
+                if dgram.len() < 8 {
+                    continue;
+                }
+                let mut dest = [0u8; 8];
+                dest.copy_from_slice(&dgram[..8]);
+
+                let peer = registry.lock().await.get(&dest).cloned();
+                if let Some(peer) = peer {
+                    let mut fwd = Vec::with_capacity(dgram.len());
+                    fwd.extend_from_slice(&id); // src id header
+                    fwd.extend_from_slice(&dgram[8..]);
+                    if let Err(e) = peer.send_datagram(fwd.into()) {
+                        eprintln!("relay: forward to {:?} failed: {e}", String::from_utf8_lossy(&dest));
+                    }
+                } else {
+                    eprintln!("relay: unknown dest {:?}", String::from_utf8_lossy(&dest));
+                }
+            }
+
+            registry.lock().await.remove(&id);
+        });
+    }
+}
+
+/// Test/embed convenience: builds a PLAIN (no-denylist) server config from
+/// `certdir` (see [`server_config`]), binds it on `bind`, and spawns
+/// [`serve`] on it in the background. Returns the actual bound address (so
+/// callers can pass `bind = 0.0.0.0:0`/`127.0.0.1:0` and learn the ephemeral
+/// port) plus the serve task's `JoinHandle`, so a test can hold the handle
+/// (dropping it does not stop the task — it keeps running detached, which is
+/// what a test wants for the lifetime of a single test function) or abort it
+/// explicitly for cleanup.
+///
+/// This is deliberately the no-denylist config: production and the
+/// standalone `relay` binary always go through
+/// [`server_config_with_denylist`] instead. A caller that needs denylist
+/// enforcement for an embedded relay should build its own
+/// `server_config_with_denylist` + `Endpoint::server` and call [`serve`]
+/// directly, mirroring what this function does.
+pub async fn spawn_server(
+    bind: SocketAddr,
+    certdir: &Path,
+) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
+    let cfg = server_config(certdir)?;
+    let endpoint = Endpoint::server(cfg, bind).with_context(|| format!("binding relay endpoint on {bind}"))?;
+    let local_addr = endpoint.local_addr().context("reading bound relay endpoint address")?;
+    let handle = tokio::spawn(serve(endpoint));
+    Ok((local_addr, handle))
+}
+
+/// A fresh, random 16-byte serial for [`test_certs`] — same width as
+/// `wiremesh-trust::random_serial`. Not cryptographically tied to that
+/// function (this is test tooling, not the real CA), but deliberately the
+/// same byte length so serial encoding/normalization behaves identically.
+fn test_cert_random_serial() -> [u8; 16] {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    // No `rand` dependency in this crate; a simple splitmix64-style mix
+    // seeded from wall-clock time plus PID is more than sufficient entropy
+    // for test-only, non-security-sensitive serial uniqueness.
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+        ^ (std::process::id() as u128) << 64;
+    let mut state = seed as u64 ^ 0x9E3779B97F4A7C15;
+    let mut bytes = [0u8; 16];
+    for chunk in bytes.chunks_mut(8) {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        chunk.copy_from_slice(&state.to_le_bytes()[..chunk.len()]);
+    }
+    bytes
+}
+
+/// Test/embed-convenience certificate generation, graduated (Cycle 4c Task
+/// 7) from `src/bin/mkcerts.rs`'s `main`: writes a self-signed CA plus leaf
+/// certs for the relay and every given gateway id into `dir` — `ca.pem`,
+/// `relay.pem`/`relay.key` (SAN "relay"), and per id a
+/// `gw-<id>.pem`/`gw-<id>.key` (+ `<id>.serial`, the lowercase-hex serial in
+/// `wiremesh-trust::hex_encode`'s encoding, so a test can put it on a
+/// [`Denylist`]). Every leaf gets an explicit 16-byte serial (rather than
+/// rcgen's own random default) for exactly that reason.
+///
+/// `bin/mkcerts.rs` is refactored to call this; its CLI behavior (defaulting
+/// to `gw-A`/`gw-B` when no ids are given) is unchanged, and lives in the
+/// bin, not here — this function always generates leaves for exactly the
+/// `gateway_ids` given.
+pub fn test_certs(dir: &Path, gateway_ids: &[&str]) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+
+    let ca_key = KeyPair::generate().context("generating CA key")?;
+    let mut ca_params = CertificateParams::new(vec![]).context("building CA cert params")?;
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let ca_cert = ca_params.self_signed(&ca_key).context("self-signing CA cert")?;
+    std::fs::write(dir.join("ca.pem"), ca_cert.pem()).context("writing ca.pem")?;
+
+    // SANs include the loopback-adjacent test addresses used by natlab labs
+    // (203.0.113.1 / 198.51.100.1, TEST-NET-3/TEST-NET-2) so the same certs
+    // work whether a test dials 127.0.0.1 (server_name = the leaf's CN, e.g.
+    // "relay") or a future netns-based test dials one of these IPs directly.
+    let mut names: Vec<String> = vec!["relay".to_string()];
+    names.extend(gateway_ids.iter().map(|s| s.to_string()));
+    for name in &names {
+        let key = KeyPair::generate().with_context(|| format!("generating key for {name}"))?;
+        let mut params = CertificateParams::new(vec![
+            name.to_string(),
+            "203.0.113.1".to_string(),
+            "198.51.100.1".to_string(),
+        ])
+        .with_context(|| format!("building cert params for {name}"))?;
+        params.distinguished_name.push(DnType::CommonName, name.as_str());
+        let serial = test_cert_random_serial();
+        params.serial_number = Some(SerialNumber::from_slice(&serial));
+        let cert = params
+            .signed_by(&key, &ca_cert, &ca_key)
+            .with_context(|| format!("signing cert for {name}"))?;
+        std::fs::write(dir.join(format!("{name}.pem")), cert.pem())
+            .with_context(|| format!("writing {name}.pem"))?;
+        std::fs::write(dir.join(format!("{name}.key")), key.serialize_pem())
+            .with_context(|| format!("writing {name}.key"))?;
+        let serial_hex: String = serial.iter().map(|b| format!("{b:02x}")).collect();
+        std::fs::write(dir.join(format!("{name}.serial")), &serial_hex)
+            .with_context(|| format!("writing {name}.serial"))?;
+    }
+
     Ok(())
 }
 
