@@ -342,4 +342,60 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn relayed_probes_direct_while_relay_available() {
+        let t0 = Instant::now();
+        let mut p = Path::new(t0);
+
+        // Drive into Relayed via the Connecting timeout with a relay
+        // available.
+        let action = p.tick(t0 + CONNECT_TIMEOUT, true);
+        assert_eq!(p.state, PathState::Relayed);
+        assert_eq!(action, Some(PathAction::MarkRelayNeeded));
+
+        // While the relay stays available, tick should ask the driver to
+        // run a low-rate background direct probe (make-before-break) and
+        // MUST stay on the relay path — it keeps carrying traffic.
+        let action = p.tick(t0 + CONNECT_TIMEOUT + Duration::from_secs(1), true);
+        assert_eq!(action, Some(PathAction::ProbeDirect));
+        assert_eq!(p.state, PathState::Relayed);
+    }
+
+    #[test]
+    fn relayed_repaths_to_disconnected_when_relay_lost() {
+        let t0 = Instant::now();
+        let mut p = Path::new(t0);
+
+        // Drive into Relayed.
+        let action = p.tick(t0 + CONNECT_TIMEOUT, true);
+        assert_eq!(p.state, PathState::Relayed);
+        assert_eq!(action, Some(PathAction::MarkRelayNeeded));
+
+        // The relay path itself is now gone: re-path to Disconnected and
+        // ask the driver to re-establish a path.
+        let lost_at = t0 + CONNECT_TIMEOUT + Duration::from_secs(2);
+        let action = p.tick(lost_at, false);
+        assert_eq!(p.state, PathState::Disconnected);
+        assert_eq!(action, Some(PathAction::MarkRelayNeeded));
+    }
+
+    #[test]
+    fn relayed_recovers_to_direct_on_handshake() {
+        let t0 = Instant::now();
+        let mut p = Path::new(t0);
+
+        // Drive into Relayed.
+        let action = p.tick(t0 + CONNECT_TIMEOUT, true);
+        assert_eq!(p.state, PathState::Relayed);
+        assert_eq!(action, Some(PathAction::MarkRelayNeeded));
+
+        // A completed direct handshake is the make-before-break cutover:
+        // recover straight to Direct, refreshing liveness timestamps.
+        let hs_at = t0 + CONNECT_TIMEOUT + Duration::from_secs(3);
+        p.on_handshake(hs_at);
+        assert_eq!(p.state, PathState::Direct);
+        assert_eq!(p.last_handshake, Some(hs_at));
+        assert_eq!(p.last_inbound, Some(hs_at));
+    }
 }
