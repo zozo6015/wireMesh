@@ -306,6 +306,81 @@ mod tests {
     }
 
     #[test]
+    fn apply_delta_relays_updated_true_replaces_relays() {
+        let mut ds = DesiredState {
+            relays: vec![RelayInfo { relay_id: 1, endpoint: "9.9.9.9:1".into() }],
+            ..Default::default()
+        };
+        let delta = Delta {
+            revision: 2,
+            upserted_peers: vec![],
+            removed_peer_ids: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![RelayInfo { relay_id: 7, endpoint: "1.2.3.4:4443".into() }],
+            relays_updated: true,
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec![],
+        };
+        ds.apply_delta(&delta);
+        assert_eq!(
+            ds.relays,
+            vec![RelayInfo { relay_id: 7, endpoint: "1.2.3.4:4443".into() }]
+        );
+    }
+
+    #[test]
+    fn apply_delta_relays_updated_true_and_empty_clears_relays() {
+        // Starting state HAS a relay: this is the last-relay-eviction case the
+        // fix enables. The old `if !d.relay_infos.is_empty()` guard could
+        // never clear `self.relays` to empty — this test would fail under it.
+        let mut ds = DesiredState {
+            relays: vec![RelayInfo { relay_id: 3, endpoint: "5.6.7.8:4443".into() }],
+            ..Default::default()
+        };
+        let delta = Delta {
+            revision: 2,
+            upserted_peers: vec![],
+            removed_peer_ids: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: true,
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec![],
+        };
+        ds.apply_delta(&delta);
+        assert_eq!(ds.relays, Vec::<RelayInfo>::new());
+    }
+
+    #[test]
+    fn apply_delta_relays_updated_false_leaves_relays_unchanged() {
+        // A sparse, non-relay delta (relays_updated: false, empty relay_infos)
+        // must not wipe an existing relay set — the reason the old guard
+        // existed in the first place.
+        let mut ds = DesiredState {
+            relays: vec![RelayInfo { relay_id: 4, endpoint: "2.2.2.2:4443".into() }],
+            ..Default::default()
+        };
+        let delta = Delta {
+            revision: 2,
+            upserted_peers: vec![peer(7, "PUBX", "c:3")],
+            removed_peer_ids: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: false,
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec![],
+        };
+        ds.apply_delta(&delta);
+        assert_eq!(
+            ds.relays,
+            vec![RelayInfo { relay_id: 4, endpoint: "2.2.2.2:4443".into() }]
+        );
+    }
+
+    #[test]
     fn cert_revoked_delta_unions_serials() {
         let mut ds = DesiredState {
             revoked_serials: vec!["A".into()],
