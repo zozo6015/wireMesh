@@ -160,3 +160,40 @@ impl Drop for RelayTransport {
         self.downlink.abort();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Review fix (4c Task 8, CRITICAL): every peer's `RelayTransport` used
+    /// to register at the relay under the same `gateway_id`, so a gateway
+    /// relaying 2+ peers through one relay would collide in the relay's
+    /// registry and one peer's downlink would go dark. `relay_pair_id` must
+    /// give each ordered (my, peer) pair its own id, deterministically, and
+    /// fit within the relay's 8-byte truncated registration id.
+    #[test]
+    fn relay_pair_id_is_directional_distinct_and_bounded() {
+        // Directional: A's registration id (for the A->B pair) must differ
+        // from B's registration id (for the B->A pair), or the two peers'
+        // registrations collide at the relay.
+        assert_ne!(relay_pair_id(1, 2), relay_pair_id(2, 1));
+
+        // Distinct per peer: one gateway's ids for two different peers must
+        // never collide — this is the whole point of the fix.
+        assert_ne!(relay_pair_id(1, 2), relay_pair_id(1, 3));
+
+        // Deterministic: same inputs, same id, every time.
+        assert_eq!(relay_pair_id(1, 2), relay_pair_id(1, 2));
+
+        // Bounded: must fit the relay's 8-byte truncated registration id,
+        // even for large gateway ids.
+        assert!(relay_pair_id(1, 2).len() <= 8, "must fit the relay's 8-byte id");
+        assert!(
+            relay_pair_id(u64::MAX, u64::MAX - 1).len() <= 8,
+            "must fit the relay's 8-byte id even for large ids"
+        );
+
+        // ASCII: must survive the relay's byte-truncation as a valid string.
+        assert!(relay_pair_id(1, 2).is_ascii());
+    }
+}

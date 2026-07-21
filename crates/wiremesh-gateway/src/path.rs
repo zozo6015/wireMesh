@@ -401,6 +401,50 @@ mod tests {
         assert_eq!(action, Some(PathAction::MarkRelayNeeded));
     }
 
+    /// Review fix (4c Task 8, IMPORTANT): `backoff` only ever grew across a
+    /// peer's lifetime, so a later relay re-path could exceed the <=15s SLA
+    /// because it inherited an already-escalated backoff from an earlier,
+    /// unrelated disconnect. A completed handshake means the path recovered,
+    /// so `on_handshake` must reset `backoff` back to `BACKOFF_INITIAL` —
+    /// the next disconnect should start fresh, not from the ceiling.
+    #[test]
+    fn on_handshake_resets_backoff() {
+        let mut t = Instant::now();
+        let mut p = Path::new(t);
+
+        // Drive the same Disconnected -> Connecting -> Disconnected cycle as
+        // `disconnected_backoff_increases_then_caps` far enough to escalate
+        // backoff above BACKOFF_INITIAL (2s -> 4s -> 8s after 2 cycles).
+        t += CONNECT_TIMEOUT;
+        let action = p.tick(t, false);
+        assert_eq!(p.state, PathState::Disconnected);
+        assert_eq!(action, Some(PathAction::MarkRelayNeeded));
+
+        for _ in 0..2 {
+            let this_backoff = p.backoff;
+            t += this_backoff;
+            let action = p.tick(t, false);
+            assert_eq!(p.state, PathState::Connecting);
+            assert_eq!(action, Some(PathAction::StartPunch));
+
+            t += CONNECT_TIMEOUT;
+            let action = p.tick(t, false);
+            assert_eq!(p.state, PathState::Disconnected);
+            assert_eq!(action, Some(PathAction::MarkRelayNeeded));
+        }
+
+        assert!(
+            p.backoff > BACKOFF_INITIAL,
+            "backoff should have escalated above the initial value by now, got {:?}",
+            p.backoff
+        );
+
+        // Recovery: a completed handshake resets backoff to BACKOFF_INITIAL
+        // so the next disconnect's retry cadence starts fresh.
+        p.on_handshake(t + Duration::from_secs(1));
+        assert_eq!(p.backoff, BACKOFF_INITIAL);
+    }
+
     #[test]
     fn relayed_recovers_to_direct_on_handshake() {
         let t0 = Instant::now();
