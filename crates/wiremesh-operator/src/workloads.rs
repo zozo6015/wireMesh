@@ -19,6 +19,7 @@
 //! is plaintext-bearer and binds loopback-only by design. The operator's admin
 //! channel is resolved in the reconciler phase.
 
+use anyhow::Context;
 use crate::crd::{
     WiremeshControllerSpec, WiremeshGateway, WiremeshRelay,
 };
@@ -378,22 +379,28 @@ pub fn gateway_deployment(
 /// A relay Deployment. An enroll init-container writes the relay's
 /// `ca.pem`/`relay.pem`/`relay.key` into a shared cert dir; the main container
 /// runs the QUIC bridge over it.
+///
+/// **Fails closed** on an invalid `endpoint`: v1 is IPv4-only, so the endpoint
+/// must be a valid IPv4 `host:port` (the same `SocketAddrV4` the controller
+/// itself requires at relay enrollment, `enrollment.rs:121`). An `Err` here
+/// makes the reconciler reject the CR rather than deploy a relay that binds a
+/// fallback port diverging from what it advertised/enrolled.
 pub fn relay_deployment(
     r: &WiremeshRelay,
     controller_sync: &str,
     controller_enroll: &str,
     ca_secret: &str,
     token_secret: &str,
-) -> Deployment {
+) -> anyhow::Result<Deployment> {
     let name = r.metadata.name.clone().unwrap_or_else(|| "wiremesh-relay".to_string());
     let image = r.spec.image.clone().unwrap_or_else(|| DEFAULT_RELAY_IMAGE.to_string());
     let endpoint = r.spec.endpoint.clone();
-    // The QUIC bridge binds all interfaces on the advertised endpoint's port.
-    // The endpoint is validated (IPv4 host:port) by the relay reconciler before
-    // it reaches this pure builder — see docs/research/operator-remote-deployment-notes.md
-    // — so a malformed value never gets here; the `51820` fallback is only a
-    // last-resort default, never the silent-divergence path CodeRabbit flagged.
-    let bind_port = endpoint.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(51820);
+    // Validate the advertised endpoint (IPv4 host:port) up front — no silent
+    // fallback. The QUIC bridge binds all interfaces on this port.
+    let addr: std::net::SocketAddrV4 = endpoint.parse().with_context(|| {
+        format!("WiremeshRelay endpoint {endpoint:?} must be a valid IPv4 host:port (v1 is IPv4-only)")
+    })?;
+    let bind_port = addr.port();
     let sync = controller_sync.to_string();
 
     // enroll init-container: `--token-file` (no shell), invoked directly so the
@@ -461,7 +468,7 @@ pub fn relay_deployment(
         ..Default::default()
     };
 
-    Deployment {
+    Ok(Deployment {
         metadata: ObjectMeta { name: Some(name.clone()), labels: Some(labels(&name)), ..Default::default() },
         spec: Some(DeploymentSpec {
             replicas: Some(1),
@@ -473,7 +480,7 @@ pub fn relay_deployment(
             ..Default::default()
         }),
         ..Default::default()
-    }
+    })
 }
 
 #[cfg(test)]
@@ -597,13 +604,12 @@ mod tests {
         let r = WiremeshRelay::new(
             "r",
             WiremeshRelaySpec {
-                // A value that WOULD be dangerous under `sh -c`.
-                endpoint: "203.0.113.9:4443; rm -rf /".into(),
+                endpoint: "203.0.113.9:4443".into(),
                 node_name: None,
                 image: None,
             },
         );
-        let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token");
+        let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
 
         for d in [gd, rd] {
             let pod = d.spec.unwrap().template.spec.unwrap();
@@ -634,7 +640,7 @@ mod tests {
             "relay-eu",
             WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None },
         );
-        let d = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "relay-eu-token");
+        let d = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "relay-eu-token").unwrap();
         let pod = d.spec.unwrap().template.spec.unwrap();
         // enroll init container present.
         assert!(pod.init_containers.as_ref().unwrap().iter().any(|c| c.name == "enroll"));
@@ -642,5 +648,19 @@ mod tests {
         let main = pod.containers.iter().find(|c| c.name == "relay").unwrap();
         let args = main.args.as_ref().unwrap();
         assert!(args.iter().any(|a| a == "0.0.0.0:4443"), "relay binds the endpoint port: {args:?}");
+    }
+
+    #[test]
+    fn relay_deployment_fails_closed_on_invalid_endpoint() {
+        for bad in ["not-an-endpoint", "203.0.113.9", "example.com:4443", "[::1]:4443", "203.0.113.9:4443; rm -rf /"] {
+            let r = WiremeshRelay::new(
+                "r",
+                WiremeshRelaySpec { endpoint: bad.into(), node_name: None, image: None },
+            );
+            assert!(
+                relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").is_err(),
+                "endpoint {bad:?} must be rejected (v1 is IPv4 host:port only)"
+            );
+        }
     }
 }
