@@ -38,7 +38,9 @@ use std::collections::BTreeMap;
 const DEFAULT_CONTROLLER_IMAGE: &str = "ghcr.io/zozo6015/wiremesh-controller:latest";
 const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/zozo6015/wiremesh-gateway:latest";
 const DEFAULT_RELAY_IMAGE: &str = "ghcr.io/zozo6015/wiremesh-relay:latest";
-const DEFAULT_FABRICCTL_IMAGE: &str = "ghcr.io/zozo6015/wiremesh-fabricctl:latest";
+/// The operator's own image, used for the controller pod's admin-exec sidecar.
+/// The reconciler overrides this with the operator's actual running image.
+pub const DEFAULT_OPERATOR_IMAGE: &str = "ghcr.io/zozo6015/wiremesh-operator:latest";
 
 const ENROLL_TCP_PORT: i32 = 9400; // WIREMESH_TCP_PORT (Enrollment RPC, server-TLS)
 const SYNC_TCP_PORT: i32 = 9500; // WIREMESH_SYNC_TCP_PORT (mTLS)
@@ -168,27 +170,17 @@ pub fn controller_service(name: &str, spec: &WiremeshControllerSpec) -> Service 
     }
 }
 
-/// The admin-token bootstrap sidecar: a native sidecar (init container with
-/// `restartPolicy: Always`) that shares the controller's UDS run-dir, waits for
-/// the socket, and mints the operator's admin token over the implicit-admin
-/// UDS. Writing that token into `out_secret` is wired by the WiremeshController
-/// reconciler (Task 5) — this builder produces the container shape.
-pub fn bootstrap_init_container(admin_uds: &str, out_secret: &str) -> Container {
+/// The admin-exec sidecar: the operator image running `idle` in the controller
+/// pod, sharing the controller's UDS run-dir. The operator reconciler `kube
+/// exec`s `wiremesh-operator operator-admin <op>` in this container, which then
+/// talks to the controller's implicit-admin UDS (no bearer token needed). This
+/// is the operator↔controller admin channel (spec §0 amendment).
+pub fn admin_exec_sidecar(operator_image: &str) -> Container {
     Container {
-        name: "admin-token-bootstrap".to_string(),
-        image: Some(DEFAULT_FABRICCTL_IMAGE.to_string()),
-        // Native sidecar: starts alongside the controller, does not gate the
-        // main container on completion (it never completes — it idles once the
-        // token is minted).
-        restart_policy: Some("Always".to_string()),
-        command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-        args: Some(vec![format!(
-            "until [ -S {admin_uds} ]; do sleep 1; done; \
-             fabricctl token mint operator --role admin --socket {admin_uds} \
-               > {RUN_DIR}/operator.token; \
-             echo 'admin-token-bootstrap: minted operator token'; sleep infinity"
-        )]),
-        env: Some(vec![env("TOKEN_SECRET_NAME", out_secret)]),
+        name: "admin-exec".to_string(),
+        image: Some(operator_image.to_string()),
+        command: Some(vec!["wiremesh-operator".to_string(), "idle".to_string()]),
+        // Read-only view of the UDS is enough — operator-admin only dials it.
         volume_mounts: Some(vec![VolumeMount {
             name: "run".to_string(),
             mount_path: RUN_DIR.to_string(),
@@ -199,8 +191,9 @@ pub fn bootstrap_init_container(admin_uds: &str, out_secret: &str) -> Container 
 }
 
 /// The controller Deployment: 1 replica, PVC at `/var/lib/wiremesh`, the six
-/// `WIREMESH_*` env vars, listener ports, and the admin-token bootstrap sidecar.
-pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec) -> Deployment {
+/// `WIREMESH_*` env vars, listener ports, and the admin-exec sidecar (running
+/// `operator_image`) the operator execs admin ops into over the shared UDS.
+pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator_image: &str) -> Deployment {
     let image = spec.image.clone().unwrap_or_else(|| DEFAULT_CONTROLLER_IMAGE.to_string());
     let sync = spec.sync_tcp_port.map(|p| p as i32).unwrap_or(SYNC_TCP_PORT);
     let admin = spec.admin_tcp_port.map(|p| p as i32).unwrap_or(ADMIN_TCP_PORT);
@@ -229,8 +222,7 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec) -> Deplo
     };
 
     let pod = PodSpec {
-        init_containers: Some(vec![bootstrap_init_container(UDS_PATH, &format!("{name}-admin-token"))]),
-        containers: vec![container],
+        containers: vec![container, admin_exec_sidecar(operator_image)],
         volumes: Some(vec![
             Volume {
                 name: "data".to_string(),
@@ -506,26 +498,24 @@ mod tests {
     }
 
     #[test]
-    fn controller_deployment_has_pvc_and_bootstrap_init() {
-        let d = controller_deployment("wm", &ctrl_spec());
+    fn controller_deployment_has_pvc_and_admin_exec_sidecar() {
+        let d = controller_deployment("wm", &ctrl_spec(), "ghcr.io/x/wiremesh-operator:test");
         let pod = d.spec.unwrap().template.spec.unwrap();
-        // PVC mounted at /var/lib/wiremesh.
-        let ctr = &pod.containers[0];
+        // PVC mounted at /var/lib/wiremesh on the controller container.
+        let ctr = pod.containers.iter().find(|c| c.name == "controller").unwrap();
         let mounts = ctr.volume_mounts.as_ref().unwrap();
         assert!(
             mounts.iter().any(|m| m.name == "data" && m.mount_path == "/var/lib/wiremesh"),
             "controller must mount its PVC at /var/lib/wiremesh"
         );
         let data_vol = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == "data").unwrap();
-        assert_eq!(
-            data_vol.persistent_volume_claim.as_ref().unwrap().claim_name,
-            "wm-data"
-        );
-        // Bootstrap init container present + named.
-        let inits = pod.init_containers.as_ref().unwrap();
+        assert_eq!(data_vol.persistent_volume_claim.as_ref().unwrap().claim_name, "wm-data");
+        // admin-exec sidecar (operator image) sharing the UDS run-dir.
+        let sidecar = pod.containers.iter().find(|c| c.name == "admin-exec").expect("admin-exec sidecar");
+        assert_eq!(sidecar.image.as_deref(), Some("ghcr.io/x/wiremesh-operator:test"));
         assert!(
-            inits.iter().any(|c| c.name == "admin-token-bootstrap"),
-            "controller must have the admin-token-bootstrap init container"
+            sidecar.volume_mounts.as_ref().unwrap().iter().any(|m| m.mount_path == "/run/wiremesh"),
+            "admin-exec sidecar must share the controller UDS run-dir"
         );
     }
 

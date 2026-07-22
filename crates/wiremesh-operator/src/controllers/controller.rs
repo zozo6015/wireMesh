@@ -7,18 +7,13 @@ use crate::crd::{Condition, WiremeshController, WiremeshControllerStatus};
 use crate::workloads;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret, Service};
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Service};
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, ResourceExt};
 use std::sync::Arc;
 use std::time::Duration;
-
-/// The Secret the bootstrap sidecar writes the operator's admin token into.
-pub fn admin_token_secret(controller_name: &str) -> String {
-    format!("{controller_name}-admin-token")
-}
 
 async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = ctx.namespace.clone();
@@ -38,26 +33,22 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
     svc.metadata.owner_references = Some(vec![oref.clone()]);
     apply(&Api::<Service>::namespaced(client.clone(), &ns), &svc).await?;
 
-    let mut dep = workloads::controller_deployment(&name, &cr.spec);
+    let operator_image =
+        std::env::var("OPERATOR_IMAGE").unwrap_or_else(|_| workloads::DEFAULT_OPERATOR_IMAGE.to_string());
+    let mut dep = workloads::controller_deployment(&name, &cr.spec, &operator_image);
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![oref.clone()]);
     apply(&Api::<Deployment>::namespaced(client.clone(), &ns), &dep).await?;
 
-    // Ready iff the Deployment reports an available replica AND the bootstrap
-    // sidecar has populated the admin-token Secret.
+    // Ready iff the Deployment reports an available replica. (No admin-token
+    // bootstrap: the operator reaches Admin over the pod-local implicit-admin
+    // UDS via the admin-exec sidecar — spec §0.)
     let live = Api::<Deployment>::namespaced(client.clone(), &ns).get(&name).await?;
-    let available = live
+    let ready = live
         .status
         .and_then(|s| s.available_replicas)
         .unwrap_or(0)
         >= 1;
-    let token_ready = matches!(
-        Api::<Secret>::namespaced(client.clone(), &ns)
-            .get_opt(&admin_token_secret(&name))
-            .await?,
-        Some(s) if s.data.as_ref().map(|d| d.contains_key("token")).unwrap_or(false)
-    );
-    let ready = available && token_ready;
 
     // The advertised control-plane endpoint gateways/relays dial (sync-tcp).
     // (admin-tcp is loopback-only and never exposed — spec §0.)
