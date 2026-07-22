@@ -6,6 +6,35 @@ CRDs**, **Rust + `kube-rs`**. Build is a separate agent-driven cycle (subagent b
 the design session was spent). Complements the merged container images
 (ghcr.io/zozo6015/wiremesh-*) and the release-distribution spec.
 
+## 0. Amendments (2026-07-22, post-implementation — these SUPERSEDE the body where they conflict)
+
+Discovered while implementing Tasks 1–4 (PR #16) and ratified with the owner. Detail
+lives in `docs/research/`.
+
+1. **Admin transport is NOT routable TCP.** The controller's Admin TCP listener binds
+   **loopback-only by design** (plaintext bearer). The operator therefore drives admin ops
+   (`Apply`/`MintToken`/`RegisterRelay`/`Drain`) by `exec`-ing `fabricctl --socket <uds>` in a
+   controller-pod **admin-exec sidecar** sharing the UDS — NOT the TCP `FabricAdmin` client
+   (which is kept only for local/out-of-cluster + tests). The controller `Service` exposes
+   enroll-tcp + sync-tcp + observe-udp, **never admin-tcp.** See
+   `operator-admin-channel-gap.md`. (Fixes body §2/§5 "Admin TCP" mentions.)
+2. **RBAC:** the operator ServiceAccount needs `pods/exec` (create) + `pods` (get/list) for
+   that sidecar transport, on top of the CRD + `deployments/services/pvc/secrets` perms.
+3. **Gateway identity must persist across pod replacement.** The gateway loads a
+   pre-provisioned `Identity` at boot; an `emptyDir` state volume is lost on restart, forcing a
+   re-enroll (and a fresh single-use token). Use a **PVC** for the gateway `--state-dir` (and
+   the relay `certdir`), OR have the reconciler re-mint + re-enroll on restart. The Task-4
+   builders currently emit `emptyDir` — the gateway reconciler must switch this to a PVC.
+4. **Controller reachability + hostname contract (for remote/DDNS gateways).** `WiremeshController`
+   needs a Service-exposure knob (`ClusterIP`/`LoadBalancer`/`NodePort` + external address);
+   observe-udp needs client-source preservation (`externalTrafficPolicy: Local` on the exposed
+   Service only); and the gateway's `--controller-sync`/`--observe` must accept a **hostname +
+   re-resolve** (a small gateway fast-follow) **before** the gateway reconciler, or it can only
+   emit IP literals. See `operator-remote-deployment-notes.md`.
+5. **Enrollment client** (the token→identity bootstrap the body assumes) is **built** —
+   `wiremesh-enroll` + `wiremesh-gateway enroll` + `wiremesh-relay-enroll`. See
+   `operator-enrollment-client-gap.md`.
+
 ## 1. Goal
 Make a WireMesh fabric fully declarative on Kubernetes: `kubectl apply` a set of CRDs and
 the operator brings up the control plane, deploys the data-plane gateways/relays, and keeps

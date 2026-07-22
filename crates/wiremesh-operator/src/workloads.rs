@@ -389,6 +389,10 @@ pub fn relay_deployment(
     let image = r.spec.image.clone().unwrap_or_else(|| DEFAULT_RELAY_IMAGE.to_string());
     let endpoint = r.spec.endpoint.clone();
     // The QUIC bridge binds all interfaces on the advertised endpoint's port.
+    // The endpoint is validated (IPv4 host:port) by the relay reconciler before
+    // it reaches this pure builder — see docs/research/operator-remote-deployment-notes.md
+    // — so a malformed value never gets here; the `51820` fallback is only a
+    // last-resort default, never the silent-divergence path CodeRabbit flagged.
     let bind_port = endpoint.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(51820);
     let sync = controller_sync.to_string();
 

@@ -39,7 +39,6 @@ async fn enroll_writes_loadable_identity() {
         ca_path,
         state_dir: state_dir.clone(),
         cidrs: vec!["10.0.0.0/16".into()],
-        endpoint: String::new(),
     })
     .await
     .expect("gateway enroll should succeed against a live controller");

@@ -21,9 +21,13 @@ pub struct EnrollArgs {
     /// Where the `Identity` is written (the gateway's `--state-dir`).
     pub state_dir: PathBuf,
     pub cidrs: Vec<String>,
-    /// Optional advertised `ip:port` (empty when unknown at enroll time).
-    pub endpoint: String,
 }
+// NOTE: a gateway enrollment carries NO `endpoint`. On the controller
+// (`services/enrollment.rs:112`) a non-empty `EnrollRequest.endpoint` selects
+// the RELAY enrollment path, so a gateway that sent one would be misrouted and
+// rejected (its token is `kind = gateway`, not `relay`). The gateway's own
+// reachable endpoint is learned later via the observe channel, never declared
+// at enroll time. Hence no `--endpoint` flag here (relays have their own bin).
 
 /// Generate a WG keypair, enroll, and persist the identity.
 pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
@@ -44,7 +48,7 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
         &args.token,
         &args.cidrs,
         &wg_pubkey,
-        &args.endpoint,
+        "", // gateways declare no endpoint at enroll (see EnrollArgs note)
         "gateway",
     )
     .await
@@ -77,7 +81,6 @@ pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<Enroll
     let mut ca = None;
     let mut state_dir = None;
     let mut cidrs = Vec::new();
-    let mut endpoint = String::new();
     while let Some(flag) = it.next() {
         let mut val = || it.next().ok_or_else(|| anyhow!("flag {flag} needs a value"));
         match flag.as_str() {
@@ -89,7 +92,6 @@ pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<Enroll
             "--ca" => ca = Some(PathBuf::from(val()?)),
             "--state-dir" => state_dir = Some(PathBuf::from(val()?)),
             "--cidr" => cidrs.push(val()?),
-            "--endpoint" => endpoint = val()?,
             other => return Err(anyhow!("unknown enroll flag {other}")),
         }
     }
@@ -100,7 +102,6 @@ pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<Enroll
         ca_path: ca.ok_or_else(|| anyhow!("--ca required"))?,
         state_dir: state_dir.ok_or_else(|| anyhow!("--state-dir required"))?,
         cidrs,
-        endpoint,
     })
 }
 

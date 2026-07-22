@@ -1,7 +1,13 @@
 # Finding: no production enrollment client blocks the operator's gateway/relay workloads
 
 **Date:** 2026-07-22 (during K8s operator build, Task 4).
-**Status:** OPEN — scope decision required before Tasks 7 (gateway) / 8 (relay) workloads.
+**Status:** ✅ RESOLVED (same day) — owner chose "build it first"; the
+`wiremesh-enroll` crate + `wiremesh-gateway enroll` + `wiremesh-relay-enroll`
+subcommands now perform client-side enrollment (token → on-disk identity in the
+exact layout each binary loads), all three landed green in this PR. The "no
+shipped binary" statements below describe the pre-fix state and are retained for
+context. Gateway/relay pods bootstrap identity via an `enroll` init-container
+(`workloads.rs`). See `docs/superpowers/plans/2026-07-22-enrollment-client.md`.
 
 ## What the operator needs
 

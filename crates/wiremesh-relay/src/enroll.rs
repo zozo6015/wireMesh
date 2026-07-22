@@ -28,14 +28,22 @@ pub struct EnrollArgs {
 /// deployment note). Re-applies the mode even if the file pre-existed looser.
 fn write_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut opts = fs::OpenOptions::new();
-    opts.write(true).create(true).truncate(true).mode(0o600);
+    // Do NOT truncate at open. If `path` pre-exists with loose permissions,
+    // truncating + writing before the chmod would leave the new private key
+    // world-readable for that window. Instead: open, tighten to 0600 FIRST,
+    // THEN truncate and write — so the secret content only ever lands in an
+    // already-0600 file. (`mode(0o600)` alone only covers freshly-created
+    // files; the explicit chmod covers a reused inode.)
+    opts.write(true).create(true).truncate(false).mode(0o600);
     let mut f = opts
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
-    f.write_all(bytes)
-        .with_context(|| format!("writing {}", path.display()))?;
     f.set_permissions(fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    f.set_len(0)
+        .with_context(|| format!("truncating {}", path.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 

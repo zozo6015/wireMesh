@@ -4,6 +4,7 @@
 //! bootstrap (see `controllers::controller`).
 
 use anyhow::Context;
+use std::time::Duration;
 use tonic::service::interceptor::InterceptedService;
 use tonic::service::Interceptor;
 use tonic::transport::Channel;
@@ -40,6 +41,11 @@ impl FabricAdmin {
     pub async fn connect(admin_tcp_addr: &str, bearer_token: &str) -> anyhow::Result<Self> {
         let channel = Channel::from_shared(format!("http://{admin_tcp_addr}"))
             .context("controller Admin TCP addr must form a valid URI")?
+            // tonic applies no connect/request timeout by default — without
+            // these a reconcile that dials an unreachable controller hangs
+            // forever, wedging the reconcile loop.
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(30))
             .connect()
             .await
             .with_context(|| format!("connecting to controller Admin TCP at {admin_tcp_addr}"))?;

@@ -78,11 +78,17 @@ mesh that throws away NAT traversal, with no error to point at.
 `externalTrafficPolicy: Local` on the Service (preserves client IP), or a
 `hostPort`/NodePort straight to the controller; if routing observe through Envoy
 `UDPRoute`, verify it preserves the client source (transparent mode) and don't
-use it otherwise. The gateway/relay reconciler should set
-`externalTrafficPolicy: Local` on the controller Service by default and document
-this. **Verification:** after a remote gateway connects, confirm the
-controller's observed endpoint for it is the gateway's real public `ip:port`,
-not the node/proxy address.
+use it otherwise. **Scope + caveat:** `externalTrafficPolicy` is only valid on
+externally-exposed Service types (`LoadBalancer`/`NodePort`) — it does nothing
+for a `ClusterIP` (there is no external hop to SNAT), so the reconciler should
+set `Local` **only when it selects `LoadBalancer`/`NodePort`** (Finding 1's
+exposure knob), not unconditionally. Note `Local` also drops packets on nodes
+with no local backend pod and skips cross-node load-balancing — fine for the
+single-replica controller here, but that's why it's not a blanket default. The
+observe port specifically needs it (or a `hostPort`); enroll/sync-tcp don't
+care (no source-derived candidate). **Verification:** after a remote gateway
+connects, confirm the controller's observed endpoint for it is the gateway's
+real public `ip:port`, not the node/proxy address.
 
 ## Finding 3 — the gateway can't take the controller as a hostname for Sync/observe (breaks dynamic-IP DDNS)
 
