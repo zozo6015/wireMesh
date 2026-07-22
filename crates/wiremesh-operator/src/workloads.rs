@@ -400,7 +400,13 @@ pub fn relay_deployment(
     let addr: std::net::SocketAddrV4 = endpoint.parse().with_context(|| {
         format!("WiremeshRelay endpoint {endpoint:?} must be a valid IPv4 host:port (v1 is IPv4-only)")
     })?;
+    // Port 0 parses but means "OS-assigned/any" — a relay that bound :0 would
+    // advertise an unusable endpoint, so reject it explicitly.
     let bind_port = addr.port();
+    anyhow::ensure!(
+        bind_port != 0,
+        "WiremeshRelay endpoint {endpoint:?} must specify a non-zero port"
+    );
     let sync = controller_sync.to_string();
 
     // enroll init-container: `--token-file` (no shell), invoked directly so the
@@ -652,7 +658,7 @@ mod tests {
 
     #[test]
     fn relay_deployment_fails_closed_on_invalid_endpoint() {
-        for bad in ["not-an-endpoint", "203.0.113.9", "example.com:4443", "[::1]:4443", "203.0.113.9:4443; rm -rf /"] {
+        for bad in ["not-an-endpoint", "203.0.113.9", "example.com:4443", "[::1]:4443", "203.0.113.9:4443; rm -rf /", "203.0.113.9:0"] {
             let r = WiremeshRelay::new(
                 "r",
                 WiremeshRelaySpec { endpoint: bad.into(), node_name: None, image: None },
