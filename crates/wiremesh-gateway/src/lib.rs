@@ -1,6 +1,7 @@
 //! wiremesh-gateway: direct-only WireGuard fabric gateway (Cycle 4a).
 pub mod config;
 pub mod enforce;
+pub mod enroll;
 pub mod epochkeys;
 pub mod identity;
 pub mod metrics;
