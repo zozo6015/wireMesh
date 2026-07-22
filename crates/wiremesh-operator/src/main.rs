@@ -16,16 +16,18 @@ fn operator_namespace() -> String {
 /// Build the admin transport from the environment. In-cluster (default) this is
 /// the UDS exec sidecar; a `WIREMESH_ADMIN_ADDR` (+`WIREMESH_ADMIN_TOKEN`) opts
 /// into the direct-gRPC transport for local runs against a reachable Admin TCP.
-fn admin_from_env(namespace: &str) -> AdminExec {
+fn admin_from_env(client: kube::Client, namespace: &str) -> AdminExec {
     if let Ok(addr) = std::env::var("WIREMESH_ADMIN_ADDR") {
         let token = std::env::var("WIREMESH_ADMIN_TOKEN").unwrap_or_default();
         AdminExec::Grpc { addr, token }
     } else {
         AdminExec::Exec {
+            client,
             namespace: namespace.to_string(),
             pod_label: std::env::var("WIREMESH_CONTROLLER_LABEL")
                 .unwrap_or_else(|_| "app.kubernetes.io/instance=wiremesh-controller".to_string()),
-            container: "admin-exec".to_string(),
+            container: std::env::var("WIREMESH_ADMIN_CONTAINER")
+                .unwrap_or_else(|_| "admin-exec".to_string()),
             uds: std::env::var("WIREMESH_SOCKET_PATH")
                 .unwrap_or_else(|_| "/run/wiremesh/controller.sock".to_string()),
         }
@@ -40,13 +42,20 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // `operator-admin` / `operator-bootstrap` subcommands run the in-controller-pod
-    // admin helper (UDS → Admin gRPC). Any other argv is the reconciler loop.
+    // `operator-admin <op>` runs the in-controller-pod admin helper (UDS → Admin
+    // gRPC, JSON out) — the reconciler `kube exec`s it. `idle` keeps the
+    // admin-exec sidecar alive so it can be exec'd into. Any other argv is the
+    // reconciler loop.
     let mut args = std::env::args();
     let _argv0 = args.next();
-    if matches!(args.next().as_deref(), Some("operator-admin") | Some("operator-bootstrap")) {
-        tracing::warn!("operator-admin subcommand is not yet implemented (see admin-channel notes)");
-        anyhow::bail!("operator-admin subcommand not yet implemented");
+    match args.next().as_deref() {
+        Some("operator-admin") => return wiremesh_operator::operator_admin::run(args).await,
+        Some("idle") => {
+            tracing::info!("wiremesh-operator idle (admin-exec sidecar)");
+            std::future::pending::<()>().await;
+            return Ok(());
+        }
+        _ => {}
     }
 
     let namespace = operator_namespace();
@@ -54,9 +63,9 @@ async fn main() -> anyhow::Result<()> {
 
     let client = kube::Client::try_default().await?;
     let ctx = Arc::new(Context {
-        client,
+        client: client.clone(),
         namespace: namespace.clone(),
-        admin: Arc::new(admin_from_env(&namespace)),
+        admin: Arc::new(admin_from_env(client, &namespace)),
     });
 
     // Liveness endpoint on :8080.

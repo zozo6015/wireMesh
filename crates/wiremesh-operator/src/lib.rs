@@ -7,6 +7,7 @@ pub mod admin_exec;
 pub mod controllers;
 pub mod crd;
 pub mod fabric;
+pub mod operator_admin;
 pub mod workloads;
 
 /// Liveness/readiness signal for the operator's HTTP probe endpoint. Returns

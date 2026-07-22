@@ -7,7 +7,7 @@ edition = "2021"
 # Kubernetes client + controller runtime + CRD derive. Pin TLS to rustls so it
 # unifies with the workspace's ring-backed rustls (see root Cargo.toml's rustls
 # note) rather than pulling aws-lc-rs.
-kube = { version = "0.95", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
+kube = { version = "0.95", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ws"] }
 k8s-openapi = { version = "0.23", features = ["v1_30"] }
 schemars = "0.8"
 tokio = { workspace = true }
@@ -21,4 +21,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 futures = "0.3"
 tonic = { workspace = true }
 prost = { workspace = true }
+# UDS gRPC client (operator-admin subcommand → controller's implicit-admin
+# socket): the same custom-connector pattern wiremesh-testkit uses.
+tower = { version = "0.4", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 wiremesh-proto = { path = "../wiremesh-proto" }
