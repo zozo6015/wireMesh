@@ -1,0 +1,12 @@
+# Build context for deploy/docker/Dockerfile — keep only what the release
+# workspace build needs (crates/, proto/, Cargo.toml, Cargo.lock).
+.git
+.github
+.claude
+.superpowers
+**/target
+target
+spike
+docs
+dev
+*.md
