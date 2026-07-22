@@ -1,0 +1,35 @@
+# WireMesh operator Helm values.
+
+# Container image registry/repo shared by all components. Individual repos are
+# derived as <registry>/<owner>/wiremesh-<component>.
+image:
+  registry: ghcr.io
+  owner: zozo6015
+  # Tag applied to the operator image (and used as the default for the
+  # controller/gateway/relay images the operator deploys).
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+operator:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  # Extra env for the operator container.
+  extraEnv: []
+  logLevel: info
+
+# RBAC (ClusterRole + binding + ServiceAccount). Disable only if you manage RBAC
+# out of band.
+rbac:
+  create: true
+
+serviceAccount:
+  create: true
+  name: wiremesh-operator
+
+# CRDs ship in the chart's crds/ directory (installed by Helm on first install;
+# Helm does NOT upgrade/delete CRDs — see docs/operator.md).

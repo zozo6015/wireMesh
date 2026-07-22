@@ -1,0 +1,58 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "wiremesh-operator.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wiremesh-operator.labels" . | nindent 4 }}
+{{- end }}
+{{- if .Values.rbac.create }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wiremesh-operator
+  labels:
+    {{- include "wiremesh-operator.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["wiremesh.io"]
+    resources: ["wiremeshcontrollers", "wiremeshsegments", "wiremeshpolicies", "wiremeshgateways", "wiremeshrelays"]
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["wiremesh.io"]
+    resources: ["wiremeshcontrollers/status", "wiremeshsegments/status", "wiremeshpolicies/status", "wiremeshgateways/status", "wiremeshrelays/status"]
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["wiremesh.io"]
+    resources: ["wiremeshsegments/finalizers", "wiremeshgateways/finalizers"]
+    verbs: ["update"]
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims", "secrets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wiremesh-operator
+  labels:
+    {{- include "wiremesh-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wiremesh-operator
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "wiremesh-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

@@ -1,0 +1,23 @@
+# A gateway fronting the `home` segment. The operator mints a single-use
+# enrollment token, then deploys a PRIVILEGED, hostNetwork gateway pod whose
+# enroll init-container redeems the token (writing its identity) before the
+# data plane starts.
+#
+# PREREQUISITE: the controller CA bundle must be published as a Secret named
+# `wiremesh-controller-ca` (key `tls.crt`) in the operator namespace for the
+# enroll `--ca` — see docs/operator.md ("CA bundle"). Without it, the gateway's
+# enroll init-container cannot trust the controller and will not start.
+#
+# Client routing (out of band): workloads on the segment must route the mesh
+# CIDRs to this gateway's node/LAN IP (static route / DHCP option 121 /
+# gateway-as-router). The operator can't set routes on your workloads.
+apiVersion: wiremesh.io/v1alpha1
+kind: WiremeshGateway
+metadata:
+  name: gw-home
+spec:
+  segmentRef: home        # -> the WiremeshSegment named "home"
+  # nodeName: <node>      # pin to a specific node (recommended for hostNetwork)
+  # nodeSelector: { kubernetes.io/hostname: <node> }
+  wgPort: 51820
+  tun: wg0

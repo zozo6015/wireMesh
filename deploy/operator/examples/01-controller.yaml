@@ -1,0 +1,12 @@
+# The control plane. The operator materializes a controller Deployment + PVC +
+# Service (enroll-tcp / sync-tcp / observe-udp) and reports status.ready.
+apiVersion: wiremesh.io/v1alpha1
+kind: WiremeshController
+metadata:
+  name: wiremesh-controller
+spec:
+  # image: ghcr.io/zozo6015/wiremesh-controller:latest   # (default)
+  storageSize: 1Gi
+  # storageClass: <your-storage-class>                    # (cluster default if unset)
+  syncTcpPort: 9500
+  observeUdpPort: 9600

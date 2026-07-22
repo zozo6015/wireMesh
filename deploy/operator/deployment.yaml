@@ -1,0 +1,68 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: wiremesh-operator
+  namespace: wiremesh
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/component: operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: wiremesh
+      app.kubernetes.io/component: operator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: wiremesh
+        app.kubernetes.io/component: operator
+    spec:
+      serviceAccountName: wiremesh-operator
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: operator
+          image: ghcr.io/zozo6015/wiremesh-operator:latest
+          imagePullPolicy: IfNotPresent
+          env:
+            # The namespace the operator materializes workloads into.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            # The operator's own image — reused for the controller pod's
+            # admin-exec sidecar. Keep in sync with `image` above.
+            - name: OPERATOR_IMAGE
+              value: ghcr.io/zozo6015/wiremesh-operator:latest
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: healthz
+              containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: healthz
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi

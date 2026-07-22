@@ -1,0 +1,27 @@
+# WireMesh operator — manifests-first install (kustomize).
+#
+#   kubectl apply -k deploy/operator/
+#
+# Installs the CRDs, the operator namespace + RBAC, and the operator Deployment.
+# The operator then materializes the controller/gateways/relays from the CRs you
+# apply (see deploy/operator/examples/).
+#
+# To pin the image or change the namespace, use the commented overlays below, or
+# copy this directory and edit. `kubectl apply -f` (non-kustomize) also works if
+# applied in order: crds/ first, then namespace.yaml, rbac.yaml, deployment.yaml.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - crds/wiremesh-crds.yaml
+  - namespace.yaml
+  - rbac.yaml
+  - deployment.yaml
+
+# Pin all wiremesh images to a specific tag/digest here, e.g.:
+# images:
+#   - name: ghcr.io/zozo6015/wiremesh-operator
+#     newTag: v0.1.0
+
+commonLabels:
+  app.kubernetes.io/part-of: wiremesh
