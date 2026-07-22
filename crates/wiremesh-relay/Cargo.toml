@@ -15,6 +15,10 @@ path = "src/bin/relay.rs"
 name = "mkcerts"
 path = "src/bin/mkcerts.rs"
 
+[[bin]]
+name = "wiremesh-relay-enroll"
+path = "src/bin/enroll.rs"
+
 [dependencies]
 quinn = "0.11"
 # Not in the 4c relay crate's original dep list; added because mkcerts/relay/lib
@@ -39,5 +43,10 @@ sha2 = { workspace = true }
 serde_json = { workspace = true }
 tonic = { workspace = true }
 wiremesh-proto = { path = "../wiremesh-proto" }
+wiremesh-enroll = { path = "../wiremesh-enroll" }
 tokio-stream = "0.1"
 prost = { workspace = true }
+
+[dev-dependencies]
+wiremesh-testkit = { path = "../wiremesh-testkit" }
+tempfile = "3"
