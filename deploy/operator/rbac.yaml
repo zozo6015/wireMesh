@@ -1,0 +1,101 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: wiremesh-operator
+  namespace: wiremesh
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/component: operator
+---
+# Cluster-scoped: ONLY the WireMesh CRDs (which are themselves cluster-scoped)
+# and their status/finalizers. Nothing else is cluster-wide.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: wiremesh-operator-crds
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/component: operator
+rules:
+  - apiGroups: ["wiremesh.io"]
+    resources:
+      - wiremeshcontrollers
+      - wiremeshsegments
+      - wiremeshpolicies
+      - wiremeshgateways
+      - wiremeshrelays
+    verbs: ["get", "list", "watch", "patch", "update"]
+  - apiGroups: ["wiremesh.io"]
+    resources:
+      - wiremeshcontrollers/status
+      - wiremeshsegments/status
+      - wiremeshpolicies/status
+      - wiremeshgateways/status
+      - wiremeshrelays/status
+    verbs: ["get", "patch", "update"]
+  - apiGroups: ["wiremesh.io"]
+    resources:
+      - wiremeshsegments/finalizers
+      - wiremeshgateways/finalizers
+    verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wiremesh-operator-crds
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/component: operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wiremesh-operator-crds
+subjects:
+  - kind: ServiceAccount
+    name: wiremesh-operator
+    namespace: wiremesh
+---
+# Namespaced: the workloads the operator materializes + the admin-exec transport
+# all live in the operator's OWN namespace, so these are a Role, not a ClusterRole.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wiremesh-operator
+  namespace: wiremesh
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/component: operator
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims", "secrets"]
+    verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
+  # Admin-exec transport: find the controller pod and exec operator-admin in it.
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: wiremesh-operator
+  namespace: wiremesh
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/component: operator
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: wiremesh-operator
+subjects:
+  - kind: ServiceAccount
+    name: wiremesh-operator
+    namespace: wiremesh

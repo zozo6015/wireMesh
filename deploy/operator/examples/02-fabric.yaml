@@ -1,0 +1,33 @@
+# Two segments and a directional allow policy. The operator aggregates ALL
+# Segments + Policies into one fabric and Applies it to the controller (over the
+# admin-exec sidecar's UDS). Editing/adding either re-renders the whole fabric.
+apiVersion: wiremesh.io/v1alpha1
+kind: WiremeshSegment
+metadata:
+  name: aws
+spec:
+  segmentName: aws
+  cidrs:
+    - 10.10.0.0/16
+---
+apiVersion: wiremesh.io/v1alpha1
+kind: WiremeshSegment
+metadata:
+  name: home
+spec:
+  segmentName: home
+  cidrs:
+    - 192.168.1.0/24
+---
+# Allow home → aws on tcp/443. Default-deny otherwise (WireMesh is default-deny).
+apiVersion: wiremesh.io/v1alpha1
+kind: WiremeshPolicy
+metadata:
+  name: home-to-aws-https
+spec:
+  from: home
+  to: aws
+  rules:
+    - allow:
+        proto: tcp
+        ports: [443]

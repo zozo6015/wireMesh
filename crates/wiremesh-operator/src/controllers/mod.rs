@@ -1,0 +1,98 @@
+//! CRD reconcilers (kube-rs `Controller` runtime). Each submodule owns one
+//! kind; this module holds the shared context, error type, and the
+//! server-side-apply / owner-reference / DNS helpers they all use.
+//!
+//! **Validation status:** the pure helpers (`service_dns`, the name/guard fns
+//! in each submodule) are unit-tested in-container. The reconcile loops
+//! themselves (apiserver I/O, finalizers, requeue) are proven by the `kind`
+//! e2e (plan Task 9) — they compile here but are NOT cluster-tested in the dev
+//! container.
+//!
+//! **Admin transport (spec §0 amendment):** the controller's Admin TCP is
+//! loopback-only, so in-cluster admin ops (`Apply`/`MintToken`/`RegisterRelay`/
+//! `Drain`) go through the UDS via an admin-exec sidecar — see
+//! [`crate::admin_exec`]. The `fabric`/`gateway`/`relay` reconcilers take an
+//! `AdminExec` so the transport is swappable (a gRPC `FabricAdmin` for local
+//! tests, kube `exec` in production).
+
+pub mod controller;
+pub mod fabric;
+pub mod gateway;
+pub mod relay;
+
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+use kube::api::{Patch, PatchParams};
+use kube::{Api, Client, Resource, ResourceExt};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+use std::fmt::Debug;
+use std::sync::Arc;
+
+/// The field-manager string the operator uses for every server-side apply.
+pub const FIELD_MANAGER: &str = "wiremesh-operator";
+
+/// Shared reconcile context: the kube client, the namespace the operator
+/// materializes workloads into, and the admin transport.
+#[derive(Clone)]
+pub struct Context {
+    pub client: Client,
+    /// The namespace the operator runs in and creates workloads into.
+    pub namespace: String,
+    /// How the operator reaches the controller Admin API (UDS exec sidecar in
+    /// production; a direct gRPC client in tests). Shared, cheap to clone.
+    pub admin: Arc<crate::admin_exec::AdminExec>,
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum Error {
+    #[error("kube api error: {0}")]
+    Kube(#[from] kube::Error),
+    #[error("admin op failed: {0}")]
+    Admin(#[source] anyhow::Error),
+    #[error("resource is missing {0}")]
+    MissingField(&'static str),
+}
+
+/// `<name>.<ns>.svc:<port>` — the in-cluster DNS a peer dials a Service at.
+pub fn service_dns(name: &str, namespace: &str, port: u16) -> String {
+    format!("{name}.{namespace}.svc:{port}")
+}
+
+/// An `OwnerReference` to `owner` so the child objects the operator creates are
+/// garbage-collected by Kubernetes when the CR is deleted. A cluster-scoped CR
+/// may own namespaced children (k8s allows cluster-scoped→namespaced).
+pub fn owner_ref<K>(owner: &K) -> Result<OwnerReference, Error>
+where
+    K: Resource<DynamicType = ()>,
+{
+    Ok(OwnerReference {
+        api_version: K::api_version(&()).to_string(),
+        kind: K::kind(&()).to_string(),
+        name: owner.name_any(),
+        uid: owner.uid().ok_or(Error::MissingField(".metadata.uid"))?,
+        controller: Some(true),
+        block_owner_deletion: Some(true),
+    })
+}
+
+/// Server-side-apply a namespaced object (idempotent, force-owned by the
+/// operator's field manager).
+pub async fn apply<K>(api: &Api<K>, obj: &K) -> Result<K, Error>
+where
+    K: Resource + Serialize + DeserializeOwned + Clone + Debug,
+    K::DynamicType: Default,
+{
+    let name = obj.meta().name.clone().ok_or(Error::MissingField(".metadata.name"))?;
+    let pp = PatchParams::apply(FIELD_MANAGER).force();
+    Ok(api.patch(&name, &pp, &Patch::Apply(obj)).await?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn service_dns_is_cluster_fqdn() {
+        assert_eq!(service_dns("wiremesh-controller", "wiremesh", 9500), "wiremesh-controller.wiremesh.svc:9500");
+    }
+}

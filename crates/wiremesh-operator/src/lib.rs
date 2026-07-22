@@ -3,8 +3,11 @@
 //! `docs/superpowers/specs/2026-07-22-kubernetes-operator-design.md`.
 
 pub mod admin;
+pub mod admin_exec;
+pub mod controllers;
 pub mod crd;
 pub mod fabric;
+pub mod operator_admin;
 pub mod workloads;
 
 /// Liveness/readiness signal for the operator's HTTP probe endpoint. Returns

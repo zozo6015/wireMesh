@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: wiremesh
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/part-of: wiremesh

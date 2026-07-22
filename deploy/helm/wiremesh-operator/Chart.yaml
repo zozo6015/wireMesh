@@ -1,0 +1,18 @@
+apiVersion: v2
+name: wiremesh-operator
+description: >-
+  The WireMesh Kubernetes operator — deploys and reconciles a WireMesh
+  zero-trust network fabric (controller, gateways, relays, and the
+  segment/policy config) from five cluster-scoped CRDs.
+type: application
+version: 0.1.0
+# The operator/controller/gateway/relay image tag this chart defaults to.
+appVersion: "0.1.0"
+home: https://github.com/zozo6015/wireMesh
+sources:
+  - https://github.com/zozo6015/wireMesh
+keywords:
+  - wireguard
+  - zero-trust
+  - networking
+  - operator
