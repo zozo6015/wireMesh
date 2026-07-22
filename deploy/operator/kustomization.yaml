@@ -6,9 +6,8 @@
 # The operator then materializes the controller/gateways/relays from the CRs you
 # apply (see deploy/operator/examples/).
 #
-# To pin the image or change the namespace, use the commented overlays below, or
-# copy this directory and edit. `kubectl apply -f` (non-kustomize) also works if
-# applied in order: crds/ first, then namespace.yaml, rbac.yaml, deployment.yaml.
+# `kubectl apply -f` (non-kustomize) also works if applied in order: crds/ first,
+# then namespace.yaml, rbac.yaml, deployment.yaml.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -18,10 +17,16 @@ resources:
   - rbac.yaml
   - deployment.yaml
 
-# Pin all wiremesh images to a specific tag/digest here, e.g.:
+# Pin the operator image here. NOTE: `images:` rewrites the container `image:`
+# field but NOT the OPERATOR_IMAGE env — add a matching `replacements:` (or edit
+# deployment.yaml) so the admin-exec sidecar uses the same pinned image, e.g.:
 # images:
 #   - name: ghcr.io/zozo6015/wiremesh-operator
 #     newTag: v0.1.0
+
+# To install into a different namespace, set it here (this rewrites the namespaced
+# objects AND the ServiceAccount subjects in the ClusterRoleBinding):
+# namespace: my-wiremesh
 
 commonLabels:
   app.kubernetes.io/part-of: wiremesh

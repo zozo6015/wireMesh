@@ -17,7 +17,11 @@ metadata:
   name: gw-home
 spec:
   segmentRef: home        # -> the WiremeshSegment named "home"
-  # nodeName: <node>      # pin to a specific node (recommended for hostNetwork)
+  # REQUIRED for a real deployment: pin the gateway to a specific node. It's a
+  # privileged hostNetwork pod holding a WireGuard endpoint + segment routes, so
+  # it must land on a known node (whose LAN IP your workloads route to). Replace
+  # <node> with a real node name (`kubectl get nodes`), or use nodeSelector.
+  nodeName: <node>
   # nodeSelector: { kubernetes.io/hostname: <node> }
   wgPort: 51820
   tun: wg0

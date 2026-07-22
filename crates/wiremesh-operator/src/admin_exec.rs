@@ -62,9 +62,23 @@ impl AdminExec {
         }
     }
 
+    /// Bound on a single admin exec so a stuck controller/socket can't wedge
+    /// the reconcile loop forever.
+    const EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Run `operator-admin <op_args>` in the controller sidecar (exec transport)
     /// and parse its JSON stdout. `stdin` feeds the process (used by `apply`).
     async fn exec_json(
+        &self,
+        op_args: &[&str],
+        stdin: Option<&str>,
+    ) -> anyhow::Result<serde_json::Value> {
+        tokio::time::timeout(Self::EXEC_TIMEOUT, self.exec_json_inner(op_args, stdin))
+            .await
+            .map_err(|_| anyhow!("operator-admin exec timed out after {:?}", Self::EXEC_TIMEOUT))?
+    }
+
+    async fn exec_json_inner(
         &self,
         op_args: &[&str],
         stdin: Option<&str>,

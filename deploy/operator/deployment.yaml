@@ -26,8 +26,13 @@ spec:
           type: RuntimeDefault
       containers:
         - name: operator
+          # For production, pin a specific tag or digest (and set pullPolicy to
+          # IfNotPresent). `latest` needs `Always` or the node may run a stale
+          # cached image. NOTE: kustomize `images:` rewrites this `image:` field
+          # but NOT the OPERATOR_IMAGE env below — keep the two in sync when you
+          # pin (or use a kustomize `replacements:` for the env).
           image: ghcr.io/zozo6015/wiremesh-operator:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always
           env:
             # The namespace the operator materializes workloads into.
             - name: POD_NAMESPACE
@@ -35,7 +40,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.namespace
             # The operator's own image — reused for the controller pod's
-            # admin-exec sidecar. Keep in sync with `image` above.
+            # admin-exec sidecar. MUST match `image:` above.
             - name: OPERATOR_IMAGE
               value: ghcr.io/zozo6015/wiremesh-operator:latest
             - name: RUST_LOG

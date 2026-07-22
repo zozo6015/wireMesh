@@ -24,6 +24,7 @@ spec:
             properties:
               adminTcpPort:
                 format: uint16
+                maximum: 65535.0
                 minimum: 0.0
                 nullable: true
                 type: integer
@@ -32,6 +33,7 @@ spec:
                 type: string
               observeUdpPort:
                 format: uint16
+                maximum: 65535.0
                 minimum: 0.0
                 nullable: true
                 type: integer
@@ -43,6 +45,7 @@ spec:
                 type: string
               syncTcpPort:
                 format: uint16
+                maximum: 65535.0
                 minimum: 0.0
                 nullable: true
                 type: integer
@@ -269,6 +272,7 @@ spec:
                 type: string
               wgPort:
                 format: uint16
+                maximum: 65535.0
                 minimum: 0.0
                 nullable: true
                 type: integer

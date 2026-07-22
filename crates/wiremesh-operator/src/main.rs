@@ -92,7 +92,15 @@ async fn healthz_server() {
     };
     tracing::info!("healthz listening on :8080");
     loop {
-        let Ok((mut sock, _)) = listener.accept().await else { continue };
+        let (mut sock, _) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                // Back off so a persistent accept error can't spin the CPU.
+                tracing::warn!("healthz accept error: {e}");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                continue;
+            }
+        };
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             let _ = sock.read(&mut buf).await;

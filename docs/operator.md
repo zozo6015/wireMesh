@@ -5,11 +5,13 @@ Deploy and run a WireMesh zero-trust fabric declaratively on Kubernetes. You
 deploys gateways/relays, and keeps the segment/policy config reconciled.
 
 > **Status:** the operator's reconcilers, the admin transport, and the install
-> artifacts are complete and unit-tested; end-to-end behavior is validated on a
-> real cluster. The **controller + fabric (segments/policy)** path is fully
-> functional. **Gateways/relays** additionally require the CA bundle published
-> (see [CA bundle](#ca-bundle)) and, for restart durability, PVC-backed state
-> (see [Limitations](#limitations)).
+> artifacts are complete and **unit-tested**; the reconcile loops, the exec
+> transport, and these manifests **compile and pass unit tests but have not yet
+> been validated end-to-end on a live cluster** — that is the current next step.
+> By design, the **controller + fabric (segments/policy)** path needs no extra
+> setup; **gateways/relays** additionally require the CA bundle published (see
+> [CA bundle](#ca-bundle)) and, for restart durability, PVC-backed state (see
+> [Limitations](#limitations)).
 
 ## Architecture
 
@@ -35,7 +37,10 @@ WiremeshRelay CR      ─▶ operator ─▶ mint token → Secret → relay pod
 
 - Kubernetes ≥ 1.28 (the admin-exec sidecar uses standard `pods/exec`).
 - A default StorageClass (for the controller PVC) — or set `spec.storageClass`.
-- The published images at `ghcr.io/zozo6015/wiremesh-*` reachable from the cluster.
+- The `wiremesh-*` images reachable from the cluster. The defaults point at
+  `ghcr.io/zozo6015/*`; mirror them to any registry and override the image
+  registry/owner (Helm `image.registry`/`image.owner`, or a kustomize `images:`
+  block) if you don't pull from GHCR.
 - For **gateways**: nodes where a privileged, `hostNetwork` pod with
   `/dev/net/tun` can run, and the CA bundle published (below).
 - Optional: **cert-manager** (recommended for the CA — see below).
@@ -82,11 +87,14 @@ kubectl apply -f deploy/operator/examples/01-controller.yaml   # control plane
 kubectl wait --for=jsonpath='{.status.ready}'=true wiremeshcontroller/wiremesh-controller --timeout=180s
 
 kubectl apply -f deploy/operator/examples/02-fabric.yaml        # segments + policy
-kubectl get wiremeshsegments -o wide                            # -> status.applied
+# Watch each segment reach status.applied=true:
+kubectl get wiremeshsegments \
+  -o custom-columns=NAME:.metadata.name,APPLIED:.status.applied,MSG:.status.message
 
 # Gateways need the CA bundle published first (see below).
 kubectl apply -f deploy/operator/examples/03-gateway.yaml
-kubectl get wiremeshgateways -o wide                            # -> status.enrolled / gatewayId
+kubectl get wiremeshgateways \
+  -o custom-columns=NAME:.metadata.name,ENROLLED:.status.enrolled,ID:.status.gatewayId,PATH:.status.pathState
 ```
 
 ## CRD reference (configuration options)

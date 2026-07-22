@@ -9,10 +9,11 @@ metadata:
 {{- end }}
 {{- if .Values.rbac.create }}
 ---
+# Cluster-scoped: ONLY the (cluster-scoped) WireMesh CRDs + status/finalizers.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: wiremesh-operator
+  name: wiremesh-operator-crds
   labels:
     {{- include "wiremesh-operator.labels" . | nindent 4 }}
 rules:
@@ -25,6 +26,31 @@ rules:
   - apiGroups: ["wiremesh.io"]
     resources: ["wiremeshsegments/finalizers", "wiremeshgateways/finalizers"]
     verbs: ["update"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: wiremesh-operator-crds
+  labels:
+    {{- include "wiremesh-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: wiremesh-operator-crds
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "wiremesh-operator.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# Namespaced: workloads + admin-exec transport, in the operator's namespace only.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: wiremesh-operator
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "wiremesh-operator.labels" . | nindent 4 }}
+rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["get", "list", "watch", "create", "patch", "update", "delete"]
@@ -42,14 +68,15 @@ rules:
     verbs: ["create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
+kind: RoleBinding
 metadata:
   name: wiremesh-operator
+  namespace: {{ .Release.Namespace }}
   labels:
     {{- include "wiremesh-operator.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
+  kind: Role
   name: wiremesh-operator
 subjects:
   - kind: ServiceAccount

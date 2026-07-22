@@ -51,10 +51,13 @@ pub struct WiremeshControllerSpec {
     pub storage_class: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_size: Option<String>,
+    #[schemars(range(max = 65535))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admin_tcp_port: Option<u16>,
+    #[schemars(range(max = 65535))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_tcp_port: Option<u16>,
+    #[schemars(range(max = 65535))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observe_udp_port: Option<u16>,
 }
@@ -139,6 +142,7 @@ pub struct WiremeshGatewaySpec {
     pub node_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub node_selector: Option<BTreeMap<String, String>>,
+    #[schemars(range(max = 65535))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wg_port: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

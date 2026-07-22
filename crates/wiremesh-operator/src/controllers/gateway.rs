@@ -73,7 +73,12 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
         .await?;
     let cidrs = seg.spec.cidrs.clone();
 
-    // Mint the enrollment token ONCE.
+    // Mint the enrollment token ONCE (guarded on the token Secret's existence).
+    // NOTE on idempotency: a crash between the mint and the Secret write below
+    // orphans that token — the next reconcile mints a fresh one. This is
+    // low-harm by design: enrollment tokens are single-use AND expiring, so an
+    // unredeemed orphan simply lapses. A stronger guarantee would need a
+    // controller-side idempotency key on MintToken (a possible follow-up).
     if needs_token(secrets.get_opt(&token_secret).await?.as_ref()) {
         let token = ctx.admin.mint_gateway_token(&cidrs).await.map_err(Error::Admin)?;
         let mut data = BTreeMap::new();
@@ -120,16 +125,34 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
 
 async fn cleanup_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Error> {
     // Drain the gateway in the controller (withdraw + revoke) before the
-    // workload is GC'd with the CR.
-    let seg_name = Api::<WiremeshSegment>::all(ctx.client.clone())
-        .get_opt(&gw.spec.segment_ref)
-        .await?
-        .map(|s| s.spec.segment_name);
-    if let Some(seg_name) = seg_name {
-        let gateways = ctx.admin.list_gateways().await.map_err(Error::Admin)?;
-        if let Some(row) = gateways.iter().find(|g| g.segment == seg_name) {
-            ctx.admin.drain(row.id).await.map_err(Error::Admin)?;
+    // workload is GC'd with the CR. Prefer the id we recorded in status — the
+    // referenced Segment CR may already be deleted, so we must NOT depend on
+    // resolving it (that would silently skip the drain).
+    let gateway_id = match gw.status.as_ref().and_then(|s| s.gateway_id) {
+        Some(id) => Some(id),
+        None => {
+            // Fallback: resolve via the segment name if the CR still exists.
+            let seg_name = Api::<WiremeshSegment>::all(ctx.client.clone())
+                .get_opt(&gw.spec.segment_ref)
+                .await?
+                .map(|s| s.spec.segment_name);
+            match seg_name {
+                Some(name) => ctx
+                    .admin
+                    .list_gateways()
+                    .await
+                    .map_err(Error::Admin)?
+                    .iter()
+                    .find(|g| g.segment == name)
+                    .map(|g| g.id),
+                None => None,
+            }
         }
+    };
+    if let Some(id) = gateway_id {
+        ctx.admin.drain(id).await.map_err(Error::Admin)?;
+    } else {
+        tracing::warn!("gateway {} cleanup: no gateway_id to drain (never enrolled?)", gw.name_any());
     }
     Ok(Action::await_change())
 }

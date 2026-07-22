@@ -26,8 +26,19 @@ async fn apply_fabric(ctx: &Context) -> Result<(), Error> {
     let client = ctx.client.clone();
     let segs = Api::<WiremeshSegment>::all(client.clone()).list(&ListParams::default()).await?;
     let pols = Api::<WiremeshPolicy>::all(client.clone()).list(&ListParams::default()).await?;
-    let seg_specs: Vec<_> = segs.iter().map(|s| s.spec.clone()).collect();
-    let pol_specs: Vec<_> = pols.iter().map(|p| p.spec.clone()).collect();
+    // Exclude objects being deleted: during a Segment finalizer the object still
+    // appears in the list (it has a deletionTimestamp but isn't gone yet), so
+    // including it would re-add the very segment the finalizer just deleted.
+    let seg_specs: Vec<_> = segs
+        .iter()
+        .filter(|s| s.metadata.deletion_timestamp.is_none())
+        .map(|s| s.spec.clone())
+        .collect();
+    let pol_specs: Vec<_> = pols
+        .iter()
+        .filter(|p| p.metadata.deletion_timestamp.is_none())
+        .map(|p| p.spec.clone())
+        .collect();
     let yaml = crate::fabric::render_fabric_yaml(&seg_specs, &pol_specs);
     ctx.admin.apply(&yaml).await.map_err(Error::Admin)?;
     Ok(())

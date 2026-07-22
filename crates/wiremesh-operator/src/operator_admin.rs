@@ -105,9 +105,11 @@ pub async fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
             serde_json::Value::Array(
                 gws.into_iter()
                     .map(|g| {
+                        // snake_case keys — must match `admin_exec::GatewayRow`'s
+                        // deserialized field names (the exec consumer).
                         serde_json::json!({
                             "id": g.id, "name": g.name, "segment": g.segment,
-                            "status": g.status, "appliedVersion": g.applied_version,
+                            "status": g.status, "applied_version": g.applied_version,
                         })
                     })
                     .collect(),
