@@ -60,6 +60,8 @@ const MAX_REGISTRATION_BYTES: usize = 1024;
 /// relay's fixed 8-byte key/datagram-header width — a 32-bit id space,
 /// collision-safe at v1's ≤50-segment scale (a wider raw `[u8;8]` id is a
 /// documented fast-follow, unchanged from the previous `relay_pair_id`).
+pub mod enroll;
+
 pub fn registration_key(my_identity: &str, peer_identity: &str) -> [u8; 8] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();

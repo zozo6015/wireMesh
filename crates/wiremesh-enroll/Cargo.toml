@@ -1,0 +1,18 @@
+[package]
+name = "wiremesh-enroll"
+version = "0.1.0"
+edition = "2021"
+
+# Shipped client half of enrollment: turns an enrollment token into a signed
+# leaf identity by driving the controller's `Enrollment.Enroll` RPC. Consumed
+# by the gateway/relay `enroll` subcommands (which write the on-disk layout
+# each binary loads at boot). See docs/research/operator-enrollment-client-gap.md.
+[dependencies]
+tonic = { workspace = true }
+rcgen = { workspace = true }
+anyhow = { workspace = true }
+wiremesh-proto = { path = "../wiremesh-proto" }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremesh-testkit = { path = "../wiremesh-testkit" }

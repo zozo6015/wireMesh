@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/wiremesh-proto", "crates/wiremesh-trust", "crates/wiremesh-controller", "crates/fabricctl", "crates/wiremesh-testkit", "crates/wiremesh-policy", "crates/wiremesh-enforcer", "crates/wiremesh-gateway", "crates/wiremesh-relay"]
+members = ["crates/wiremesh-proto", "crates/wiremesh-trust", "crates/wiremesh-controller", "crates/fabricctl", "crates/wiremesh-testkit", "crates/wiremesh-policy", "crates/wiremesh-enforcer", "crates/wiremesh-gateway", "crates/wiremesh-relay", "crates/wiremesh-operator", "crates/wiremesh-enroll"]
 # `crates/wiremesh-enforcer-ebpf` (Task 7 Step 3) is its own standalone
 # aya-template workspace (ships its own `[workspace]`, must not be nested --
 # same reason every `spike/*` crate is standalone, see CLAUDE.md's

@@ -110,6 +110,17 @@ struct ActiveTunInfo {
 }
 
 fn main() -> anyhow::Result<()> {
+    // `enroll` subcommand: one-shot token->Identity bootstrap, then exit. Any
+    // other argv is the normal data-plane path (GatewayConfig::from_env reads
+    // std::env::args() itself, so the normal path is unaffected).
+    let mut args = std::env::args();
+    let _argv0 = args.next();
+    if args.next().as_deref() == Some("enroll") {
+        let eargs = wiremesh_gateway::enroll::parse_args(args)?;
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(wiremesh_gateway::enroll::run_enroll(eargs));
+    }
+
     let cfg = GatewayConfig::from_env()?;
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(run(cfg))

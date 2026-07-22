@@ -50,6 +50,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
           target/release/relay \
           target/release/mkcerts \
           target/release/fabricctl \
+          target/release/wiremesh-operator \
           /out/
 
 # ---------------------------------------------------------------------------
@@ -114,3 +115,15 @@ COPY --from=builder /out/wiremesh-gateway /usr/local/bin/wiremesh-gateway
 # Gateway identity + fail-static state.json live here (per-file 0600).
 VOLUME ["/var/lib/wiremesh"]
 ENTRYPOINT ["/usr/local/bin/wiremesh-gateway"]
+
+# ---------------------------------------------------------------------------
+# operator — Kubernetes operator (kube-rs). Talks to the K8s apiserver + the
+# controller Admin API; needs no privileged host access. Non-root.
+# ---------------------------------------------------------------------------
+FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS operator
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --uid 65532 --user-group --no-create-home wiremesh
+COPY --from=builder /out/wiremesh-operator /usr/local/bin/wiremesh-operator
+USER wiremesh
+ENTRYPOINT ["/usr/local/bin/wiremesh-operator"]
