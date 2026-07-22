@@ -5,6 +5,7 @@
 pub mod admin;
 pub mod crd;
 pub mod fabric;
+pub mod workloads;
 
 /// Liveness/readiness signal for the operator's HTTP probe endpoint. Returns
 /// the HTTP status code and body the `/healthz` handler serves.
