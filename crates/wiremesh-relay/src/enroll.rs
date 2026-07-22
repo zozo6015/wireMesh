@@ -71,6 +71,7 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
 /// Parse the `enroll` flags from the args iterator (positioned past argv[0]).
 pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<EnrollArgs> {
     let mut token = None;
+    let mut token_file = None;
     let mut controller = None;
     let mut ca = None;
     let mut certdir = None;
@@ -79,6 +80,9 @@ pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<Enroll
         let mut val = || it.next().ok_or_else(|| anyhow!("flag {flag} needs a value"));
         match flag.as_str() {
             "--token" => token = Some(val()?),
+            // `--token-file` avoids exposing the token in argv / a shell command
+            // substitution (the K8s enroll init-container mounts it as a file).
+            "--token-file" => token_file = Some(PathBuf::from(val()?)),
             "--controller" => controller = Some(val()?),
             "--ca" => ca = Some(PathBuf::from(val()?)),
             "--certdir" => certdir = Some(PathBuf::from(val()?)),
@@ -86,8 +90,17 @@ pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<Enroll
             other => return Err(anyhow!("unknown enroll flag {other}")),
         }
     }
+    let token = match (token, token_file) {
+        (Some(t), None) => t,
+        (None, Some(f)) => std::fs::read_to_string(&f)
+            .with_context(|| format!("reading token file {}", f.display()))?
+            .trim()
+            .to_string(),
+        (None, None) => return Err(anyhow!("one of --token or --token-file is required")),
+        (Some(_), Some(_)) => return Err(anyhow!("--token and --token-file are mutually exclusive")),
+    };
     Ok(EnrollArgs {
-        token: token.ok_or_else(|| anyhow!("--token required"))?,
+        token,
         controller: controller.ok_or_else(|| anyhow!("--controller required"))?,
         ca_path: ca.ok_or_else(|| anyhow!("--ca required"))?,
         certdir: certdir.ok_or_else(|| anyhow!("--certdir required"))?,

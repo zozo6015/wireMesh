@@ -75,6 +75,26 @@ fn host_of(addr: &str) -> &str {
     addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
 }
 
+/// A CRD-supplied WireGuard interface name flows into the gateway's argv, so
+/// clamp it to a valid Linux ifname (defense-in-depth against argv flag
+/// smuggling — a leading `-` or shell metacharacters). Falls back to `wg0` for
+/// anything that is not a plain 1-15 char `[A-Za-z0-9_-]` name not starting
+/// with `-`. (Values still reach the binary positionally, but this keeps a
+/// hostile CRD from ever placing a `-flag`-looking token there.)
+fn safe_ifname(tun: Option<&str>) -> String {
+    match tun {
+        Some(t)
+            if !t.is_empty()
+                && t.len() <= 15
+                && !t.starts_with('-')
+                && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+        {
+            t.to_string()
+        }
+        _ => "wg0".to_string(),
+    }
+}
+
 // --------------------------------------------------------------------------
 // Controller
 // --------------------------------------------------------------------------
@@ -263,21 +283,25 @@ pub fn gateway_deployment(
 ) -> Deployment {
     let name = gw.metadata.name.clone().unwrap_or_else(|| "wiremesh-gateway".to_string());
     let image = gw.spec.image.clone().unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_string());
-    let tun = gw.spec.tun.clone().unwrap_or_else(|| "wg0".to_string());
+    let tun = safe_ifname(gw.spec.tun.as_deref());
     let wg_port = gw.spec.wg_port.unwrap_or(51820);
     let observe = format!("{}:{OBSERVE_UDP_PORT}", host_of(controller_sync));
 
-    // enroll init-container: reads the token from the mounted secret file and
-    // the CA from the mounted CA secret, writes Identity into the shared state.
+    // enroll init-container: reads the token from the mounted secret FILE
+    // (`--token-file`, no shell/command-substitution) and the CA from the
+    // mounted CA secret, writes Identity into the shared state. Invoked
+    // directly (no `/bin/sh -c`) so no CRD value is ever shell-interpreted.
     let enroll = Container {
         name: "enroll".to_string(),
         image: Some(image.clone()),
-        command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-        args: Some(vec![format!(
-            "wiremesh-gateway enroll --token \"$(cat /etc/wiremesh-token/token)\" \
-             --controller {controller_enroll} --ca /etc/wiremesh-ca/ca.pem \
-             --state-dir {DATA_DIR}"
-        )]),
+        command: Some(vec!["wiremesh-gateway".to_string()]),
+        args: Some(vec![
+            "enroll".to_string(),
+            "--token-file".to_string(), "/etc/wiremesh-token/token".to_string(),
+            "--controller".to_string(), controller_enroll.to_string(),
+            "--ca".to_string(), "/etc/wiremesh-ca/ca.pem".to_string(),
+            "--state-dir".to_string(), DATA_DIR.to_string(),
+        ]),
         volume_mounts: Some(vec![
             VolumeMount { name: "state".to_string(), mount_path: DATA_DIR.to_string(), ..Default::default() },
             VolumeMount { name: "token".to_string(), mount_path: "/etc/wiremesh-token".to_string(), read_only: Some(true), ..Default::default() },
@@ -368,15 +392,20 @@ pub fn relay_deployment(
     let bind_port = endpoint.rsplit_once(':').and_then(|(_, p)| p.parse::<u16>().ok()).unwrap_or(51820);
     let sync = controller_sync.to_string();
 
+    // enroll init-container: `--token-file` (no shell), invoked directly so the
+    // CRD-supplied `endpoint` reaches the binary as one argv element (never
+    // shell-interpreted); the controller further validates it is IPv4 host:port.
     let enroll = Container {
         name: "enroll".to_string(),
         image: Some(image.clone()),
-        command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-        args: Some(vec![format!(
-            "wiremesh-relay-enroll --token \"$(cat /etc/wiremesh-token/token)\" \
-             --controller {controller_enroll} --ca /etc/wiremesh-ca/ca.pem \
-             --certdir {DATA_DIR} --endpoint {endpoint}"
-        )]),
+        command: Some(vec!["wiremesh-relay-enroll".to_string()]),
+        args: Some(vec![
+            "--token-file".to_string(), "/etc/wiremesh-token/token".to_string(),
+            "--controller".to_string(), controller_enroll.to_string(),
+            "--ca".to_string(), "/etc/wiremesh-ca/ca.pem".to_string(),
+            "--certdir".to_string(), DATA_DIR.to_string(),
+            "--endpoint".to_string(), endpoint.clone(),
+        ]),
         volume_mounts: Some(vec![
             VolumeMount { name: "certs".to_string(), mount_path: DATA_DIR.to_string(), ..Default::default() },
             VolumeMount { name: "token".to_string(), mount_path: "/etc/wiremesh-token".to_string(), read_only: Some(true), ..Default::default() },
@@ -542,6 +571,57 @@ mod tests {
                 == Some("gw-aws-token")),
             "gateway must mount the enrollment-token secret"
         );
+    }
+
+    #[test]
+    fn enroll_init_containers_use_no_shell() {
+        // A hostile CRD value must never be shell-interpreted: the enroll
+        // init-containers invoke the binary directly (no /bin/sh -c) and carry
+        // no command-substitution / shell-metacharacter args.
+        let gw = WiremeshGateway::new(
+            "gw",
+            WiremeshGatewaySpec {
+                segment_ref: "aws".into(),
+                node_name: None,
+                node_selector: None,
+                wg_port: None,
+                tun: None,
+                image: None,
+            },
+        );
+        let gd = gateway_deployment(&gw, "wm:9500", "wm:9400", "wm-ca", "gw-token");
+        let r = WiremeshRelay::new(
+            "r",
+            WiremeshRelaySpec {
+                // A value that WOULD be dangerous under `sh -c`.
+                endpoint: "203.0.113.9:4443; rm -rf /".into(),
+                node_name: None,
+                image: None,
+            },
+        );
+        let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token");
+
+        for d in [gd, rd] {
+            let pod = d.spec.unwrap().template.spec.unwrap();
+            let enroll = pod.init_containers.as_ref().unwrap().iter().find(|c| c.name == "enroll").unwrap();
+            let cmd = enroll.command.as_ref().unwrap();
+            assert!(!cmd.iter().any(|c| c == "/bin/sh" || c == "sh" || c == "-c"), "no shell wrapper: {cmd:?}");
+            for a in enroll.args.as_ref().unwrap() {
+                assert!(!a.contains("$("), "no command substitution in {a:?}");
+            }
+            // `--token-file` is used (token never in argv/shell).
+            assert!(enroll.args.as_ref().unwrap().iter().any(|a| a == "--token-file"));
+        }
+    }
+
+    #[test]
+    fn safe_ifname_rejects_flag_smuggling() {
+        assert_eq!(safe_ifname(Some("wg0")), "wg0");
+        assert_eq!(safe_ifname(Some("wg-eth1")), "wg-eth1");
+        assert_eq!(safe_ifname(Some("--metrics")), "wg0", "leading-dash rejected");
+        assert_eq!(safe_ifname(Some("a; rm -rf /")), "wg0", "metachars rejected");
+        assert_eq!(safe_ifname(Some("waytoolonginterfacename")), "wg0", "over-length rejected");
+        assert_eq!(safe_ifname(None), "wg0");
     }
 
     #[test]
