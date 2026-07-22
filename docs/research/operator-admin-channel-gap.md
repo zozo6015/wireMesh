@@ -58,3 +58,21 @@ Option 1 (admin-exec sidecar sharing the UDS) is the least-invasive path that
 needs no controller change and no plaintext bearer on the wire. Confirm with
 the owner before building the WiremeshController reconciler (Task 5), since it
 determines the controller pod shape and the operator's RBAC (`pods/exec`).
+
+## DECISION (owner, 2026-07-22): Option 1 — UDS admin-exec sidecar
+
+The controller pod carries a small admin-exec sidecar sharing the UDS
+emptyDir. The operator drives admin ops (`Apply`, `MintToken`,
+`RegisterRelay`, `Drain`, ...) by `exec`-ing `fabricctl --socket
+/run/wiremesh/controller.sock ...` in that sidecar via the kube `pods/exec`
+subresource. Implications for the reconciler phase:
+- The operator ServiceAccount needs `pods/exec` (create) + `pods` (get/list).
+- The controller Deployment adds the admin-exec sidecar container (a
+  long-lived `fabricctl`-image container that just holds the UDS mount; the
+  operator execs into it). NOT the same as the `admin-token-bootstrap`
+  init-sidecar, though both mount the run-dir — consider merging them.
+- The `FabricAdmin` TCP client (`admin.rs`) is therefore NOT the operator's
+  primary admin path in-cluster; an exec-based `FabricAdmin` variant (build an
+  argv, `exec` it, parse stdout) is the reconciler's transport. Keep the TCP
+  client for out-of-cluster/local use (e.g. tests against `TestController`).
+- No admin-tcp on any Service (already the case).
