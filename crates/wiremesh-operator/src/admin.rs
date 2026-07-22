@@ -65,10 +65,20 @@ impl FabricAdmin {
 
     /// Mint a single-use enrollment token for a gateway bound to `bound_cidrs`.
     pub async fn mint_gateway_token(&mut self, bound_cidrs: &[String]) -> anyhow::Result<String> {
+        self.mint_token("gateway", bound_cidrs).await
+    }
+
+    /// Mint a single-use enrollment token for a relay (relays have no
+    /// segment/CIDR binding).
+    pub async fn mint_relay_token(&mut self) -> anyhow::Result<String> {
+        self.mint_token("relay", &[]).await
+    }
+
+    async fn mint_token(&mut self, kind: &str, bound_cidrs: &[String]) -> anyhow::Result<String> {
         Ok(self
             .client
             .mint_token(MintTokenRequest {
-                kind: "gateway".to_string(),
+                kind: kind.to_string(),
                 bound_cidrs: bound_cidrs.to_vec(),
                 rebind_segment_id: 0,
             })
