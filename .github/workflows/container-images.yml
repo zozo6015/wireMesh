@@ -1,9 +1,17 @@
 name: Container images
 
 # Build the WireMesh binaries + per-component container images and push them to
-# ghcr.io/<owner>/wiremesh-{controller,gateway,relay,fabricctl}. The expensive
-# release build (whole workspace, incl. the embedded eBPF program) happens once
-# in the `builder` job whose BuildKit layer cache the four image jobs reuse.
+# ghcr.io/<owner>/wiremesh-{controller,gateway,relay,fabricctl,operator} as
+# MULTI-ARCH (linux/amd64 + linux/arm64) manifests — the deployment fleet
+# includes arm64 nodes (e.g. Raspberry Pi clusters).
+#
+# Each arch builds NATIVELY (amd64 on ubuntu-latest, arm64 on ubuntu-24.04-arm,
+# free for public repos) — QEMU emulation of the full Rust + eBPF release build
+# was measured at >20x slower and is not used. The expensive release build
+# happens once per arch in the `builder` job whose BuildKit layer cache the
+# per-component image jobs reuse; per-arch images are pushed by digest and a
+# final `merge` job stitches them into one tagged multi-arch manifest per
+# component (the documented buildx "distribute across runners" pattern).
 
 on:
   push:
@@ -17,8 +25,8 @@ on:
       - 'deploy/docker/**'
       - '.dockerignore'
       - '.github/workflows/container-images.yml'
-  # PRs build every image to validate the Dockerfile/build, but do NOT push
-  # (see the `push:` guard below) — only main/tags publish to ghcr.io.
+  # PRs build every image on both arches to validate the Dockerfile/build, but
+  # do NOT push (see the `push:` guards below) — only main/tags publish.
   pull_request:
     branches: [main]
     paths: *build_paths
@@ -28,32 +36,93 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
-  # Warm the shared `builder` stage cache once (the whole release + eBPF build).
+  # Warm the shared `builder` stage cache once per arch (the whole release +
+  # eBPF build), natively on that arch's runner.
   builder:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: ubuntu-latest,      arch: amd64, docker: linux/amd64 }
+          - { os: ubuntu-24.04-arm,   arch: arm64, docker: linux/arm64 }
+    runs-on: ${{ matrix.platform.os }}
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      # arm64 emulation so the shared builder stage compiles for both arches
-      # (the cluster fleet includes arm64 nodes, e.g. Raspberry Pi).
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
-      - name: Build & cache the builder stage
+      - name: Build & cache the builder stage (${{ matrix.platform.arch }})
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: .
           file: deploy/docker/Dockerfile
           target: builder
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform.docker }}
           push: false
-          cache-from: type=gha,scope=builder
-          cache-to: type=gha,mode=max,scope=builder
+          cache-from: type=gha,scope=builder-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=builder-${{ matrix.platform.arch }}
 
-  # Assemble + push each runtime image, reusing the cached builder stage so only
-  # the small per-component runtime layer is rebuilt.
+  # Assemble each runtime image per arch (reusing that arch's cached builder
+  # stage) and push it by digest; the merge job below tags the pair as one
+  # multi-arch manifest. On PRs this builds (validation) without pushing.
   images:
     needs: builder
+    strategy:
+      fail-fast: false
+      matrix:
+        component: [controller, gateway, relay, fabricctl, operator]
+        platform:
+          - { os: ubuntu-latest,      arch: amd64, docker: linux/amd64 }
+          - { os: ubuntu-24.04-arm,   arch: arm64, docker: linux/arm64 }
+    runs-on: ${{ matrix.platform.os }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Log in to ghcr.io
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build wiremesh-${{ matrix.component }} (${{ matrix.platform.arch }})
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          target: ${{ matrix.component }}
+          platforms: ${{ matrix.platform.docker }}
+          # Push by digest (untagged) — the merge job creates the tagged
+          # multi-arch manifest referencing both arch digests.
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ github.repository_owner }}/wiremesh-${{ matrix.component }},push-by-digest=true,name-canonical=true,push=${{ github.event_name != 'pull_request' }}
+          cache-from: |
+            type=gha,scope=builder-${{ matrix.platform.arch }}
+            type=gha,scope=${{ matrix.component }}-${{ matrix.platform.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}-${{ matrix.platform.arch }}
+      - name: Export digest
+        if: github.event_name != 'pull_request'
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+      - name: Upload digest
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: digest-${{ matrix.component }}-${{ matrix.platform.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Stitch each component's per-arch digests into one tagged multi-arch
+  # manifest (sha/branch/tag/latest tags, same policy as before).
+  merge:
+    needs: images
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -61,18 +130,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - { component: controller, image: wiremesh-controller }
-          - { component: gateway,    image: wiremesh-gateway }
-          - { component: relay,      image: wiremesh-relay }
-          - { component: fabricctl,  image: wiremesh-fabricctl }
-          - { component: operator,   image: wiremesh-operator }
+        component: [controller, gateway, relay, fabricctl, operator]
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
+      - name: Download digests
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: digest-${{ matrix.component }}-*
+          path: /tmp/digests
+          merge-multiple: true
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Log in to ghcr.io
-        if: github.event_name != 'pull_request'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -82,23 +149,22 @@ jobs:
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ matrix.image }}
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/wiremesh-${{ matrix.component }}
           tags: |
             type=sha
             type=ref,event=branch
             type=ref,event=tag
             type=raw,value=latest,enable={{is_default_branch}}
-      - name: Build & push ${{ matrix.image }}
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
-        with:
-          context: .
-          file: deploy/docker/Dockerfile
-          target: ${{ matrix.component }}
-          platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: |
-            type=gha,scope=builder
-            type=gha,scope=${{ matrix.component }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.component }}
+      - name: Create multi-arch manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/wiremesh-${{ matrix.component }}
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "$IMAGE@sha256:%s " *)
+      - name: Verify multi-arch manifest
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ github.repository_owner }}/wiremesh-${{ matrix.component }}
+        run: |
+          docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"
