@@ -341,6 +341,14 @@ impl TestController {
         self.running().tcp_addr()
     }
 
+    /// The controller's CA bundle PEM — the trust root an enrolling gateway or
+    /// relay pins to verify the controller's TLS server cert. Exposed so
+    /// out-of-crate tests (e.g. `wiremesh-enroll`) can drive the real
+    /// client-side enrollment flow.
+    pub fn ca_bundle_pem(&self) -> &str {
+        self.running().ca_bundle_pem()
+    }
+
     /// The controller's bound TCP address the Sync service (mTLS: client
     /// cert required) listens on — a separate listener/port from
     /// `tcp_addr()` (see `wiremesh_controller::serve`'s doc comment for why).
