@@ -7,18 +7,24 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity as TlsIdentity};
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{
-    sync_message::Body, PunchDirective, RelayHealth, ReportRequest, SyncMessage, WatchRequest,
+    sync_message::Body, EpochAck, PunchDirective, RelayHealth, ReportRequest, RotateDirective,
+    SubmitEpochKeyRequest, SyncMessage, WatchRequest,
 };
 
 /// One decoded Sync message, surfaced to the gateway boot loop. `Snapshot`/
 /// `Delta` fold into the running [`DesiredState`] and arrive as
 /// [`SyncEvent::State`]; a NAT-traversal [`PunchDirective`] (cycle4b §4) is
 /// NOT a desired-state change and arrives as [`SyncEvent::Punch`] for the
-/// boot loop to route to the hole puncher + path state machine (Task 10).
+/// boot loop to route to the hole puncher + path state machine (Task 10); a
+/// key-rotation [`RotateDirective`] is likewise not a desired-state change
+/// and arrives as [`SyncEvent::Rotate`] for the boot loop to route to the
+/// per-gateway [`crate::rotation::Rotation`] state machine (wiring lands in
+/// the netns-integration task; this variant only carries the directive).
 #[derive(Debug, Clone)]
 pub enum SyncEvent {
     State(DesiredState),
     Punch(PunchDirective),
+    Rotate(RotateDirective),
 }
 
 pub async fn connect(sync_addr: SocketAddr, id: &Identity) -> anyhow::Result<SyncClient<Channel>> {
@@ -54,16 +60,41 @@ pub async fn watch(client: &mut SyncClient<Channel>) -> anyhow::Result<tonic::St
 /// driver), sent fresh every `Report` call; an empty list is the equally
 /// meaningful "no relay transports open right now" (e.g. every peer is
 /// `Direct`), not "leave the previous snapshot alone".
+///
+/// `epoch_acks` (key-rotation Task 1/3) carries this gateway's liveness acks
+/// for a rotating PEER's pending epoch: an `EpochAck{peer_gateway_id: A,
+/// epoch: N, live: true}` means "I have a live, rx-corroborated WireGuard
+/// session with rotating gateway A's epoch-N key" — the signal that drives
+/// the controller's promote state machine. The steady-state sync loop sends
+/// an empty vec; only the rotation observation tick (Role B) populates it.
 pub async fn report(
     client: &mut SyncClient<Channel>,
     applied_version: u64,
     local_endpoints: Vec<String>,
     relay_health: Vec<RelayHealth>,
+    epoch_acks: Vec<EpochAck>,
 ) -> anyhow::Result<()> {
     client
-        .report(ReportRequest { applied_version, local_endpoints, relay_health })
+        .report(ReportRequest { applied_version, local_endpoints, relay_health, epoch_acks })
         .await
         .map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
+    Ok(())
+}
+
+/// Submit this gateway's freshly-minted REAL WireGuard public key for a
+/// pending rotation `epoch` (key-rotation Role A) — the private key never
+/// leaves the gateway. The controller overwrites the epoch's
+/// `awaiting-submission` sentinel with `pubkey`, then fans it out to peers so
+/// they can bring up their overlap Device toward the real key.
+pub async fn submit_epoch_key(
+    client: &mut SyncClient<Channel>,
+    epoch: u32,
+    pubkey: String,
+) -> anyhow::Result<()> {
+    client
+        .submit_epoch_key(SubmitEpochKeyRequest { epoch, pubkey })
+        .await
+        .map_err(|s| anyhow!("Sync.SubmitEpochKey failed: {s}"))?;
     Ok(())
 }
 
@@ -97,6 +128,9 @@ fn classify(body: Option<Body>, current: &mut Option<DesiredState>) -> anyhow::R
             Ok(SyncEvent::State(cur.clone()))
         }
         Some(Body::Punch(d)) => Ok(SyncEvent::Punch(d)),
+        // RotateDirective is surfaced verbatim; the boot loop routes it to
+        // the per-gateway Rotation state machine (netns-integration task).
+        Some(Body::Rotate(d)) => Ok(SyncEvent::Rotate(d)),
         None => Err(anyhow!("empty SyncMessage body")),
     }
 }
@@ -143,6 +177,17 @@ mod tests {
             other => panic!("expected Punch, got {other:?}"),
         }
         assert!(current.is_none(), "a punch directive must not fold into desired state");
+    }
+
+    #[test]
+    fn classify_rotate_yields_rotate_event() {
+        let mut current = None;
+        let rotate = wiremesh_proto::v1::RotateDirective { epoch: 5 };
+        match classify(Some(Body::Rotate(rotate.clone())), &mut current).unwrap() {
+            SyncEvent::Rotate(d) => assert_eq!(d.epoch, 5),
+            other => panic!("expected Rotate, got {other:?}"),
+        }
+        assert!(current.is_none(), "a rotate directive must not fold into desired state");
     }
 
     #[test]

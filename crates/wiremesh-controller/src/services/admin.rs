@@ -599,47 +599,10 @@ impl Admin for AdminSvc {
             }
         })?;
 
-        // Publish so already-connected peers see the new pending key. A
-        // missing identity here would mean the gateway vanished between
-        // `rotate_key`'s existence check and this re-read — treated as an
-        // internal error (shouldn't happen: nothing in cycle-2 deletes
-        // gateway rows).
-        let identity = self
-            .db
-            .gateway_identity_by_id(gateway_id)
-            .await
-            .map_err(|e| Status::internal(format!("re-reading gateway after rotation: {e}")))?
-            .ok_or_else(|| {
-                Status::internal(format!(
-                    "gateway {gateway_id} vanished immediately after RotateKey committed"
-                ))
-            })?;
-        let allowed_ips = self
-            .db
-            .cidrs_for_segment(identity.segment_id)
-            .await
-            .map_err(|e| Status::internal(format!("reading segment cidrs after rotation: {e}")))?;
-        let keys = self
-            .db
-            .all_keys_for_gateway(gateway_id)
-            .await
-            .map_err(|e| Status::internal(format!("reading gateway keys after rotation: {e}")))?;
-        let revision = self
-            .db
-            .current_revision()
-            .await
-            .map_err(|e| Status::internal(format!("reading revision after rotation: {e}")))?;
-
-        // `send` errors only when there are currently no `Sync.Watch`
-        // subscribers — nobody to notify, which is not a failure (mirrors
-        // `EnrollmentSvc::enroll`'s identical `let _ =`).
-        let _ = self.change_tx.send(ChangeEvent::KeyRotated {
-            gateway_id,
-            segment_name: identity.segment_name,
-            allowed_ips,
-            keys,
-            revision,
-        });
+        // Publish so already-connected peers see the new pending key —
+        // shared re-read-and-fan-out helper (also used by
+        // `SyncSvc::submit_epoch_key` after a real pubkey lands).
+        crate::projection::emit_key_rotated(&self.db, &self.change_tx, gateway_id).await?;
 
         Ok(Response::new(RotateKeyResponse {
             epoch: outcome.epoch as u32,
@@ -667,9 +630,10 @@ impl Admin for AdminSvc {
         Ok(Response::new(DebugKeyStatesResponse {
             keys: rows
                 .into_iter()
-                .map(|(epoch, _pubkey, state)| GatewayKeyState {
+                .map(|(epoch, pubkey, state)| GatewayKeyState {
                     epoch: epoch as u32,
                     state,
+                    pubkey,
                 })
                 .collect(),
         }))

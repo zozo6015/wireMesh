@@ -44,7 +44,7 @@ use wiremesh_proto::v1::enrollment_client::EnrollmentClient;
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{
     ApplyDiff, ApplyRequest, CreateSegmentRequest, MintApiTokenRequest, MintTokenRequest,
-    ReportRequest, SyncMessage, WatchRequest,
+    ReportRequest, SubmitEpochKeyRequest, SyncMessage, WatchRequest,
 };
 
 /// (Task 13) Client-side counterpart to `crate::auth`'s bearer-auth
@@ -110,6 +110,17 @@ pub struct TestController {
     // still re-assigns the ports). `127.0.0.1` for `start()` (unchanged);
     // a routable underlay IP for the mesh-milestone test's `start_on`.
     bind_ip: std::net::Ipv4Addr,
+    // (Key-rotation Task 4) The rotation-initiation-timer/decision-sweep
+    // intervals this instance was booted with — captured at
+    // `start`/`start_on`/`start_with_rotation_intervals` so `restart` reuses
+    // the SAME small intervals a test started with, rather than reverting to
+    // `Config`'s 30-day/5s defaults. Without this, a test that shrinks these
+    // intervals to observe timer/sweep behavior would silently lose that
+    // after a `restart()` — exactly the scenario
+    // `sweep_retires_orphaned_retiring_row_after_crash` depends on NOT
+    // happening.
+    rotation_interval: std::time::Duration,
+    rotation_sweep_interval: std::time::Duration,
     // Held only so the directory (and everything the controller wrote under
     // it — DB, CA, secrets, the socket) is cleaned up on drop; never read
     // directly.
@@ -169,6 +180,45 @@ impl TestController {
     /// byte-for-byte unchanged. The TLS server cert SAN stays `127.0.0.1`
     /// regardless (see `Config::bind_ip`'s doc comment).
     pub async fn start_on(bind_ip: std::net::Ipv4Addr) -> TestController {
+        Self::start_inner(
+            bind_ip,
+            Config::default_rotation_interval(),
+            Config::default_rotation_sweep_interval(),
+        )
+        .await
+    }
+
+    /// (Key-rotation Task 4) Additive counterpart to [`Self::start`]/
+    /// [`Self::start_on`] that boots against the DEFAULT `bind_ip` but
+    /// caller-supplied `rotation_interval`/`rotation_sweep_interval` — what
+    /// every rotation-timer/decision-sweep test uses instead of `start()`'s
+    /// 30-day/5s production defaults, so the timer's/sweep's background
+    /// cadence can be observed within a test's own bounded budget rather than
+    /// requiring an actual 30-day (or even 5s-per-tick) wait. Both intervals
+    /// are stored on the returned `TestController` so a later `restart()`
+    /// reuses them (see the `rotation_interval`/`rotation_sweep_interval`
+    /// fields' doc comment) — a restart must NOT silently revert to
+    /// `Config`'s production defaults.
+    pub async fn start_with_rotation_intervals(
+        rotation_interval: std::time::Duration,
+        rotation_sweep_interval: std::time::Duration,
+    ) -> TestController {
+        Self::start_inner(
+            Config::default_bind_ip(),
+            rotation_interval,
+            rotation_sweep_interval,
+        )
+        .await
+    }
+
+    /// Shared boot logic behind [`Self::start_on`] (defaults) and
+    /// [`Self::start_with_rotation_intervals`] (caller-supplied intervals) —
+    /// see either method's doc comment for what each is for.
+    async fn start_inner(
+        bind_ip: std::net::Ipv4Addr,
+        rotation_interval: std::time::Duration,
+        rotation_sweep_interval: std::time::Duration,
+    ) -> TestController {
         let data_dir = tempfile::tempdir().expect("creating temp data dir for TestController");
         let socket_path = data_dir.path().join("controller.sock");
 
@@ -180,6 +230,8 @@ impl TestController {
             admin_tcp_port: 0,
             observe_udp_port: 0,
             bind_ip,
+            rotation_interval,
+            rotation_sweep_interval,
         };
 
         let server_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -200,6 +252,8 @@ impl TestController {
             running: Some(running),
             server_runtime: Some(server_runtime),
             bind_ip,
+            rotation_interval,
+            rotation_sweep_interval,
         }
     }
 
@@ -240,6 +294,14 @@ impl TestController {
             admin_tcp_port: 0,
             observe_udp_port: 0,
             bind_ip: self.bind_ip,
+            // (Key-rotation Task 4) Reuse the SAME intervals this instance
+            // was started with — NOT `Config`'s 30-day/5s production
+            // defaults — so a restart doesn't silently widen a test's
+            // shrunk rotation-timer/decision-sweep cadence back out. See the
+            // `rotation_interval`/`rotation_sweep_interval` fields' doc
+            // comment.
+            rotation_interval: self.rotation_interval,
+            rotation_sweep_interval: self.rotation_sweep_interval,
         };
 
         // (Task 13) Reuse the SAME `server_runtime` across a restart (rather
@@ -396,14 +458,15 @@ impl TestController {
         AdminClient::new(channel)
     }
 
-    /// (Task 11) Debug/test accessor: every `GATEWAY_KEY` row (any state —
-    /// `pending`, `active`, `retiring`) for `gateway_id`, as `(epoch, state)`
-    /// pairs — read via `Admin.DebugKeyStates` over the controller's Unix
-    /// socket (not a direct file-level DB read), so it exercises the same
+    /// (Task 11; pubkey added key-rotation Task 2) Debug/test accessor:
+    /// every `GATEWAY_KEY` row (any state — `pending`, `active`,
+    /// `retiring`) for `gateway_id`, as `(epoch, pubkey, state)` triples —
+    /// read via `Admin.DebugKeyStates` over the controller's Unix socket
+    /// (not a direct file-level DB read), so it exercises the same
     /// running-controller path a real debug/ops surface would, and works
     /// unchanged after `restart()` swaps in a new `RunningController` over
     /// the same on-disk DB.
-    pub async fn debug_key_states(&self, gateway_id: u64) -> Vec<(u32, String)> {
+    pub async fn debug_key_states(&self, gateway_id: u64) -> Vec<(u32, String, String)> {
         let resp = self
             .admin_client()
             .await
@@ -411,7 +474,10 @@ impl TestController {
             .await
             .expect("Admin.DebugKeyStates")
             .into_inner();
-        resp.keys.into_iter().map(|k| (k.epoch, k.state)).collect()
+        resp.keys
+            .into_iter()
+            .map(|k| (k.epoch, k.pubkey, k.state))
+            .collect()
     }
 
     /// (Task 12) `true` iff `gateway_id` is currently an existing, active
@@ -842,9 +908,45 @@ impl StubGateway {
                 applied_version,
                 local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
                 relay_health: vec![],
+                epoch_acks: vec![],
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report failed: {status}"))?;
+        Ok(())
+    }
+
+    /// (Key-rotation Task 2) Submits this gateway's REAL WireGuard public
+    /// key for a pending rotation `epoch` via `Sync.SubmitEpochKey`, over a
+    /// fresh mTLS channel using this gateway's own identity — mirrors
+    /// [`Self::report`]'s connection setup exactly.
+    pub async fn submit_epoch_key(&self, epoch: u32, pubkey: &str) -> anyhow::Result<()> {
+        let uri = format!("https://{}", self.sync_addr);
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
+            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
+            .tls_config(tls)
+            .map_err(|e| {
+                anyhow::anyhow!("configuring StubGateway mTLS for Sync.SubmitEpochKey: {e}")
+            })?
+            .connect()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "connecting to the controller's Sync (mTLS) TCP port for \
+                     Sync.SubmitEpochKey: {e}"
+                )
+            })?;
+
+        SyncClient::new(channel)
+            .submit_epoch_key(SubmitEpochKeyRequest {
+                epoch,
+                pubkey: pubkey.to_string(),
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("Sync.SubmitEpochKey failed: {status}"))?;
         Ok(())
     }
 
@@ -899,9 +1001,66 @@ impl StubGateway {
                         healthy: *healthy,
                     })
                     .collect(),
+                epoch_acks: vec![],
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report (relay health) failed: {status}"))?;
+        Ok(())
+    }
+
+    /// (Key-rotation Task 3) Additive counterpart to [`Self::report`] that
+    /// populates `ReportRequest.epoch_acks` instead — what a real gateway's
+    /// own WireGuard UAPI-driven liveness check (a later task) will
+    /// eventually compute, stood in here by a caller-supplied
+    /// `(peer_gateway_id, epoch, live)` list. Per the ack-direction rule
+    /// (`.superpowers/sdd/task-3-brief.md`): calling
+    /// `b.report_epoch_acks(_, &[(a.id(), n, true)])` means "B has a live
+    /// WireGuard session with rotating-gateway A's epoch-n key" — the ack is
+    /// recorded against A (the rotating gateway), not B (the reporter).
+    /// Mirrors [`Self::report_with_relay_health`]'s connection setup exactly.
+    pub async fn report_epoch_acks(
+        &self,
+        applied_version: u64,
+        acks: &[(u64, u32, bool)],
+    ) -> anyhow::Result<()> {
+        let uri = format!("https://{}", self.sync_addr);
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
+            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
+            .tls_config(tls)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "configuring StubGateway mTLS for Sync.Report (epoch acks): {e}"
+                )
+            })?
+            .connect()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "connecting to the controller's Sync (mTLS) TCP port for Sync.Report \
+                     (epoch acks): {e}"
+                )
+            })?;
+
+        SyncClient::new(channel)
+            .report(ReportRequest {
+                applied_version,
+                local_endpoints: vec![],
+                relay_health: vec![],
+                epoch_acks: acks
+                    .iter()
+                    .map(|(peer_gateway_id, epoch, live)| wiremesh_proto::v1::EpochAck {
+                        peer_gateway_id: *peer_gateway_id,
+                        epoch: *epoch,
+                        live: *live,
+                    })
+                    .collect(),
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("Sync.Report (epoch acks) failed: {status}"))?;
         Ok(())
     }
 

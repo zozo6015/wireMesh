@@ -15,6 +15,7 @@ pub mod db;
 pub mod db_async;
 pub mod observe;
 pub mod projection;
+pub mod rotation;
 pub mod routes;
 pub mod services;
 
@@ -123,6 +124,30 @@ pub struct Config {
     /// exposing it on a routable interface would make the bearer token
     /// interceptable/replayable on the wire.
     pub bind_ip: std::net::Ipv4Addr,
+    /// (Key-rotation Task 4) How often the rotation-initiation background
+    /// task fires: on each tick, every `active` gateway whose key set is
+    /// single-`active`-only (not already mid-rotation — see
+    /// [`services::sync::initiate_due_rotations`]) gets a fresh `rotate_key`
+    /// call with no operator action at all. Defaults to 30 days
+    /// ([`Config::default_rotation_interval`]) for every real deployment;
+    /// tests shrink this to sub-second values via
+    /// `wiremesh_testkit::TestController::start_with_rotation_intervals` so
+    /// the timer's behavior can be observed without an actual 30-day wait.
+    /// `serve()` consumes `tokio::time::interval`'s immediate first tick
+    /// before looping (see that call site's comment), so the first real
+    /// initiation lands after one full `rotation_interval`, not immediately
+    /// at boot.
+    pub rotation_interval: std::time::Duration,
+    /// (Key-rotation Task 4) How often the decision-sweep background task
+    /// fires: on each tick, it drives the Task-3 ack-driven promote/retire/
+    /// abort decision for every gateway with an in-flight rotation (rebuilding
+    /// a lazily-lost `RotationTracker` for a DB `pending` row that has none —
+    /// crash recovery), and retires any `retiring` row left ORPHANED by a
+    /// crash inside the promote→retire grace window (no in-memory tracker —
+    /// see [`services::sync::sweep_rotations`]). Defaults to 5 seconds
+    /// ([`Config::default_rotation_sweep_interval`]); shrunk by tests the
+    /// same way as `rotation_interval`.
+    pub rotation_sweep_interval: std::time::Duration,
 }
 
 impl Config {
@@ -130,6 +155,18 @@ impl Config {
     /// behavior every caller except the mesh-milestone test wants.
     pub fn default_bind_ip() -> std::net::Ipv4Addr {
         std::net::Ipv4Addr::LOCALHOST
+    }
+
+    /// The default rotation-initiation interval: 30 days. See
+    /// [`Config::rotation_interval`]'s doc comment.
+    pub fn default_rotation_interval() -> std::time::Duration {
+        std::time::Duration::from_secs(30 * 24 * 60 * 60)
+    }
+
+    /// The default decision-sweep interval: 5 seconds. See
+    /// [`Config::rotation_sweep_interval`]'s doc comment.
+    pub fn default_rotation_sweep_interval() -> std::time::Duration {
+        std::time::Duration::from_secs(5)
     }
 }
 
@@ -164,6 +201,16 @@ pub struct RunningController {
     /// down the same bounded-join-then-abort way as every other server task.
     broker_shutdown_tx: Option<oneshot::Sender<()>>,
     broker_join: Option<JoinHandle<()>>,
+    /// (Key-rotation Task 4) The rotation-initiation timer's background task
+    /// — see [`Config::rotation_interval`] / [`services::sync::initiate_due_rotations`].
+    /// Torn down the same bounded-join-then-abort way as every other server
+    /// task.
+    rotation_timer_shutdown_tx: Option<oneshot::Sender<()>>,
+    rotation_timer_join: Option<JoinHandle<()>>,
+    /// (Key-rotation Task 4) The decision-sweep's background task — see
+    /// [`Config::rotation_sweep_interval`] / [`services::sync::sweep_rotations`].
+    rotation_sweep_shutdown_tx: Option<oneshot::Sender<()>>,
+    rotation_sweep_join: Option<JoinHandle<()>>,
 }
 
 impl RunningController {
@@ -252,12 +299,20 @@ impl RunningController {
         if let Some(tx) = self.broker_shutdown_tx.take() {
             let _ = tx.send(());
         }
+        if let Some(tx) = self.rotation_timer_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(tx) = self.rotation_sweep_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
         join_bounded(self.admin_join.take()).await;
         join_bounded(self.admin_tcp_join.take()).await;
         join_bounded(self.enroll_join.take()).await;
         join_bounded(self.sync_join.take()).await;
         join_bounded(self.observe_join.take()).await;
         join_bounded(self.broker_join.take()).await;
+        join_bounded(self.rotation_timer_join.take()).await;
+        join_bounded(self.rotation_sweep_join.take()).await;
     }
 }
 
@@ -329,6 +384,18 @@ impl Drop for RunningController {
             let _ = tx.send(());
         }
         if let Some(join) = self.broker_join.take() {
+            join.abort();
+        }
+        if let Some(tx) = self.rotation_timer_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.rotation_timer_join.take() {
+            join.abort();
+        }
+        if let Some(tx) = self.rotation_sweep_shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        if let Some(join) = self.rotation_sweep_join.take() {
             join.abort();
         }
     }
@@ -543,7 +610,79 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         .clone()
         .spawn(change_tx.subscribe(), broker_shutdown_rx);
 
-    let sync_svc = SyncSvc::new(db_handle, change_tx, broker);
+    // (Key-rotation Task 4) `db_handle`/`change_tx`/`broker` are each cloned
+    // here (rather than moved, as before this task) because the
+    // rotation-initiation timer and decision-sweep tasks spawned below also
+    // need their own handles to the same DB/broadcast-channel/broker.
+    let sync_svc = SyncSvc::new(db_handle.clone(), change_tx.clone(), broker.clone());
+    // The SAME `rotations` map `SyncSvc` drives ack-triggered promotions
+    // against — cloning the `Arc` here (rather than each side building its
+    // own) is what lets the sweep task rebuild/observe the exact in-flight
+    // trackers `Sync.Report`/`Sync.SubmitEpochKey` create, and vice versa.
+    let rotations = sync_svc.rotations_handle();
+
+    // (Key-rotation Task 4) The rotation-initiation timer: fires every
+    // `config.rotation_interval` (default 30 days; tests shrink this via
+    // `TestController::start_with_rotation_intervals`) and initiates a fresh
+    // rotation for every `active` gateway not already mid-rotation. The
+    // immediate first tick `tokio::time::interval` fires is deliberately
+    // consumed BEFORE the loop starts (mirrors `broker::Broker::spawn`'s
+    // identical comment) — without this, a controller boot would
+    // immediately rotate every gateway's key rather than waiting a full
+    // interval, which is both surprising and (for the 30-day default)
+    // irrelevant, but for a shrunk test interval would make "one interval
+    // elapsed" tests unable to distinguish "fired at t=0" from "fired after
+    // one real interval."
+    let (rotation_timer_shutdown_tx, mut rotation_timer_shutdown_rx) = oneshot::channel::<()>();
+    let rotation_timer_db = db_handle.clone();
+    let rotation_timer_change_tx = change_tx.clone();
+    let rotation_interval = config.rotation_interval;
+    let rotation_timer_join = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(rotation_interval);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = &mut rotation_timer_shutdown_rx => break,
+                _ = ticker.tick() => {
+                    services::sync::initiate_due_rotations(&rotation_timer_db, &rotation_timer_change_tx)
+                        .await;
+                }
+            }
+        }
+    });
+
+    // (Key-rotation Task 4) The decision sweep: fires every
+    // `config.rotation_sweep_interval` (default 5s) and drives the Task-3
+    // ack-driven promote/retire/abort decision for every in-flight rotation
+    // — including rebuilding a lazily-lost tracker for a crash-surviving
+    // `pending` row, and retiring a `retiring` row orphaned by a crash inside
+    // the promote→retire grace window (no in-memory tracker left to drive
+    // it via `decide`). Shares the SAME `rotations` Arc as `sync_svc` above.
+    let (rotation_sweep_shutdown_tx, mut rotation_sweep_shutdown_rx) = oneshot::channel::<()>();
+    let rotation_sweep_db = db_handle.clone();
+    let rotation_sweep_change_tx = change_tx.clone();
+    let rotation_sweep_broker = broker.clone();
+    let rotation_sweep_rotations = rotations.clone();
+    let rotation_sweep_interval = config.rotation_sweep_interval;
+    let rotation_sweep_join = tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(rotation_sweep_interval);
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = &mut rotation_sweep_shutdown_rx => break,
+                _ = ticker.tick() => {
+                    services::sync::sweep_rotations(
+                        &rotation_sweep_db,
+                        &rotation_sweep_change_tx,
+                        &rotation_sweep_broker,
+                        &rotation_sweep_rotations,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
+
     // `client_auth_optional` defaults to `false` — i.e. REQUIRED — so this
     // is exactly the mTLS posture Sync needs: the Sync listener rejects any
     // TLS handshake that doesn't present a client cert chaining to
@@ -588,6 +727,10 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         observe_join: Some(observe_join),
         broker_shutdown_tx: Some(broker_shutdown_tx),
         broker_join: Some(broker_join),
+        rotation_timer_shutdown_tx: Some(rotation_timer_shutdown_tx),
+        rotation_timer_join: Some(rotation_timer_join),
+        rotation_sweep_shutdown_tx: Some(rotation_sweep_shutdown_tx),
+        rotation_sweep_join: Some(rotation_sweep_join),
     })
 }
 

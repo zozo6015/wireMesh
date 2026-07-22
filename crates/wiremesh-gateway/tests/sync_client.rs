@@ -48,11 +48,12 @@ async fn receives_snapshot_and_reports_version() {
     let ds = match sync::next_event(&mut stream, &mut cur).await.expect("first msg").expect("snapshot") {
         sync::SyncEvent::State(ds) => ds,
         sync::SyncEvent::Punch(p) => panic!("expected snapshot, got punch directive: {p:?}"),
+        sync::SyncEvent::Rotate(r) => panic!("expected snapshot, got rotate directive: {r:?}"),
     };
     // Gateway A's peer is gateway B (seg-b, 10.10.2.0/24).
     assert!(ds.peers.iter().any(|p| p.allowed_ips.contains(&"10.10.2.0/24".to_string())),
             "snapshot lists peer B's segment: {:?}", ds.peers);
 
-    sync::report(&mut client, ds.policy_version, vec![], vec![]).await.expect("report ack");
+    sync::report(&mut client, ds.policy_version, vec![], vec![], vec![]).await.expect("report ack");
     let _ = stream; // keep alive
 }

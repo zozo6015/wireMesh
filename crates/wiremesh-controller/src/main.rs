@@ -48,6 +48,8 @@ async fn main() -> Result<()> {
         admin_tcp_port,
         observe_udp_port,
         bind_ip: Config::default_bind_ip(),
+        rotation_interval: Config::default_rotation_interval(),
+        rotation_sweep_interval: Config::default_rotation_sweep_interval(),
     };
 
     let running = serve(config).await?;

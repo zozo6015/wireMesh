@@ -8,11 +8,29 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 use wiremesh_proto::v1::{Delta, Peer, RelayInfo, StateSnapshot};
 
+/// One advertised key-epoch entry for a peer, as reported by the controller
+/// (`Peer.keys` — key-rotation Task 2/7). A peer rotating its WireGuard key
+/// advertises both its current `"active"` epoch and, once rotation begins, a
+/// real-keyed `"pending"` epoch (or the controller's `"awaiting-submission"`
+/// sentinel until the peer gateway has actually submitted a new pubkey).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerKeyInfo {
+    pub epoch: u32,
+    pub pubkey_b64: String,
+    pub state: String, // "pending" | "active" | "retiring"
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PeerState {
     pub gateway_id: u64,
     pub segment_name: String,
     pub active_pubkey_b64: Option<String>,
+    /// The peer's full advertised key set (all epochs/states), as reported by
+    /// the controller (`Peer.keys`). `#[serde(default)]` keeps
+    /// `DesiredState::load()` backward-compatible with a pre-Task-7
+    /// `state.json` that predates this field.
+    #[serde(default)]
+    pub keys: Vec<PeerKeyInfo>,
     /// The peer's FULL candidate-endpoint list, as reported by the
     /// controller (`Peer.candidate_endpoints` — cycle4b §5/§6.1: the
     /// controller-observed address plus any locally-reported ones,
@@ -37,10 +55,16 @@ impl PeerState {
             .iter()
             .find(|k| k.state == "active")
             .map(|k| k.pubkey.clone());
+        let keys = p
+            .keys
+            .iter()
+            .map(|k| PeerKeyInfo { epoch: k.epoch, pubkey_b64: k.pubkey.clone(), state: k.state.clone() })
+            .collect();
         PeerState {
             gateway_id: p.gateway_id,
             segment_name: p.segment_name.clone(),
             active_pubkey_b64,
+            keys,
             candidates: p.candidate_endpoints.clone(),
             allowed_ips: p.allowed_ips.clone(),
         }
@@ -54,6 +78,20 @@ impl PeerState {
     /// something to iterate over once it lands.
     pub fn primary_endpoint(&self) -> Option<&String> {
         self.candidates.first()
+    }
+
+    /// The peer's current active key-epoch entry, if advertised.
+    pub fn active_key(&self) -> Option<&PeerKeyInfo> {
+        self.keys.iter().find(|k| k.state == "active")
+    }
+
+    /// A real-keyed pending epoch: `state == "pending"` AND the pubkey isn't
+    /// the controller's `"awaiting-submission"` sentinel (key-rotation Task
+    /// 2) — a pending entry still bearing it has no real WG pubkey yet.
+    pub fn pending_key(&self) -> Option<&PeerKeyInfo> {
+        self.keys
+            .iter()
+            .find(|k| k.state == "pending" && k.pubkey_b64 != "awaiting-submission")
     }
 }
 
@@ -223,6 +261,63 @@ mod tests {
             "from_proto must keep the FULL candidate list, not just .first()"
         );
         assert_eq!(ps.primary_endpoint().map(String::as_str), Some("198.51.100.9:51820"));
+    }
+
+    #[test]
+    fn from_proto_retains_full_key_set() {
+        let p = Peer {
+            gateway_id: 11,
+            segment_name: "seg11".into(),
+            keys: vec![
+                PeerKey { epoch: 0, pubkey: "KA".into(), state: "active".into() },
+                PeerKey { epoch: 1, pubkey: "KP".into(), state: "pending".into() },
+            ],
+            candidate_endpoints: vec!["203.0.113.11:51820".into()],
+            allowed_ips: vec!["10.10.11.0/24".into()],
+        };
+        let ps = PeerState::from_proto(&p);
+        assert_eq!(ps.keys.len(), 2);
+        let active = ps.active_key().expect("active key present");
+        assert_eq!(active.epoch, 0);
+        assert_eq!(active.pubkey_b64, "KA");
+        let pending = ps.pending_key().expect("pending key present");
+        assert_eq!(pending.epoch, 1);
+        assert_eq!(pending.pubkey_b64, "KP");
+    }
+
+    #[test]
+    fn pending_key_ignores_sentinel() {
+        let p = Peer {
+            gateway_id: 12,
+            segment_name: "seg12".into(),
+            keys: vec![
+                PeerKey { epoch: 0, pubkey: "KA".into(), state: "active".into() },
+                PeerKey { epoch: 1, pubkey: "awaiting-submission".into(), state: "pending".into() },
+            ],
+            candidate_endpoints: vec!["203.0.113.12:51820".into()],
+            allowed_ips: vec!["10.10.12.0/24".into()],
+        };
+        let ps = PeerState::from_proto(&p);
+        assert!(ps.pending_key().is_none(), "sentinel pending key must not be reported as a real pending key");
+        let active = ps.active_key().expect("active key still present");
+        assert_eq!(active.pubkey_b64, "KA");
+    }
+
+    #[test]
+    fn active_pubkey_b64_still_populated() {
+        let p = Peer {
+            gateway_id: 13,
+            segment_name: "seg13".into(),
+            keys: vec![
+                PeerKey { epoch: 0, pubkey: "KA".into(), state: "active".into() },
+                PeerKey { epoch: 1, pubkey: "KP".into(), state: "pending".into() },
+            ],
+            candidate_endpoints: vec!["203.0.113.13:51820".into()],
+            allowed_ips: vec!["10.10.13.0/24".into()],
+        };
+        let ps = PeerState::from_proto(&p);
+        assert_eq!(ps.active_pubkey_b64.as_deref(), Some("KA"));
+        assert_eq!(ps.active_key().map(|k| k.pubkey_b64.as_str()), Some("KA"));
     }
 
     #[test]

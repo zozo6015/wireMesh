@@ -6,9 +6,14 @@
 //! then calls the (not-yet-existing) `Admin.RotateKey(gateway_id = a.id())`.
 //! That must:
 //!
-//!   1. insert a new `pending` `GATEWAY_KEY(epoch = n+1)` row for A, and push
-//!      a `Delta` down B's still-open Sync stream carrying A as an upserted
-//!      peer whose `keys` include one with `state == "pending"`;
+//!   1. insert a new `pending` `GATEWAY_KEY(epoch = n+1)` row for A in the
+//!      DB — but (Key-rotation Task 8a's projection guard, see
+//!      `tests/projection_guard.rs`) NOT advertise it to B over the wire
+//!      yet, since it still carries the `"awaiting-submission"` sentinel
+//!      pubkey (Task 2): the `Delta` pushed down B's still-open Sync stream
+//!      upserts A with its active key intact and its `keys` containing NO
+//!      entry with `state == "pending"` until A submits its real key via
+//!      `Sync.SubmitEpochKey`;
 //!   2. survive a controller restart — after `h.restart().await`, the
 //!      pending epoch must still be readable back out of the DB (via the
 //!      testkit's `debug_key_states` admin/debug helper), proving the
@@ -70,8 +75,10 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
         .await
         .expect("Admin.RotateKey(gateway_id = a.id()) must succeed");
 
-    // B must see a Delta announcing A's new pending-epoch key, bounded by a
-    // timeout so a missing delta fails fast instead of hanging the suite.
+    // B must see a Delta upserting A (its active key intact, the pending
+    // sentinel withheld per the Task 8a projection guard — see the
+    // assertions below), bounded by a timeout so a missing delta fails fast
+    // instead of hanging the suite.
     let msg = tokio::time::timeout(Duration::from_secs(5), b_stream.next())
         .await
         .expect("timed out waiting for the delta triggered by Admin.RotateKey")
@@ -95,32 +102,34 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
                 delta.upserted_peers
             )
         });
-    let pending_key = a_peer
-        .keys
-        .iter()
-        .find(|k| k.state == "pending")
-        .unwrap_or_else(|| {
-            panic!(
-                "expected gateway A's peer entry in the rotation delta to carry a PeerKey \
-                 with state == \"pending\", got keys: {:?}",
-                a_peer.keys
-            )
-        });
-    // A broken rotation that reuses the current epoch (rather than
-    // allocating a new, strictly higher one) must be caught here, not just
-    // "some pending key exists".
-    if let Some(prior_max) = pre_rotation_max_epoch {
-        assert!(
-            pending_key.epoch > prior_max,
-            "expected the new pending epoch ({}) to be strictly greater than the prior \
-             max epoch ({prior_max}), got keys: {:?}",
-            pending_key.epoch,
-            a_peer.keys
-        );
-    }
+    // (Key-rotation Task 8a — projection guard, see tests/projection_guard.rs)
+    // A freshly rotated epoch's pubkey is still the "awaiting-submission"
+    // sentinel (Task 2) until A calls Sync.SubmitEpochKey — the controller
+    // must NOT advertise a peer key that doesn't exist yet, so the delta
+    // right after Admin.RotateKey must carry NO "pending" PeerKey at all,
+    // while still carrying A's existing active key untouched. (Before the
+    // guard, this delta DID include a "pending" sentinel key; that's why
+    // this section changed — see this test file's RED-run note in the
+    // Task-8a report.)
+    assert!(
+        a_peer.keys.iter().all(|k| k.state != "pending"),
+        "expected the sentinel-holding pending epoch to be WITHHELD from the \
+         advertised rotation delta until A submits its real key (projection guard), \
+         got keys: {:?}",
+        a_peer.keys
+    );
+    assert!(
+        a_peer
+            .keys
+            .iter()
+            .any(|k| k.epoch == 0 && k.state == "active"),
+        "expected gateway A's peer entry in the rotation delta to still carry its \
+         active epoch-0 key even though the pending sentinel is withheld, got keys: {:?}",
+        a_peer.keys
+    );
     // The previous active epoch must still be present — make-before-break
-    // means rotation ADDS a pending key, it must never REPLACE the existing
-    // active one.
+    // means rotation ADDS a pending key (in the DB — see the debug_key_states
+    // assertions below), it must never REPLACE the existing active one.
     for (epoch, state) in &pre_rotation_a_keys {
         if state == "active" {
             assert!(
@@ -135,6 +144,37 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
         }
     }
 
+    // The DB-level pending epoch (withheld from the wire by the projection
+    // guard, but still real bookkeeping) is what the restart assertions
+    // below prove survives a controller restart — read it via
+    // debug_key_states rather than the (now guard-withheld) delta.
+    let post_rotate_states = h.debug_key_states(a.id()).await;
+    let (pending_epoch, _pubkey, pending_state) = post_rotate_states
+        .iter()
+        .max_by_key(|(epoch, _, _)| *epoch)
+        .unwrap_or_else(|| {
+            panic!(
+                "expected at least one GATEWAY_KEY row for gateway A after rotation, \
+                 got: {post_rotate_states:?}"
+            )
+        });
+    assert_eq!(
+        pending_state, "pending",
+        "expected the highest-epoch row right after Admin.RotateKey to be 'pending', \
+         got states: {post_rotate_states:?}"
+    );
+    // A broken rotation that reuses the current epoch (rather than
+    // allocating a new, strictly higher one) must be caught here, not just
+    // "some pending row exists".
+    if let Some(prior_max) = pre_rotation_max_epoch {
+        assert!(
+            *pending_epoch > prior_max,
+            "expected the new pending epoch ({pending_epoch}) to be strictly greater \
+             than the prior max epoch ({prior_max}), got states: {post_rotate_states:?}"
+        );
+    }
+    let pending_epoch = *pending_epoch;
+
     // Restart mid-rotation: the pending epoch's bookkeeping must resume from
     // the DB snapshot, not just live in the pre-restart controller's memory.
     h.restart().await;
@@ -143,17 +183,16 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
     assert!(
         states
             .iter()
-            .any(|(epoch, st)| *epoch == pending_key.epoch && st == "pending"),
-        "expected pending GATEWAY_KEY epoch {} for gateway A to survive the controller \
-         restart, got states: {states:?}",
-        pending_key.epoch
+            .any(|(epoch, _pubkey, st)| *epoch == pending_epoch && st == "pending"),
+        "expected pending GATEWAY_KEY epoch {pending_epoch} for gateway A to survive the \
+         controller restart, got states: {states:?}"
     );
     for (epoch, state) in &pre_rotation_a_keys {
         if state == "active" {
             assert!(
                 states
                     .iter()
-                    .any(|(e, st)| e == epoch && st == "active"),
+                    .any(|(e, _pubkey, st)| e == epoch && st == "active"),
                 "expected the original active epoch {epoch} to also survive the \
                  controller restart, got states: {states:?}"
             );

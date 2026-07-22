@@ -2,7 +2,8 @@
 use prost::Message;
 use wiremesh_proto::v1::{
     StateSnapshot, Peer, sync_message::Body, SyncMessage, PunchDirective, ReportRequest,
-    RelayInfo, RelayHealth, Delta, EnrollRequest,
+    RelayInfo, RelayHealth, Delta, EnrollRequest, RotateDirective, SubmitEpochKeyRequest,
+    EpochAck,
 };
 
 #[test]
@@ -65,6 +66,7 @@ fn report_request_local_endpoints_roundtrips() {
         applied_version: 5,
         local_endpoints: vec!["10.0.0.5:51820".into()],
         relay_health: vec![],
+        epoch_acks: vec![],
     };
     let bytes = with_endpoints.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
@@ -72,7 +74,12 @@ fn report_request_local_endpoints_roundtrips() {
 
     // Empty local_endpoints must still roundtrip cleanly (old-client behavior,
     // pre-dating this additive field).
-    let no_endpoints = ReportRequest { applied_version: 5, local_endpoints: vec![], relay_health: vec![] };
+    let no_endpoints = ReportRequest {
+        applied_version: 5,
+        local_endpoints: vec![],
+        relay_health: vec![],
+        epoch_acks: vec![],
+    };
     let bytes = no_endpoints.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
     assert_eq!(decoded, no_endpoints);
@@ -174,6 +181,7 @@ fn report_request_relay_health_roundtrips() {
             RelayHealth { relay_id: 1, healthy: true },
             RelayHealth { relay_id: 2, healthy: false },
         ],
+        epoch_acks: vec![],
     };
 
     let bytes = report.encode_to_vec();
@@ -219,4 +227,76 @@ fn enroll_request_endpoint_roundtrips() {
     let bytes = no_endpoint.encode_to_vec();
     let decoded = EnrollRequest::decode(bytes.as_slice()).expect("decoding the encoded EnrollRequest");
     assert_eq!(decoded.endpoint, "");
+}
+
+#[test]
+fn rotate_directive_message_roundtrips() {
+    // Key-rotation Task 1: SyncMessage.body gains a fourth oneof variant,
+    // RotateDirective, the controller-issued instruction that tells a
+    // gateway to begin publishing/accepting a new key epoch. Genuine wire
+    // roundtrip (see rationale in snapshot_message_roundtrips above).
+    let rotate = RotateDirective { epoch: 5 };
+    let msg = SyncMessage { body: Some(Body::Rotate(rotate.clone())) };
+
+    let bytes = msg.encode_to_vec();
+    let decoded = SyncMessage::decode(bytes.as_slice()).expect("decoding the encoded SyncMessage");
+
+    match decoded.body {
+        Some(Body::Rotate(r)) => assert_eq!(r.epoch, 5),
+        other => panic!("wrong body: {other:?}"),
+    }
+}
+
+#[test]
+fn submit_epoch_key_request_roundtrips() {
+    // Key-rotation Task 1: a gateway submits its newly generated per-epoch
+    // WireGuard public key to the controller via SubmitEpochKeyRequest.
+    let req = SubmitEpochKeyRequest { epoch: 5, pubkey: "REALKEY==".into() };
+
+    let bytes = req.encode_to_vec();
+    let decoded = SubmitEpochKeyRequest::decode(bytes.as_slice())
+        .expect("decoding the encoded SubmitEpochKeyRequest");
+
+    assert_eq!(decoded, req);
+}
+
+#[test]
+fn report_request_epoch_acks_roundtrips() {
+    // Key-rotation Task 1: ReportRequest gains `repeated EpochAck
+    // epoch_acks = 4;` so a gateway can tell the controller which peers it
+    // has confirmed are live on a given key epoch (make-before-break
+    // corroboration). One live ack, one not-yet-live ack, to prove `live`
+    // isn't just defaulting true.
+    let with_acks = ReportRequest {
+        applied_version: 9,
+        local_endpoints: vec!["10.0.0.5:51820".into()],
+        relay_health: vec![],
+        epoch_acks: vec![
+            EpochAck { peer_gateway_id: 1, epoch: 6, live: true },
+            EpochAck { peer_gateway_id: 2, epoch: 6, live: false },
+        ],
+    };
+
+    let bytes = with_acks.encode_to_vec();
+    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+
+    assert_eq!(decoded.epoch_acks.len(), 2);
+    assert_eq!(decoded.epoch_acks[0].peer_gateway_id, 1);
+    assert_eq!(decoded.epoch_acks[0].epoch, 6);
+    assert_eq!(decoded.epoch_acks[0].live, true);
+    assert_eq!(decoded.epoch_acks[1].peer_gateway_id, 2);
+    assert_eq!(decoded.epoch_acks[1].epoch, 6);
+    assert_eq!(decoded.epoch_acks[1].live, false);
+
+    // Empty epoch_acks must still roundtrip cleanly (additive field,
+    // old-client behavior).
+    let no_acks = ReportRequest {
+        applied_version: 9,
+        local_endpoints: vec!["10.0.0.5:51820".into()],
+        relay_health: vec![],
+        epoch_acks: vec![],
+    };
+    let bytes = no_acks.encode_to_vec();
+    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    assert_eq!(decoded, no_acks);
 }

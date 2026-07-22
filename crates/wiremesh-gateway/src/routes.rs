@@ -20,6 +20,28 @@ pub fn enable_ip_forward() -> anyhow::Result<()> {
     run("sysctl", &["-w", "net.ipv4.ip_forward=1"])
 }
 
+/// Set reverse-path filtering to LOOSE (mode 2) on every interface
+/// (`conf.all` + `conf.default`, whose numeric `max` with any per-interface
+/// value the kernel takes — so 2 wins even where an interface is 1/strict).
+///
+/// A make-before-break key rotation forwards traffic ASYMMETRICALLY for a
+/// brief window: once one gateway flips its send route onto the new epoch's
+/// tun (`wg0e<N>`) but its peer hasn't yet flipped the reverse route, a
+/// decrypted packet ingresses on `wg0e<N>` while the route back to its source
+/// segment still points at `wg0` — which STRICT rp_filter (mode 1, the
+/// default on many kernels) drops, silently eating flood packets exactly
+/// across the cutover the zero-drop bar measures. Loose mode accepts a source
+/// reachable via ANY interface, which it always is here (via the old OR new
+/// tun during the overlap), closing that window. Best-effort and idempotent
+/// (a plain `sysctl -w`); a forwarding gateway running loose rp_filter is
+/// the correct posture, and it is strictly MORE permissive, so it never
+/// changes which flows the default-deny ENFORCER (a separate mechanism) drops.
+pub fn set_rp_filter_loose() -> anyhow::Result<()> {
+    run("sysctl", &["-w", "net.ipv4.conf.all.rp_filter=2"])?;
+    run("sysctl", &["-w", "net.ipv4.conf.default.rp_filter=2"])?;
+    Ok(())
+}
+
 pub fn add_route(cidr: &str, ifname: &str) -> anyhow::Result<()> {
     // `replace` is idempotent (add-or-update).
     run("ip", &["route", "replace", cidr, "dev", ifname])

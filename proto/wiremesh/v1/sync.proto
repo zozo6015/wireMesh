@@ -4,9 +4,10 @@ package wiremesh.v1;
 service Sync {
   rpc Watch(WatchRequest) returns (stream SyncMessage);
   rpc Report(ReportRequest) returns (ReportResponse);
+  rpc SubmitEpochKey(SubmitEpochKeyRequest) returns (SubmitEpochKeyResponse);
 }
 message WatchRequest {}
-message SyncMessage { oneof body { StateSnapshot snapshot = 1; Delta delta = 2; PunchDirective punch = 3; } }
+message SyncMessage { oneof body { StateSnapshot snapshot = 1; Delta delta = 2; PunchDirective punch = 3; RotateDirective rotate = 4; } }
 // Broker-issued NAT-traversal instruction: sent to one gateway of a pair,
 // carrying the *other* gateway's candidate set, so both sides can fire a
 // punch at (approximately) the same instant. Does not use the
@@ -19,6 +20,20 @@ message PunchDirective {
                                     // of the broker's back-to-back sends, which are the
                                     // primary go-skew guarantee)
 }
+// Controller->gateway, sent to the addressed gateway's own Watch stream
+// (like PunchDirective, explicit addressing — not the subject_gateway_id()
+// self-skip routing path): tells the gateway to mint the given new epoch's
+// key and begin make-before-break rotation.
+message RotateDirective {
+  uint32 epoch = 1;
+}
+// Gateway->controller: submits the real WG public key it generated for
+// `epoch` (the private key never leaves the gateway).
+message SubmitEpochKeyRequest {
+  uint32 epoch = 1;
+  string pubkey = 2;
+}
+message SubmitEpochKeyResponse {}
 message PeerKey { uint32 epoch = 1; string pubkey = 2; string state = 3; } // pending|active|retiring
 message Peer {
   uint64 gateway_id = 1;
@@ -68,5 +83,9 @@ message ReportRequest {
                                          // (pre-4b) client behavior.
   repeated RelayHealth relay_health = 3; // additive; gateway per-relay health
                                           // reports (4c).
+  repeated EpochAck epoch_acks = 4;      // gateway->controller liveness acks
+                                          // for peers' pending epochs during
+                                          // rotation (key-rotation Task 1).
 }
+message EpochAck { uint64 peer_gateway_id = 1; uint32 epoch = 2; bool live = 3; }
 message ReportResponse {}
