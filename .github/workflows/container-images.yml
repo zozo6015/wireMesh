@@ -35,6 +35,9 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # arm64 emulation so the shared builder stage compiles for both arches
+      # (the cluster fleet includes arm64 nodes, e.g. Raspberry Pi).
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Build & cache the builder stage
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
@@ -42,6 +45,7 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile
           target: builder
+          platforms: linux/amd64,linux/arm64
           push: false
           cache-from: type=gha,scope=builder
           cache-to: type=gha,mode=max,scope=builder
@@ -65,6 +69,7 @@ jobs:
           - { component: operator,   image: wiremesh-operator }
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4.2.0
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - name: Log in to ghcr.io
         if: github.event_name != 'pull_request'
@@ -89,6 +94,7 @@ jobs:
           context: .
           file: deploy/docker/Dockerfile
           target: ${{ matrix.component }}
+          platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
