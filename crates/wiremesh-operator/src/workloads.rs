@@ -25,8 +25,8 @@ use crate::crd::{
 };
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EmptyDirVolumeSource, EnvVar, HostPathVolumeSource, PodSpec,
-    PodTemplateSpec, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    Container, ContainerPort, EmptyDirVolumeSource, EnvVar, HostPathVolumeSource, KeyToPath,
+    PodSpec, PodTemplateSpec, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, SecretVolumeSource, SecurityContext, Service, ServicePort,
     ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
 };
@@ -54,6 +54,12 @@ const UDS_PATH: &str = "/run/wiremesh/controller.sock";
 /// The stable label the controller pod carries (independent of the CR's name),
 /// so the operator's admin-exec transport can find it by a fixed selector.
 pub const CONTROLLER_COMPONENT_LABEL: (&str, &str) = ("app.kubernetes.io/component", "controller");
+
+/// The Secret holding the mesh CA — a cert-manager `Certificate`'s output
+/// (`tls.crt`/`tls.key`). The controller seeds its CA from it (so its identity
+/// is cert-manager-rooted); gateways/relays mount its cert as their enroll
+/// trust anchor.
+pub const CONTROLLER_CA_SECRET: &str = "wiremesh-controller-ca";
 
 /// The label selector the admin-exec transport uses to find the controller pod.
 pub fn controller_pod_selector() -> String {
@@ -182,6 +188,32 @@ pub fn controller_service(name: &str, spec: &WiremeshControllerSpec) -> Service 
 /// exec`s `wiremesh-operator operator-admin <op>` in this container, which then
 /// talks to the controller's implicit-admin UDS (no bearer token needed). This
 /// is the operator↔controller admin channel (spec §0 amendment).
+/// Seeds the controller's CA (`<data_dir>/ca.pem` + `ca.key`) from the
+/// cert-manager `Certificate` Secret (`tls.crt`/`tls.key`) before the controller
+/// boots — so the controller's mesh CA is cert-manager-rooted. All paths are
+/// constant (no CRD input interpolated). `install` sets the mode atomically.
+fn ca_seed_init_container(image: &str) -> Container {
+    Container {
+        name: "ca-seed".to_string(),
+        image: Some(image.to_string()),
+        command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+        args: Some(vec![format!(
+            "install -m 0644 /mnt/ca-secret/tls.crt {DATA_DIR}/ca.pem && \
+             install -m 0600 /mnt/ca-secret/tls.key {DATA_DIR}/ca.key"
+        )]),
+        volume_mounts: Some(vec![
+            VolumeMount { name: "data".to_string(), mount_path: DATA_DIR.to_string(), ..Default::default() },
+            VolumeMount {
+                name: "ca-secret".to_string(),
+                mount_path: "/mnt/ca-secret".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    }
+}
+
 pub fn admin_exec_sidecar(operator_image: &str) -> Container {
     Container {
         name: "admin-exec".to_string(),
@@ -216,6 +248,9 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
             env("WIREMESH_SOCKET_PATH", UDS_PATH),
             env("WIREMESH_ADMIN_TCP_PORT", admin.to_string()),
             env("WIREMESH_OBSERVE_UDP_PORT", observe.to_string()),
+            // Bind enroll/sync/observe to all interfaces so the Service can route
+            // to them (the Admin TCP listener stays loopback-only regardless).
+            env("WIREMESH_BIND_IP", "0.0.0.0"),
         ]),
         ports: Some(vec![
             tcp_port("enroll-tcp", ENROLL_TCP_PORT),
@@ -228,7 +263,13 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
         ..Default::default()
     };
 
+    let image = spec.image.clone().unwrap_or_else(|| DEFAULT_CONTROLLER_IMAGE.to_string());
     let pod = PodSpec {
+        // Seed the controller's CA from the cert-manager `Certificate` Secret
+        // (tls.crt/tls.key → the data-dir ca.pem/ca.key) BEFORE the controller
+        // boots, so the controller's mesh CA is cert-manager-rooted and the same
+        // CA can be handed to gateways/relays for enroll trust.
+        init_containers: Some(vec![ca_seed_init_container(&image)]),
         containers: vec![container, admin_exec_sidecar(operator_image)],
         volumes: Some(vec![
             Volume {
@@ -242,6 +283,14 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
             Volume {
                 name: "run".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource::default()),
+                ..Default::default()
+            },
+            Volume {
+                name: "ca-secret".to_string(),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(CONTROLLER_CA_SECRET.to_string()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ]),
@@ -369,7 +418,18 @@ pub fn gateway_deployment(
             },
             Volume {
                 name: "ca".to_string(),
-                secret: Some(SecretVolumeSource { secret_name: Some(ca_secret.to_string()), ..Default::default() }),
+                // The CA Secret is a cert-manager Certificate (`tls.crt`/`tls.key`);
+                // expose ONLY the CA cert as `ca.pem` (what enroll `--ca` reads) —
+                // never the CA private key.
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(ca_secret.to_string()),
+                    items: Some(vec![KeyToPath {
+                        key: "tls.crt".to_string(),
+                        path: "ca.pem".to_string(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ]),
@@ -486,7 +546,18 @@ pub fn relay_deployment(
             },
             Volume {
                 name: "ca".to_string(),
-                secret: Some(SecretVolumeSource { secret_name: Some(ca_secret.to_string()), ..Default::default() }),
+                // The CA Secret is a cert-manager Certificate (`tls.crt`/`tls.key`);
+                // expose ONLY the CA cert as `ca.pem` (what enroll `--ca` reads) —
+                // never the CA private key.
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(ca_secret.to_string()),
+                    items: Some(vec![KeyToPath {
+                        key: "tls.crt".to_string(),
+                        path: "ca.pem".to_string(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ]),
