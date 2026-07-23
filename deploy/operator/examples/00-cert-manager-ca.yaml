@@ -1,0 +1,39 @@
+# The mesh CA, issued by cert-manager (recommended — see docs/operator.md
+# "CA bundle"). Apply this BEFORE the WiremeshController so the controller's
+# ca-seed init-container finds the Secret on first boot.
+#
+#   kubectl apply -f deploy/operator/examples/00-cert-manager-ca.yaml
+#
+# Produces Secret `wiremesh-controller-ca` (type kubernetes.io/tls:
+# tls.crt/tls.key/ca.crt). The controller seeds its CA from tls.crt/tls.key; the
+# operator projects ONLY tls.crt -> ca.pem into gateways/relays as their enroll
+# trust anchor (the CA private key never leaves the controller).
+#
+# NOTE: if a *manual* `wiremesh-controller-ca` Secret already exists (e.g. an
+# Opaque one with a `ca.pem` key), delete it first so cert-manager owns the name:
+#   kubectl -n wiremesh delete secret wiremesh-controller-ca
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: wiremesh-selfsigned
+  namespace: wiremesh
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: wiremesh-controller-ca
+  namespace: wiremesh
+spec:
+  isCA: true
+  commonName: wiremesh-ca
+  secretName: wiremesh-controller-ca   # -> Secret consumed by controller + gw/relay
+  duration: 87600h                     # 10y — a stable mesh root
+  renewBefore: 720h                    # 30d
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+  issuerRef:
+    name: wiremesh-selfsigned
+    kind: Issuer
