@@ -193,6 +193,64 @@ operator cannot set routes on your workloads**; this is a per-network step.
 For remote/behind-NAT and dynamic-IP (DDNS) controller reachability, see
 `docs/research/operator-remote-deployment-notes.md`.
 
+## External connectivity via the Gateway API
+
+Gateways and relays **inside this cluster** reach the controller by its ClusterIP
+— the operator wires that automatically, and you need nothing here. Gateways or
+relays running on **other networks** connect *inbound* to the controller, so it
+must be exposed through an ingress. WireMesh ships Kubernetes **Gateway API**
+routes for that, so you can front the controller with any Gateway API
+implementation (Envoy Gateway, etc.).
+
+The controller listens on these ports (the operator sets `WIREMESH_BIND_IP=0.0.0.0`
+so the Service routes to them). **Configure one Gateway listener per row:**
+
+| Purpose | Backend Service port | Listener protocol | TLS handling | Route kind |
+|---------|----------------------|-------------------|--------------|------------|
+| Enrollment RPC | `9400` | `TCP` | **passthrough** — do NOT terminate | `TCPRoute` |
+| Sync (mTLS) | `9500` | `TCP` | **passthrough** — do NOT terminate | `TCPRoute` |
+| Endpoint observation | `9600` | `UDP` | n/a | `UDPRoute` |
+
+> The admin port (`9443`) is **never** exposed — it is forced loopback-only and
+> is not in this table by design.
+
+There is **no HTTPRoute**: enroll/sync are gRPC-over-TLS that must be passed
+through (the Sync mTLS *client* cert has to reach the controller), so they are L4
+TCP, not terminatable HTTP. The *external* listener port can be anything you
+like; only the *backend* port must match the table.
+
+**1. Add listeners to your Gateway** (`gateway.networking.k8s.io/v1`), one per
+port above — `protocol: TCP` for enroll/sync, `protocol: UDP` for observe. Name
+them so the routes can target them by `sectionName` (defaults: `wiremesh-enroll`,
+`wiremesh-sync`, `wiremesh-observe`).
+
+**2. Create the routes** — either enable them in Helm:
+
+```sh
+helm upgrade wiremesh-operator deploy/helm/wiremesh-operator \
+  --set gatewayApi.enabled=true \
+  --set gatewayApi.gateway.name=<your-gateway> \
+  --set gatewayApi.gateway.namespace=<your-gateway-ns>
+```
+
+or apply the standalone manifests (edit the `parentRefs` first):
+`kubectl apply -f deploy/operator/gateway-api/routes.yaml`. Full walkthrough +
+a sample `Gateway`: [`deploy/operator/gateway-api/README.md`](../deploy/operator/gateway-api/README.md).
+
+**Caveats (both critical):**
+
+- **TLS passthrough, never termination.** A Gateway that terminates TLS breaks
+  enrollment (wrong CA) and Sync (the mTLS client cert dies at the proxy). Plain
+  `TCPRoute` on a `protocol: TCP` listener passes the bytes through untouched.
+- **observe-UDP source preservation.** The controller learns each remote
+  gateway's public `ip:port` from the *source* of its observe packet and uses it
+  for hole-punching. A UDP proxy that SNATs (Envoy `UDPRoute` does, by default)
+  masks that source → NAT traversal silently degrades to **relay-always**. If your
+  UDP path can't preserve the client source, expose observe-udp another way (a
+  source-preserving `LoadBalancer`/`NodePort` with `externalTrafficPolicy: Local`,
+  or a `hostPort`) or accept relay-always for off-cluster pairs. Details:
+  `docs/research/operator-remote-deployment-notes.md` (Finding 2).
+
 ## Limitations
 
 - **Gateway restart durability:** gateway identity currently lives in an

@@ -28,5 +28,10 @@ resources:
 # objects AND the ServiceAccount subjects in the ClusterRoleBinding):
 # namespace: my-wiremesh
 
+# OFF-CLUSTER gateways/relays only: to expose the controller through a Gateway
+# API implementation, apply deploy/operator/gateway-api/routes.yaml separately
+# (it references YOUR Gateway, so it is intentionally NOT in resources above).
+# See deploy/operator/gateway-api/README.md and docs/operator.md.
+
 commonLabels:
   app.kubernetes.io/part-of: wiremesh

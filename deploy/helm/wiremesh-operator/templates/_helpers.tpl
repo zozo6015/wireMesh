@@ -26,3 +26,11 @@ helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
 app.kubernetes.io/name: wiremesh
 app.kubernetes.io/component: operator
 {{- end -}}
+
+{{- define "wiremesh-operator.controllerRouteLabels" -}}
+app.kubernetes.io/name: wiremesh
+app.kubernetes.io/component: controller
+app.kubernetes.io/part-of: wiremesh
+app.kubernetes.io/managed-by: {{ .Release.Service }}
+helm.sh/chart: {{ .Chart.Name }}-{{ .Chart.Version }}
+{{- end -}}

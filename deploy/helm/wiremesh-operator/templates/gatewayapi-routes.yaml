@@ -1,0 +1,63 @@
+{{- if .Values.gatewayApi.enabled -}}
+{{- $gw := .Values.gatewayApi.gateway -}}
+{{- $gwName := required "gatewayApi.gateway.name is required when gatewayApi.enabled=true" $gw.name -}}
+{{- $gwNs := required "gatewayApi.gateway.namespace is required when gatewayApi.enabled=true" $gw.namespace -}}
+{{- $svc := .Values.gatewayApi.controllerService -}}
+{{- $svcName := $svc.name -}}
+{{- $svcNs := default .Release.Namespace $svc.namespace -}}
+{{- $r := .Values.gatewayApi.routes -}}
+# Gateway API routes exposing the controller to off-cluster gateways/relays.
+# TCPRoute/UDPRoute are gateway.networking.k8s.io/v1alpha2. NO HTTPRoute:
+# enroll/sync are gRPC-over-TLS that MUST be passed through, so they are L4 TCP.
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: wiremesh-controller-enroll
+  namespace: {{ $svcNs }}
+  labels:
+    {{- include "wiremesh-operator.controllerRouteLabels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ $gwName }}
+      namespace: {{ $gwNs }}
+      sectionName: {{ $r.enroll.sectionName }}
+  rules:
+    - backendRefs:
+        - name: {{ $svcName }}
+          port: {{ $r.enroll.port }}
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: wiremesh-controller-sync
+  namespace: {{ $svcNs }}
+  labels:
+    {{- include "wiremesh-operator.controllerRouteLabels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ $gwName }}
+      namespace: {{ $gwNs }}
+      sectionName: {{ $r.sync.sectionName }}
+  rules:
+    - backendRefs:
+        - name: {{ $svcName }}
+          port: {{ $r.sync.port }}
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: UDPRoute
+metadata:
+  name: wiremesh-controller-observe
+  namespace: {{ $svcNs }}
+  labels:
+    {{- include "wiremesh-operator.controllerRouteLabels" . | nindent 4 }}
+spec:
+  parentRefs:
+    - name: {{ $gwName }}
+      namespace: {{ $gwNs }}
+      sectionName: {{ $r.observe.sectionName }}
+  rules:
+    - backendRefs:
+        - name: {{ $svcName }}
+          port: {{ $r.observe.port }}
+{{- end }}

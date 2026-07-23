@@ -1,0 +1,70 @@
+# Gateway API routes exposing the WireMesh controller to OFF-CLUSTER gateways
+# and relays. These attach the controller Service to listeners on YOUR Gateway.
+#
+# PREREQUISITES you configure on your Gateway (see README.md for ports):
+#   - a TCP listener for enroll  (backend port 9400)   -- passthrough, do NOT terminate TLS
+#   - a TCP listener for sync    (backend port 9500)   -- passthrough, do NOT terminate TLS
+#   - a UDP listener for observe (backend port 9600)   -- source preservation matters (see README)
+#
+# Edit the parentRefs (Gateway name/namespace + sectionName = your listener name)
+# and, if your WiremeshController CR is not named `wiremesh-controller`, the
+# backendRefs `name`.
+#
+# TCPRoute/UDPRoute are gateway.networking.k8s.io/v1alpha2 (Envoy Gateway supports
+# both). There is deliberately NO HTTPRoute: enroll/sync are gRPC-over-TLS that
+# must be passed through (the sync mTLS client cert has to reach the controller),
+# so they are L4 TCP, not terminatable HTTP.
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: wiremesh-controller-enroll
+  namespace: wiremesh
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/component: controller
+spec:
+  parentRefs:
+    - name: CHANGE-ME-gateway         # your Gateway's name
+      namespace: CHANGE-ME-gw-ns      # your Gateway's namespace
+      sectionName: wiremesh-enroll    # the Gateway TCP listener for enroll
+  rules:
+    - backendRefs:
+        - name: wiremesh-controller   # the controller Service (= CR name)
+          port: 9400
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: TCPRoute
+metadata:
+  name: wiremesh-controller-sync
+  namespace: wiremesh
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/component: controller
+spec:
+  parentRefs:
+    - name: CHANGE-ME-gateway
+      namespace: CHANGE-ME-gw-ns
+      sectionName: wiremesh-sync      # the Gateway TCP listener for sync
+  rules:
+    - backendRefs:
+        - name: wiremesh-controller
+          port: 9500
+---
+apiVersion: gateway.networking.k8s.io/v1alpha2
+kind: UDPRoute
+metadata:
+  name: wiremesh-controller-observe
+  namespace: wiremesh
+  labels:
+    app.kubernetes.io/name: wiremesh
+    app.kubernetes.io/component: controller
+spec:
+  parentRefs:
+    - name: CHANGE-ME-gateway
+      namespace: CHANGE-ME-gw-ns
+      sectionName: wiremesh-observe   # the Gateway UDP listener for observe
+  rules:
+    - backendRefs:
+        - name: wiremesh-controller
+          port: 9600
