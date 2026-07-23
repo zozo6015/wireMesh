@@ -18,9 +18,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-    # TEMPORARY (remove before merge): dry-run the whole pipeline on branch push.
-    # is_tag=false on a branch, so the `release` publish job is skipped.
-    branches: ['release-pipeline']
   workflow_dispatch:
     inputs:
       version:
