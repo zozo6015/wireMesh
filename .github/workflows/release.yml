@@ -118,47 +118,60 @@ jobs:
             tarballs/**
 
   # ---------------------------------------------------------------------------
-  macos-binaries:
+  macos:
+    # Both mac arches on macos-14 (Apple Silicon): arm64 native + x86_64 cross
+    # (Apple's toolchain cross-links natively) — avoids the slow/scarce macos-13
+    # Intel runner. Produces per-arch tarballs + a universal unsigned .pkg.
     needs: version
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            runner: macos-13
-          - arch: arm64
-            runner: macos-14
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
       - name: Install protoc
         run: brew install protobuf
       - name: Stamp version
         run: bash scripts/set-version.sh "${{ needs.version.outputs.version }}"
-      - name: Build portable components
-        run: cargo build --release -p fabricctl -p wiremesh-controller -p wiremesh-relay
-      - name: Package tarballs
+      - name: Build (arm64 native + x86_64 cross)
+        run: |
+          cargo build --release -p fabricctl -p wiremesh-controller -p wiremesh-relay
+          cargo build --release --target x86_64-apple-darwin -p fabricctl -p wiremesh-controller -p wiremesh-relay
+      - name: Tarballs (both arches) + universal .pkg
         run: |
           set -euo pipefail
-          V="${{ needs.version.outputs.version }}"; A="${{ matrix.arch }}"
-          D="target/release"; OUT="tarballs"; mkdir -p "$OUT" stage
-          tar_one() { local name="$1"; shift; rm -rf stage/*;
-            for spec in "$@"; do cp "$D/${spec%%:*}" "stage/${spec##*:}"; done
-            tar -C stage -czf "$OUT/${name}-${V}-macos-${A}.tar.gz" .; }
-          tar_one wiremesh-controller wiremesh-controller:wiremesh-controller
-          tar_one wiremesh-relay      relay:wiremesh-relay mkcerts:wiremesh-mkcerts
-          tar_one wiremesh-fabricctl  fabricctl:fabricctl
+          V="${{ needs.version.outputs.version }}"
+          OUT="tarballs"; mkdir -p "$OUT" stage
+          tar_one() { local name="$1" dir="$2" arch="$3"; shift 3; rm -rf stage/*
+            for spec in "$@"; do cp "$dir/${spec%%:*}" "stage/${spec##*:}"; done
+            tar -C stage -czf "$OUT/${name}-${V}-macos-${arch}.tar.gz" .; }
+          for pair in "arm64:target/release" "x86_64:target/x86_64-apple-darwin/release"; do
+            A="${pair%%:*}"; D="${pair##*:}"
+            tar_one wiremesh-fabricctl  "$D" "$A" fabricctl:fabricctl
+            tar_one wiremesh-controller "$D" "$A" wiremesh-controller:wiremesh-controller
+            tar_one wiremesh-relay      "$D" "$A" relay:wiremesh-relay mkcerts:wiremesh-mkcerts
+          done
+          mkdir -p root/usr/local/bin
+          lipo -create target/release/fabricctl          target/x86_64-apple-darwin/release/fabricctl          -output root/usr/local/bin/fabricctl
+          lipo -create target/release/wiremesh-controller target/x86_64-apple-darwin/release/wiremesh-controller -output root/usr/local/bin/wiremesh-controller
+          lipo -create target/release/relay               target/x86_64-apple-darwin/release/relay               -output root/usr/local/bin/wiremesh-relay
+          lipo -create target/release/mkcerts             target/x86_64-apple-darwin/release/mkcerts             -output root/usr/local/bin/wiremesh-mkcerts
+          pkgbuild --root root --identifier io.wiremesh.cli --version "$V" \
+            --install-location / "$OUT/wiremesh-${V}-macos-universal-unsigned.pkg"
           ls -l "$OUT"
+      - name: Sign + notarize (skipped without Apple secrets)
+        env:
+          APPLE_CERT: ${{ secrets.APPLE_INSTALLER_CERT_P12 }}
+        run: |
+          if [ -z "${APPLE_CERT:-}" ]; then
+            echo "::notice::APPLE_* secrets absent — publishing the UNSIGNED .pkg. Add them to sign+notarize."
+          else
+            echo "::notice::Apple secrets present — sign/notarize wiring is a tracked follow-up."
+          fi
       - uses: actions/upload-artifact@v4
         with:
-          name: macos-binaries-${{ matrix.arch }}
-          path: |
-            target/release/fabricctl
-            target/release/wiremesh-controller
-            target/release/relay
-            target/release/mkcerts
-            tarballs/**
+          name: macos-artifacts
+          path: tarballs/**
 
   # ---------------------------------------------------------------------------
   windows-binaries:
@@ -190,7 +203,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          dotnet tool install --global wix
+          # Pin WiX v4: v6+/v7 require accepting the OSMF paid-tier EULA
+          # (error WIX7015). v4 is free and matches this project's v4 wxs schema.
+          dotnet tool install --global wix --version 4.0.5
           export PATH="$PATH:$HOME/.dotnet/tools"
           V="${{ needs.version.outputs.version }}"; MV="${{ needs.version.outputs.msi_version }}"
           wix build deploy/packages/windows/wiremesh.wxs -arch x64 \
@@ -239,50 +254,8 @@ jobs:
           path: packages/**
 
   # ---------------------------------------------------------------------------
-  macos-pkg:
-    needs: [version, macos-binaries]
-    runs-on: macos-14
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: macos-binaries-x86_64
-          path: x86_64
-      - uses: actions/download-artifact@v4
-        with:
-          name: macos-binaries-arm64
-          path: arm64
-      - name: Lipo universal + build unsigned .pkg
-        run: |
-          set -euo pipefail
-          V="${{ needs.version.outputs.version }}"
-          mkdir -p root/usr/local/bin
-          for b in fabricctl wiremesh-controller relay mkcerts; do
-            lipo -create "x86_64/$b" "arm64/$b" -output "root/usr/local/bin/${b/relay/wiremesh-relay}" 2>/dev/null \
-              || lipo -create "x86_64/$b" "arm64/$b" -output "root/usr/local/bin/$b"
-          done
-          # normalise names
-          [ -f root/usr/local/bin/mkcerts ] && mv root/usr/local/bin/mkcerts root/usr/local/bin/wiremesh-mkcerts || true
-          ls -l root/usr/local/bin
-          pkgbuild --root root --identifier io.wiremesh.cli --version "$V" \
-            --install-location / "wiremesh-${V}-macos-universal-unsigned.pkg"
-          ls -l *.pkg
-      - name: Sign + notarize (skipped without Apple secrets)
-        env:
-          APPLE_CERT: ${{ secrets.APPLE_INSTALLER_CERT_P12 }}
-        run: |
-          if [ -z "${APPLE_CERT:-}" ]; then
-            echo "::notice::APPLE_* secrets absent — publishing the UNSIGNED .pkg. Add them to sign+notarize."
-          else
-            echo "::notice::Apple secrets present — signing/notarization wiring is a tracked follow-up."
-          fi
-      - uses: actions/upload-artifact@v4
-        with:
-          name: macos-pkg
-          path: '*.pkg'
-
-  # ---------------------------------------------------------------------------
   release:
-    needs: [version, linux-binaries, macos-binaries, windows-binaries, linux-packages, macos-pkg]
+    needs: [version, linux-binaries, macos, windows-binaries, linux-packages]
     if: ${{ needs.version.outputs.is_tag == 'true' }}
     runs-on: ubuntu-latest
     steps:
