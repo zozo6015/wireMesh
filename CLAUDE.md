@@ -94,8 +94,9 @@ itself is stable and the direct probe is rate-limited so it never disrupts it.
 
 **Deployment notes:** the nftables enforcer backend requires
 `conntrack-tools` on the gateway host (`flush_flows` uses `conntrack -F`);
-the gateway binary itself requires `iproute2` and `nftables` on the host
-(route/link programming and the MSS clamp shell out to `ip`/`nft`). The
+the gateway binary itself requires `iproute2`, `nftables`, and `procps` on
+the host (route/link programming and the MSS clamp shell out to `ip`/`nft`,
+and `enable_ip_forward`/rp_filter shell out to `sysctl`). The
 `wiremesh-relay` binary needs its identity (cert/key/ca, from fabric-CA
 enrollment with `--kind relay`) at `/var/lib/wiremesh/` — the certificate,
 private-key, and CA identity files EACH require mode 0600 individually (not
