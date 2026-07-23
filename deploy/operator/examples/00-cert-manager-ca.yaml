@@ -34,6 +34,10 @@ spec:
   privateKey:
     algorithm: ECDSA
     size: 256
+    # PKCS#8 is REQUIRED: the controller's trust loader (rcgen) parses the CA key
+    # as PKCS#8 ("BEGIN PRIVATE KEY"). cert-manager's default EC encoding is SEC1
+    # ("BEGIN EC PRIVATE KEY"), which fails to parse ("Could not parse key pair").
+    encoding: PKCS8
   issuerRef:
     name: wiremesh-selfsigned
     kind: Issuer
