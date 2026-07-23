@@ -19,9 +19,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const GATEWAY_FINALIZER: &str = "wiremesh.io/gateway-drain";
-/// Convention: the CA bundle the operator publishes for gateway/relay enroll
-/// `--ca` (extracted from the controller — see the CA-bundle plumbing).
-pub const CONTROLLER_CA_SECRET: &str = "wiremesh-controller-ca";
 
 pub fn token_secret_name(gateway_name: &str) -> String {
     format!("wiremesh-gw-{gateway_name}-token")
@@ -89,7 +86,7 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // be passed through to the enroll init-container (--cidr).
     let addrs = super::controller_endpoints(ctx).await?;
     let mut dep = workloads::gateway_deployment(
-        gw, &addrs.sync, &addrs.enroll, &addrs.observe, CONTROLLER_CA_SECRET, &token_secret, &cidrs,
+        gw, &addrs.sync, &addrs.enroll, &addrs.observe, crate::workloads::CONTROLLER_CA_SECRET, &token_secret, &cidrs,
     );
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![owner_ref(gw)?]);

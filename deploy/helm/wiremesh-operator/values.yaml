@@ -36,3 +36,30 @@ serviceAccount:
 
 # CRDs ship in the chart's crds/ directory (installed by Helm on first install;
 # Helm does NOT upgrade/delete CRDs — see docs/operator.md).
+
+# Gateway API routes exposing the controller to OFF-CLUSTER gateways/relays.
+# Leave disabled if every gateway/relay pod runs in THIS cluster (they reach the
+# controller ClusterIP directly). When enabled, requires a Gateway API
+# implementation (you run Envoy Gateway) and a Gateway you provision with TCP
+# listeners for enroll/sync + a UDP listener for observe — see docs/operator.md
+# "External connectivity via the Gateway API" for the ports and the
+# TLS-passthrough / UDP-source-preservation caveats.
+gatewayApi:
+  enabled: false
+  # The Gateway (gateway.networking.k8s.io) these routes attach to.
+  gateway:
+    name: ""          # REQUIRED when enabled
+    namespace: ""     # REQUIRED when enabled — the Gateway's namespace
+  # The controller Service the routes target. Defaults to the WiremeshController
+  # CR name (`wiremesh-controller`) in the release namespace; override name if
+  # your CR is named differently.
+  controllerService:
+    name: wiremesh-controller
+    namespace: ""     # defaults to .Release.Namespace
+  # Per-endpoint listener sectionName (must match a listener you configured on
+  # the Gateway) + the controller backend port. There is deliberately no
+  # HTTPRoute: enroll/sync are TLS-passthrough L4, not terminatable HTTP.
+  routes:
+    enroll:   { sectionName: wiremesh-enroll,  port: 9400 }  # TCPRoute (passthrough)
+    sync:     { sectionName: wiremesh-sync,    port: 9500 }  # TCPRoute (passthrough)
+    observe:  { sectionName: wiremesh-observe, port: 9600 }  # UDPRoute (source-preserving)

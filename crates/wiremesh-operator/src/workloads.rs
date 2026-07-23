@@ -25,8 +25,8 @@ use crate::crd::{
 };
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
 use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EmptyDirVolumeSource, EnvVar, HostPathVolumeSource, PodSpec,
-    PodTemplateSpec, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    Container, ContainerPort, EmptyDirVolumeSource, EnvVar, HostPathVolumeSource, KeyToPath,
+    PodSpec, PodTemplateSpec, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, SecretVolumeSource, SecurityContext, Service, ServicePort,
     ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
 };
@@ -54,6 +54,12 @@ const UDS_PATH: &str = "/run/wiremesh/controller.sock";
 /// The stable label the controller pod carries (independent of the CR's name),
 /// so the operator's admin-exec transport can find it by a fixed selector.
 pub const CONTROLLER_COMPONENT_LABEL: (&str, &str) = ("app.kubernetes.io/component", "controller");
+
+/// The Secret holding the mesh CA — a cert-manager `Certificate`'s output
+/// (`tls.crt`/`tls.key`). The controller seeds its CA from it (so its identity
+/// is cert-manager-rooted); gateways/relays mount its cert as their enroll
+/// trust anchor.
+pub const CONTROLLER_CA_SECRET: &str = "wiremesh-controller-ca";
 
 /// The label selector the admin-exec transport uses to find the controller pod.
 pub fn controller_pod_selector() -> String {
@@ -182,6 +188,45 @@ pub fn controller_service(name: &str, spec: &WiremeshControllerSpec) -> Service 
 /// exec`s `wiremesh-operator operator-admin <op>` in this container, which then
 /// talks to the controller's implicit-admin UDS (no bearer token needed). This
 /// is the operator↔controller admin channel (spec §0 amendment).
+/// Seeds the controller's CA (`<data_dir>/ca.pem` + `ca.key`) from the
+/// cert-manager `Certificate` Secret (`tls.crt`/`tls.key`) before the controller
+/// boots — so the controller's mesh CA is cert-manager-rooted. All paths are
+/// constant (no CRD input interpolated). `install` sets the mode atomically.
+///
+/// Seed **once**: if the controller PVC already holds a CA, keep it untouched
+/// (overwriting on every restart/rotation would invalidate every identity issued
+/// under the prior CA). And if no CA Secret is mounted (the volume is `optional`
+/// — see below), no-op and let the controller self-generate. So the CA Secret is
+/// a *bootstrap* input, never a hard startup prerequisite.
+fn ca_seed_init_container(image: &str) -> Container {
+    Container {
+        name: "ca-seed".to_string(),
+        image: Some(image.to_string()),
+        command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+        args: Some(vec![format!(
+            "if [ -e {DATA_DIR}/ca.pem ] || [ -e {DATA_DIR}/ca.key ]; then \
+                 if [ -e {DATA_DIR}/ca.pem ] && [ -e {DATA_DIR}/ca.key ]; then exit 0; fi; \
+                 echo 'wiremesh ca-seed: incomplete existing CA state on the PVC' >&2; exit 1; \
+             fi; \
+             if [ ! -e /mnt/ca-secret/tls.crt ] || [ ! -e /mnt/ca-secret/tls.key ]; then \
+                 echo 'wiremesh ca-seed: no CA secret mounted; controller will self-generate its CA' >&2; exit 0; \
+             fi; \
+             install -m 0644 /mnt/ca-secret/tls.crt {DATA_DIR}/ca.pem && \
+             install -m 0600 /mnt/ca-secret/tls.key {DATA_DIR}/ca.key"
+        )]),
+        volume_mounts: Some(vec![
+            VolumeMount { name: "data".to_string(), mount_path: DATA_DIR.to_string(), ..Default::default() },
+            VolumeMount {
+                name: "ca-secret".to_string(),
+                mount_path: "/mnt/ca-secret".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
+        ]),
+        ..Default::default()
+    }
+}
+
 pub fn admin_exec_sidecar(operator_image: &str) -> Container {
     Container {
         name: "admin-exec".to_string(),
@@ -216,6 +261,9 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
             env("WIREMESH_SOCKET_PATH", UDS_PATH),
             env("WIREMESH_ADMIN_TCP_PORT", admin.to_string()),
             env("WIREMESH_OBSERVE_UDP_PORT", observe.to_string()),
+            // Bind enroll/sync/observe to all interfaces so the Service can route
+            // to them (the Admin TCP listener stays loopback-only regardless).
+            env("WIREMESH_BIND_IP", "0.0.0.0"),
         ]),
         ports: Some(vec![
             tcp_port("enroll-tcp", ENROLL_TCP_PORT),
@@ -228,7 +276,13 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
         ..Default::default()
     };
 
+    let image = spec.image.clone().unwrap_or_else(|| DEFAULT_CONTROLLER_IMAGE.to_string());
     let pod = PodSpec {
+        // Seed the controller's CA from the cert-manager `Certificate` Secret
+        // (tls.crt/tls.key → the data-dir ca.pem/ca.key) BEFORE the controller
+        // boots, so the controller's mesh CA is cert-manager-rooted and the same
+        // CA can be handed to gateways/relays for enroll trust.
+        init_containers: Some(vec![ca_seed_init_container(&image)]),
         containers: vec![container, admin_exec_sidecar(operator_image)],
         volumes: Some(vec![
             Volume {
@@ -242,6 +296,18 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
             Volume {
                 name: "run".to_string(),
                 empty_dir: Some(EmptyDirVolumeSource::default()),
+                ..Default::default()
+            },
+            Volume {
+                name: "ca-secret".to_string(),
+                // `optional` so the pod still starts when no cert-manager CA
+                // Secret exists — the ca-seed init-container then no-ops and the
+                // controller self-generates its CA (see ca_seed_init_container).
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(CONTROLLER_CA_SECRET.to_string()),
+                    optional: Some(true),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ]),
@@ -369,7 +435,18 @@ pub fn gateway_deployment(
             },
             Volume {
                 name: "ca".to_string(),
-                secret: Some(SecretVolumeSource { secret_name: Some(ca_secret.to_string()), ..Default::default() }),
+                // The CA Secret is a cert-manager Certificate (`tls.crt`/`tls.key`);
+                // expose ONLY the CA cert as `ca.pem` (what enroll `--ca` reads) —
+                // never the CA private key.
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(ca_secret.to_string()),
+                    items: Some(vec![KeyToPath {
+                        key: "tls.crt".to_string(),
+                        path: "ca.pem".to_string(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ]),
@@ -486,7 +563,18 @@ pub fn relay_deployment(
             },
             Volume {
                 name: "ca".to_string(),
-                secret: Some(SecretVolumeSource { secret_name: Some(ca_secret.to_string()), ..Default::default() }),
+                // The CA Secret is a cert-manager Certificate (`tls.crt`/`tls.key`);
+                // expose ONLY the CA cert as `ca.pem` (what enroll `--ca` reads) —
+                // never the CA private key.
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(ca_secret.to_string()),
+                    items: Some(vec![KeyToPath {
+                        key: "tls.crt".to_string(),
+                        path: "ca.pem".to_string(),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
         ]),
@@ -683,6 +771,110 @@ mod tests {
             assert!(
                 relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").is_err(),
                 "endpoint {bad:?} must be rejected (v1 is IPv4 host:port only)"
+            );
+        }
+    }
+
+    #[test]
+    fn controller_binds_all_interfaces_for_service_routing() {
+        // The controller must bind enroll/sync/observe to 0.0.0.0 (not the
+        // loopback default) so the ClusterIP Service can route to the pod —
+        // otherwise gateways get `Connection refused` (the bug found on-cluster).
+        let d = controller_deployment("wm", &ctrl_spec(), "op:test");
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let ctr = pod.containers.iter().find(|c| c.name == "controller").unwrap();
+        let env = ctr.env.as_ref().unwrap();
+        let bind = env.iter().find(|e| e.name == "WIREMESH_BIND_IP").expect("WIREMESH_BIND_IP env");
+        assert_eq!(bind.value.as_deref(), Some("0.0.0.0"), "controller must bind all interfaces");
+    }
+
+    #[test]
+    fn controller_seeds_ca_from_cert_manager_secret() {
+        // A `ca-seed` init-container copies the cert-manager Certificate Secret
+        // (tls.crt/tls.key) into the controller data-dir as ca.pem/ca.key BEFORE
+        // boot, so the controller's mesh CA is cert-manager-rooted.
+        let d = controller_deployment("wm", &ctrl_spec(), "op:test");
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let seed = pod
+            .init_containers
+            .as_ref()
+            .expect("init containers")
+            .iter()
+            .find(|c| c.name == "ca-seed")
+            .expect("ca-seed init container");
+        // Mounts BOTH the data volume (dest) and the CA-secret volume (source, RO).
+        let mounts = seed.volume_mounts.as_ref().unwrap();
+        assert!(
+            mounts.iter().any(|m| m.name == "data" && m.mount_path == "/var/lib/wiremesh"),
+            "ca-seed must mount the controller data dir"
+        );
+        assert!(
+            mounts.iter().any(|m| m.name == "ca-secret" && m.read_only == Some(true)),
+            "ca-seed must mount the CA secret read-only"
+        );
+        // Args seed BOTH ca.pem (from tls.crt) and ca.key (from tls.key).
+        let args = seed.args.as_ref().unwrap().join(" ");
+        assert!(args.contains("tls.crt") && args.contains("ca.pem"), "seeds ca.pem from tls.crt: {args:?}");
+        assert!(args.contains("tls.key") && args.contains("ca.key"), "seeds ca.key from tls.key: {args:?}");
+        // Seed ONCE: never clobber an existing CA on the PVC (guards a restart/
+        // rotation from invalidating already-issued identities).
+        assert!(
+            args.contains(&format!("[ -e {DATA_DIR}/ca.pem ]")),
+            "ca-seed must skip when a CA already exists on the PVC: {args:?}"
+        );
+        // No-op when no CA secret is mounted (so it is not a hard startup dep).
+        assert!(
+            args.contains("/mnt/ca-secret/tls.crt") && args.contains("self-generate"),
+            "ca-seed must no-op (self-generate) when no CA secret is mounted: {args:?}"
+        );
+        // The pod sources the CA-secret volume from CONTROLLER_CA_SECRET, and the
+        // volume is OPTIONAL so an absent Secret does not block controller boot.
+        let ca_vol = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == "ca-secret").expect("ca-secret volume");
+        let ca_src = ca_vol.secret.as_ref().expect("ca-secret is a Secret source");
+        assert_eq!(
+            ca_src.secret_name.as_deref(),
+            Some(CONTROLLER_CA_SECRET),
+            "ca-secret volume must source the cert-manager CA Secret"
+        );
+        assert_eq!(ca_src.optional, Some(true), "the CA secret volume must be optional (no hard startup dependency)");
+    }
+
+    #[test]
+    fn gateway_and_relay_ca_mount_exposes_cert_only_never_key() {
+        // SECURITY INVARIANT: gateways/relays trust the CA but must NEVER receive
+        // the CA private key. The CA volume must project ONLY tls.crt -> ca.pem.
+        let gw = WiremeshGateway::new(
+            "gw",
+            WiremeshGatewaySpec {
+                segment_ref: "aws".into(),
+                node_name: None,
+                node_selector: None,
+                wg_port: None,
+                tun: None,
+                image: None,
+            },
+        );
+        let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
+        let r = WiremeshRelay::new(
+            "r",
+            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None },
+        );
+        let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
+
+        for d in [gd, rd] {
+            let pod = d.spec.unwrap().template.spec.unwrap();
+            let ca_vol = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == "ca").expect("ca volume");
+            let src = ca_vol.secret.as_ref().expect("ca volume is a Secret source");
+            assert_eq!(src.secret_name.as_deref(), Some("wm-ca"));
+            let items = src.items.as_ref().expect("CA volume MUST use explicit items (never project the whole Secret)");
+            // Exactly one projected item: tls.crt -> ca.pem.
+            assert_eq!(items.len(), 1, "CA volume must project exactly one key");
+            assert_eq!(items[0].key, "tls.crt");
+            assert_eq!(items[0].path, "ca.pem");
+            // The CA private key must never be projected under any path.
+            assert!(
+                !items.iter().any(|i| i.key == "tls.key"),
+                "the CA private key (tls.key) must NEVER reach a gateway/relay"
             );
         }
     }

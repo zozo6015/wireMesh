@@ -7,7 +7,7 @@
 //! pipeline evicts the stale relay.
 
 use super::{apply, owner_ref, Context, Error};
-use crate::controllers::gateway::CONTROLLER_CA_SECRET;
+
 use crate::crd::{WiremeshRelay, WiremeshResourceStatus};
 use crate::workloads;
 use futures::StreamExt;
@@ -62,7 +62,7 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
 
     // Deploy the relay (fails closed on an invalid endpoint — v1 IPv4 only).
     let addrs = super::controller_endpoints(&ctx).await?;
-    let mut dep = workloads::relay_deployment(relay.as_ref(), &addrs.sync, &addrs.enroll, CONTROLLER_CA_SECRET, &token_secret)
+    let mut dep = workloads::relay_deployment(relay.as_ref(), &addrs.sync, &addrs.enroll, crate::workloads::CONTROLLER_CA_SECRET, &token_secret)
         .map_err(Error::Admin)?;
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![owner_ref(relay.as_ref())?]);

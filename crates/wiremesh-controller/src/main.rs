@@ -39,6 +39,18 @@ async fn main() -> Result<()> {
         .unwrap_or_else(|_| PathBuf::from("/run/wiremesh/controller.sock"));
     let admin_tcp_port = port_env("WIREMESH_ADMIN_TCP_PORT", 0)?;
     let observe_udp_port = port_env("WIREMESH_OBSERVE_UDP_PORT", 0)?;
+    // The IP the enroll/sync/observe listeners bind to. Defaults to loopback
+    // (historical/dev). In Kubernetes the operator sets `WIREMESH_BIND_IP=0.0.0.0`
+    // so those listeners are reachable via the controller Service (the Admin TCP
+    // listener stays loopback-only regardless — see Config::bind_ip). Malformed
+    // values fall back to the loopback default.
+    let bind_ip = match std::env::var("WIREMESH_BIND_IP") {
+        Ok(s) => s.parse().unwrap_or_else(|_| {
+            eprintln!("wiremesh-controller: invalid WIREMESH_BIND_IP={s:?}, using {}", Config::default_bind_ip());
+            Config::default_bind_ip()
+        }),
+        Err(_) => Config::default_bind_ip(),
+    };
 
     let config = Config {
         data_dir,
@@ -47,7 +59,7 @@ async fn main() -> Result<()> {
         socket_path,
         admin_tcp_port,
         observe_udp_port,
-        bind_ip: Config::default_bind_ip(),
+        bind_ip,
         rotation_interval: Config::default_rotation_interval(),
         rotation_sweep_interval: Config::default_rotation_sweep_interval(),
     };
