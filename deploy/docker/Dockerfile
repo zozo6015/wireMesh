@@ -98,7 +98,8 @@ ENTRYPOINT ["/usr/local/bin/fabricctl"]
 # ---------------------------------------------------------------------------
 # gateway — per-segment data plane. Embeds boringtun (no `wg` needed) but
 # programs routes/links and the nftables MSS clamp by shelling out to `ip`
-# (iproute2) and `nft` (nftables); the nftables enforcer backend flushes state
+# (iproute2), `nft` (nftables), and `sysctl` (procps — enables ip_forward and
+# sets rp_filter=2, see routes.rs); the nftables enforcer backend flushes state
 # with `conntrack` (conntrack-tools).
 #
 # Runs as ROOT by design (deliberate exception to the non-root policy above):
@@ -109,7 +110,7 @@ ENTRYPOINT ["/usr/local/bin/fabricctl"]
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS gateway
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        ca-certificates iproute2 nftables conntrack \
+        ca-certificates iproute2 nftables conntrack procps \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /out/wiremesh-gateway /usr/local/bin/wiremesh-gateway
 # Gateway identity + fail-static state.json live here (per-file 0600).
