@@ -107,7 +107,10 @@ impl AdminExec {
         // (KUBERNETES_SERVICE_HOST + the mounted SA token). `--cache-dir=/tmp`
         // keeps it happy under readOnlyRootFilesystem.
         let mut kc = tokio::process::Command::new("kubectl");
-        kc.arg("--cache-dir=/tmp/.kube-cache")
+        // kill_on_drop: if the EXEC_TIMEOUT fires, exec_json's future (and this
+        // Child) is dropped — kill the kubectl process rather than orphan it.
+        kc.kill_on_drop(true)
+            .arg("--cache-dir=/tmp/.kube-cache")
             .arg("-n").arg(namespace)
             .arg("exec").arg(&pod_name)
             .arg("-c").arg(container);

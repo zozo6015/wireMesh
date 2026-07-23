@@ -125,11 +125,21 @@ FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bb
 ARG TARGETARCH
 # kubectl is bundled because the operator execs `operator-admin` in the
 # controller sidecar via kubectl (kube-rs 0.95's WebSocket exec fails SA auth
-# against real API servers). Keep this near the cluster's minor version.
+# against real API servers). Keep this near the cluster's minor version. The
+# download is verified against a pinned per-arch SHA-256 (not a trust-on-fetch
+# checksum) so a compromised/altered dl.k8s.io can't inject a binary.
 ARG KUBECTL_VERSION=v1.32.0
+ARG KUBECTL_SHA256_amd64=646d58f6d98ee670a71d9cdffbf6625aeea2849d567f214bc43a35f8ccb7bf70
+ARG KUBECTL_SHA256_arm64=ba4004f98f3d3a7b7d2954ff0a424caa2c2b06b78c17b1dccf2acc76a311a896
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && curl -fsSLo /usr/local/bin/kubectl \
         "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
+    && case "${TARGETARCH}" in \
+         amd64) EXPECT="${KUBECTL_SHA256_amd64}" ;; \
+         arm64) EXPECT="${KUBECTL_SHA256_arm64}" ;; \
+         *) echo "unsupported TARGETARCH=${TARGETARCH}" && exit 1 ;; \
+       esac \
+    && echo "${EXPECT}  /usr/local/bin/kubectl" | sha256sum -c - \
     && chmod 0755 /usr/local/bin/kubectl \
     && kubectl version --client=true 2>/dev/null | head -1 \
     && apt-get purge -y curl && apt-get autoremove -y \
