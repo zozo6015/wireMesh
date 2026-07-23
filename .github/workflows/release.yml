@@ -29,7 +29,7 @@ on:
         default: '0.0.0-dev'
 
 permissions:
-  contents: write   # create the Release + upload assets
+  contents: read   # build/package jobs need no write; the release job elevates
 
 env:
   # Components shipped as standalone binaries / packages.
@@ -84,6 +84,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - name: Stamp version
         run: bash scripts/set-version.sh "${{ needs.version.outputs.version }}"
@@ -119,13 +121,15 @@ jobs:
 
   # ---------------------------------------------------------------------------
   macos:
-    # Both mac arches on macos-14 (Apple Silicon): arm64 native + x86_64 cross
-    # (Apple's toolchain cross-links natively) — avoids the slow/scarce macos-13
+    # Both mac arches on one Apple-Silicon runner: arm64 native + x86_64 cross
+    # (Apple's toolchain cross-links natively) — avoids the retired macos-13
     # Intel runner. Produces per-arch tarballs + a universal unsigned .pkg.
     needs: version
-    runs-on: macos-14
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-apple-darwin
@@ -182,6 +186,8 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: arduino/setup-protoc@v3
         with:
@@ -227,6 +233,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
           name: linux-binaries-${{ matrix.arch }}
@@ -258,6 +266,8 @@ jobs:
     needs: [version, linux-binaries, macos, windows-binaries, linux-packages]
     if: ${{ needs.version.outputs.is_tag == 'true' }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # create the Release + upload assets
     steps:
       - uses: actions/download-artifact@v4
         with:

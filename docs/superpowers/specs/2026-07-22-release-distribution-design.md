@@ -35,13 +35,21 @@ PR #15 → ghcr.io/zozo6015/wiremesh-*).
   `cargo` (no eBPF toolchain needed — those crates don't depend on the enforcer).
 
 ## 1. Goal
-Distribute the WireMesh binaries the three ways users actually consume them, on
-`v*` release tags, for **x86_64 + arm64**:
-1. **Standalone binaries** — per-component tarballs attached to the GitHub Release.
-2. **Linux `.deb` + `.rpm`** served from a **hosted, GPG-signed apt/yum repo** (GitHub Pages).
-3. **macOS signed + notarized `.pkg`** installer.
+Distribute the WireMesh binaries the ways users actually consume them, on
+`v*` release tags, for **x86_64 + arm64** (Windows x86_64 per §0):
+1. **Standalone binaries** — per-component tarballs attached to the GitHub Release (+ `SHA256SUMS`).
+2. **Linux `.deb` + `.rpm`** — attached to the Release as downloads. WireMesh
+   itself **hosts no package repository** (project tenet: ships binaries + docs,
+   never hosted infrastructure); an *optional, self-hostable* GPG-signed apt/yum
+   repo tree the user can stand up from these assets is a follow-up (§4.2).
+3. **Windows `.msi`** (fabricctl) + **macOS `.pkg`** installers (unsigned until
+   signing secrets are provisioned).
 
 ## 2. Platform × component matrix (THE hard constraint)
+> **AMENDED by §0 (2026-07-23):** add a **Windows x86_64** column — `fabricctl`
+> only (controller/relay are Unix-only servers; gateway is Linux-only). The table
+> below shows Linux+macOS; Windows = fabricctl (`.msi`/tarball) as in §0.
+
 The **gateway is Linux-only** — it loads eBPF (tc/BPF), creates a tun, and programs
 nftables/routes; it does not compile or run on macOS. So macOS artifacts cover only the
 portable components.
@@ -76,8 +84,10 @@ The signing/notarization/repo pieces need secrets that only the owner can create
 build cycle CANNOT complete these without them:
 - **GPG signing key** (for the apt/yum repo + optionally the deb/rpm themselves):
   a dedicated ASCII-armored private key + passphrase → repo secrets
-  `WIREMESH_GPG_PRIVATE_KEY`, `WIREMESH_GPG_PASSPHRASE`; publish the public key at a
-  stable URL (in the Pages repo) so users can `apt-key`/`rpm --import` it.
+  `WIREMESH_GPG_PRIVATE_KEY`, `WIREMESH_GPG_PASSPHRASE`; publish the public key so
+  users install it as a **keyring** — apt: drop it at
+  `/usr/share/keyrings/wiremesh.gpg` and use `deb [signed-by=/usr/share/keyrings/wiremesh.gpg] …`
+  (NOT the deprecated `apt-key`); rpm: `rpm --import`.
 - **Apple Developer ID** (for the `.pkg`): a "Developer ID Installer" certificate (.p12)
   + password, an Apple Team ID, and notarization credentials (an App Store Connect API
   key: issuer id + key id + .p8) → secrets `APPLE_INSTALLER_CERT_P12`,
@@ -91,6 +101,12 @@ build cycle CANNOT complete these without them:
 
 ## 4. Tooling & build strategy
 ### 4.1 Multi-arch binaries
+> **SUPERSEDED by §0 (2026-07-23):** the pipeline uses **native runners per arch**
+> — no `cross`. Linux via the Dockerfile `export` stage on `ubuntu-latest` +
+> `ubuntu-24.04-arm`; macOS builds both arches on `macos-14` (arm64 native +
+> `x86_64-apple-darwin` cross via Apple's toolchain); Windows `fabricctl` on
+> `windows-latest`. The arm64-gateway cross-compile risk below is moot. The rest
+> of this subsection is retained for historical context only.
 - **Linux x86_64 + arm64**: cross-compile from one x86_64 runner using
   `cross` (or `cargo-zigbuild`) for `aarch64-unknown-linux-gnu`. The eBPF object is
   arch-independent (`aya` emits `bpfel` bytecode regardless of host/target arch), so only
@@ -151,5 +167,6 @@ Guard signing/notarization/Pages jobs on the presence of the secrets (skip-with-
 - v1 could ship x86_64-only if the arm64 gateway cross-compile proves hard; arm64 is the
   main unknown — de-risk it first (a throwaway `cross build --target aarch64` of the gateway).
 - Homebrew tap remains a cheap ADDITION later (formula pointing at the release tarballs).
-- Windows: out of scope (no gateway; fabricctl-only demand unclear).
+- Windows: **now IN scope (§0, 2026-07-23)** — a Windows x86_64 `fabricctl` binary
+  + a WiX `.msi`. controller/relay stay Unix-only; gateway stays Linux-only.
 - Reproducible builds / SBOM (syft) + cosign image signing: a security follow-up.

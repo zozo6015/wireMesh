@@ -49,6 +49,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
           target/release/wiremesh-gateway \
           target/release/relay \
           target/release/mkcerts \
+          target/release/wiremesh-relay-enroll \
           target/release/fabricctl \
           target/release/wiremesh-operator \
           /out/
@@ -63,7 +64,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # their own arch; no cross-compilation.
 # ---------------------------------------------------------------------------
 FROM scratch AS export
-COPY --from=builder /out/ /
+# Only the binaries the release ships — NOT wiremesh-operator (Kubernetes-only,
+# distributed solely as a container image).
+COPY --from=builder \
+     /out/wiremesh-controller \
+     /out/wiremesh-gateway \
+     /out/relay \
+     /out/mkcerts \
+     /out/wiremesh-relay-enroll \
+     /out/fabricctl \
+     /
 
 # ---------------------------------------------------------------------------
 # controller — single-tenant control plane (gRPC/mTLS, embedded CA, sqlite via

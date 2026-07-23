@@ -16,6 +16,8 @@ contents:
     dst: /usr/bin/wiremesh-relay
   - src: dist/linux-${ARCH}/mkcerts
     dst: /usr/bin/wiremesh-mkcerts
+  - src: dist/linux-${ARCH}/wiremesh-relay-enroll
+    dst: /usr/bin/wiremesh-relay-enroll
   - src: deploy/packages/systemd/wiremesh-relay.service
     dst: /lib/systemd/system/wiremesh-relay.service
   - src: deploy/packages/env/relay.env

@@ -17,6 +17,10 @@ ExecStart=/usr/bin/wiremesh-gateway $GATEWAY_ARGS
 Restart=on-failure
 RestartSec=5
 WorkingDirectory=/var/lib/wiremesh
+# Grant only the capabilities the data plane needs, and cap the bounding set to
+# the same so the (root) process can never acquire more; block privilege gain.
+NoNewPrivileges=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN
 
 [Install]

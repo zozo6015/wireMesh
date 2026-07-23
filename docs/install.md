@@ -19,9 +19,29 @@ via the `Release` workflow on every `v*` tag, as **standalone binaries, Linux
 | `wiremesh-relay` (+`mkcerts`) | ✅ deb/rpm/tar | ✅ pkg/tar | ❌ Unix-only |
 | `wiremesh-gateway` | ✅ deb/rpm/tar | ❌ | ❌ |
 
+## Verify your download first
+
+Every Release includes a `SHA256SUMS` file covering all artifacts (tarballs,
+`.deb`, `.rpm`, `.msi`, `.pkg`). **Verify before installing** — this is your
+integrity check while Authenticode/Apple/GPG signing is still being provisioned:
+
+```sh
+# Download SHA256SUMS + your artifact(s) into the same dir, then:
+sha256sum -c SHA256SUMS --ignore-missing        # Linux
+shasum -a 256 -c SHA256SUMS --ignore-missing    # macOS
+```
+
+```powershell
+# Windows (PowerShell): compare against the line in SHA256SUMS for your file
+(Get-FileHash .\wiremesh-fabricctl-<version>-windows-x86_64.msi -Algorithm SHA256).Hash
+```
+
+Only install artifacts that verify.
+
 ## Linux — `.deb` / `.rpm`
 
-Download the package for your component + arch from the [Release](https://github.com/zozo6015/wireMesh/releases), then:
+Download the package for your component + arch from the [Release](https://github.com/zozo6015/wireMesh/releases),
+verify it against `SHA256SUMS` (above), then:
 
 ```sh
 # Debian/Ubuntu
@@ -47,8 +67,10 @@ sudo wiremesh-gateway enroll --token-file /etc/wiremesh/gateway.token \
 sudo systemctl enable --now wiremesh-gateway
 ```
 
-(A GPG-signed hosted apt/yum repo — `apt install wiremesh-gateway` without a
-manual download — is a tracked follow-up, gated on the owner's signing key.)
+(WireMesh itself hosts no package repository — it ships the `.deb`/`.rpm` as
+Release downloads. If you want `apt`/`dnf` to resolve `wiremesh-*` directly, you
+can stand up your **own** GPG-signed apt/yum repo from these assets; a helper to
+assemble a self-hosted repo tree is a tracked follow-up, gated on a signing key.)
 
 ## Standalone binaries (any Linux/macOS/Windows)
 
@@ -62,19 +84,26 @@ sudo install -m0755 fabricctl /usr/local/bin/
 
 ## Windows — `.msi`
 
-Run `wiremesh-fabricctl-<version>-windows-x86_64.msi`. It installs `fabricctl`
-into `C:\Program Files\WireMesh` and adds that directory to the system `PATH`.
-On Windows, `fabricctl` talks to the controller over **TCP** (`--addr <host:port>
---token <token>`); the Unix-domain-socket admin path is not available. (Unsigned
-until an Authenticode certificate is provisioned — SmartScreen will warn; choose
-*More info → Run anyway*.)
+**Verify the `.msi` against `SHA256SUMS` first** (see above). Then run
+`wiremesh-fabricctl-<version>-windows-x86_64.msi`. It installs `fabricctl` into
+`C:\Program Files\WireMesh` and adds that directory to the system `PATH`. On
+Windows, `fabricctl` talks to the controller over **TCP** (`--addr <host:port>
+--token <token>`); the Unix-domain-socket admin path is not available.
+
+The installer is not yet Authenticode-signed, so SmartScreen will warn about an
+unknown publisher — your SHA-256 check is what establishes integrity in the
+meantime. Signed installers are a tracked follow-up.
 
 ## macOS — `.pkg`
 
-Open `wiremesh-<version>-macos-universal*.pkg`; it installs the CLIs to
-`/usr/local/bin`. Universal (x86_64 + arm64). Unsigned/un-notarized until an
-Apple Developer ID is provisioned — right-click → *Open* to bypass Gatekeeper, or
-use the tarball.
+**Verify the `.pkg` against `SHA256SUMS` first** (see above). Then open
+`wiremesh-<version>-macos-universal*.pkg`; it installs the CLIs to
+`/usr/local/bin`. Universal (x86_64 + arm64).
+
+The `.pkg` is not yet signed/notarized, so Gatekeeper will warn — your SHA-256
+check is what establishes integrity in the meantime. If you prefer to avoid the
+Gatekeeper prompt entirely, use the verified `.tar.gz` instead. Signed +
+notarized installers are a tracked follow-up.
 
 ## Versioning
 

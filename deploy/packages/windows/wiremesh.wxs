@@ -9,8 +9,9 @@
 
   Built by release.yml on a windows runner (WiX v4; fabricctl.exe staged via the
   -b bindpath), producing wiremesh-fabricctl-<version>-windows-x86_64.msi.
-  Version must be numeric x.y.z (dry-runs pass 0.0.0). Authenticode-unsigned
-  until a code-signing cert is provisioned (signtool step guarded in release.yml).
+  Version must be numeric x.y.z (dry-runs pass 0.0.0). The .msi is currently
+  Authenticode-unsigned; signing is a documented follow-up, pending a
+  code-signing certificate and workflow support.
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package Name="WireMesh fabricctl"

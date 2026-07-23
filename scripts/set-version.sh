@@ -12,10 +12,12 @@ set -euo pipefail
 VERSION="${1:?usage: set-version.sh <version>}"
 VERSION="${VERSION#v}"
 
-# Reject anything that isn't a plain semver-ish token (defends the perl substitution).
-case "$VERSION" in
-  *[!0-9A-Za-z.+-]*) echo "set-version: refusing suspicious version '$VERSION'" >&2; exit 1 ;;
-esac
+# Require MAJOR.MINOR.PATCH with an optional -prerelease and/or +build suffix
+# (accepts 1.2.3, 0.0.0-dev, 1.2.3-rc.1, 1.2.3+build; rejects "", foo, 1, 1..2, +).
+if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+  echo "set-version: '$VERSION' is not MAJOR.MINOR.PATCH[-prerelease][+build]" >&2
+  exit 1
+fi
 
 for crate in fabricctl wiremesh-controller wiremesh-gateway wiremesh-relay; do
   f="crates/$crate/Cargo.toml"

@@ -239,7 +239,7 @@ async fn connect(cli: &Cli) -> anyhow::Result<AdminAuthClient> {
                 // connector `wiremesh-testkit::TestController::admin_client`
                 // uses — the placeholder URI is required but ignored by
                 // `connect_with_connector`, which always dials the Unix socket.
-                let channel = Endpoint::try_from("http://[::]:50051")?
+                let channel = Endpoint::try_from("http://127.0.0.1:50051")?
                     .connect_with_connector(service_fn(move |_: Uri| {
                         let path = path.clone();
                         async move {
