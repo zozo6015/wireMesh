@@ -18,7 +18,6 @@ name: Release
 on:
   push:
     tags: ['v*']
-    branches: ['release-pipeline']   # TEMPORARY dry-run trigger; removed before merge
   workflow_dispatch:
     inputs:
       version:
