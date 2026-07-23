@@ -254,7 +254,7 @@
     <p class="eyebrow">WireMesh &middot; Build Progress</p>
     <h1>Zero-trust network fabric &mdash; cycle-by-cycle build tracker</h1>
     <p class="lede">Open-source (Apache-2.0), self-hosted, cloud-agnostic L3/L4 network fabric in Rust: WireGuard data plane, default-deny eBPF policy, one gateway per segment, no agents on workloads. The engineering design ships as four plan cycles; this page tracks what's done, in flight, and next.</p>
-    <p class="stamp">Last updated <b>2026-07-22</b> &middot; Phase 0 + Cycle 2 + Cycle 3 + <b>all of Cycle 4</b> merged &middot; key-rotation (#14) + ghcr images (#15) merged &middot; <b>operator foundation + enroll client MERGED (PR #16)</b> &middot; <b>4 reconcilers + UDS admin-exec transport + deployment artifacts (manifests/kustomize + Helm) + docs built</b> (branch <code>operator-reconcilers</code>) &mdash; operator now deployable; core (controller + fabric) functional, cluster-validation next</p>
+    <p class="stamp">Last updated <b>2026-07-23</b> &middot; Phase 0 + Cycle 2 + Cycle 3 + <b>all of Cycle 4</b> merged &middot; key-rotation (#14) + ghcr images (#15) merged &middot; <b>K8s operator VALIDATED end-to-end on a real k3s/arm64 cluster</b> &mdash; gateway enrolled + data plane Running; six cluster-found fixes (#19&ndash;#24) merged to <code>main</code></p>
   </header>
 
   <div class="metrics">
@@ -276,7 +276,7 @@
     <div class="metric">
       <p class="k">Current focus</p>
       <div class="v" style="font-size:19px;">K8s operator</div>
-      <p class="sub">enrollment client landed (3/3) &middot; operator crate + CRDs in flight</p>
+      <p class="sub">cluster-validated &middot; gateway enrolled + data plane Running</p>
     </div>
   </div>
 
@@ -364,10 +364,11 @@
         <div class="cycle-head">
           <span class="cycle-no">05</span>
           <h3>Packaging &amp; Kubernetes operator</h3>
-          <span class="pill progress"><span>In flight &middot; 2026-07-22</span></span>
+          <span class="pill done"><span>Cluster-validated &middot; 2026-07-23</span></span>
         </div>
         <p><b>Merged:</b> multi-stage <code>ghcr.io</code> container images for controller / gateway / relay / fabricctl (PR #15, SHA-pinned actions + digest-pinned bases); key-rotation fast-follow (PR #14). <b>Enrollment client (landed, 3/3 green):</b> a new <code>wiremesh-enroll</code> crate + <code>wiremesh-gateway enroll</code> / <code>wiremesh-relay-enroll</code> subcommands that turn a minted token into the on-disk identity each binary boots from &mdash; the missing piece (spec &sect;7-A deferral) that lets the operator bootstrap gateway/relay pods. <b>Operator foundation Tasks 1&ndash;4 MERGED (<a href="https://github.com/zozo6015/wireMesh/pull/16">PR #16</a>, CodeRabbit-clean):</b> crate + 5 cluster-scoped CRDs + crdgen, <code>FabricAdmin</code>, fabric-YAML aggregation, workload builders. <b>Then (branch <code>operator-reconcilers</code>, lib 20/20 green):</b> the <b>4 reconcilers</b> (controller/fabric/gateway/relay via kube-rs, SSA + owner-refs + finalizers + status); the <b>UDS admin-exec transport</b> (operator execs <code>operator-admin</code> in a controller-pod sidecar over the implicit-admin socket &mdash; no bearer token); and the <b>deployment artifacts</b> (manifests-first kustomize base + RBAC incl. <code>pods/exec</code>, a Helm chart, example CRs) + <code>docs/operator.md</code>.</p>
-        <p class="dep"><b>Two architecture gaps found + resolved:</b> the enrollment-client gap (built it) and the operator&harr;controller admin channel (Admin TCP is loopback-only &rarr; UDS admin-exec sidecar). <b>Deployable now</b> &mdash; controller + fabric (segments/policy) reconcilers are functional; gateways/relays additionally need the <code>wiremesh-controller-ca</code> Secret (cert-manager manifest provided) + PVC-backed state. <b>Next:</b> merge &rarr; CI publishes the operator image &rarr; owner deploys on a reachable cluster for end-to-end validation. <b>Also pending:</b> Cycle 2b OpenBao provider driver.</p>
+        <p class="dep"><b>Two architecture gaps found + resolved:</b> the enrollment-client gap (built it) and the operator&harr;controller admin channel (Admin TCP is loopback-only &rarr; UDS admin-exec sidecar, later hardened to a bundled-<code>kubectl</code> exec after kube-rs WebSocket-exec 403s).</p>
+        <p class="dep"><b>VALIDATED END-TO-END on a real cluster (k3s, 4&times;arm64 Raspberry Pi, 2026-07-23):</b> gateway <code>gw-home</code> enrolled (<code>gateway_id=3</code>) with its data plane <b>Running 1/1</b> &mdash; the full path proven: operator deploys the gateway &rarr; it reaches the controller <b>Service</b> (<code>bind_ip=0.0.0.0</code>) &rarr; trusts the <b>cert-manager</b>-rooted CA &rarr; enrolls &rarr; data plane comes up (metrics + endpoint observation). <b>Six cluster-found fixes merged to <code>main</code>:</b> <a href="https://github.com/zozo6015/wireMesh/pull/19">#19</a> native-arm64 multi-arch images, <a href="https://github.com/zozo6015/wireMesh/pull/20">#20</a> bundled-kubectl admin transport, <a href="https://github.com/zozo6015/wireMesh/pull/21">#21</a> review fixes, <a href="https://github.com/zozo6015/wireMesh/pull/22">#22</a> Service-reachable <code>bind_ip</code> + cert-manager CA seed + Gateway API routes, <a href="https://github.com/zozo6015/wireMesh/pull/23">#23</a> gateway image <code>procps</code> (sysctl), <a href="https://github.com/zozo6015/wireMesh/pull/24">#24</a> cert-manager key <code>encoding: PKCS8</code>. <b>Follow-ups:</b> reconciler status/finalizer-drain should match the <em>active</em> roster gateway (not the first by segment); PVC-backed gateway identity (emptyDir restart loses identity); independent reviewer pass; Cycle 2b OpenBao driver.</p>
       </article>
 
     </div>
