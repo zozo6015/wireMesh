@@ -10,16 +10,23 @@
 # and, if your WiremeshController CR is not named `wiremesh-controller`, the
 # backendRefs `name`.
 #
-# TCPRoute/UDPRoute are gateway.networking.k8s.io/v1alpha2 (Envoy Gateway supports
-# both). There is deliberately NO HTTPRoute: enroll/sync are gRPC-over-TLS that
-# must be passed through (the sync mTLS client cert has to reach the controller),
-# so they are L4 TCP, not terminatable HTTP.
+# NAMESPACE: these routes carry NO metadata.namespace — apply them INTO the
+# controller's namespace so each backendRef resolves the controller Service in
+# the same namespace, e.g.  `kubectl -n <controller-ns> apply -f routes.yaml`
+# (the operator's default namespace is `wiremesh`). This standalone manifest is
+# intentionally NOT part of `kubectl apply -k` and does not inherit any Kustomize
+# namespace.
+#
+# TCPRoute/UDPRoute are gateway.networking.k8s.io/v1 (GA since Gateway API v1.6;
+# use v1alpha2 only on clusters older than that). There is deliberately NO
+# HTTPRoute: enroll/sync are gRPC-over-TLS that must be passed through (the sync
+# mTLS client cert has to reach the controller), so they are L4 TCP, not
+# terminatable HTTP.
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: TCPRoute
 metadata:
   name: wiremesh-controller-enroll
-  namespace: wiremesh
   labels:
     app.kubernetes.io/name: wiremesh
     app.kubernetes.io/component: controller
@@ -33,11 +40,10 @@ spec:
         - name: wiremesh-controller   # the controller Service (= CR name)
           port: 9400
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: TCPRoute
 metadata:
   name: wiremesh-controller-sync
-  namespace: wiremesh
   labels:
     app.kubernetes.io/name: wiremesh
     app.kubernetes.io/component: controller
@@ -51,11 +57,10 @@ spec:
         - name: wiremesh-controller
           port: 9500
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: UDPRoute
 metadata:
   name: wiremesh-controller-observe
-  namespace: wiremesh
   labels:
     app.kubernetes.io/name: wiremesh
     app.kubernetes.io/component: controller

@@ -192,13 +192,26 @@ pub fn controller_service(name: &str, spec: &WiremeshControllerSpec) -> Service 
 /// cert-manager `Certificate` Secret (`tls.crt`/`tls.key`) before the controller
 /// boots — so the controller's mesh CA is cert-manager-rooted. All paths are
 /// constant (no CRD input interpolated). `install` sets the mode atomically.
+///
+/// Seed **once**: if the controller PVC already holds a CA, keep it untouched
+/// (overwriting on every restart/rotation would invalidate every identity issued
+/// under the prior CA). And if no CA Secret is mounted (the volume is `optional`
+/// — see below), no-op and let the controller self-generate. So the CA Secret is
+/// a *bootstrap* input, never a hard startup prerequisite.
 fn ca_seed_init_container(image: &str) -> Container {
     Container {
         name: "ca-seed".to_string(),
         image: Some(image.to_string()),
         command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
         args: Some(vec![format!(
-            "install -m 0644 /mnt/ca-secret/tls.crt {DATA_DIR}/ca.pem && \
+            "if [ -e {DATA_DIR}/ca.pem ] || [ -e {DATA_DIR}/ca.key ]; then \
+                 if [ -e {DATA_DIR}/ca.pem ] && [ -e {DATA_DIR}/ca.key ]; then exit 0; fi; \
+                 echo 'wiremesh ca-seed: incomplete existing CA state on the PVC' >&2; exit 1; \
+             fi; \
+             if [ ! -e /mnt/ca-secret/tls.crt ] || [ ! -e /mnt/ca-secret/tls.key ]; then \
+                 echo 'wiremesh ca-seed: no CA secret mounted; controller will self-generate its CA' >&2; exit 0; \
+             fi; \
+             install -m 0644 /mnt/ca-secret/tls.crt {DATA_DIR}/ca.pem && \
              install -m 0600 /mnt/ca-secret/tls.key {DATA_DIR}/ca.key"
         )]),
         volume_mounts: Some(vec![
@@ -287,8 +300,12 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
             },
             Volume {
                 name: "ca-secret".to_string(),
+                // `optional` so the pod still starts when no cert-manager CA
+                // Secret exists — the ca-seed init-container then no-ops and the
+                // controller self-generates its CA (see ca_seed_init_container).
                 secret: Some(SecretVolumeSource {
                     secret_name: Some(CONTROLLER_CA_SECRET.to_string()),
+                    optional: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -799,13 +816,27 @@ mod tests {
         let args = seed.args.as_ref().unwrap().join(" ");
         assert!(args.contains("tls.crt") && args.contains("ca.pem"), "seeds ca.pem from tls.crt: {args:?}");
         assert!(args.contains("tls.key") && args.contains("ca.key"), "seeds ca.key from tls.key: {args:?}");
-        // The pod sources the CA-secret volume from the CONTROLLER_CA_SECRET Secret.
+        // Seed ONCE: never clobber an existing CA on the PVC (guards a restart/
+        // rotation from invalidating already-issued identities).
+        assert!(
+            args.contains(&format!("[ -e {DATA_DIR}/ca.pem ]")),
+            "ca-seed must skip when a CA already exists on the PVC: {args:?}"
+        );
+        // No-op when no CA secret is mounted (so it is not a hard startup dep).
+        assert!(
+            args.contains("/mnt/ca-secret/tls.crt") && args.contains("self-generate"),
+            "ca-seed must no-op (self-generate) when no CA secret is mounted: {args:?}"
+        );
+        // The pod sources the CA-secret volume from CONTROLLER_CA_SECRET, and the
+        // volume is OPTIONAL so an absent Secret does not block controller boot.
         let ca_vol = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == "ca-secret").expect("ca-secret volume");
+        let ca_src = ca_vol.secret.as_ref().expect("ca-secret is a Secret source");
         assert_eq!(
-            ca_vol.secret.as_ref().and_then(|s| s.secret_name.as_deref()),
+            ca_src.secret_name.as_deref(),
             Some(CONTROLLER_CA_SECRET),
             "ca-secret volume must source the cert-manager CA Secret"
         );
+        assert_eq!(ca_src.optional, Some(true), "the CA secret volume must be optional (no hard startup dependency)");
     }
 
     #[test]

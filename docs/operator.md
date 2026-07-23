@@ -180,8 +180,13 @@ This produces the `wiremesh-controller-ca` Secret (`tls.crt`/`tls.key`). See
 consumes it (mounting `tls.crt`/`tls.key` as `ca.pem`/`ca.key` into its data
 dir; `wiremesh-trust` uses a provided CA instead of self-generating).
 
-**Without cert-manager**, the controller self-generates its CA on first boot;
-publish it to the `wiremesh-controller-ca` Secret (extract `/var/lib/wiremesh/ca.pem`).
+**Without cert-manager**, the CA Secret is optional: the controller
+self-generates its CA on first boot (the `ca-seed` init-container no-ops when the
+Secret is absent, and does **not** overwrite an existing CA on later restarts).
+For gateways/relays to trust that self-generated CA, publish its cert
+(`/var/lib/wiremesh/ca.pem`) into the `wiremesh-controller-ca` Secret under key
+**`tls.crt`** — the same key gateways/relays project to their `ca.pem` trust
+anchor.
 
 ## Client routing (out of band)
 
@@ -233,9 +238,15 @@ helm upgrade wiremesh-operator deploy/helm/wiremesh-operator \
   --set gatewayApi.gateway.namespace=<your-gateway-ns>
 ```
 
-or apply the standalone manifests (edit the `parentRefs` first):
-`kubectl apply -f deploy/operator/gateway-api/routes.yaml`. Full walkthrough +
-a sample `Gateway`: [`deploy/operator/gateway-api/README.md`](../deploy/operator/gateway-api/README.md).
+or apply the standalone manifests (edit the `parentRefs` first). They carry no
+`metadata.namespace`, so apply them **into the controller's namespace** (default
+`wiremesh`) — the `backendRef` resolves the Service in the route's own namespace:
+`kubectl -n <controller-namespace> apply -f deploy/operator/gateway-api/routes.yaml`.
+Full walkthrough + a sample `Gateway`:
+[`deploy/operator/gateway-api/README.md`](../deploy/operator/gateway-api/README.md).
+
+The routes use `gateway.networking.k8s.io/v1` `TCPRoute`/`UDPRoute` (GA since
+Gateway API v1.6; use `v1alpha2` on older clusters).
 
 **Caveats (both critical):**
 

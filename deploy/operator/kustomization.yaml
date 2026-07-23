@@ -31,6 +31,8 @@ resources:
 # OFF-CLUSTER gateways/relays only: to expose the controller through a Gateway
 # API implementation, apply deploy/operator/gateway-api/routes.yaml separately
 # (it references YOUR Gateway, so it is intentionally NOT in resources above).
+# That standalone manifest is NOT processed by kustomize and does NOT inherit the
+# `namespace:` set here — apply it with `kubectl -n <this-namespace> apply -f ...`.
 # See deploy/operator/gateway-api/README.md and docs/operator.md.
 
 commonLabels:

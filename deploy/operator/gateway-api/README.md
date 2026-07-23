@@ -52,21 +52,26 @@ spec:
       allowedRoutes: { namespaces: { from: All } }
 ```
 
-Envoy Gateway needs its `TCPRoute`/`UDPRoute` support enabled (they're
-Gateway API v1alpha2). The Gateway's address (LoadBalancer IP / node) + these
-ports are what a remote gateway points its `--controller-sync` / enroll at.
+Envoy Gateway needs its `TCPRoute`/`UDPRoute` support enabled — these are
+`gateway.networking.k8s.io/v1` (GA since Gateway API v1.6; on older clusters use
+`v1alpha2` instead). The Gateway's address (LoadBalancer IP / node) + these ports
+are what a remote gateway points its `--controller-sync` / enroll at.
 
 ## 2. Apply the routes
 
 Edit `routes.yaml` — set `parentRefs` (your Gateway name/namespace + the
 `sectionName` listener names above), and the `backendRefs.name` if your
-`WiremeshController` CR isn't named `wiremesh-controller` — then:
+`WiremeshController` CR isn't named `wiremesh-controller`. The routes carry **no**
+`metadata.namespace`, so apply them **into the controller's namespace** (default
+`wiremesh`) — each `backendRef` resolves the controller Service in the route's own
+namespace:
 
 ```sh
-kubectl apply -f deploy/operator/gateway-api/routes.yaml
+kubectl -n <controller-namespace> apply -f deploy/operator/gateway-api/routes.yaml
 ```
 
-(Or enable them via the Helm chart: `--set gatewayApi.enabled=true` +
+(Or enable them via the Helm chart — which places them in the release namespace
+automatically: `--set gatewayApi.enabled=true` +
 `gatewayApi.gateway.name/namespace`.)
 
 ## Caveats

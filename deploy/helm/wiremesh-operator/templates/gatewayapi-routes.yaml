@@ -7,10 +7,10 @@
 {{- $svcNs := default .Release.Namespace $svc.namespace -}}
 {{- $r := .Values.gatewayApi.routes -}}
 # Gateway API routes exposing the controller to off-cluster gateways/relays.
-# TCPRoute/UDPRoute are gateway.networking.k8s.io/v1alpha2. NO HTTPRoute:
+# TCPRoute/UDPRoute are gateway.networking.k8s.io/v1. NO HTTPRoute:
 # enroll/sync are gRPC-over-TLS that MUST be passed through, so they are L4 TCP.
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: TCPRoute
 metadata:
   name: wiremesh-controller-enroll
@@ -27,7 +27,7 @@ spec:
         - name: {{ $svcName }}
           port: {{ $r.enroll.port }}
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: TCPRoute
 metadata:
   name: wiremesh-controller-sync
@@ -44,7 +44,7 @@ spec:
         - name: {{ $svcName }}
           port: {{ $r.sync.port }}
 ---
-apiVersion: gateway.networking.k8s.io/v1alpha2
+apiVersion: gateway.networking.k8s.io/v1
 kind: UDPRoute
 metadata:
   name: wiremesh-controller-observe
