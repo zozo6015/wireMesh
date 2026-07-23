@@ -162,29 +162,30 @@ jobs:
 
   # ---------------------------------------------------------------------------
   windows-binaries:
+    # Windows ships fabricctl ONLY — the controller and relay are Unix servers
+    # (UDS admin socket + os::unix::fs 0600 secret perms) and do not build on
+    # Windows. fabricctl's own UDS path is cfg-gated; it uses TCP admin here.
     needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc
-        run: choco install protoc -y
+      - uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Stamp version
         shell: bash
         run: bash scripts/set-version.sh "${{ needs.version.outputs.version }}"
-      - name: Build portable components
-        run: cargo build --release -p fabricctl -p wiremesh-controller -p wiremesh-relay
-      - name: Stage exes + zip
+      - name: Build fabricctl
+        run: cargo build --release -p fabricctl
+      - name: Stage exe + zip
         shell: bash
         run: |
           set -euo pipefail
           V="${{ needs.version.outputs.version }}"
           mkdir -p stage tarballs
-          cp target/release/fabricctl.exe            stage/fabricctl.exe
-          cp target/release/wiremesh-controller.exe  stage/wiremesh-controller.exe
-          cp target/release/relay.exe                stage/wiremesh-relay.exe
-          cp target/release/mkcerts.exe              stage/wiremesh-mkcerts.exe
-          (cd stage && 7z a "../tarballs/wiremesh-${V}-windows-x86_64.zip" ./*)
+          cp target/release/fabricctl.exe stage/fabricctl.exe
+          (cd stage && 7z a "../tarballs/wiremesh-fabricctl-${V}-windows-x86_64.zip" ./*)
       - name: Build MSI (WiX)
         shell: bash
         run: |
@@ -194,7 +195,7 @@ jobs:
           V="${{ needs.version.outputs.version }}"; MV="${{ needs.version.outputs.msi_version }}"
           wix build deploy/packages/windows/wiremesh.wxs -arch x64 \
             -d Version="$MV" -b stage \
-            -o "tarballs/wiremesh-${V}-windows-x86_64.msi"
+            -o "tarballs/wiremesh-fabricctl-${V}-windows-x86_64.msi"
           ls -l tarballs
       - uses: actions/upload-artifact@v4
         with:
@@ -223,10 +224,13 @@ jobs:
           export PATH="$PATH:$(go env GOPATH)/bin"
           export VERSION="${{ needs.version.outputs.version }}" ARCH="${{ matrix.arch }}"
           chmod +x dist/linux-$ARCH/* || true
-          mkdir -p packages
+          mkdir -p packages rendered
           for c in controller gateway relay fabricctl; do
-            nfpm pkg -f deploy/packages/nfpm/$c.yaml -p deb -t packages/
-            nfpm pkg -f deploy/packages/nfpm/$c.yaml -p rpm -t packages/
+            # nfpm does not env-expand contents.src globs, so pre-expand the
+            # config ourselves (only ${VERSION}/${ARCH} appear in these files).
+            envsubst '${VERSION} ${ARCH}' < deploy/packages/nfpm/$c.yaml > rendered/$c.yaml
+            nfpm pkg -f rendered/$c.yaml -p deb -t packages/
+            nfpm pkg -f rendered/$c.yaml -p rpm -t packages/
           done
           ls -l packages
       - uses: actions/upload-artifact@v4

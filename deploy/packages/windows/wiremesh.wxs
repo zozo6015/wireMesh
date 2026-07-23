@@ -1,19 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  WireMesh Windows installer (WiX v4). Bundles the portable CLIs — fabricctl,
-  wiremesh-controller, wiremesh-relay (+ mkcerts) — into %ProgramFiles%\WireMesh
-  and puts that dir on the system PATH. The gateway is NOT included (Linux-only).
+  WireMesh Windows installer (WiX v4). Installs the admin CLI `fabricctl` into
+  %ProgramFiles%\WireMesh and puts that dir on the system PATH.
 
-  Build (on a windows runner, with the exes staged next to this file):
+  Windows ships fabricctl ONLY: the gateway is Linux-only (eBPF/tun) and the
+  controller/relay are Unix servers (UDS admin socket + unix file-mode secret
+  handling) that do not build on Windows.
+
+  Build (on a windows runner, fabricctl.exe staged next to this file via -b):
     dotnet tool install --global wix
     wix build deploy/packages/windows/wiremesh.wxs -arch x64 \
-      -d Version=1.2.3 -b <dir-with-exes> -o wiremesh-<version>-x86_64.msi
+      -d Version=1.2.3 -b <dir-with-fabricctl.exe> -o wiremesh-fabricctl-<version>.msi
 
-  Version must be numeric x.y.z (dry-runs pass 0.0.0). Unsigned until an
-  Authenticode cert is provisioned (signtool step is guarded in release.yml).
+  Version must be numeric x.y.z (dry-runs pass 0.0.0). Authenticode-unsigned
+  until a code-signing cert is provisioned (signtool step guarded in release.yml).
 -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
-  <Package Name="WireMesh"
+  <Package Name="WireMesh fabricctl"
            Manufacturer="WireMesh"
            Version="$(var.Version)"
            UpgradeCode="6F3A1E2C-9B44-4C7D-8E21-2A5C1D0F7B90"
@@ -30,18 +33,6 @@
           <File Id="fabricctl.exe" Source="fabricctl.exe" KeyPath="yes" />
         </Component>
 
-        <Component Id="C_controller" Guid="A1B2C3D4-0002-4A00-9000-00000000F002">
-          <File Id="wiremesh_controller.exe" Source="wiremesh-controller.exe" KeyPath="yes" />
-        </Component>
-
-        <Component Id="C_relay" Guid="A1B2C3D4-0003-4A00-9000-00000000F003">
-          <File Id="wiremesh_relay.exe" Source="wiremesh-relay.exe" KeyPath="yes" />
-        </Component>
-
-        <Component Id="C_mkcerts" Guid="A1B2C3D4-0004-4A00-9000-00000000F004">
-          <File Id="wiremesh_mkcerts.exe" Source="wiremesh-mkcerts.exe" KeyPath="yes" />
-        </Component>
-
         <Component Id="C_Path" Guid="A1B2C3D4-0005-4A00-9000-00000000F005">
           <Environment Id="E_Path" Name="PATH" Value="[INSTALLFOLDER]"
                        Part="last" Action="set" System="yes" Permanent="no" />
@@ -50,11 +41,8 @@
       </Directory>
     </StandardDirectory>
 
-    <Feature Id="Main" Title="WireMesh CLIs" Level="1">
+    <Feature Id="Main" Title="WireMesh fabricctl" Level="1">
       <ComponentRef Id="C_fabricctl" />
-      <ComponentRef Id="C_controller" />
-      <ComponentRef Id="C_relay" />
-      <ComponentRef Id="C_mkcerts" />
       <ComponentRef Id="C_Path" />
     </Feature>
 

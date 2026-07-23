@@ -5,16 +5,18 @@ via the `Release` workflow on every `v*` tag, as **standalone binaries, Linux
 `.deb`/`.rpm` packages, a Windows `.msi` installer, and a macOS `.pkg`**.
 
 > The **gateway is Linux-only** (it loads eBPF, creates a tun, programs
-> nftables/routes). macOS and Windows artifacts cover the portable components
-> only: `fabricctl` (admin CLI), `wiremesh-controller`, `wiremesh-relay`.
+> nftables/routes). The **controller and relay are Unix servers** (Unix-domain
+> admin socket + unix file-mode secret handling), so on **Windows only
+> `fabricctl` (the admin CLI) ships**. macOS is Unix, so it gets all three
+> portable components.
 
 ## Platform × component matrix
 
 | Component | Linux (amd64/arm64) | macOS (x86_64/arm64) | Windows (x86_64) |
 |-----------|:--:|:--:|:--:|
 | `fabricctl` (admin CLI) | ✅ deb/rpm/tar | ✅ pkg/tar | ✅ msi/zip |
-| `wiremesh-controller` | ✅ deb/rpm/tar | ✅ pkg/tar | ✅ msi/zip |
-| `wiremesh-relay` (+`mkcerts`) | ✅ deb/rpm/tar | ✅ pkg/tar | ✅ msi/zip |
+| `wiremesh-controller` | ✅ deb/rpm/tar | ✅ pkg/tar | ❌ Unix-only |
+| `wiremesh-relay` (+`mkcerts`) | ✅ deb/rpm/tar | ✅ pkg/tar | ❌ Unix-only |
 | `wiremesh-gateway` | ✅ deb/rpm/tar | ❌ | ❌ |
 
 ## Linux — `.deb` / `.rpm`
@@ -60,11 +62,12 @@ sudo install -m0755 fabricctl /usr/local/bin/
 
 ## Windows — `.msi`
 
-Run `wiremesh-<version>-windows-x86_64.msi`. It installs `fabricctl`,
-`wiremesh-controller`, `wiremesh-relay`, `wiremesh-mkcerts` into
-`C:\Program Files\WireMesh` and adds that directory to the system `PATH`.
-(Unsigned until an Authenticode certificate is provisioned — SmartScreen will
-warn; choose *More info → Run anyway*.)
+Run `wiremesh-fabricctl-<version>-windows-x86_64.msi`. It installs `fabricctl`
+into `C:\Program Files\WireMesh` and adds that directory to the system `PATH`.
+On Windows, `fabricctl` talks to the controller over **TCP** (`--addr <host:port>
+--token <token>`); the Unix-domain-socket admin path is not available. (Unsigned
+until an Authenticode certificate is provisioned — SmartScreen will warn; choose
+*More info → Run anyway*.)
 
 ## macOS — `.pkg`
 

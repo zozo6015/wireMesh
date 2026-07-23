@@ -6,12 +6,18 @@ container images (`deploy/docker/Dockerfile` + `.github/workflows/container-imag
 PR #15 → ghcr.io/zozo6015/wiremesh-*).
 
 ## 0. 2026-07-23 amendments (owner decisions)
-- **Windows is now IN scope** (was §7 out-of-scope): ship Windows x86_64 binaries
-  for the portable components **and a Windows installer** (an `.msi` via WiX,
-  bundling the CLIs + a PATH entry; Authenticode-unsigned until an owner code-signing
-  cert is provisioned — same skip-with-notice guard as the other signing jobs).
-- **macOS + Windows component scope = fabricctl + controller + relay** (not
-  fabricctl-only). The **gateway stays Linux-only** (eBPF/tun). `mkcerts` rides with relay.
+- **Windows is now IN scope** (was §7 out-of-scope): ship a Windows x86_64
+  `fabricctl` binary **and a Windows `.msi` installer** (WiX, fabricctl + a PATH
+  entry; Authenticode-unsigned until an owner code-signing cert is provisioned —
+  same skip-with-notice guard as the other signing jobs).
+- **Component scope: macOS = fabricctl + controller + relay; Windows = fabricctl
+  ONLY.** Discovered during the build (2026-07-23): the controller and relay use
+  Unix-only APIs unconditionally — a `tokio::net::UnixListener` admin socket and
+  `std::os::unix::fs` 0600 secret perms — so they compile on macOS (Unix) but
+  **not on Windows**. Windows isn't a control-plane/relay target, so we ship only
+  the admin CLI there; `fabricctl`'s own `--socket` UDS path is `#[cfg(unix)]`-gated
+  so it builds on Windows and uses TCP admin (`--addr`+`--token`) instead. The
+  **gateway stays Linux-only** (eBPF/tun). `mkcerts` rides with relay.
 - **Versioning is git-tag-driven**: pushing `vMAJOR.MINOR.PATCH` sets that version
   everywhere — the built binaries' `--version`, tarball/deb/rpm/msi/pkg names, package
   versions, and the GitHub Release. `workflow_dispatch` takes an explicit `version`
