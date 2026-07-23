@@ -7,11 +7,8 @@
   controller/relay are Unix servers (UDS admin socket + unix file-mode secret
   handling) that do not build on Windows.
 
-  Build (on a windows runner, fabricctl.exe staged next to this file via -b):
-    dotnet tool install --global wix
-    wix build deploy/packages/windows/wiremesh.wxs -arch x64 \
-      -d Version=1.2.3 -b <dir-with-fabricctl.exe> -o wiremesh-fabricctl-<version>.msi
-
+  Built by release.yml on a windows runner (WiX v4; fabricctl.exe staged via the
+  -b bindpath), producing wiremesh-fabricctl-<version>-windows-x86_64.msi.
   Version must be numeric x.y.z (dry-runs pass 0.0.0). Authenticode-unsigned
   until a code-signing cert is provisioned (signtool step guarded in release.yml).
 -->
