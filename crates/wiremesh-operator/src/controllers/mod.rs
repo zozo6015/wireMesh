@@ -122,6 +122,14 @@ pub async fn controller_endpoints(ctx: &Context) -> Result<ControllerAddrs, Erro
         .and_then(|s| s.cluster_ip)
         .filter(|ip| !ip.is_empty() && ip != "None")
         .ok_or(Error::MissingField("controller Service clusterIP (not assigned yet)"))?;
+    // v1 is IPv4-only, and `ip:port` (unbracketed) is only well-formed for IPv4.
+    // On a dual-stack cluster with an IPv6-primary Service, reject clearly rather
+    // than emit a malformed address the gateway/relay can't parse.
+    if ip.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(Error::MissingField(
+            "controller Service clusterIP must be IPv4 (v1 is IPv4-only); set the Service ipFamilies to IPv4",
+        ));
+    }
 
     Ok(ControllerAddrs {
         sync: format!("{ip}:{sync_port}"),

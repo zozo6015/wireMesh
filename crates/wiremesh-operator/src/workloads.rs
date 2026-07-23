@@ -248,21 +248,23 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
         ..Default::default()
     };
 
-    // Stamp a stable `component: controller` label so the operator's admin-exec
-    // transport can find the controller pod by a fixed selector regardless of
-    // the CR's (user-chosen) name.
+    // Stamp a stable `component: controller` label on the POD (so the operator's
+    // admin-exec transport can find the controller pod regardless of the CR's
+    // user-chosen name). The Deployment SELECTOR stays `labels(name)` — a
+    // selector is immutable after create, and it still matches the pod (a
+    // selector is a subset match), so this is safe against an existing Deployment.
     let mut pod_labels = labels(name);
     pod_labels.insert(CONTROLLER_COMPONENT_LABEL.0.to_string(), CONTROLLER_COMPONENT_LABEL.1.to_string());
 
     Deployment {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
-            labels: Some(pod_labels.clone()),
+            labels: Some(labels(name)),
             ..Default::default()
         },
         spec: Some(DeploymentSpec {
             replicas: Some(1),
-            selector: LabelSelector { match_labels: Some(pod_labels.clone()), ..Default::default() },
+            selector: LabelSelector { match_labels: Some(labels(name)), ..Default::default() },
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta { labels: Some(pod_labels), ..Default::default() }),
                 spec: Some(pod),
