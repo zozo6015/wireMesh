@@ -51,6 +51,18 @@ const DATA_DIR: &str = "/var/lib/wiremesh";
 const RUN_DIR: &str = "/run/wiremesh";
 const UDS_PATH: &str = "/run/wiremesh/controller.sock";
 
+/// The stable label the controller pod carries (independent of the CR's name),
+/// so the operator's admin-exec transport can find it by a fixed selector.
+pub const CONTROLLER_COMPONENT_LABEL: (&str, &str) = ("app.kubernetes.io/component", "controller");
+
+/// The label selector the admin-exec transport uses to find the controller pod.
+pub fn controller_pod_selector() -> String {
+    format!(
+        "app.kubernetes.io/name=wiremesh,{}={}",
+        CONTROLLER_COMPONENT_LABEL.0, CONTROLLER_COMPONENT_LABEL.1
+    )
+}
+
 /// The `app` label every object for one instance shares (also the Service
 /// selector).
 fn labels(name: &str) -> BTreeMap<String, String> {
@@ -71,11 +83,6 @@ fn tcp_port(name: &str, port: i32) -> ContainerPort {
         protocol: Some("TCP".to_string()),
         ..Default::default()
     }
-}
-
-/// Host part of a `host:port` address (everything before the last `:`).
-fn host_of(addr: &str) -> &str {
-    addr.rsplit_once(':').map(|(h, _)| h).unwrap_or(addr)
 }
 
 /// A CRD-supplied WireGuard interface name flows into the gateway's argv, so
@@ -241,6 +248,14 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
         ..Default::default()
     };
 
+    // Stamp a stable `component: controller` label on the POD (so the operator's
+    // admin-exec transport can find the controller pod regardless of the CR's
+    // user-chosen name). The Deployment SELECTOR stays `labels(name)` — a
+    // selector is immutable after create, and it still matches the pod (a
+    // selector is a subset match), so this is safe against an existing Deployment.
+    let mut pod_labels = labels(name);
+    pod_labels.insert(CONTROLLER_COMPONENT_LABEL.0.to_string(), CONTROLLER_COMPONENT_LABEL.1.to_string());
+
     Deployment {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -251,7 +266,7 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
             replicas: Some(1),
             selector: LabelSelector { match_labels: Some(labels(name)), ..Default::default() },
             template: PodTemplateSpec {
-                metadata: Some(ObjectMeta { labels: Some(labels(name)), ..Default::default() }),
+                metadata: Some(ObjectMeta { labels: Some(pod_labels), ..Default::default() }),
                 spec: Some(pod),
             },
             ..Default::default()
@@ -271,30 +286,38 @@ pub fn gateway_deployment(
     gw: &WiremeshGateway,
     controller_sync: &str,
     controller_enroll: &str,
+    controller_observe: &str,
     ca_secret: &str,
     token_secret: &str,
+    cidrs: &[String],
 ) -> Deployment {
     let name = gw.metadata.name.clone().unwrap_or_else(|| "wiremesh-gateway".to_string());
     let image = gw.spec.image.clone().unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_string());
     let tun = safe_ifname(gw.spec.tun.as_deref());
     let wg_port = gw.spec.wg_port.unwrap_or(51820);
-    let observe = format!("{}:{OBSERVE_UDP_PORT}", host_of(controller_sync));
 
     // enroll init-container: reads the token from the mounted secret FILE
     // (`--token-file`, no shell/command-substitution) and the CA from the
     // mounted CA secret, writes Identity into the shared state. Invoked
     // directly (no `/bin/sh -c`) so no CRD value is ever shell-interpreted.
+    // The `--cidr`s MUST match the segment CIDRs the enrollment token is bound
+    // to (the controller rejects an empty/mismatched cidrs list).
+    let mut enroll_args = vec![
+        "enroll".to_string(),
+        "--token-file".to_string(), "/etc/wiremesh-token/token".to_string(),
+        "--controller".to_string(), controller_enroll.to_string(),
+        "--ca".to_string(), "/etc/wiremesh-ca/ca.pem".to_string(),
+        "--state-dir".to_string(), DATA_DIR.to_string(),
+    ];
+    for c in cidrs {
+        enroll_args.push("--cidr".to_string());
+        enroll_args.push(c.clone());
+    }
     let enroll = Container {
         name: "enroll".to_string(),
         image: Some(image.clone()),
         command: Some(vec!["wiremesh-gateway".to_string()]),
-        args: Some(vec![
-            "enroll".to_string(),
-            "--token-file".to_string(), "/etc/wiremesh-token/token".to_string(),
-            "--controller".to_string(), controller_enroll.to_string(),
-            "--ca".to_string(), "/etc/wiremesh-ca/ca.pem".to_string(),
-            "--state-dir".to_string(), DATA_DIR.to_string(),
-        ]),
+        args: Some(enroll_args),
         volume_mounts: Some(vec![
             VolumeMount { name: "state".to_string(), mount_path: DATA_DIR.to_string(), ..Default::default() },
             VolumeMount { name: "token".to_string(), mount_path: "/etc/wiremesh-token".to_string(), read_only: Some(true), ..Default::default() },
@@ -308,7 +331,7 @@ pub fn gateway_deployment(
         image: Some(image),
         args: Some(vec![
             "--controller-sync".to_string(), controller_sync.to_string(),
-            "--observe".to_string(), observe,
+            "--observe".to_string(), controller_observe.to_string(),
             "--tun".to_string(), tun,
             "--wg-port".to_string(), wg_port.to_string(),
             "--state-dir".to_string(), DATA_DIR.to_string(),
@@ -324,6 +347,10 @@ pub fn gateway_deployment(
 
     let pod = PodSpec {
         host_network: Some(true),
+        // A hostNetwork pod defaults to dnsPolicy "Default" (host resolv.conf,
+        // no cluster DNS). Use ClusterFirstWithHostNet so cluster names still
+        // resolve — belt-and-suspenders even though we now pass ClusterIPs.
+        dns_policy: Some("ClusterFirstWithHostNet".to_string()),
         node_name: gw.spec.node_name.clone(),
         node_selector: gw.spec.node_selector.clone(),
         init_containers: Some(vec![enroll]),
@@ -550,7 +577,7 @@ mod tests {
                 image: None,
             },
         );
-        let d = gateway_deployment(&gw, "wm:9500", "wm:9400", "wm-ca", "gw-aws-token");
+        let d = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token", &["10.10.0.0/16".to_string()]);
         let pod = d.spec.unwrap().template.spec.unwrap();
         assert_eq!(pod.host_network, Some(true), "gateway pod must be hostNetwork");
         assert!(
@@ -596,7 +623,7 @@ mod tests {
                 image: None,
             },
         );
-        let gd = gateway_deployment(&gw, "wm:9500", "wm:9400", "wm-ca", "gw-token");
+        let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
         let r = WiremeshRelay::new(
             "r",
             WiremeshRelaySpec {

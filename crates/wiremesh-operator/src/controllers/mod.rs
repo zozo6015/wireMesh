@@ -20,8 +20,10 @@ pub mod fabric;
 pub mod gateway;
 pub mod relay;
 
+use crate::crd::WiremeshController;
+use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use kube::api::{Patch, PatchParams};
+use kube::api::{ListParams, Patch, PatchParams};
 use kube::{Api, Client, Resource, ResourceExt};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -85,6 +87,55 @@ where
     let name = obj.meta().name.clone().ok_or(Error::MissingField(".metadata.name"))?;
     let pp = PatchParams::apply(FIELD_MANAGER).force();
     Ok(api.patch(&name, &pp, &Patch::Apply(obj)).await?)
+}
+
+/// The controller's control-plane endpoints gateways/relays dial, as **numeric
+/// `IP:port`** (the controller Service's ClusterIP). Numeric — because the
+/// gateway/relay binaries parse these flags into `std::net::SocketAddr` (no DNS
+/// resolution) — and a ClusterIP is stable for the Service's lifetime and
+/// reachable from hostNetwork pods via kube-proxy, so no cluster DNS is needed.
+pub struct ControllerAddrs {
+    /// Sync (mTLS) — `--controller-sync` / relay `--controller`.
+    pub sync: String,
+    /// Enrollment RPC (server-TLS) — the enroll init-container `--controller`.
+    pub enroll: String,
+    /// Observation UDP — gateway `--observe`.
+    pub observe: String,
+}
+
+/// Resolve the (single-tenant) controller's endpoints from its Service's
+/// ClusterIP. Errs (→ requeue) if no `WiremeshController` exists yet or its
+/// Service has no ClusterIP assigned.
+pub async fn controller_endpoints(ctx: &Context) -> Result<ControllerAddrs, Error> {
+    let ctrls = Api::<WiremeshController>::all(ctx.client.clone())
+        .list(&ListParams::default())
+        .await?;
+    let c = ctrls.items.first().ok_or(Error::MissingField("WiremeshController (none exists)"))?;
+    let name = c.name_any();
+    let sync_port = c.spec.sync_tcp_port.unwrap_or(9500);
+    let observe_port = c.spec.observe_udp_port.unwrap_or(9600);
+    let enroll_port = 9400; // WIREMESH_TCP_PORT (enrollment listener)
+
+    let svc = Api::<Service>::namespaced(ctx.client.clone(), &ctx.namespace).get(&name).await?;
+    let ip = svc
+        .spec
+        .and_then(|s| s.cluster_ip)
+        .filter(|ip| !ip.is_empty() && ip != "None")
+        .ok_or(Error::MissingField("controller Service clusterIP (not assigned yet)"))?;
+    // v1 is IPv4-only, and `ip:port` (unbracketed) is only well-formed for IPv4.
+    // On a dual-stack cluster with an IPv6-primary Service, reject clearly rather
+    // than emit a malformed address the gateway/relay can't parse.
+    if ip.parse::<std::net::Ipv4Addr>().is_err() {
+        return Err(Error::MissingField(
+            "controller Service clusterIP must be IPv4 (v1 is IPv4-only); set the Service ipFamilies to IPv4",
+        ));
+    }
+
+    Ok(ControllerAddrs {
+        sync: format!("{ip}:{sync_port}"),
+        enroll: format!("{ip}:{enroll_port}"),
+        observe: format!("{ip}:{observe_port}"),
+    })
 }
 
 #[cfg(test)]

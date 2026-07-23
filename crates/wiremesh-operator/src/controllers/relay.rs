@@ -6,15 +6,15 @@
 //! On CR delete the relay pod is GC'd (owner ref) and the controller's health
 //! pipeline evicts the stale relay.
 
-use super::{apply, owner_ref, service_dns, Context, Error};
+use super::{apply, owner_ref, Context, Error};
 use crate::controllers::gateway::CONTROLLER_CA_SECRET;
-use crate::crd::{WiremeshController, WiremeshRelay, WiremeshResourceStatus};
+use crate::crd::{WiremeshRelay, WiremeshResourceStatus};
 use crate::workloads;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::ByteString;
-use kube::api::{ListParams, Patch, PatchParams};
+use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::watcher;
 use kube::{Api, ResourceExt};
@@ -32,15 +32,6 @@ pub fn needs_token(existing: Option<&Secret>) -> bool {
         None => true,
         Some(s) => !s.data.as_ref().map(|d| d.contains_key("token")).unwrap_or(false),
     }
-}
-
-async fn controller_endpoints(ctx: &Context) -> Result<(String, String), Error> {
-    let ctrls = Api::<WiremeshController>::all(ctx.client.clone()).list(&ListParams::default()).await?;
-    let c = ctrls.items.first().ok_or(Error::MissingField("WiremeshController (none exists)"))?;
-    let name = c.name_any();
-    let sync = c.spec.sync_tcp_port.unwrap_or(9500);
-    let enroll = 9400;
-    Ok((service_dns(&name, &ctx.namespace, sync), service_dns(&name, &ctx.namespace, enroll)))
 }
 
 async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Action, Error> {
@@ -70,8 +61,8 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
     }
 
     // Deploy the relay (fails closed on an invalid endpoint — v1 IPv4 only).
-    let (sync, enroll) = controller_endpoints(&ctx).await?;
-    let mut dep = workloads::relay_deployment(relay.as_ref(), &sync, &enroll, CONTROLLER_CA_SECRET, &token_secret)
+    let addrs = super::controller_endpoints(&ctx).await?;
+    let mut dep = workloads::relay_deployment(relay.as_ref(), &addrs.sync, &addrs.enroll, CONTROLLER_CA_SECRET, &token_secret)
         .map_err(Error::Admin)?;
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![owner_ref(relay.as_ref())?]);
