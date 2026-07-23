@@ -19,10 +19,10 @@
 use crate::admin::FabricAdmin;
 use anyhow::{anyhow, Context};
 use k8s_openapi::api::core::v1::Pod;
-use kube::api::{AttachParams, ListParams};
+use kube::api::ListParams;
 use kube::{Api, Client};
 use serde::Deserialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 /// A gateway roster row — the shape both transports return (the gRPC path maps
 /// the proto `GatewayInfo`; the exec path parses the sidecar's JSON).
@@ -89,6 +89,7 @@ impl AdminExec {
             }
             AdminExec::Grpc { .. } => unreachable!("exec_json() on Grpc transport"),
         };
+        // Resolve the controller pod by label (regular API — works fine).
         let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
         let running = pods
             .list(&ListParams::default().labels(pod_label))
@@ -99,32 +100,46 @@ impl AdminExec {
             .ok_or_else(|| anyhow!("no Running controller pod matching {pod_label}"))?;
         let pod_name = running.metadata.name.ok_or_else(|| anyhow!("controller pod has no name"))?;
 
-        let mut cmd: Vec<String> = vec!["wiremesh-operator".into(), "operator-admin".into()];
-        cmd.extend(op_args.iter().map(|s| s.to_string()));
-        cmd.push("--socket".into());
-        cmd.push(uds.clone());
+        // Exec via the bundled `kubectl` rather than kube-rs's WebSocket exec:
+        // kube-rs 0.95's WS upgrade fails auth against real API servers (403),
+        // whereas kubectl carries the ServiceAccount token correctly and falls
+        // back to SPDY. kubectl uses the pod's in-cluster config automatically
+        // (KUBERNETES_SERVICE_HOST + the mounted SA token). `--cache-dir=/tmp`
+        // keeps it happy under readOnlyRootFilesystem.
+        let mut kc = tokio::process::Command::new("kubectl");
+        // kill_on_drop: if the EXEC_TIMEOUT fires, exec_json's future (and this
+        // Child) is dropped — kill the kubectl process rather than orphan it.
+        kc.kill_on_drop(true)
+            .arg("--cache-dir=/tmp/.kube-cache")
+            .arg("-n").arg(namespace)
+            .arg("exec").arg(&pod_name)
+            .arg("-c").arg(container);
+        if stdin.is_some() {
+            kc.arg("-i");
+        }
+        kc.arg("--")
+            .arg("wiremesh-operator").arg("operator-admin")
+            .args(op_args)
+            .arg("--socket").arg(uds);
+        kc.stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
 
-        let ap = AttachParams::default()
-            .container(container)
-            .stdin(stdin.is_some())
-            .stdout(true)
-            .stderr(true);
-        let mut proc = pods.exec(&pod_name, cmd, &ap).await?;
-
+        let mut child = kc.spawn().context("spawning kubectl exec")?;
         if let Some(input) = stdin {
-            let mut sin = proc.stdin().ok_or_else(|| anyhow!("exec stdin unavailable"))?;
+            let mut sin = child.stdin.take().ok_or_else(|| anyhow!("kubectl stdin unavailable"))?;
             sin.write_all(input.as_bytes()).await?;
-            sin.shutdown().await?;
+            sin.shutdown().await?; // EOF so operator-admin's stdin read completes
+        } else {
+            // Close stdin immediately for non-stdin ops.
+            drop(child.stdin.take());
         }
-        let mut out = String::new();
-        if let Some(mut so) = proc.stdout() {
-            so.read_to_string(&mut out).await?;
+        let output = child.wait_with_output().await.context("kubectl exec failed")?;
+        let out = String::from_utf8_lossy(&output.stdout);
+        let err = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            return Err(anyhow!("kubectl exec exited {:?}: stderr={err:?}", output.status.code()));
         }
-        let mut err = String::new();
-        if let Some(mut se) = proc.stderr() {
-            se.read_to_string(&mut err).await?;
-        }
-        proc.join().await.context("operator-admin exec failed")?;
         serde_json::from_str(out.trim())
             .with_context(|| format!("parsing operator-admin JSON (stdout={out:?} stderr={err:?})"))
     }

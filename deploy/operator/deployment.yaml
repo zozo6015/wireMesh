@@ -71,3 +71,11 @@ spec:
               memory: 64Mi
             limits:
               memory: 256Mi
+          volumeMounts:
+            # Writable scratch for kubectl's discovery cache (the operator execs
+            # operator-admin via kubectl) under readOnlyRootFilesystem.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
