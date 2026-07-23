@@ -59,3 +59,11 @@ spec:
               drop: ["ALL"]
           resources:
             {{- toYaml .Values.operator.resources | nindent 12 }}
+          volumeMounts:
+            # Writable scratch for kubectl's discovery cache (the operator execs
+            # operator-admin via kubectl) under readOnlyRootFilesystem.
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}

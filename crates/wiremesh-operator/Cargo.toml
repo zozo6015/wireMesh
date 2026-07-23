@@ -7,7 +7,9 @@ edition = "2021"
 # Kubernetes client + controller runtime + CRD derive. Pin TLS to rustls so it
 # unifies with the workspace's ring-backed rustls (see root Cargo.toml's rustls
 # note) rather than pulling aws-lc-rs.
-kube = { version = "0.95", default-features = false, features = ["client", "runtime", "derive", "rustls-tls", "ws"] }
+# No "ws" feature: the operator execs via the bundled kubectl (kube-rs 0.95's
+# WebSocket exec fails SA auth against real API servers — see admin_exec.rs).
+kube = { version = "0.95", default-features = false, features = ["client", "runtime", "derive", "rustls-tls"] }
 k8s-openapi = { version = "0.23", features = ["v1_30"] }
 schemars = "0.8"
 tokio = { workspace = true }

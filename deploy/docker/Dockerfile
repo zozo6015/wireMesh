@@ -121,7 +121,18 @@ ENTRYPOINT ["/usr/local/bin/wiremesh-gateway"]
 # controller Admin API; needs no privileged host access. Non-root.
 # ---------------------------------------------------------------------------
 FROM debian:bookworm-slim@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS operator
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+# `TARGETARCH` is set per-platform by buildx (amd64 / arm64).
+ARG TARGETARCH
+# kubectl is bundled because the operator execs `operator-admin` in the
+# controller sidecar via kubectl (kube-rs 0.95's WebSocket exec fails SA auth
+# against real API servers). Keep this near the cluster's minor version.
+ARG KUBECTL_VERSION=v1.32.0
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && curl -fsSLo /usr/local/bin/kubectl \
+        "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${TARGETARCH}/kubectl" \
+    && chmod 0755 /usr/local/bin/kubectl \
+    && kubectl version --client=true 2>/dev/null | head -1 \
+    && apt-get purge -y curl && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 65532 --user-group --no-create-home wiremesh
 COPY --from=builder /out/wiremesh-operator /usr/local/bin/wiremesh-operator
