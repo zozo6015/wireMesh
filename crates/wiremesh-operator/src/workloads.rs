@@ -757,4 +757,94 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn controller_binds_all_interfaces_for_service_routing() {
+        // The controller must bind enroll/sync/observe to 0.0.0.0 (not the
+        // loopback default) so the ClusterIP Service can route to the pod —
+        // otherwise gateways get `Connection refused` (the bug found on-cluster).
+        let d = controller_deployment("wm", &ctrl_spec(), "op:test");
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let ctr = pod.containers.iter().find(|c| c.name == "controller").unwrap();
+        let env = ctr.env.as_ref().unwrap();
+        let bind = env.iter().find(|e| e.name == "WIREMESH_BIND_IP").expect("WIREMESH_BIND_IP env");
+        assert_eq!(bind.value.as_deref(), Some("0.0.0.0"), "controller must bind all interfaces");
+    }
+
+    #[test]
+    fn controller_seeds_ca_from_cert_manager_secret() {
+        // A `ca-seed` init-container copies the cert-manager Certificate Secret
+        // (tls.crt/tls.key) into the controller data-dir as ca.pem/ca.key BEFORE
+        // boot, so the controller's mesh CA is cert-manager-rooted.
+        let d = controller_deployment("wm", &ctrl_spec(), "op:test");
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let seed = pod
+            .init_containers
+            .as_ref()
+            .expect("init containers")
+            .iter()
+            .find(|c| c.name == "ca-seed")
+            .expect("ca-seed init container");
+        // Mounts BOTH the data volume (dest) and the CA-secret volume (source, RO).
+        let mounts = seed.volume_mounts.as_ref().unwrap();
+        assert!(
+            mounts.iter().any(|m| m.name == "data" && m.mount_path == "/var/lib/wiremesh"),
+            "ca-seed must mount the controller data dir"
+        );
+        assert!(
+            mounts.iter().any(|m| m.name == "ca-secret" && m.read_only == Some(true)),
+            "ca-seed must mount the CA secret read-only"
+        );
+        // Args seed BOTH ca.pem (from tls.crt) and ca.key (from tls.key).
+        let args = seed.args.as_ref().unwrap().join(" ");
+        assert!(args.contains("tls.crt") && args.contains("ca.pem"), "seeds ca.pem from tls.crt: {args:?}");
+        assert!(args.contains("tls.key") && args.contains("ca.key"), "seeds ca.key from tls.key: {args:?}");
+        // The pod sources the CA-secret volume from the CONTROLLER_CA_SECRET Secret.
+        let ca_vol = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == "ca-secret").expect("ca-secret volume");
+        assert_eq!(
+            ca_vol.secret.as_ref().and_then(|s| s.secret_name.as_deref()),
+            Some(CONTROLLER_CA_SECRET),
+            "ca-secret volume must source the cert-manager CA Secret"
+        );
+    }
+
+    #[test]
+    fn gateway_and_relay_ca_mount_exposes_cert_only_never_key() {
+        // SECURITY INVARIANT: gateways/relays trust the CA but must NEVER receive
+        // the CA private key. The CA volume must project ONLY tls.crt -> ca.pem.
+        let gw = WiremeshGateway::new(
+            "gw",
+            WiremeshGatewaySpec {
+                segment_ref: "aws".into(),
+                node_name: None,
+                node_selector: None,
+                wg_port: None,
+                tun: None,
+                image: None,
+            },
+        );
+        let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
+        let r = WiremeshRelay::new(
+            "r",
+            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None },
+        );
+        let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
+
+        for d in [gd, rd] {
+            let pod = d.spec.unwrap().template.spec.unwrap();
+            let ca_vol = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == "ca").expect("ca volume");
+            let src = ca_vol.secret.as_ref().expect("ca volume is a Secret source");
+            assert_eq!(src.secret_name.as_deref(), Some("wm-ca"));
+            let items = src.items.as_ref().expect("CA volume MUST use explicit items (never project the whole Secret)");
+            // Exactly one projected item: tls.crt -> ca.pem.
+            assert_eq!(items.len(), 1, "CA volume must project exactly one key");
+            assert_eq!(items[0].key, "tls.crt");
+            assert_eq!(items[0].path, "ca.pem");
+            // The CA private key must never be projected under any path.
+            assert!(
+                !items.iter().any(|i| i.key == "tls.key"),
+                "the CA private key (tls.key) must NEVER reach a gateway/relay"
+            );
+        }
+    }
 }
