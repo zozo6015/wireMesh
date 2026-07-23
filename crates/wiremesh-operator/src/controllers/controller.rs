@@ -62,9 +62,9 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
             status: if ready { "True" } else { "False" }.into(),
             reason: if ready { "AllComponentsReady" } else { "WaitingForController" }.into(),
             message: if ready {
-                "controller Deployment available and admin token minted".into()
+                "controller Deployment available".into()
             } else {
-                "waiting for controller Deployment + admin-token bootstrap".into()
+                "waiting for controller Deployment to become available".into()
             },
         }],
     };

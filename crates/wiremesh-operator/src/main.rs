@@ -24,8 +24,9 @@ fn admin_from_env(client: kube::Client, namespace: &str) -> AdminExec {
         AdminExec::Exec {
             client,
             namespace: namespace.to_string(),
+            // Stable, CR-name-independent selector for the controller pod.
             pod_label: std::env::var("WIREMESH_CONTROLLER_LABEL")
-                .unwrap_or_else(|_| "app.kubernetes.io/instance=wiremesh-controller".to_string()),
+                .unwrap_or_else(|_| wiremesh_operator::workloads::controller_pod_selector()),
             container: std::env::var("WIREMESH_ADMIN_CONTAINER")
                 .unwrap_or_else(|_| "admin-exec".to_string()),
             uds: std::env::var("WIREMESH_SOCKET_PATH")

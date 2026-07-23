@@ -2,14 +2,14 @@
 //! store it in a Secret, deploy the privileged hostNetwork gateway, and report
 //! `status.enrolled`/`gateway_id`. Finalizer drains the gateway on delete.
 
-use super::{apply, owner_ref, service_dns, Context, Error};
-use crate::crd::{Condition, WiremeshController, WiremeshGateway, WiremeshGatewayStatus, WiremeshSegment};
+use super::{apply, owner_ref, Context, Error};
+use crate::crd::{Condition, WiremeshGateway, WiremeshGatewayStatus, WiremeshSegment};
 use crate::workloads;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Secret;
 use k8s_openapi::ByteString;
-use kube::api::{ListParams, Patch, PatchParams};
+use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{finalizer, Event};
 use kube::runtime::watcher;
@@ -34,18 +34,6 @@ pub fn needs_token(existing: Option<&Secret>) -> bool {
         None => true,
         Some(s) => !s.data.as_ref().map(|d| d.contains_key("token")).unwrap_or(false),
     }
-}
-
-/// The controller's sync + enroll endpoints (single-tenant: one controller per
-/// cluster, so the operator uses THE `WiremeshController`).
-async fn controller_endpoints(ctx: &Context) -> Result<(String, String), Error> {
-    let ctrls = Api::<WiremeshController>::all(ctx.client.clone()).list(&ListParams::default()).await?;
-    let c = ctrls.items.first().ok_or(Error::MissingField("WiremeshController (none exists)"))?;
-    let name = c.name_any();
-    let sync = c.spec.sync_tcp_port.unwrap_or(9500);
-    // Enrollment RPC listens on WIREMESH_TCP_PORT (workloads ENROLL_TCP_PORT).
-    let enroll = 9400;
-    Ok((service_dns(&name, &ctx.namespace, sync), service_dns(&name, &ctx.namespace, enroll)))
 }
 
 async fn reconcile(gw: Arc<WiremeshGateway>, ctx: Arc<Context>) -> Result<Action, Error> {
@@ -97,9 +85,12 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
         apply(&secrets, &sec).await?;
     }
 
-    // Deploy the gateway.
-    let (sync, enroll) = controller_endpoints(ctx).await?;
-    let mut dep = workloads::gateway_deployment(gw, &sync, &enroll, CONTROLLER_CA_SECRET, &token_secret);
+    // Deploy the gateway. The enroll token is bound to `cidrs`, so those MUST
+    // be passed through to the enroll init-container (--cidr).
+    let addrs = super::controller_endpoints(ctx).await?;
+    let mut dep = workloads::gateway_deployment(
+        gw, &addrs.sync, &addrs.enroll, &addrs.observe, CONTROLLER_CA_SECRET, &token_secret, &cidrs,
+    );
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![owner_ref(gw)?]);
     apply(&Api::<Deployment>::namespaced(client.clone(), &ns), &dep).await?;

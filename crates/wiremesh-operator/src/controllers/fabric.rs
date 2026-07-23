@@ -34,10 +34,19 @@ async fn apply_fabric(ctx: &Context) -> Result<(), Error> {
         .filter(|s| s.metadata.deletion_timestamp.is_none())
         .map(|s| s.spec.clone())
         .collect();
+    // The set of segment names that will be in the fabric.
+    let live_segments: std::collections::HashSet<&str> =
+        seg_specs.iter().map(|s| s.segment_name.as_str()).collect();
+    // Exclude policies being deleted, AND any policy that references a segment
+    // no longer present (or being deleted): the controller's policy validator
+    // rejects a fabric with a dangling `from`/`to`, which would make the Segment
+    // delete-finalizer's post-delete re-render fail forever and wedge the CR in
+    // Terminating. Dropping the dangling policy is the graceful convergence.
     let pol_specs: Vec<_> = pols
         .iter()
         .filter(|p| p.metadata.deletion_timestamp.is_none())
         .map(|p| p.spec.clone())
+        .filter(|p| live_segments.contains(p.from.as_str()) && live_segments.contains(p.to.as_str()))
         .collect();
     let yaml = crate::fabric::render_fabric_yaml(&seg_specs, &pol_specs);
     ctx.admin.apply(&yaml).await.map_err(Error::Admin)?;
