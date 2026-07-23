@@ -1,0 +1,25 @@
+name: wiremesh-controller
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+maintainer: "WireMesh <noreply@zozoo.io>"
+description: |
+  WireMesh controller — the single-tenant control plane for a zero-trust L3/L4
+  network fabric (enrollment, policy, mTLS Sync). Runs as a system service.
+vendor: WireMesh
+homepage: https://github.com/zozo6015/wireMesh
+license: Apache-2.0
+section: net
+priority: optional
+contents:
+  - src: dist/linux-${ARCH}/wiremesh-controller
+    dst: /usr/bin/wiremesh-controller
+  - src: deploy/packages/systemd/wiremesh-controller.service
+    dst: /lib/systemd/system/wiremesh-controller.service
+  - src: deploy/packages/env/controller.env
+    dst: /etc/wiremesh/controller.env
+    type: "config|noreplace"
+scripts:
+  postinstall: deploy/packages/scripts/postinstall-server.sh
+  preremove: deploy/packages/scripts/preremove-controller.sh
+  postremove: deploy/packages/scripts/postremove.sh

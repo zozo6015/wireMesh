@@ -1,0 +1,23 @@
+[Unit]
+Description=WireMesh relay (QUIC datagram bridge)
+Documentation=https://github.com/zozo6015/wireMesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wiremesh
+Group=wiremesh
+EnvironmentFile=/etc/wiremesh/relay.env
+ExecStart=/usr/bin/wiremesh-relay $RELAY_ARGS
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/wiremesh
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/wiremesh
+
+[Install]
+WantedBy=multi-user.target

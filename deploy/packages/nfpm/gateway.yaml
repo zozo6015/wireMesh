@@ -1,0 +1,38 @@
+name: wiremesh-gateway
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+maintainer: "WireMesh <noreply@zozoo.io>"
+description: |
+  WireMesh gateway — the per-segment WireGuard data plane with eBPF default-deny
+  L4 enforcement. Linux only (loads eBPF, creates a tun, programs nftables/routes).
+vendor: WireMesh
+homepage: https://github.com/zozo6015/wireMesh
+license: Apache-2.0
+section: net
+priority: optional
+overrides:
+  deb:
+    depends:
+      - iproute2
+      - nftables
+      - conntrack
+      - procps
+  rpm:
+    depends:
+      - iproute2
+      - nftables
+      - conntrack-tools
+      - procps-ng
+contents:
+  - src: dist/linux-${ARCH}/wiremesh-gateway
+    dst: /usr/bin/wiremesh-gateway
+  - src: deploy/packages/systemd/wiremesh-gateway.service
+    dst: /lib/systemd/system/wiremesh-gateway.service
+  - src: deploy/packages/env/gateway.env
+    dst: /etc/wiremesh/gateway.env
+    type: "config|noreplace"
+scripts:
+  postinstall: deploy/packages/scripts/postinstall-gateway.sh
+  preremove: deploy/packages/scripts/preremove-gateway.sh
+  postremove: deploy/packages/scripts/postremove.sh

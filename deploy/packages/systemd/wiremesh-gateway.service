@@ -1,0 +1,23 @@
+[Unit]
+Description=WireMesh gateway (per-segment data plane)
+Documentation=https://github.com/zozo6015/wireMesh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Runs as root: loads eBPF (tc/BPF), creates the tun, programs nftables/routes.
+EnvironmentFile=/etc/wiremesh/gateway.env
+# One-time enrollment is a manual step before first start (needs a token):
+#   wiremesh-gateway enroll --token-file /etc/wiremesh/gateway.token \
+#     --controller <host:9400> --ca /etc/wiremesh/ca.pem \
+#     --state-dir /var/lib/wiremesh --cidr <segment-cidr>
+# See /etc/wiremesh/gateway.env and docs/install.md.
+ExecStart=/usr/bin/wiremesh-gateway $GATEWAY_ARGS
+Restart=on-failure
+RestartSec=5
+WorkingDirectory=/var/lib/wiremesh
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_BPF CAP_SYS_ADMIN
+
+[Install]
+WantedBy=multi-user.target

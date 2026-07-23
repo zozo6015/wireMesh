@@ -1,0 +1,304 @@
+name: Release
+
+# Build the WireMesh release artifacts and attach them to a GitHub Release, next
+# to the container images (container-images.yml → ghcr). Native runners per arch
+# (no cross-compile — the arm64 gateway already builds natively). Produces:
+#   - standalone tarballs (Linux amd64/arm64: all components incl. gateway;
+#     macOS x86_64/arm64 + Windows x86_64: fabricctl/controller/relay — gateway
+#     is Linux-only)
+#   - Linux .deb + .rpm (nfpm) for controller/gateway/relay/fabricctl, both arches
+#   - a Windows .msi installer (WiX) bundling the three CLIs + a PATH entry
+#   - a macOS universal .pkg (fabricctl/controller/relay)
+# Signing (GPG apt/yum repo, Apple notarization, Windows Authenticode) is a
+# documented follow-up, guarded on secrets that skip-with-notice when absent.
+#
+# Trigger: push a `v*` tag (real release) OR workflow_dispatch with a `version`
+# input (unsigned dry-run; no Release is published).
+
+on:
+  push:
+    tags: ['v*']
+    # TEMPORARY (remove before merge): dry-run the whole pipeline on branch push.
+    # is_tag=false on a branch, so the `release` publish job is skipped.
+    branches: ['release-pipeline']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version for a dry-run build (no Release published), e.g. 0.0.0-dev'
+        required: false
+        default: '0.0.0-dev'
+
+permissions:
+  contents: write   # create the Release + upload assets
+
+env:
+  # Components shipped as standalone binaries / packages.
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      msi_version: ${{ steps.v.outputs.msi_version }}
+      is_tag: ${{ steps.v.outputs.is_tag }}
+    steps:
+      - id: v
+        env:
+          # Untrusted dispatch input — never interpolate directly into the script.
+          INPUT_VERSION: ${{ github.event.inputs.version }}
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"; IS_TAG=true
+          else
+            VER="${INPUT_VERSION:-0.0.0-dev}"; IS_TAG=false
+          fi
+          # Validate BEFORE it becomes an output that downstream jobs interpolate
+          # into their own run: blocks — reject anything but a version token.
+          if ! printf '%s' "$VER" | grep -qE '^[0-9A-Za-z.+-]+$'; then
+            echo "::error::invalid version '$VER' (allowed: [0-9A-Za-z.+-])"; exit 1
+          fi
+          # Numeric x.y.z for the MSI ProductVersion (strip any pre-release suffix).
+          NUM="$(printf '%s' "$VER" | grep -oE '^[0-9]+(\.[0-9]+){0,2}' || true)"
+          NUM="${NUM:-0.0.0}"
+          # pad to three components
+          while [ "$(printf '%s' "$NUM" | tr -cd '.' | wc -c)" -lt 2 ]; do NUM="$NUM.0"; done
+          echo "version=$VER"       >> "$GITHUB_OUTPUT"
+          echo "msi_version=$NUM"   >> "$GITHUB_OUTPUT"
+          echo "is_tag=$IS_TAG"     >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$VER (msi=$NUM, tag=$IS_TAG)"
+
+  # ---------------------------------------------------------------------------
+  linux-binaries:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Stamp version
+        run: bash scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      - name: Build release binaries (Dockerfile export stage)
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            -f deploy/docker/Dockerfile --target export \
+            --platform linux/${{ matrix.arch }} \
+            --output type=local,dest=dist/linux-${{ matrix.arch }} .
+          ls -l dist/linux-${{ matrix.arch }}
+      - name: Package tarballs
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"; A="${{ matrix.arch }}"
+          D="dist/linux-$A"; OUT="tarballs"; mkdir -p "$OUT" stage
+          tar_one() { # <tarball-basename> <file:destname> ...
+            local name="$1"; shift; rm -rf stage/*;
+            for spec in "$@"; do tar_src="${spec%%:*}"; tar_dst="${spec##*:}"; cp "$D/$tar_src" "stage/$tar_dst"; done
+            tar -C stage -czf "$OUT/${name}-${V}-linux-${A}.tar.gz" .
+          }
+          tar_one wiremesh-controller wiremesh-controller:wiremesh-controller
+          tar_one wiremesh-gateway    wiremesh-gateway:wiremesh-gateway
+          tar_one wiremesh-relay      relay:wiremesh-relay mkcerts:wiremesh-mkcerts
+          tar_one wiremesh-fabricctl  fabricctl:fabricctl
+          ls -l "$OUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries-${{ matrix.arch }}
+          path: |
+            dist/linux-${{ matrix.arch }}/**
+            tarballs/**
+
+  # ---------------------------------------------------------------------------
+  macos-binaries:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-13
+          - arch: arm64
+            runner: macos-14
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: brew install protobuf
+      - name: Stamp version
+        run: bash scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      - name: Build portable components
+        run: cargo build --release -p fabricctl -p wiremesh-controller -p wiremesh-relay
+      - name: Package tarballs
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"; A="${{ matrix.arch }}"
+          D="target/release"; OUT="tarballs"; mkdir -p "$OUT" stage
+          tar_one() { local name="$1"; shift; rm -rf stage/*;
+            for spec in "$@"; do cp "$D/${spec%%:*}" "stage/${spec##*:}"; done
+            tar -C stage -czf "$OUT/${name}-${V}-macos-${A}.tar.gz" .; }
+          tar_one wiremesh-controller wiremesh-controller:wiremesh-controller
+          tar_one wiremesh-relay      relay:wiremesh-relay mkcerts:wiremesh-mkcerts
+          tar_one wiremesh-fabricctl  fabricctl:fabricctl
+          ls -l "$OUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-binaries-${{ matrix.arch }}
+          path: |
+            target/release/fabricctl
+            target/release/wiremesh-controller
+            target/release/relay
+            target/release/mkcerts
+            tarballs/**
+
+  # ---------------------------------------------------------------------------
+  windows-binaries:
+    needs: version
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: choco install protoc -y
+      - name: Stamp version
+        shell: bash
+        run: bash scripts/set-version.sh "${{ needs.version.outputs.version }}"
+      - name: Build portable components
+        run: cargo build --release -p fabricctl -p wiremesh-controller -p wiremesh-relay
+      - name: Stage exes + zip
+        shell: bash
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          mkdir -p stage tarballs
+          cp target/release/fabricctl.exe            stage/fabricctl.exe
+          cp target/release/wiremesh-controller.exe  stage/wiremesh-controller.exe
+          cp target/release/relay.exe                stage/wiremesh-relay.exe
+          cp target/release/mkcerts.exe              stage/wiremesh-mkcerts.exe
+          (cd stage && 7z a "../tarballs/wiremesh-${V}-windows-x86_64.zip" ./*)
+      - name: Build MSI (WiX)
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet tool install --global wix
+          export PATH="$PATH:$HOME/.dotnet/tools"
+          V="${{ needs.version.outputs.version }}"; MV="${{ needs.version.outputs.msi_version }}"
+          wix build deploy/packages/windows/wiremesh.wxs -arch x64 \
+            -d Version="$MV" -b stage \
+            -o "tarballs/wiremesh-${V}-windows-x86_64.msi"
+          ls -l tarballs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: tarballs/**
+
+  # ---------------------------------------------------------------------------
+  linux-packages:
+    needs: [version, linux-binaries]
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-binaries-${{ matrix.arch }}
+          path: .
+      - name: Install nfpm
+        run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.38.0
+      - name: Build .deb + .rpm
+        run: |
+          set -euo pipefail
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          export VERSION="${{ needs.version.outputs.version }}" ARCH="${{ matrix.arch }}"
+          chmod +x dist/linux-$ARCH/* || true
+          mkdir -p packages
+          for c in controller gateway relay fabricctl; do
+            nfpm pkg -f deploy/packages/nfpm/$c.yaml -p deb -t packages/
+            nfpm pkg -f deploy/packages/nfpm/$c.yaml -p rpm -t packages/
+          done
+          ls -l packages
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-packages-${{ matrix.arch }}
+          path: packages/**
+
+  # ---------------------------------------------------------------------------
+  macos-pkg:
+    needs: [version, macos-binaries]
+    runs-on: macos-14
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-binaries-x86_64
+          path: x86_64
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-binaries-arm64
+          path: arm64
+      - name: Lipo universal + build unsigned .pkg
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          mkdir -p root/usr/local/bin
+          for b in fabricctl wiremesh-controller relay mkcerts; do
+            lipo -create "x86_64/$b" "arm64/$b" -output "root/usr/local/bin/${b/relay/wiremesh-relay}" 2>/dev/null \
+              || lipo -create "x86_64/$b" "arm64/$b" -output "root/usr/local/bin/$b"
+          done
+          # normalise names
+          [ -f root/usr/local/bin/mkcerts ] && mv root/usr/local/bin/mkcerts root/usr/local/bin/wiremesh-mkcerts || true
+          ls -l root/usr/local/bin
+          pkgbuild --root root --identifier io.wiremesh.cli --version "$V" \
+            --install-location / "wiremesh-${V}-macos-universal-unsigned.pkg"
+          ls -l *.pkg
+      - name: Sign + notarize (skipped without Apple secrets)
+        env:
+          APPLE_CERT: ${{ secrets.APPLE_INSTALLER_CERT_P12 }}
+        run: |
+          if [ -z "${APPLE_CERT:-}" ]; then
+            echo "::notice::APPLE_* secrets absent — publishing the UNSIGNED .pkg. Add them to sign+notarize."
+          else
+            echo "::notice::Apple secrets present — signing/notarization wiring is a tracked follow-up."
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-pkg
+          path: '*.pkg'
+
+  # ---------------------------------------------------------------------------
+  release:
+    needs: [version, linux-binaries, macos-binaries, windows-binaries, linux-packages, macos-pkg]
+    if: ${{ needs.version.outputs.is_tag == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: incoming
+      - name: Collect assets + checksums
+        run: |
+          set -euo pipefail
+          mkdir -p assets
+          find incoming -type f \( -name '*.tar.gz' -o -name '*.deb' -o -name '*.rpm' \
+            -o -name '*.zip' -o -name '*.msi' -o -name '*.pkg' \) -exec cp {} assets/ \;
+          (cd assets && sha256sum * > SHA256SUMS)
+          ls -l assets
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          V="${{ needs.version.outputs.version }}"
+          gh release create "v$V" --repo "$GITHUB_REPOSITORY" \
+            --title "WireMesh v$V" --generate-notes assets/* \
+            || gh release upload "v$V" --repo "$GITHUB_REPOSITORY" assets/* --clobber

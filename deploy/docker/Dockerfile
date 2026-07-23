@@ -54,6 +54,18 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
           /out/
 
 # ---------------------------------------------------------------------------
+# export — release binaries only, on a scratch layer, so the release pipeline can
+# extract them per-arch without a container:
+#   docker buildx build -f deploy/docker/Dockerfile --target export \
+#     --platform linux/amd64 --output type=local,dest=./dist/linux-amd64 .
+# Reuses the proven `builder` (eBPF toolchain included) — same binaries the
+# runtime images ship. Native per-arch runners (amd64 / ubuntu-24.04-arm) build
+# their own arch; no cross-compilation.
+# ---------------------------------------------------------------------------
+FROM scratch AS export
+COPY --from=builder /out/ /
+
+# ---------------------------------------------------------------------------
 # controller — single-tenant control plane (gRPC/mTLS, embedded CA, sqlite via
 # rusqlite `bundled` so no libsqlite3 at runtime; rustls+ring so no libssl).
 # Runs as a non-root user; mount the data dir as a volume/PVC.
