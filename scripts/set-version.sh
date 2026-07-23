@@ -24,5 +24,12 @@ for crate in fabricctl wiremesh-controller wiremesh-gateway wiremesh-relay; do
   [ -f "$f" ] || { echo "set-version: $f not found" >&2; exit 1; }
   # First `version = "..."` only ($seen starts undef per perl invocation).
   V="$VERSION" perl -i -pe 'if (!$seen && /^version\s*=\s*"/) { s/"[^"]*"/"$ENV{V}"/; $seen=1 }' "$f"
+  # Verify the substitution actually landed — a moved/renamed [package] version
+  # line would otherwise silently ship a stale version. Fixed-string match so a
+  # version like 1.2.3+build isn't misread as a regex.
+  if ! grep -qF "\"$VERSION\"" "$f"; then
+    echo "set-version: FAILED to set version in $f (no version = \"...\" produced)" >&2
+    exit 1
+  fi
   echo "set $crate version -> $VERSION"
 done

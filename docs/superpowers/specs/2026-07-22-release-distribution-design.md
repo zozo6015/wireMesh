@@ -94,10 +94,13 @@ build cycle CANNOT complete these without them:
   `APPLE_CERT_PASSWORD`, `APPLE_TEAM_ID`, `APPLE_NOTARY_KEY_ID`, `APPLE_NOTARY_ISSUER_ID`,
   `APPLE_NOTARY_KEY_P8`. (Without an Apple Developer account this becomes an UNSIGNED
   `.pkg` or the Homebrew-tap fallback — flag to owner.)
-- **GitHub Pages** enabled for the repo (or a `gh-pages`/dedicated `wiremesh-apt` repo)
-  to host the apt/yum repo tree.
-- `packages: write` (already used) for GHCR; `contents: write` for Release assets;
-  Pages deploy permissions for the repo publish job.
+- `contents: write` on the `release` job for Release assets (`packages: write`
+  on GHCR is used by the separate container-images workflow).
+- **(OPTIONAL, follow-up only)** hosting for a *self-hosted* signed apt/yum repo
+  tree — WireMesh ships the `.deb`/`.rpm` as Release downloads and hosts no repo
+  itself (project tenet). If an operator wants a repo, they host it themselves
+  (their own Pages/object-store/web root) from these assets; that publish path +
+  any hosting permissions are their concern, not the core pipeline's.
 
 ## 4. Tooling & build strategy
 ### 4.1 Multi-arch binaries

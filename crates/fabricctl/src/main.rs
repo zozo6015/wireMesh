@@ -235,10 +235,11 @@ async fn connect(cli: &Cli) -> anyhow::Result<AdminAuthClient> {
             #[cfg(unix)]
             {
                 let path = socket.clone();
-                // Same `tower::service_fn` + `hyper_util::rt::TokioIo` UDS
-                // connector `wiremesh-testkit::TestController::admin_client`
-                // uses — the placeholder URI is required but ignored by
-                // `connect_with_connector`, which always dials the Unix socket.
+                // The same `tower::service_fn` + `hyper_util::rt::TokioIo` UDS
+                // connector pattern as `wiremesh-testkit::TestController::admin_client`.
+                // The placeholder URI below is required by the builder but never
+                // dialed — `connect_with_connector` always opens the Unix socket —
+                // so its exact value is irrelevant.
                 let channel = Endpoint::try_from("http://127.0.0.1:50051")?
                     .connect_with_connector(service_fn(move |_: Uri| {
                         let path = path.clone();

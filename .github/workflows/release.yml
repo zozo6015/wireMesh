@@ -18,6 +18,7 @@ name: Release
 on:
   push:
     tags: ['v*']
+    branches: ['release-pipeline']   # TEMPORARY dry-run trigger; removed before merge
   workflow_dispatch:
     inputs:
       version:
@@ -85,19 +86,25 @@ jobs:
           persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - name: Stamp version
-        run: bash scripts/set-version.sh "${{ needs.version.outputs.version }}"
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash scripts/set-version.sh "$VERSION"
       - name: Build release binaries (Dockerfile export stage)
+        env:
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           docker buildx build \
             -f deploy/docker/Dockerfile --target export \
-            --platform linux/${{ matrix.arch }} \
-            --output type=local,dest=dist/linux-${{ matrix.arch }} .
-          ls -l dist/linux-${{ matrix.arch }}
+            --platform "linux/$ARCH" \
+            --output "type=local,dest=dist/linux-$ARCH" .
+          ls -l "dist/linux-$ARCH"
       - name: Package tarballs
+        env:
+          V: ${{ needs.version.outputs.version }}
+          A: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          V="${{ needs.version.outputs.version }}"; A="${{ matrix.arch }}"
           D="dist/linux-$A"; OUT="tarballs"; mkdir -p "$OUT" stage
           tar_one() { # <tarball-basename> <file:destname> ...
             local name="$1"; shift; rm -rf stage/*;
@@ -133,15 +140,18 @@ jobs:
       - name: Install protoc
         run: brew install protobuf
       - name: Stamp version
-        run: bash scripts/set-version.sh "${{ needs.version.outputs.version }}"
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash scripts/set-version.sh "$VERSION"
       - name: Build (arm64 native + x86_64 cross)
         run: |
           cargo build --release -p fabricctl -p wiremesh-controller -p wiremesh-relay
           cargo build --release --target x86_64-apple-darwin -p fabricctl -p wiremesh-controller -p wiremesh-relay
       - name: Tarballs (both arches) + universal .pkg
+        env:
+          V: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          V="${{ needs.version.outputs.version }}"
           OUT="tarballs"; mkdir -p "$OUT" stage
           tar_one() { local name="$1" dir="$2" arch="$3"; shift 3; rm -rf stage/*
             for spec in "$@"; do cp "$dir/${spec%%:*}" "stage/${spec##*:}"; done
@@ -191,26 +201,31 @@ jobs:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Stamp version
         shell: bash
-        run: bash scripts/set-version.sh "${{ needs.version.outputs.version }}"
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash scripts/set-version.sh "$VERSION"
       - name: Build fabricctl
         run: cargo build --release -p fabricctl
       - name: Stage exe + zip
         shell: bash
+        env:
+          V: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          V="${{ needs.version.outputs.version }}"
           mkdir -p stage tarballs
           cp target/release/fabricctl.exe stage/fabricctl.exe
           (cd stage && 7z a "../tarballs/wiremesh-fabricctl-${V}-windows-x86_64.zip" ./*)
       - name: Build MSI (WiX)
         shell: bash
+        env:
+          V: ${{ needs.version.outputs.version }}
+          MV: ${{ needs.version.outputs.msi_version }}
         run: |
           set -euo pipefail
           # Pin WiX v4: v6+/v7 require accepting the OSMF paid-tier EULA
           # (error WIX7015). v4 is free and matches this project's v4 wxs schema.
           dotnet tool install --global wix --version 4.0.5
           export PATH="$PATH:$HOME/.dotnet/tools"
-          V="${{ needs.version.outputs.version }}"; MV="${{ needs.version.outputs.msi_version }}"
           wix build deploy/packages/windows/wiremesh.wxs -arch x64 \
             -d Version="$MV" -b stage \
             -o "tarballs/wiremesh-fabricctl-${V}-windows-x86_64.msi"
@@ -239,11 +254,13 @@ jobs:
       - name: Install nfpm
         run: go install github.com/goreleaser/nfpm/v2/cmd/nfpm@v2.38.0
       - name: Build .deb + .rpm
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
           export PATH="$PATH:$(go env GOPATH)/bin"
-          export VERSION="${{ needs.version.outputs.version }}" ARCH="${{ matrix.arch }}"
-          chmod +x dist/linux-$ARCH/* || true
+          chmod +x "dist/linux-$ARCH"/*
           mkdir -p packages rendered
           for c in controller gateway relay fabricctl; do
             # nfpm does not env-expand contents.src globs, so pre-expand the
@@ -280,9 +297,9 @@ jobs:
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          V: ${{ needs.version.outputs.version }}
         run: |
           set -euo pipefail
-          V="${{ needs.version.outputs.version }}"
           gh release create "v$V" --repo "$GITHUB_REPOSITORY" \
             --title "WireMesh v$V" --generate-notes assets/* \
             || gh release upload "v$V" --repo "$GITHUB_REPOSITORY" assets/* --clobber

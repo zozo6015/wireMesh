@@ -55,16 +55,27 @@ config under `/etc/wiremesh/`. The gateway package pulls in `iproute2 nftables
 conntrack procps`. After editing the config:
 
 ```sh
-sudo systemctl enable --now wiremesh-controller     # or wiremesh-gateway / wiremesh-relay
+# The controller has no enrollment step — start it directly:
+sudo systemctl enable --now wiremesh-controller
 ```
 
-**Gateway** — enroll once before first start (needs a token from the controller/operator):
+The **gateway** and **relay** must be **enrolled once before first start** (each
+needs a token minted by the controller/operator). Replace the UPPERCASE
+placeholders with your values (they are written this way so the commands are
+safe to copy-paste — angle-bracket placeholders would be shell redirections):
 
 ```sh
+# Gateway:
 sudo wiremesh-gateway enroll --token-file /etc/wiremesh/gateway.token \
-  --controller <controller-host>:9400 --ca /etc/wiremesh/ca.pem \
-  --state-dir /var/lib/wiremesh --cidr <this-segment-cidr>
+  --controller CONTROLLER_HOST:9400 --ca /etc/wiremesh/ca.pem \
+  --state-dir /var/lib/wiremesh --cidr SEGMENT_CIDR
 sudo systemctl enable --now wiremesh-gateway
+
+# Relay:
+sudo wiremesh-relay-enroll --token-file /etc/wiremesh/relay.token \
+  --controller CONTROLLER_HOST:9400 --ca /etc/wiremesh/ca.pem \
+  --certdir /var/lib/wiremesh --endpoint PUBLIC_IP:4443
+sudo systemctl enable --now wiremesh-relay
 ```
 
 (WireMesh itself hosts no package repository — it ships the `.deb`/`.rpm` as
@@ -97,8 +108,9 @@ meantime. Signed installers are a tracked follow-up.
 ## macOS — `.pkg`
 
 **Verify the `.pkg` against `SHA256SUMS` first** (see above). Then open
-`wiremesh-<version>-macos-universal*.pkg`; it installs the CLIs to
-`/usr/local/bin`. Universal (x86_64 + arm64).
+`wiremesh-<version>-macos-universal-unsigned.pkg`; it installs the CLIs to
+`/usr/local/bin`. Universal (x86_64 + arm64). (The `-unsigned` suffix drops once
+Apple signing/notarization is provisioned.)
 
 The `.pkg` is not yet signed/notarized, so Gatekeeper will warn — your SHA-256
 check is what establishes integrity in the meantime. If you prefer to avoid the

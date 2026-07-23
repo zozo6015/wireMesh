@@ -11,6 +11,13 @@ homepage: https://github.com/zozo6015/wireMesh
 license: Apache-2.0
 section: net
 priority: optional
+overrides:
+  deb:
+    depends:
+      - passwd          # groupadd/useradd (postinstall-server.sh)
+  rpm:
+    depends:
+      - shadow-utils    # groupadd/useradd (postinstall-server.sh)
 contents:
   - src: dist/linux-${ARCH}/wiremesh-controller
     dst: /usr/bin/wiremesh-controller
