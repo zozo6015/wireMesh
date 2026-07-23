@@ -245,8 +245,14 @@ or apply the standalone manifests (edit the `parentRefs` first). They carry no
 Full walkthrough + a sample `Gateway`:
 [`deploy/operator/gateway-api/README.md`](../deploy/operator/gateway-api/README.md).
 
-The routes use `gateway.networking.k8s.io/v1` `TCPRoute`/`UDPRoute` (GA since
-Gateway API v1.6; use `v1alpha2` on older clusters).
+**Gateway API version.** The shipped routes are `gateway.networking.k8s.io/v1`
+`TCPRoute`/`UDPRoute`, which require the **Gateway API v1.6+ CRDs** (where these
+kinds graduated to `v1`) and a controller that serves them (Envoy Gateway
+**v1.6+**). On older clusters (Gateway API < v1.6, which serve these kinds only
+under `v1alpha2`), change the three route files' `apiVersion` to
+`gateway.networking.k8s.io/v1alpha2` before applying — the `kind`/`spec` are
+otherwise identical. Confirm what your cluster serves with
+`kubectl get crd tcproutes.gateway.networking.k8s.io -o jsonpath='{.spec.versions[*].name}'`.
 
 **Caveats (both critical):**
 
