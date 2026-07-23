@@ -1,0 +1,15 @@
+name: wiremesh-fabricctl
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+maintainer: "WireMesh <noreply@zozoo.io>"
+description: |
+  fabricctl — the WireMesh admin CLI (talks to the controller Admin API).
+vendor: WireMesh
+homepage: https://github.com/zozo6015/wireMesh
+license: Apache-2.0
+section: net
+priority: optional
+contents:
+  - src: dist/linux-${ARCH}/fabricctl
+    dst: /usr/bin/fabricctl

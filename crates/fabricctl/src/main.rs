@@ -230,21 +230,35 @@ type AdminAuthClient = AdminClient<InterceptedService<Channel, AuthMode>>;
 async fn connect(cli: &Cli) -> anyhow::Result<AdminAuthClient> {
     match (&cli.socket, &cli.token, &cli.addr) {
         (Some(socket), None, None) => {
-            let path = socket.clone();
-            // Same `tower::service_fn` + `hyper_util::rt::TokioIo` UDS
-            // connector `wiremesh-testkit::TestController::admin_client`
-            // uses — the placeholder URI is required but ignored by
-            // `connect_with_connector`, which always dials the Unix socket.
-            let channel = Endpoint::try_from("http://[::]:50051")?
-                .connect_with_connector(service_fn(move |_: Uri| {
-                    let path = path.clone();
-                    async move {
-                        let stream = tokio::net::UnixStream::connect(path).await?;
-                        Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
-                    }
-                }))
-                .await?;
-            Ok(AdminClient::with_interceptor(channel, AuthMode::None))
+            // The UDS admin transport is Unix-only (Windows has no AF_UNIX in
+            // tokio); on Windows fabricctl uses the TCP `--addr`+`--token` path.
+            #[cfg(unix)]
+            {
+                let path = socket.clone();
+                // The same `tower::service_fn` + `hyper_util::rt::TokioIo` UDS
+                // connector pattern as `wiremesh-testkit::TestController::admin_client`.
+                // The placeholder URI below is required by the builder but never
+                // dialed — `connect_with_connector` always opens the Unix socket —
+                // so its exact value is irrelevant.
+                let channel = Endpoint::try_from("http://127.0.0.1:50051")?
+                    .connect_with_connector(service_fn(move |_: Uri| {
+                        let path = path.clone();
+                        async move {
+                            let stream = tokio::net::UnixStream::connect(path).await?;
+                            Ok::<_, std::io::Error>(hyper_util::rt::TokioIo::new(stream))
+                        }
+                    }))
+                    .await?;
+                Ok(AdminClient::with_interceptor(channel, AuthMode::None))
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = socket;
+                anyhow::bail!(
+                    "--socket (Unix-domain admin) is only supported on Unix; \
+                     on Windows use --addr <host:port> --token <token>"
+                )
+            }
         }
         (None, Some(token), Some(addr)) => {
             let uri = format!("http://{addr}");

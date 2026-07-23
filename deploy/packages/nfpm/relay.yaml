@@ -1,0 +1,36 @@
+name: wiremesh-relay
+arch: ${ARCH}
+platform: linux
+version: ${VERSION}
+maintainer: "WireMesh <noreply@zozoo.io>"
+description: |
+  WireMesh relay — a QUIC-datagram WireGuard relay (mandatory mTLS) for
+  symmetric-NAT pairs. Ships the mkcerts identity helper as wiremesh-mkcerts.
+vendor: WireMesh
+homepage: https://github.com/zozo6015/wireMesh
+license: Apache-2.0
+section: net
+priority: optional
+overrides:
+  deb:
+    depends:
+      - passwd          # groupadd/useradd (postinstall-server.sh)
+  rpm:
+    depends:
+      - shadow-utils    # groupadd/useradd (postinstall-server.sh)
+contents:
+  - src: dist/linux-${ARCH}/relay
+    dst: /usr/bin/wiremesh-relay
+  - src: dist/linux-${ARCH}/mkcerts
+    dst: /usr/bin/wiremesh-mkcerts
+  - src: dist/linux-${ARCH}/wiremesh-relay-enroll
+    dst: /usr/bin/wiremesh-relay-enroll
+  - src: deploy/packages/systemd/wiremesh-relay.service
+    dst: /lib/systemd/system/wiremesh-relay.service
+  - src: deploy/packages/env/relay.env
+    dst: /etc/wiremesh/relay.env
+    type: "config|noreplace"
+scripts:
+  postinstall: deploy/packages/scripts/postinstall-server.sh
+  preremove: deploy/packages/scripts/preremove-relay.sh
+  postremove: deploy/packages/scripts/postremove.sh

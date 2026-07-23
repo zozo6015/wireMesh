@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  WireMesh Windows installer (WiX v4). Installs the admin CLI `fabricctl` into
+  %ProgramFiles%\WireMesh and puts that dir on the system PATH.
+
+  Windows ships fabricctl ONLY: the gateway is Linux-only (eBPF/tun) and the
+  controller/relay are Unix servers (UDS admin socket + unix file-mode secret
+  handling) that do not build on Windows.
+
+  Built by release.yml on a windows runner (WiX v4; fabricctl.exe staged via the
+  -b bindpath), producing wiremesh-fabricctl-<version>-windows-x86_64.msi.
+  Version must be numeric x.y.z (dry-runs pass 0.0.0). The .msi is currently
+  Authenticode-unsigned; signing is a documented follow-up, pending a
+  code-signing certificate and workflow support.
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package Name="WireMesh fabricctl"
+           Manufacturer="WireMesh"
+           Version="$(var.Version)"
+           UpgradeCode="6F3A1E2C-9B44-4C7D-8E21-2A5C1D0F7B90"
+           Scope="perMachine"
+           Compressed="yes">
+
+    <MajorUpgrade DowngradeErrorMessage="A newer version of WireMesh is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="WireMesh">
+
+        <Component Id="C_fabricctl" Guid="A1B2C3D4-0001-4A00-9000-00000000F001">
+          <File Id="fabricctl.exe" Source="fabricctl.exe" KeyPath="yes" />
+        </Component>
+
+        <Component Id="C_Path" Guid="A1B2C3D4-0005-4A00-9000-00000000F005">
+          <Environment Id="E_Path" Name="PATH" Value="[INSTALLFOLDER]"
+                       Part="last" Action="set" System="yes" Permanent="no" />
+        </Component>
+
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="WireMesh fabricctl" Level="1">
+      <ComponentRef Id="C_fabricctl" />
+      <ComponentRef Id="C_Path" />
+    </Feature>
+
+  </Package>
+</Wix>
