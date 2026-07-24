@@ -254,7 +254,7 @@
     <p class="eyebrow">WireMesh &middot; Build Progress</p>
     <h1>Zero-trust network fabric &mdash; cycle-by-cycle build tracker</h1>
     <p class="lede">Open-source (Apache-2.0), self-hosted, cloud-agnostic L3/L4 network fabric in Rust: WireGuard data plane, default-deny eBPF policy, one gateway per segment, no agents on workloads. The engineering design ships as four plan cycles; this page tracks what's done, in flight, and next.</p>
-    <p class="stamp">Last updated <b>2026-07-23</b> &middot; Phase 0 + Cycle 2 + Cycle 3 + <b>all of Cycle 4</b> merged &middot; key-rotation (#14) + ghcr images (#15) merged &middot; <b>K8s operator VALIDATED end-to-end on a real k3s/arm64 cluster</b> &mdash; gateway enrolled + data plane Running; six cluster-found fixes (#19&ndash;#24) merged to <code>main</code></p>
+    <p class="stamp">Last updated <b>2026-07-24</b> &middot; Phase 0 + Cycle 2/3/4 + key-rotation + ghcr images all merged &middot; <b>K8s operator VALIDATED end-to-end</b> on a real k3s/arm64 cluster &middot; <b>multi-platform release pipeline merged (#26)</b> &middot; <b>v0.1.0 RELEASED</b> &mdash; 34 signed-later assets (deb/rpm/msi/pkg/tarballs) published</p>
   </header>
 
   <div class="metrics">
@@ -274,9 +274,9 @@
       <p class="sub">4 go &middot; 1 go-with-caveats</p>
     </div>
     <div class="metric">
-      <p class="k">Current focus</p>
-      <div class="v" style="font-size:19px;">K8s operator</div>
-      <p class="sub">cluster-validated &middot; gateway enrolled + data plane Running</p>
+      <p class="k">Latest release</p>
+      <div class="v" style="font-size:19px;">v0.1.0</div>
+      <p class="sub">34 assets &middot; deb/rpm/msi/pkg/tarballs &middot; operator cluster-validated</p>
     </div>
   </div>
 
@@ -294,7 +294,9 @@
         <span class="darrow">&rarr;</span>
         <div class="dnode done"><span class="dk">Cycle 4b/4c</span><b>NAT + relay</b><span class="dm">hole punch &middot; path SM<br>relay failover &middot; merged</span></div>
         <span class="darrow">&rarr;</span>
-        <div class="dnode progress"><span class="dk">Packaging</span><b>Deploy + operator</b><span class="dm">ghcr images &middot; enroll client<br>K8s operator (5 CRDs)</span></div>
+        <div class="dnode done"><span class="dk">Packaging</span><b>Deploy + operator</b><span class="dm">ghcr images &middot; operator<br>validated on cluster</span></div>
+        <span class="darrow">&rarr;</span>
+        <div class="dnode done"><span class="dk">Release</span><b>v0.1.0 shipped</b><span class="dm">deb/rpm/msi/pkg<br>+ tarballs, tag-driven</span></div>
       </div>
     </div>
     <p class="schematic-cap">Cycle 2 unblocks 3 and 4 &middot; Cycle 3 feeds enforcement backends into Cycle 4a &middot; Phase 0 crates (natlab, enforcer, relay, punch) graduate into the gateway &middot; Cycle 4a's Sync client + tunnel manager unblock 4b's path state machine</p>
@@ -369,6 +371,16 @@
         <p><b>Merged:</b> multi-stage <code>ghcr.io</code> container images for controller / gateway / relay / fabricctl (PR #15, SHA-pinned actions + digest-pinned bases); key-rotation fast-follow (PR #14). <b>Enrollment client (landed, 3/3 green):</b> a new <code>wiremesh-enroll</code> crate + <code>wiremesh-gateway enroll</code> / <code>wiremesh-relay-enroll</code> subcommands that turn a minted token into the on-disk identity each binary boots from &mdash; the missing piece (spec &sect;7-A deferral) that lets the operator bootstrap gateway/relay pods. <b>Operator foundation Tasks 1&ndash;4 MERGED (<a href="https://github.com/zozo6015/wireMesh/pull/16">PR #16</a>, CodeRabbit-clean):</b> crate + 5 cluster-scoped CRDs + crdgen, <code>FabricAdmin</code>, fabric-YAML aggregation, workload builders. <b>Then (branch <code>operator-reconcilers</code>, lib 20/20 green):</b> the <b>4 reconcilers</b> (controller/fabric/gateway/relay via kube-rs, SSA + owner-refs + finalizers + status); the <b>UDS admin-exec transport</b> (operator execs <code>operator-admin</code> in a controller-pod sidecar over the implicit-admin socket &mdash; no bearer token); and the <b>deployment artifacts</b> (manifests-first kustomize base + RBAC incl. <code>pods/exec</code>, a Helm chart, example CRs) + <code>docs/operator.md</code>.</p>
         <p class="dep"><b>Two architecture gaps found + resolved:</b> the enrollment-client gap (built it) and the operator&harr;controller admin channel (Admin TCP is loopback-only &rarr; UDS admin-exec sidecar, later hardened to a bundled-<code>kubectl</code> exec after kube-rs WebSocket-exec 403s).</p>
         <p class="dep"><b>VALIDATED END-TO-END on a real cluster (k3s, 4&times;arm64 Raspberry Pi, 2026-07-23):</b> gateway <code>gw-home</code> enrolled (<code>gateway_id=3</code>) with its data plane <b>Running 1/1</b> &mdash; the full path proven: operator deploys the gateway &rarr; it reaches the controller <b>Service</b> (<code>bind_ip=0.0.0.0</code>) &rarr; trusts the <b>cert-manager</b>-rooted CA &rarr; enrolls &rarr; data plane comes up (metrics + endpoint observation). <b>Six cluster-found fixes merged to <code>main</code>:</b> <a href="https://github.com/zozo6015/wireMesh/pull/19">#19</a> native-arm64 multi-arch images, <a href="https://github.com/zozo6015/wireMesh/pull/20">#20</a> bundled-kubectl admin transport, <a href="https://github.com/zozo6015/wireMesh/pull/21">#21</a> review fixes, <a href="https://github.com/zozo6015/wireMesh/pull/22">#22</a> Service-reachable <code>bind_ip</code> + cert-manager CA seed + Gateway API routes, <a href="https://github.com/zozo6015/wireMesh/pull/23">#23</a> gateway image <code>procps</code> (sysctl), <a href="https://github.com/zozo6015/wireMesh/pull/24">#24</a> cert-manager key <code>encoding: PKCS8</code>. <b>Follow-ups:</b> reconciler status/finalizer-drain should match the <em>active</em> roster gateway (not the first by segment); PVC-backed gateway identity (emptyDir restart loses identity); independent reviewer pass; Cycle 2b OpenBao driver.</p>
+      </article>
+
+      <article class="cycle" data-status="done">
+        <div class="cycle-head">
+          <span class="cycle-no">Release</span>
+          <h3>Release &amp; distribution &mdash; v0.1.0</h3>
+          <span class="pill done"><span>Published &middot; 2026-07-24</span></span>
+        </div>
+        <p><b>Tag-driven multi-platform release pipeline</b> (<a href="https://github.com/zozo6015/wireMesh/pull/26">PR #26</a>, <code>.github/workflows/release.yml</code>): pushing a <code>v*</code> tag builds and attaches to a GitHub Release &mdash; Linux amd64/arm64 binaries (via a new Dockerfile <code>export</code> stage), macOS x86_64/arm64 + Windows x86_64 (<code>fabricctl</code> only &mdash; controller/relay are Unix-only, the gateway is Linux-only), <code>nfpm</code> <b>.deb + .rpm</b> for all four components (systemd units + <code>/etc/wiremesh</code> config + per-distro deps), a WiX <b>.msi</b>, a universal macOS <b>.pkg</b>, and <code>SHA256SUMS</code>. Native runners per arch (no cross-compile); versioning driven from the tag. Dry-run-validated across 6 rounds + two CodeRabbit passes addressed.</p>
+        <p class="dep"><b><a href="https://github.com/zozo6015/wireMesh/releases/tag/v0.1.0">v0.1.0 published (2026-07-24)</a> &mdash; 34 assets:</b> 8 <code>.deb</code> + 8 <code>.rpm</code> (controller/gateway/relay/fabricctl &times; amd64+arm64), 14 tarballs (Linux all four; macOS controller/relay/fabricctl), the fabricctl Windows <code>.msi</code>+<code>.zip</code>, the macOS universal <code>.pkg</code>, and <code>SHA256SUMS</code>. <b>Two release-blockers found + fixed first (<a href="https://github.com/zozo6015/wireMesh/pull/27">PR #27</a>):</b> the controller systemd unit needed <code>RuntimeDirectory=wiremesh</code> (<code>ProtectSystem=strict</code> made <code>/run</code> read-only &rarr; the admin-socket bind crashed the <code>.deb</code>), and <code>fabricctl enroll-token</code> was added (the Admin <code>MintToken</code> RPC had no CLI, blocking bare-metal enrollment). <b>Guarded, pending owner secrets:</b> a GPG-signed apt/yum repo (self-hosted &mdash; the project hosts no infrastructure), Apple notarization, Windows Authenticode &mdash; <code>SHA256SUMS</code> is the integrity check meanwhile.</p>
       </article>
 
     </div>
