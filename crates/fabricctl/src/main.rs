@@ -27,7 +27,7 @@ use wiremesh_proto::v1::admin_client::AdminClient;
 use wiremesh_proto::v1::{
     ApplyRequest, AuditQueryRequest, CreateSegmentRequest, DeleteSegmentRequest, DrainRequest,
     GetPolicyRequest, ListGatewaysRequest, ListRelaysRequest, ListSegmentsRequest,
-    MintApiTokenRequest, RegisterRelayRequest, RevokeApiTokenRequest,
+    MintApiTokenRequest, MintTokenRequest, RegisterRelayRequest, RevokeApiTokenRequest,
 };
 
 #[derive(Parser)]
@@ -89,6 +89,22 @@ enum Command {
     Policy {
         #[command(subcommand)]
         cmd: PolicyCmd,
+    },
+    /// Mint a single-use ENROLLMENT token that a gateway/relay redeems to obtain
+    /// its identity (`wiremesh-gateway enroll` / `wiremesh-relay-enroll`). Prints
+    /// the token — shown once, so capture it. This is the enrollment token, NOT
+    /// the API bearer token minted by `token mint`.
+    EnrollToken {
+        /// `gateway` or `relay`.
+        #[arg(long)]
+        kind: String,
+        /// Segment CIDR(s) the token is bound to (gateway tokens; repeatable).
+        #[arg(long)]
+        cidr: Vec<String>,
+        /// Optionally rebind/replace the existing active gateway on this segment
+        /// id (0 = normal first enrollment).
+        #[arg(long, default_value_t = 0)]
+        rebind_segment: u64,
     },
 }
 
@@ -290,7 +306,31 @@ async fn main() -> anyhow::Result<()> {
         Command::Audit { cmd } => run_audit(&mut client, cmd).await,
         Command::Apply { file } => run_apply(&mut client, file).await,
         Command::Policy { cmd } => run_policy(&mut client, cmd).await,
+        Command::EnrollToken { kind, cidr, rebind_segment } => {
+            run_enroll_token(&mut client, kind, cidr, rebind_segment).await
+        }
     }
+}
+
+/// Mints a single-use enrollment token via `Admin.MintToken` and prints it (the
+/// same RPC the operator uses to bootstrap gateway/relay pods). The token is
+/// shown once — capture it for the gateway/relay enroll step.
+async fn run_enroll_token(
+    client: &mut AdminAuthClient,
+    kind: String,
+    cidr: Vec<String>,
+    rebind_segment: u64,
+) -> anyhow::Result<()> {
+    let resp = client
+        .mint_token(MintTokenRequest {
+            kind,
+            bound_cidrs: cidr,
+            rebind_segment_id: rebind_segment,
+        })
+        .await?
+        .into_inner();
+    println!("{}", resp.token);
+    Ok(())
 }
 
 async fn run_segment(client: &mut AdminAuthClient, cmd: SegmentCmd) -> anyhow::Result<()> {

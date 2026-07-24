@@ -13,6 +13,12 @@ ExecStart=/usr/bin/wiremesh-controller
 Restart=on-failure
 RestartSec=5
 WorkingDirectory=/var/lib/wiremesh
+# The controller binds its admin UDS at /run/wiremesh/controller.sock (the
+# WIREMESH_SOCKET_PATH default). RuntimeDirectory creates + owns /run/wiremesh
+# writable BEFORE start — required because ProtectSystem=strict makes /run
+# read-only otherwise, which would fail the socket bind.
+RuntimeDirectory=wiremesh
+RuntimeDirectoryMode=0700
 # Hardening (control plane holds the CA + DB under /var/lib/wiremesh).
 NoNewPrivileges=true
 ProtectSystem=strict
