@@ -82,11 +82,37 @@ pub fn base64_pub_from_priv(priv_b64: &str) -> anyhow::Result<String> {
     Ok(base64_encode(public.as_bytes()))
 }
 
+/// Apply a full device config in one atomic `set` (`replace_peers=true` +
+/// the complete peer list).
+///
+/// CAVEAT (mesh-convergence fix cycle, learned empirically): with this
+/// project's boringtun (0.6.0) a full apply is SESSION-DESTRUCTIVE for
+/// every peer — `replace_peers=true` is implemented as `clear_peers()`
+/// (`device/api.rs`), so all noise sessions and handshake state are
+/// rebuilt. The `apply_device_if_changed` change-guard in `main.rs` exists
+/// precisely so byte-identical re-applies never reach this function. A
+/// surgical single-peer alternative was prototyped (remove+re-add of just
+/// the re-pointed peer — the only mutation boringtun supports, since its
+/// `update_peer` panics on in-place modification of an existing peer) and
+/// REJECTED on evidence: exercising boringtun's live `remove_peer`+re-add
+/// path left the re-added peer with traffic flowing but NO current session
+/// reported (relay_matrix case1's real-handshake assertion failed
+/// deterministically), while the full apply passes. Until boringtun is
+/// patched/upgraded, the full apply is the only safe write path; the
+/// finding-§2 consequence (a desired-state change resets established
+/// sessions) is bounded by the change-guard plus the T4 live-endpoint pins,
+/// which at least guarantee the rebuilt peers keep their live endpoints and
+/// re-handshake to the RIGHT place immediately.
 pub fn apply(ifname: &str, cfg: &DeviceConfig) -> anyhow::Result<()> {
+    send_set(ifname, &encode_set(cfg)?)
+}
+
+/// Shared UAPI `set=1` round-trip: connect, send `body`, check `errno`.
+fn send_set(ifname: &str, body: &str) -> anyhow::Result<()> {
     let path = format!("/var/run/wireguard/{ifname}.sock");
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("connecting to WG UAPI socket {path}"))?;
-    let req = format!("set=1\n{}", encode_set(cfg)?);
+    let req = format!("set=1\n{body}");
     stream.write_all(req.as_bytes()).context("writing UAPI set request")?;
     let mut resp = String::new();
     stream.read_to_string(&mut resp).context("reading UAPI response")?;
@@ -171,6 +197,20 @@ pub(crate) fn parse_get_response(resp: &str) -> HashMap<String, PeerGetInfo> {
 /// `last_handshake_time_{sec,nsec}` are 0, the UAPI's zero-value default)
 /// is simply absent from the map, rather than mapping to the Unix epoch —
 /// which would be indistinguishable from a genuine handshake at time 0.
+///
+/// SEMANTICS CAVEAT (mesh-convergence fix cycle root-cause): the WG UAPI
+/// spec defines these fields as the ABSOLUTE unix time of the last
+/// handshake, but this project's boringtun (0.6.0) fills them with
+/// `time_since_last_handshake()` — the ELAPSED duration since the handshake
+/// (`device/api.rs`). The `SystemTime` produced here is therefore
+/// `UNIX_EPOCH + <elapsed>` under boringtun (a 1970-adjacent value that
+/// GROWS between handshakes and DROPS to ~epoch on each new one) and a real
+/// wall-clock instant under a spec-conforming implementation. This function
+/// deliberately stays a mechanical conversion of what the wire said;
+/// consumers that need real event detection or ages must normalize — see
+/// `main.rs::reported_handshake_age`. (This is also the true mechanism
+/// behind the cycle-4b "handshake time advances every tick with rx flat"
+/// quirk: elapsed time simply grows with the wall clock.)
 pub(crate) fn handshake_times_from(peers: &HashMap<String, PeerGetInfo>) -> HashMap<String, SystemTime> {
     peers
         .iter()

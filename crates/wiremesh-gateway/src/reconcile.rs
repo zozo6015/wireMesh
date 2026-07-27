@@ -89,11 +89,36 @@ pub fn device_config(ds: &DesiredState, private_key_b64: &str, listen_port: u16)
 /// here, so like [`peer_configs`] it emits [`PERSISTENT_KEEPALIVE_SECS`] on
 /// every peer unconditionally rather than taking a caller value (finding §5:
 /// idle NAT mappings expired because no keepalive was ever set).
+///
+/// Make-before-break peer application (mesh-convergence fix T4):
+/// `live_endpoints` holds, for every peer whose tunnel currently shows
+/// liveness (the post-T2 rx-corroborated notion — `Direct`, or `Relayed`
+/// pointing at the relay-transport local socket), the endpoint that tunnel
+/// is actually using (`gateway_id -> "ip:port"`). A peer present in the map
+/// is emitted with EXACTLY that endpoint — never `primary_endpoint()`'s
+/// static candidate. Rationale
+/// (`docs/research/ops-finding-multi-gateway-convergence.md` §2): in the
+/// 2026-07-27 incident, enrolling a third gateway re-applied the peer set
+/// and reset FI's ESTABLISHED `home` endpoint back to the static candidate
+/// `79.119.133.77:51820` — then-undialable — breaking a WORKING pair that
+/// never re-formed on its own. A newcomer must not break existing tunnels:
+/// re-applying desired state may add/remove peers and update
+/// keys/allowed-ips, but never rewrite a live tunnel's endpoint. A peer
+/// ABSENT from the map (a new peer, or an existing peer with no live
+/// tunnel) gets `primary_endpoint()` exactly as before — that IS the
+/// recovery path (a dead pair must keep chasing fresh candidates). A stale
+/// entry for a peer no longer in `ds.peers` is ignored: pins never
+/// resurrect a removed peer. The endpoint pin and the Role-B pubkey pin
+/// compose independently. Extending THIS builder (rather than adding a
+/// sibling) means no call site can rebuild the steady-state device without
+/// deciding about live endpoints — the same "no call site can drift"
+/// rationale as T1's keepalive.
 pub fn device_config_pinned(
     ds: &DesiredState,
     private_key_b64: &str,
     listen_port: u16,
     pinned_pubkeys: &std::collections::HashMap<u64, String>,
+    live_endpoints: &std::collections::HashMap<u64, String>,
 ) -> DeviceConfig {
     let peers = ds
         .peers
@@ -103,9 +128,16 @@ pub fn device_config_pinned(
                 Some(pinned) => pinned.clone(),
                 None => p.active_pubkey_b64.clone()?,
             };
+            let endpoint = match live_endpoints.get(&p.gateway_id) {
+                // Live tunnel: keep the endpoint it is actually using
+                // (make-before-break, finding §2).
+                Some(live) => Some(live.clone()),
+                // No live tunnel: dial the advertised candidate (recovery).
+                None => p.primary_endpoint().cloned(),
+            };
             Some(PeerConfig {
                 public_key_b64,
-                endpoint: p.primary_endpoint().cloned(),
+                endpoint,
                 allowed_ips: p.allowed_ips.clone(),
                 keepalive_secs: PERSISTENT_KEEPALIVE_SECS,
             })

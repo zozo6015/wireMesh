@@ -169,7 +169,10 @@ fn t1_device_config_pinned_carries_25s_keepalive_for_new_and_pinned_peers() {
         peer(4, Some("K4-new"), "10.10.4.0/24"), // the newcomer (finding §2 shape)
     ]);
     let pins: HashMap<u64, String> = HashMap::from([(2u64, "K2-pinned-old-epoch".to_string())]);
-    let dev = device_config_pinned(&ds, "PRIV", 51820, &pins);
+    // (Mechanical T4 arity churn: empty live-endpoint map — no live tunnels
+    // in this pure test; the T4 semantics are pinned in
+    // `tests/apply_make_before_break.rs`.)
+    let dev = device_config_pinned(&ds, "PRIV", 51820, &pins, &HashMap::new());
     assert_eq!(dev.peers.len(), 2);
     for p in &dev.peers {
         assert_eq!(

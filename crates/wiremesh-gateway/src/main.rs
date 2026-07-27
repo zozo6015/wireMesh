@@ -16,6 +16,7 @@ use wiremesh_gateway::epochkeys::EpochKeys;
 use wiremesh_gateway::identity::Identity;
 use wiremesh_gateway::metrics;
 use wiremesh_gateway::path::{Path, PathAction, PathState};
+use wiremesh_gateway::punch_backoff::{PunchBackoff, PunchDecision};
 use wiremesh_gateway::relay::RelayTransport;
 use wiremesh_gateway::rotation::{Rotation, RotationAction, RotationPhase};
 use wiremesh_gateway::state::DesiredState;
@@ -211,11 +212,23 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // `wg0` apply site so the peer's promote delta doesn't rekey `wg0`. Empty
     // in steady state.
     let wg0_pins = Arc::new(std::sync::Mutex::new(HashMap::<u64, String>::new()));
+    // Live-endpoint pins (mesh-convergence fix T4): peer gateway_id -> the
+    // "ip:port" its LIVE tunnel is actually using (punched mapping or
+    // relay-transport local socket). Written by `set_peer_endpoint`, cleared
+    // by `run_path_ticks` when a peer's path leaves the live states, and read
+    // by EVERY steady-state device rebuild (`apply_state`,
+    // `set_peer_endpoint`, the Role-A cutover guard seed) so a peer-set
+    // re-apply — e.g. a NEW gateway enrolling — can never reset an
+    // established tunnel's endpoint back to its static candidate (finding §2:
+    // exactly that reset broke the working home↔FI pair when px enrolled).
+    // Empty at boot: fail-static has no liveness yet, so the boot apply dials
+    // candidates as before.
+    let live_endpoints = Arc::new(std::sync::Mutex::new(HashMap::<u64, String>::new()));
 
     let mut applied: Option<DesiredState> = DesiredState::load(&cfg.state_dir)?;
     if let Some(ds) = &applied {
         eprintln!("wiremesh-gateway: fail-static boot from state.json rev {}", ds.revision);
-        apply_state(&enforcers, None, ds, &active, &wg0_pins).await?;
+        apply_state(&enforcers, None, ds, &active, &wg0_pins, &live_endpoints).await?;
         applied_version.store(ds.policy_version, Ordering::Relaxed);
     }
 
@@ -277,6 +290,8 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
         wg0_pins: wg0_pins.clone(),
         peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        live_endpoints: live_endpoints.clone(),
+        punch_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     // Metrics endpoint (Prometheus scrape) on an ephemeral loopback port,
@@ -329,9 +344,11 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     // Per-peer rx/tx/handshake-age gauges (fix T5, finding
                     // §6): rendered from the snapshot `run_path_ticks`
                     // published off the SAME UAPI fetch the path SM diffed
-                    // (≤1 tick stale). Age is computed at scrape time from
-                    // the absolute handshake instant; a never-handshaked
-                    // peer (or a clock stepped behind the handshake) yields
+                    // (≤1 tick stale). Age is computed at scrape time via
+                    // `reported_handshake_age`, which normalizes boringtun
+                    // 0.6.0's elapsed-time field semantics (a naive
+                    // `now - t` would report ~56 years for a live tunnel —
+                    // see that helper's doc); a never-handshaked peer yields
                     // `None`, and the renderer omits its age line — absence,
                     // not a bogus 0, mirroring `uapi::handshake_times_from`.
                     let peer_stats: Vec<(String, metrics::PeerStats)> = ctx
@@ -340,8 +357,8 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         .unwrap()
                         .iter()
                         .map(|(gid, pl)| {
-                            let age = pl.latest_handshake.and_then(|t| {
-                                SystemTime::now().duration_since(t).ok().map(|d| d.as_secs())
+                            let age = pl.latest_handshake.map(|t| {
+                                reported_handshake_age(t, SystemTime::now()).as_secs()
                             });
                             (
                                 gid.to_string(),
@@ -413,6 +430,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         active: active.clone(),
         wg0_pins: wg0_pins.clone(),
         desired: ctx.desired.clone(),
+        live_endpoints: live_endpoints.clone(),
         retire_ready: Arc::new(std::sync::Mutex::new(None)),
     };
     tokio::spawn(run_rotation_ticks(rot.clone()));
@@ -458,6 +476,11 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 &ds,
                                 &rot.active,
                                 &wg0_pins,
+                                // The REAL shared live-endpoint map (fix T4)
+                                // — passing an empty map here would BE the
+                                // finding-§2 bug (a new enrollment's State
+                                // event resetting established endpoints).
+                                &live_endpoints,
                             )
                             .await?;
                             ds.save(&cfg.state_dir)?;
@@ -497,20 +520,29 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 d.candidates.len(),
                                 d.go_unix_ms
                             );
-                            match ctx.try_start_punch(gid) {
-                                Some(guard) => {
-                                    tokio::spawn(punch_and_apply(
-                                        ctx.clone(),
-                                        gid,
-                                        d.candidates,
-                                        Some(d.go_unix_ms),
-                                        guard,
-                                    ));
+                            // Fix T3 (finding §3): consult the pair's punch
+                            // back-off BEFORE the concurrency guard. While
+                            // backed off, directives are skipped SILENTLY —
+                            // the state change was logged when the window
+                            // opened, and the incident's directive storm
+                            // re-fired every few seconds (once per directive
+                            // would flood the log).
+                            if ctx.punch_allowed(gid, &d.candidates) {
+                                match ctx.try_start_punch(gid) {
+                                    Some(guard) => {
+                                        tokio::spawn(punch_and_apply(
+                                            ctx.clone(),
+                                            gid,
+                                            d.candidates,
+                                            Some(d.go_unix_ms),
+                                            guard,
+                                        ));
+                                    }
+                                    None => eprintln!(
+                                        "wiremesh-gateway: punch already in flight for peer={gid}; \
+                                         skipping controller directive"
+                                    ),
                                 }
-                                None => eprintln!(
-                                    "wiremesh-gateway: punch already in flight for peer={gid}; \
-                                     skipping controller directive"
-                                ),
                             }
                         }
                         Ok(Some(sync::SyncEvent::Rotate(d))) => {
@@ -638,6 +670,27 @@ struct PathCtx {
     /// `set_peer_endpoint` builds the same pinned config `apply_state` does and
     /// a punch during a rotation overlap can't rekey `wg0` off the pin.
     wg0_pins: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    /// Live-endpoint pins (fix T4): peer `gateway_id` -> the "ip:port" its
+    /// LIVE tunnel is actually using — the durable record that replaces
+    /// `set_peer_endpoint`'s old candidate-reorder-on-a-clone (which was
+    /// never persisted, so the next `apply_state` reverted every endpoint to
+    /// the pristine static candidate: the finding-§2 incident bug). Written
+    /// by `set_peer_endpoint` (where a punched/relay endpoint is known),
+    /// cleared by `run_path_ticks` when the peer's path leaves the live
+    /// states (`Direct`/`Relayed`) — which is what re-enables the recovery
+    /// re-point at fresh candidates — and passed by every steady-state
+    /// device rebuild to `reconcile::device_config_pinned`. The same `Arc`
+    /// the boot loop and `RotationShared` hold.
+    live_endpoints: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    /// Per-peer punch back-off state (fix T3, finding §3: an undialable
+    /// pair's punch directives re-fired every few seconds indefinitely, and
+    /// the near-continuously-open transient `SO_REUSEPORT` punch socket then
+    /// starved OTHER pairs' inbound WG traffic). Consulted via
+    /// [`PathCtx::punch_allowed`] before BOTH spawn sites (controller
+    /// `Punch` directives and tick-driven `StartPunch`/`ProbeDirect`); fed
+    /// by [`PathCtx::record_punch_outcome`] from `punch_and_apply`. Note
+    /// `try_start_punch` bounds concurrency; this bounds RATE.
+    punch_backoff: Arc<std::sync::Mutex<HashMap<u64, PunchBackoff>>>,
     /// Latest per-peer UAPI liveness snapshot (rx/tx bytes + latest
     /// handshake), keyed by peer `gateway_id` — published by `run_path_ticks`
     /// from the SAME `uapi::get_peer_liveness` fetch that drives the path
@@ -665,6 +718,63 @@ impl PathCtx {
             before.as_str(),
             after.as_str()
         );
+    }
+
+    /// Consult peer `gid`'s punch back-off (fix T3) with the candidate list
+    /// of the attempt about to run. `true` = the attempt may proceed (then
+    /// still subject to `try_start_punch`'s concurrency guard); `false` =
+    /// the pair is inside an open back-off window and the attempt must be
+    /// skipped. Deliberately SILENT on skip: plan T3 requires logging once
+    /// per state CHANGE (the window opening, logged by
+    /// [`record_punch_outcome`]), not once per skipped directive — the
+    /// incident's directive storm re-fired every few seconds and would have
+    /// flooded the log.
+    fn punch_allowed(&self, gid: u64, candidates: &[String]) -> bool {
+        let now = Instant::now();
+        let mut map = self.punch_backoff.lock().unwrap();
+        let backoff = map
+            .entry(gid)
+            .or_insert_with(|| PunchBackoff::new(punch_jitter_seed(self.identity.gateway_id, gid)));
+        matches!(backoff.decide(now, candidates), PunchDecision::Allow)
+    }
+
+    /// Feed a finished `punch_and_apply` attempt's outcome into peer `gid`'s
+    /// back-off (fix T3): a confirmed candidate resets it immediately; a
+    /// failure counts toward (or extends) the back-off. Logs exactly when
+    /// the back-off state CHANGES — a new window opening (including each
+    /// doubled window after a failed half-open retry) — never per skipped
+    /// directive, per plan T3.
+    fn record_punch_outcome(&self, gid: u64, success: bool) {
+        let mut map = self.punch_backoff.lock().unwrap();
+        let Some(backoff) = map.get_mut(&gid) else {
+            // No decide ever ran for this peer (shouldn't happen — both
+            // spawn sites consult `punch_allowed` first); nothing to feed.
+            return;
+        };
+        if success {
+            let was_backed_off = backoff.backoff_until().is_some();
+            backoff.record_success();
+            if was_backed_off {
+                eprintln!(
+                    "wiremesh-gateway: peer={gid} punch back-off cleared (punch confirmed)"
+                );
+            }
+        } else {
+            let now = Instant::now();
+            let before = backoff.backoff_until();
+            backoff.record_failure(now);
+            let after = backoff.backoff_until();
+            if after != before {
+                if let Some(until) = after {
+                    eprintln!(
+                        "wiremesh-gateway: peer={gid} punch back-off engaged for {:?} \
+                         (consecutive punch failures; directives skipped until it expires \
+                         or candidates change — finding §3 storm guard)",
+                        until.saturating_duration_since(now)
+                    );
+                }
+            }
+        }
     }
 
     /// Try to claim the in-flight-punch slot for peer `gid`. Returns `None`
@@ -753,6 +863,64 @@ struct PeerRelay {
     relay_id: u64,
 }
 
+/// Normalize a UAPI-reported last-handshake value to the handshake's AGE
+/// (time since it completed), robust to BOTH field semantics in the wild
+/// (mesh-convergence fix cycle, nat_matrix regression root-cause):
+///
+/// - The WG UAPI spec defines `last_handshake_time_{sec,nsec}` as the
+///   ABSOLUTE unix time of the last handshake — age is `now - reported`.
+/// - This project's boringtun (0.6.0) instead fills the fields with
+///   `time_since_last_handshake()` — the ELAPSED time since the handshake
+///   (`device/api.rs` / `noise/timers.rs`), so the parsed "`SystemTime`" is
+///   really `UNIX_EPOCH + <elapsed>` and the age is simply `reported -
+///   UNIX_EPOCH`. This is why `wg show` prints "56 years ago" on live
+///   tunnels, and it is the true mechanism behind the cycle-4b "handshake
+///   time advances every tick with rx flat" quirk: elapsed time grows with
+///   the wall clock between handshakes. Fatally for the first T2 driver
+///   cut, it also means the epoch-interpreted value DROPS on a genuine new
+///   handshake (elapsed resets to ~0), so a `t > prev` "advance" check
+///   misses exactly the event it exists to detect — observed as the
+///   nat_matrix cases 1/3/4 sticking in `connecting` while real WG traffic
+///   flowed.
+///
+/// The two are disambiguated by magnitude: a real absolute timestamp is ~56
+/// years past the epoch, while an elapsed value would need a >20-year-old
+/// session to cross the threshold below. In AGE space both semantics behave
+/// identically — the age grows between handshakes and drops on each new one
+/// — which is what the path-tick driver keys its handshake-event detection
+/// on, and what the T5 `last_handshake_age_seconds` gauge reports.
+fn reported_handshake_age(reported: SystemTime, now: SystemTime) -> Duration {
+    /// Values further than this past the epoch are treated as absolute
+    /// timestamps (20 years — no session's elapsed age gets near it, and
+    /// any plausible real handshake instant is far beyond it).
+    const ABSOLUTE_IF_PAST: Duration = Duration::from_secs(20 * 365 * 86_400);
+    let since_epoch = reported.duration_since(UNIX_EPOCH).unwrap_or_default();
+    if since_epoch >= ABSOLUTE_IF_PAST {
+        // Spec-conforming absolute timestamp; clock skew clamps to 0 rather
+        // than erroring (a just-completed handshake must read as age ~0).
+        now.duration_since(reported).unwrap_or_default()
+    } else {
+        // boringtun elapsed semantics: the reported value IS the age.
+        since_epoch
+    }
+}
+
+/// Jitter seed for a peer pair's [`PunchBackoff`] (fix T3). Mixes this
+/// gateway's own id with the peer's so (a) the two ENDS of one pair draw
+/// different jitter sequences (own/peer are swapped on the other side) and
+/// (b) distinct pairs on one gateway decorrelate — the point of the jitter
+/// is that backed-off retries across the fabric don't re-synchronize into
+/// simultaneous punch storms (finding §3). Deterministic across restarts by
+/// design: the back-off module keeps ALL randomness injected/seeded (the
+/// `path.rs` testability rule), and reproducible retry timing is a feature
+/// when replaying an incident from logs.
+fn punch_jitter_seed(own_gateway_id: u64, peer_gateway_id: u64) -> u64 {
+    own_gateway_id
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .rotate_left(32)
+        ^ peer_gateway_id.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+}
+
 /// Decode a base64 WireGuard public key into the lowercase-hex form the WG
 /// UAPI keys its per-peer state by (`uapi::get_peer_liveness`), so a
 /// controller-provided `active_pubkey_b64` can be correlated with the device's
@@ -839,20 +1007,35 @@ async fn punch_and_apply(
         Ok(Ok(c)) => c,
         Ok(Err(e)) => {
             eprintln!("wiremesh-gateway: punch to peer={gid} failed: {e}");
+            // Fix T3: an attempt that ran and did not confirm feeds the
+            // pair's back-off (finding §3 storm guard).
+            ctx.record_punch_outcome(gid, false);
             return;
         }
         Err(e) => {
             eprintln!("wiremesh-gateway: punch task for peer={gid} panicked: {e}");
+            // A join panic isn't `punch_candidates` returning `Err`, but the
+            // attempt provably ran without confirming — count it (fix T3):
+            // a repeatedly-panicking punch path must decay like any other
+            // persistent failure rather than storm.
+            ctx.record_punch_outcome(gid, false);
             return;
         }
     };
 
     let Some(addr) = confirmed else {
         // Nothing confirmed within the window (e.g. symmetric-NAT peer — the
-        // documented relay-needed case). The path SM will drive retry/relay.
+        // documented relay-needed case). The path SM will drive retry/relay,
+        // rate-bounded by the pair's back-off (fix T3).
         eprintln!("wiremesh-gateway: no candidate confirmed for peer={gid}");
+        ctx.record_punch_outcome(gid, false);
         return;
     };
+
+    // Fix T3: a confirmed candidate resets the pair's back-off immediately
+    // (recorded on confirmation, before the endpoint apply — the punch
+    // itself proved the pair dialable, which is the back-off's question).
+    ctx.record_punch_outcome(gid, true);
 
     // Re-reconcile the FULL device (replace_peers) with the confirmed endpoint
     // moved to the front of this peer's candidate list so `primary_endpoint()`
@@ -872,20 +1055,38 @@ async fn punch_and_apply(
 }
 
 /// Point peer `gid`'s WG endpoint at `endpoint` and re-apply the full device
-/// config. This does NOT re-add the peer or rekey it: WireGuard's UAPI keys
-/// a peer's live session by its (unchanged) `public_key=`, so a
-/// `replace_peers=true` `set` that repeats the same peers with just a
-/// different `endpoint=` for one of them only changes where WireGuard sends
-/// its next packet — the running noise session survives untouched. Shared by
-/// [`punch_and_apply`] (a hole-punch-confirmed direct candidate,
-/// `is_relay=false`) and [`ensure_relay_transport`] (pointing a peer at its
-/// `RelayTransport`'s local relay socket, Cycle 4c Task 8, `is_relay=true`).
+/// config (guarded: `apply_device_if_changed` makes a re-confirm of an
+/// already-applied endpoint a true no-op, so the controller re-brokering
+/// punches every few seconds never resets a live session). NOTE the
+/// kernel-WireGuard intuition that a `replace_peers` set with unchanged keys
+/// preserves sessions is FALSE for this project's boringtun (0.6.0) — a
+/// changed apply rebuilds every peer's session (see `uapi::apply`'s caveat).
+/// A surgical single-peer remove+re-add alternative was prototyped during
+/// the mesh-convergence fix cycle and rejected on netns evidence: boringtun's
+/// live `remove_peer`+re-add path left the re-added peer with traffic
+/// flowing but no current session reported, deterministically failing
+/// relay_matrix case1's real-handshake assertion, while this full-apply
+/// path passes all suites. Shared by [`punch_and_apply`] (a
+/// hole-punch-confirmed direct candidate, `is_relay=false`) and
+/// [`ensure_relay_transport`] (pointing a peer at its `RelayTransport`'s
+/// local relay socket, Cycle 4c Task 8, `is_relay=true`).
 ///
 /// `is_relay` records into `ctx.relay_pointed` (Cycle 4c Task 9) whether
 /// `endpoint` is the local relay-transport socket or a real direct
 /// candidate — the disambiguator `run_path_ticks` needs so a WG handshake
 /// completing OVER THE RELAY isn't mistaken for the make-before-break Direct
 /// cutover.
+///
+/// Fix T4 (finding §2): the endpoint is recorded as a durable pin in
+/// `ctx.live_endpoints` and the device is rebuilt from the PRISTINE desired
+/// state plus that pin map. The previous implementation instead reordered
+/// the candidates of a LOCAL CLONE of desired state — never persisted — so
+/// the very next `apply_state` (any Sync `State` event, e.g. a new gateway
+/// enrolling) rebuilt from the pristine candidates and reverted every
+/// established endpoint to its static candidate; that reset is exactly what
+/// broke the working home↔FI pair when px enrolled in the 2026-07-27
+/// incident. `run_path_ticks` clears the pin again when the peer's path
+/// leaves the live states, re-enabling candidate-chasing recovery.
 async fn set_peer_endpoint(
     ctx: &PathCtx,
     gid: u64,
@@ -899,24 +1100,28 @@ async fn set_peer_endpoint(
         let a = ctx.active.lock().unwrap();
         (a.ifname.clone(), a.priv_key.clone(), a.wg_port)
     };
+    // Record the live-endpoint pin FIRST (fix T4): from here on, every
+    // steady-state rebuild — this one and any concurrent/later `apply_state`
+    // — emits this endpoint for `gid` instead of the static candidate. (If
+    // the apply below fails, the pin still describes where the tunnel SHOULD
+    // point; the next apply retries it, and `run_path_ticks` clears the pin
+    // if no live path ever materializes.)
+    ctx.live_endpoints.lock().unwrap().insert(gid, endpoint.to_string());
     let dev = {
         let desired = ctx.desired.lock().unwrap();
         let ds = desired.as_ref().ok_or_else(|| {
             anyhow::anyhow!("no desired state yet; cannot set endpoint for peer={gid}")
         })?;
-        let mut ds = ds.clone();
-        if let Some(peer) = ds.peers.iter_mut().find(|p| p.gateway_id == gid) {
-            let a = endpoint.to_string();
-            peer.candidates.retain(|c| c != &a);
-            peer.candidates.insert(0, a);
-        }
         // Honor the same Role-B `wg0` pin `apply_state` uses, so a punch/relay
         // re-point during a rotation overlap can't rekey the active tun off the
         // pinned old-epoch key (make-before-break), and — with the change-guard
         // below — resolving to an already-applied endpoint is a true no-op that
-        // never resets the live session.
+        // never resets the live session. The live-endpoint map carries this
+        // call's own pin (inserted above) plus every other live peer's, so
+        // re-pointing ONE peer can't clobber another's established endpoint.
         let pins = ctx.wg0_pins.lock().unwrap();
-        reconcile::device_config_pinned(&ds, &priv_key, wg_port, &pins)
+        let live = ctx.live_endpoints.lock().unwrap();
+        reconcile::device_config_pinned(ds, &priv_key, wg_port, &pins, &live)
     };
     apply_device_if_changed(&ifname, &dev, &ctx.active).await?;
     ctx.relay_pointed.lock().unwrap().insert(gid, is_relay);
@@ -1106,9 +1311,16 @@ async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
 /// known-futile probe from also breaking the relay path it's running
 /// alongside.
 async fn run_path_ticks(ctx: PathCtx) {
-    // Last handshake time we've observed per peer, to detect *advancement*
-    // (a repeated identical timestamp must NOT re-fire `on_handshake`).
-    let mut last_seen: HashMap<u64, SystemTime> = HashMap::new();
+    // Last handshake AGE we've observed per peer (via
+    // `reported_handshake_age` — see its doc for the boringtun
+    // elapsed-vs-absolute semantics this normalizes). A NEW handshake is an
+    // age DECREASE: between handshakes the age only grows (by ~one tick per
+    // tick), and each genuine completion resets it to ~0. The previous
+    // epoch-space `t > prev` comparison was wrong under boringtun's elapsed
+    // semantics — true every tick between handshakes (pure wall-clock noise,
+    // the cycle-4b quirk) and FALSE at a genuine new handshake — which is
+    // what stuck nat_matrix cases 1/3/4 in `connecting` with live traffic.
+    let mut last_hs_age: HashMap<u64, Duration> = HashMap::new();
     // Last rx_bytes we've observed per peer, to detect an *increase* — WG
     // keepalives (every `uapi::PERSISTENT_KEEPALIVE_SECS` = 25s) bump
     // rx_bytes without advancing the handshake time (which only moves on
@@ -1172,6 +1384,12 @@ async fn run_path_ticks(ctx: PathCtx) {
         // teardown does elsewhere in this function.
         ctx.relay_pointed.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
         ctx.relay_next_idx.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
+        // Same rationale for the T4 endpoint pins and T3 back-off state: a
+        // peer removed from the fabric must not leave a stale pin (which
+        // could otherwise resurface if the id were ever reused) or an
+        // orphaned back-off entry behind.
+        ctx.live_endpoints.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
+        ctx.punch_backoff.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
 
         // Snapshot which peers currently have a healthy relay transport
         // (single `tokio::sync::Mutex` acquisition for the whole tick, ahead
@@ -1229,45 +1447,68 @@ async fn run_path_ticks(ctx: PathCtx) {
                     // diagnostic shape (finding §4's "rx stayed 0").
                     stats_snapshot.insert(gid, info);
 
-                    if let Some(t) = info.latest_handshake {
-                        let rx = info.rx_bytes;
-                        let advanced = last_seen.get(&gid).map_or(true, |prev| t > *prev);
-                        if advanced {
-                            last_seen.insert(gid, t);
-                        }
-                        let rx_increased = last_rx.get(&gid).map_or(false, |&prev| rx > prev);
-                        last_rx.insert(gid, rx);
+                    // rx tracking runs for EVERY peer with a device entry —
+                    // seeded from boot, BEFORE the first handshake exists
+                    // (nat_matrix regression fix): the tick that first
+                    // observes a completed handshake usually also carries the
+                    // first data bytes (the handshake was demand-driven), and
+                    // with `last_rx` unseeded that tick could never see the
+                    // rx delta — the genuine first connect parked as
+                    // uncorroborated and the machine (correctly) refused
+                    // Direct. Seeding from the 0-rx boot ticks makes the
+                    // handshake tick's rx jump visible, so a real first
+                    // connect corroborates in the same tick, exactly like the
+                    // pre-T2 timing. A never-yet-observed peer's baseline is
+                    // 0 BY CONSTRUCTION — boringtun peer objects start their
+                    // counters at zero when created (device boot, or a
+                    // desired-state apply adding the peer, both of which this
+                    // ~1s tick loop observes within a tick or two) — so a
+                    // first observation with rx > 0 is itself a genuine
+                    // delta; without this, a tick task briefly starved while
+                    // the handshake AND first data both landed would miss the
+                    // one-shot jump and park a healthy first connect until
+                    // the next 25s keepalive (observed as a rare nat_matrix
+                    // establishment flake). An rx DECREASE means the peer
+                    // object was rebuilt (a `replace_peers` apply resets
+                    // counters) — not inbound; it reseeds the baseline so the
+                    // NEXT delta is visible instead of hiding behind the old
+                    // high-water mark.
+                    let rx = info.rx_bytes;
+                    let rx_increased = last_rx.get(&gid).map_or(rx > 0, |&prev| rx > prev);
+                    last_rx.insert(gid, rx);
 
-                        // Mesh-convergence fix T2: a handshake-time advance is
-                        // ONLY trusted with rx corroboration — an rx_bytes
-                        // increase this same tick, or (via `pending_hs`) within
-                        // `HANDSHAKE_CORROBORATION_WINDOW`. This project's
-                        // boringtun advances `last_handshake_time` on every
-                        // tick while retrying an established-but-dead session
-                        // with rx frozen (the Cycle-4b quirk,
-                        // docs/research/cycle4b-path-liveness-note.md), and
-                        // the PREVIOUS driver's "first-ever handshake is
-                        // trusted unconditionally" exception let exactly that
-                        // phantom evidence claim `direct` on a first session
-                        // whose peer rx stayed 0 — observed live in the
+                    if let Some(t) = info.latest_handshake {
+                        // A NEW handshake is an AGE DECREASE (see
+                        // `reported_handshake_age` — this is the semantics-
+                        // robust event detector; boringtun 0.6.0 reports
+                        // elapsed-since-handshake in the absolute-time
+                        // fields, so epoch-space `t > prev` was noise: true
+                        // every tick between handshakes and false at the
+                        // genuine event).
+                        let age = reported_handshake_age(t, SystemTime::now());
+                        let new_handshake =
+                            last_hs_age.get(&gid).map_or(true, |prev| age < *prev);
+                        last_hs_age.insert(gid, age);
+
+                        // Mesh-convergence fix T2: a handshake event is ONLY
+                        // trusted with rx corroboration — an rx_bytes
+                        // increase this same tick, or (via `pending_hs`)
+                        // within `HANDSHAKE_CORROBORATION_WINDOW`. The
                         // 2026-07-27 incident
                         // (docs/research/ops-finding-multi-gateway-convergence.md
-                        // §4: FI showed handshakes "13-70s ago" with
-                        // rx_bytes=0 sustained while gw-home reported
-                        // direct). The exception's historical justification —
-                        // a genuine first handshake's corroborating data
-                        // packet could lag unboundedly, sticking the netns nat
-                        // matrix in Connecting, because the one-shot
-                        // `advanced` event was never re-observed once missed —
-                        // is answered by remembering the advance in
-                        // `pending_hs` (it is no longer one-shot) and by fix
-                        // T1's 25s persistent keepalive on every peer, which
-                        // guarantees a real completed handshake is followed by
-                        // authenticated inbound within one keepalive interval.
-                        // The machine itself enforces the same rule
-                        // (`Path::on_handshake(_, false)` is non-evidence), so
-                        // this driver cannot weaken it — it can only decide
-                        // WHEN corroboration has been established.
+                        // §4) showed uncorroborated handshake evidence
+                        // claiming `direct` for a dead tunnel (FI: handshakes
+                        // "13-70s ago" with rx_bytes=0 sustained) — under the
+                        // then-driver's "first-ever handshake is trusted
+                        // unconditionally" exception, which is gone. A missed
+                        // same-tick delta is not fatal: the event stays in
+                        // `pending_hs`, and fix T1's 25s persistent keepalive
+                        // guarantees a real handshake is followed by
+                        // authenticated inbound within one keepalive
+                        // interval, promoting it. The machine itself enforces
+                        // the same rule (`Path::on_handshake(_, false)` is
+                        // non-evidence), so this driver cannot weaken it — it
+                        // only decides WHEN corroboration is established.
                         //
                         // Cycle 4c Task 9 gating is preserved: a corroborated
                         // handshake CARRIED OVER THE RELAY (`relay_pointed`)
@@ -1277,7 +1518,7 @@ async fn run_path_ticks(ctx: PathCtx) {
                         // instead; only a handshake completing after
                         // `punch_and_apply` repointed the endpoint at a real
                         // direct candidate counts as the cutover.
-                        if advanced && rx_increased {
+                        if new_handshake && rx_increased {
                             // Corroborated in the same tick — the genuine
                             // completed-handshake case (data resumed with it).
                             pending_hs.remove(&gid);
@@ -1288,19 +1529,20 @@ async fn run_path_ticks(ctx: PathCtx) {
                             } else {
                                 path.on_handshake(now, true);
                             }
-                        } else if advanced {
-                            // Advance with flat rx: NOT liveness (finding §4).
-                            // Remember it for within-window promotion and tell
-                            // the machine, which ignores it by contract.
+                        } else if new_handshake {
+                            // Handshake event with flat rx: NOT liveness
+                            // (finding §4). Remember it for within-window
+                            // promotion and tell the machine, which ignores
+                            // it by contract.
                             pending_hs.insert(gid, now);
                             path.on_handshake(now, false);
                         } else if rx_increased {
-                            // rx moved without a fresh advance this tick: real
-                            // decrypted inbound. If an uncorroborated advance
-                            // is pending and still inside the window, this is
-                            // its corroboration — promote it to the real
-                            // handshake event; otherwise it's keepalive/data
-                            // liveness as before.
+                            // rx moved without a handshake event this tick:
+                            // real decrypted inbound. If an uncorroborated
+                            // handshake is pending and still inside the
+                            // window, this is its corroboration — promote it
+                            // to the real handshake event; otherwise it's
+                            // keepalive/data liveness as before.
                             let promoted = matches!(
                                 pending_hs.remove(&gid),
                                 Some(hs_at) if now.saturating_duration_since(hs_at)
@@ -1345,6 +1587,17 @@ async fn run_path_ticks(ctx: PathCtx) {
         *ctx.peer_stats.lock().unwrap() = stats_snapshot;
 
         for (gid, before, after) in to_record {
+            // Fix T4: a path leaving the LIVE states (Direct / Relayed) no
+            // longer shows liveness, so its endpoint pin must go — that is
+            // precisely what re-enables the recovery re-point: the next
+            // device rebuild dials the peer's (possibly fresh) candidates
+            // again instead of a dead pinned endpoint. While the pin held
+            // (path live), no re-apply could clobber the endpoint (finding
+            // §2); once liveness is gone, make-before-break no longer
+            // applies and candidate-chasing must resume.
+            if !matches!(after, PathState::Direct | PathState::Relayed) {
+                ctx.live_endpoints.lock().unwrap().remove(&gid);
+            }
             ctx.record_transition(gid, before, after);
         }
         for gid in to_teardown_relay {
@@ -1359,11 +1612,18 @@ async fn run_path_ticks(ctx: PathCtx) {
             tokio::spawn(ensure_relay_transport(ctx.clone(), gid, ds.relays.clone()));
         }
         for (gid, candidates) in to_punch {
-            // Bounded by the SM's own backoff (StartPunch only fires on
-            // Disconnected → Connecting expiry; ProbeDirect fires on every
-            // Relayed tick while the relay stays up). Dedup against a
-            // concurrent controller-directed punch — or another
-            // StartPunch/ProbeDirect tick — for the same peer (Fix 3).
+            // Fix T3 (finding §3): the pair's punch back-off is consulted
+            // before EVERY attempt — the path SM's own backoff bounds how
+            // often StartPunch fires per DISCONNECT cycle, but an undialable
+            // pair re-enters that cycle forever (and ProbeDirect re-fires
+            // per `PROBE_DIRECT_INTERVAL` indefinitely while Relayed), which
+            // is exactly the incident's indefinite storm. Skips are silent:
+            // the state change was logged when the window opened.
+            if !ctx.punch_allowed(gid, &candidates) {
+                continue;
+            }
+            // Dedup against a concurrent controller-directed punch — or
+            // another StartPunch/ProbeDirect tick — for the same peer (Fix 3).
             match ctx.try_start_punch(gid) {
                 Some(guard) => {
                     tokio::spawn(punch_and_apply(ctx.clone(), gid, candidates, None, guard));
@@ -1417,6 +1677,7 @@ async fn apply_state(
     ds: &DesiredState,
     active: &Arc<std::sync::Mutex<ActiveTunInfo>>,
     wg0_pins: &Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    live_endpoints: &Arc<std::sync::Mutex<HashMap<u64, String>>>,
 ) -> anyhow::Result<()> {
     // Resolve the active tun (ifname + priv key + port), captured together.
     let (ifname, priv_key, wg_port) = {
@@ -1425,11 +1686,17 @@ async fn apply_state(
     };
     // Build the (cheap, synchronous) active-tun device config, pinning any
     // rotating peer's entry to its old epoch key (Role B make-before-break;
-    // empty pin map in steady state = identical to the pre-rotation config),
-    // then apply it only if it actually changed.
+    // empty pin map in steady state = identical to the pre-rotation config)
+    // AND every live peer's entry to the endpoint its tunnel is actually
+    // using (fix T4, finding §2: this apply runs on EVERY Sync `State`
+    // event — e.g. a brand-new gateway enrolling — and must never reset an
+    // established pair's endpoint back to a static candidate; that reset is
+    // what broke the working home↔FI pair when px enrolled). Then apply it
+    // only if it actually changed.
     let dev = {
         let pins = wg0_pins.lock().unwrap();
-        reconcile::device_config_pinned(ds, &priv_key, wg_port, &pins)
+        let live = live_endpoints.lock().unwrap();
+        reconcile::device_config_pinned(ds, &priv_key, wg_port, &pins, &live)
     };
     apply_device_if_changed(&ifname, &dev, active).await?;
     // Apply the current policy IR to EVERY live enforcer (boot tun + every
@@ -1553,6 +1820,13 @@ struct RotationShared {
     /// no-ops on the new tun and never clobber the correct offset-port session
     /// `handle_rotate` set up out-of-band (make-before-break).
     desired: Arc<std::sync::Mutex<Option<DesiredState>>>,
+    /// Shared live-endpoint pin map (same `Arc` [`PathCtx`] and `apply_state`
+    /// use — fix T4). Needed at the Role-A cutover guard seed for the same
+    /// reason as `desired`/`wg0_pins`: the seeded config must be EXACTLY what
+    /// `apply_state`/`set_peer_endpoint` will recompute (they now build with
+    /// this map), or the change-guard would mismatch and the next apply would
+    /// needlessly rebuild the new tun's live session.
+    live_endpoints: Arc<std::sync::Mutex<HashMap<u64, String>>>,
     /// Signal from the rotation tick to the run task: the OLD epoch to retire
     /// (tear its Device down + evict its enforcer) once every peer has cut over
     /// to the new tun and the retire grace has elapsed. The run task owns the
@@ -1965,8 +2239,11 @@ async fn run_rotation_ticks(rot: RotationShared) {
                                 let ds_guard = rot.desired.lock().unwrap();
                                 ds_guard.as_ref().and_then(|ds| {
                                     let pins = rot.wg0_pins.lock().unwrap();
+                                    // Same live-endpoint map the recomputes
+                                    // use (fix T4) — seed must match exactly.
+                                    let live = rot.live_endpoints.lock().unwrap();
                                     let dev = reconcile::device_config_pinned(
-                                        ds, &a.new_priv, a.new_port, &pins,
+                                        ds, &a.new_priv, a.new_port, &pins, &live,
                                     );
                                     uapi::encode_set(&dev).ok()
                                 })
@@ -2123,6 +2400,8 @@ mod tests {
             relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             wg0_pins: Arc::new(std::sync::Mutex::new(HashMap::new())),
             peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            live_endpoints: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            punch_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
