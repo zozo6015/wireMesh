@@ -129,6 +129,16 @@ struct ActiveTunInfo {
     /// a cutover: the new tun's config was pushed out-of-band by `handle_rotate`
     /// and nothing has been re-applied through the guard yet.
     applied_config: Option<String>,
+    /// The peer set of the last config pushed to the active tun — i.e. what
+    /// WireGuard currently holds (kept in lockstep with `applied_config`
+    /// everywhere it's written). `apply_state` diffs this against the freshly
+    /// built desired peers to detect the PURE-ADDITION case (a newcomer
+    /// enrolling with every existing peer unchanged), which it then applies
+    /// via the incremental, session-preserving [`uapi::add_peers`] instead of
+    /// the session-destructive full `replace_peers` apply — the T8 done-bar's
+    /// make-before-break requirement (finding §2). Empty whenever
+    /// `applied_config` is `None`.
+    applied_peers: Vec<uapi::PeerConfig>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -206,6 +216,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         priv_key: id.wg_private_key_b64.clone(),
         wg_port: cfg.wg_listen_port,
         applied_config: None,
+        applied_peers: Vec::new(),
     }));
     // Rotating peers whose `wg0` entry must stay pinned to their OLD epoch key
     // for the overlap's lifetime (Role B make-before-break) — read by every
@@ -1057,16 +1068,25 @@ async fn punch_and_apply(
 /// Point peer `gid`'s WG endpoint at `endpoint` and re-apply the full device
 /// config (guarded: `apply_device_if_changed` makes a re-confirm of an
 /// already-applied endpoint a true no-op, so the controller re-brokering
-/// punches every few seconds never resets a live session). NOTE the
-/// kernel-WireGuard intuition that a `replace_peers` set with unchanged keys
-/// preserves sessions is FALSE for this project's boringtun (0.6.0) — a
-/// changed apply rebuilds every peer's session (see `uapi::apply`'s caveat).
-/// A surgical single-peer remove+re-add alternative was prototyped during
-/// the mesh-convergence fix cycle and rejected on netns evidence: boringtun's
-/// live `remove_peer`+re-add path left the re-added peer with traffic
-/// flowing but no current session reported, deterministically failing
-/// relay_matrix case1's real-handshake assertion, while this full-apply
-/// path passes all suites. Shared by [`punch_and_apply`] (a
+/// punches every few seconds never resets a live session).
+///
+/// This uses the FULL `replace_peers` apply (via `apply_device_if_changed`),
+/// NOT a scoped single-peer re-point, because re-pointing is a MODIFY of an
+/// existing peer and boringtun (0.6.0) cannot modify in place. A scoped
+/// remove+re-add of just the target peer WAS prototyped (T8 convergence
+/// work) to spare other peers' sessions from the full apply's `clear_peers()`
+/// — it works for the direct path (nat_matrix green) but deterministically
+/// breaks the RELAY path's session reporting (relay_matrix case1's
+/// real-handshake assertion fails, `latest_handshake=0` on both sides while
+/// data flows), so it was reverted. The full apply's `clear_peers()` reset of
+/// OTHER established peers on a ≥3-gateway fabric (the residual T8
+/// ASSERTION-3 interruption) is a known remaining limitation tracked for a
+/// follow-up (needs either a boringtun fix for remove+re-add relay sessions,
+/// or a redesign that doesn't conflict with fail-static peer bootstrapping).
+/// The T4 live-endpoint pins bound its blast radius: every rebuilt peer keeps
+/// its live endpoint and re-handshakes to the RIGHT place immediately, so the
+/// established pair recovers within a round-trip rather than breaking
+/// permanently like the original incident. Shared by [`punch_and_apply`] (a
 /// hole-punch-confirmed direct candidate, `is_relay=false`) and
 /// [`ensure_relay_transport`] (pointing a peer at its `RelayTransport`'s
 /// local relay socket, Cycle 4c Task 8, `is_relay=true`).
@@ -1656,11 +1676,73 @@ async fn apply_device_if_changed(
     }
     let ifn = ifname.to_string();
     let dev = dev.clone();
+    let peers = dev.peers.clone();
     tokio::task::spawn_blocking(move || uapi::apply(&ifn, &dev))
         .await
         .context("active-tun UAPI apply task panicked")??;
-    active.lock().unwrap().applied_config = Some(encoded);
+    // Keep both change-guard fields in lockstep: `applied_peers` is the
+    // structured mirror of the config just pushed, which `apply_state`'s
+    // incremental-add delta diffs against (T8 make-before-break).
+    {
+        let mut a = active.lock().unwrap();
+        a.applied_config = Some(encoded);
+        a.applied_peers = peers;
+    }
     Ok(())
+}
+
+/// How the desired peer set differs from what WireGuard currently holds —
+/// the decision `apply_state` makes between the incremental add-only path and
+/// the full `replace_peers` apply (T8 make-before-break, finding §2).
+enum PeerSetDelta {
+    /// The set is identical (order-insensitive) — no UAPI write needed.
+    Unchanged,
+    /// The only difference is brand-new peers; every peer already on the
+    /// device is byte-identical. Safe for the session-preserving
+    /// [`uapi::add_peers`]. Carries the peers to add.
+    PureAdditions(Vec<uapi::PeerConfig>),
+    /// A peer was removed, or an existing peer's endpoint/allowed-ips/keepalive
+    /// changed — the full apply is required (and its session reset accepted).
+    NeedsFullApply,
+}
+
+/// Classify the change from `prev` (peers currently on the device) to `next`
+/// (freshly built desired peers). Peers are identified by their WireGuard
+/// public key (unique per peer); a same-key peer whose other fields differ is
+/// a MODIFICATION (→ [`PeerSetDelta::NeedsFullApply`], since boringtun cannot
+/// modify a peer in place — see `uapi::apply`'s caveat). Only when every
+/// pre-existing peer is byte-identical AND nothing was removed do added peers
+/// yield [`PeerSetDelta::PureAdditions`].
+fn classify_peer_delta(prev: &[uapi::PeerConfig], next: &[uapi::PeerConfig]) -> PeerSetDelta {
+    use std::collections::HashMap;
+    let prev_by_key: HashMap<&str, &uapi::PeerConfig> =
+        prev.iter().map(|p| (p.public_key_b64.as_str(), p)).collect();
+    let next_keys: std::collections::HashSet<&str> =
+        next.iter().map(|p| p.public_key_b64.as_str()).collect();
+
+    // Any peer removed (present before, absent now) forces a full apply.
+    if prev.iter().any(|p| !next_keys.contains(p.public_key_b64.as_str())) {
+        return PeerSetDelta::NeedsFullApply;
+    }
+
+    let mut added = Vec::new();
+    for p in next {
+        match prev_by_key.get(p.public_key_b64.as_str()) {
+            // Pre-existing peer: must be unchanged, else it's a modify.
+            Some(existing) => {
+                if **existing != *p {
+                    return PeerSetDelta::NeedsFullApply;
+                }
+            }
+            None => added.push(p.clone()),
+        }
+    }
+
+    if added.is_empty() {
+        PeerSetDelta::Unchanged
+    } else {
+        PeerSetDelta::PureAdditions(added)
+    }
 }
 
 /// Apply one desired state to the data plane (tunnel peers, enforcer, routes).
@@ -1698,7 +1780,50 @@ async fn apply_state(
         let live = live_endpoints.lock().unwrap();
         reconcile::device_config_pinned(ds, &priv_key, wg_port, &pins, &live)
     };
-    apply_device_if_changed(&ifname, &dev, active).await?;
+    // T8 make-before-break (finding §2): classify the change from what
+    // WireGuard currently holds (`applied_peers`) to the freshly built
+    // desired peer set. If the ONLY change is added peers — a newcomer
+    // enrolling with every existing peer byte-identical, no removals or
+    // modifications — apply just the new peers via the incremental,
+    // session-preserving `uapi::add_peers` so established pairs keep flowing
+    // uninterrupted (the full `replace_peers` apply would clear_peers() and
+    // force every pair to re-handshake). Any removal/modification, or the
+    // boot/first apply (no prior config, so `private_key`/`listen_port` must
+    // be sent), falls through to the full apply.
+    let prior = {
+        let a = active.lock().unwrap();
+        a.applied_config.as_ref().map(|_| a.applied_peers.clone())
+    };
+    match prior.as_deref().map(|prev| classify_peer_delta(prev, &dev.peers)) {
+        Some(PeerSetDelta::Unchanged) => {
+            // No peer change at all — the full-apply guard would no-op too,
+            // but classifying here also correctly skips a pure REORDER (same
+            // set, different order) that the byte-guard would otherwise treat
+            // as a change and destructively re-apply.
+        }
+        Some(PeerSetDelta::PureAdditions(added)) => {
+            let encoded =
+                uapi::encode_set(&dev).context("encoding active-tun device config")?;
+            let ifn = ifname.clone();
+            tokio::task::spawn_blocking(move || uapi::add_peers(&ifn, &added))
+                .await
+                .context("incremental add-peers UAPI task panicked")??;
+            // The device now holds the previous (untouched) peers plus the
+            // added ones — exactly the set `encoded` describes; record both
+            // guard fields so a later re-reconcile/re-point stays consistent.
+            let mut a = active.lock().unwrap();
+            a.applied_config = Some(encoded);
+            a.applied_peers = dev.peers.clone();
+            eprintln!(
+                "wiremesh-gateway: incremental add of {} new peer(s) — existing sessions preserved",
+                dev.peers.len().saturating_sub(prior.as_deref().map_or(0, <[_]>::len)),
+            );
+        }
+        // Removal/modification, or boot/first apply (`None`): full apply.
+        Some(PeerSetDelta::NeedsFullApply) | None => {
+            apply_device_if_changed(&ifname, &dev, active).await?;
+        }
+    }
     // Apply the current policy IR to EVERY live enforcer (boot tun + every
     // rotation tun), not just the active one — a policy TIGHTENING during/after
     // a rotation overlap must reach the tun actually carrying traffic (Role A's
@@ -2235,18 +2360,25 @@ async fn run_rotation_ticks(rot: RotationShared) {
                             // session down. Seeding makes those recomputes a
                             // no-op on the data plane while the enforcer-policy
                             // loop (unguarded) still reaches the new tun.
-                            let applied_config = {
+                            let (applied_config, applied_peers) = {
                                 let ds_guard = rot.desired.lock().unwrap();
-                                ds_guard.as_ref().and_then(|ds| {
-                                    let pins = rot.wg0_pins.lock().unwrap();
-                                    // Same live-endpoint map the recomputes
-                                    // use (fix T4) — seed must match exactly.
-                                    let live = rot.live_endpoints.lock().unwrap();
-                                    let dev = reconcile::device_config_pinned(
-                                        ds, &a.new_priv, a.new_port, &pins, &live,
-                                    );
-                                    uapi::encode_set(&dev).ok()
-                                })
+                                ds_guard
+                                    .as_ref()
+                                    .and_then(|ds| {
+                                        let pins = rot.wg0_pins.lock().unwrap();
+                                        // Same live-endpoint map the recomputes
+                                        // use (fix T4) — seed must match exactly.
+                                        let live = rot.live_endpoints.lock().unwrap();
+                                        let dev = reconcile::device_config_pinned(
+                                            ds, &a.new_priv, a.new_port, &pins, &live,
+                                        );
+                                        // Seed BOTH guard fields (T8): the
+                                        // structured peers keep `apply_state`'s
+                                        // incremental-add delta consistent with
+                                        // the encoded bytes right after the flip.
+                                        uapi::encode_set(&dev).ok().map(|enc| (enc, dev.peers))
+                                    })
+                                    .map_or((None, Vec::new()), |(enc, peers)| (Some(enc), peers))
                             };
                             // Flip the shared active descriptor onto the new tun:
                             // apply_state/set_peer_endpoint/path-ticks now all
@@ -2256,6 +2388,7 @@ async fn run_rotation_ticks(rot: RotationShared) {
                                 priv_key: a.new_priv.clone(),
                                 wg_port: a.new_port,
                                 applied_config,
+                                applied_peers,
                             };
                             eprintln!(
                                 "wiremesh-gateway: Role A cutover — routes flipped onto {} (epoch {epoch})",
@@ -2380,6 +2513,7 @@ mod tests {
                 priv_key: String::new(),
                 wg_port: 0,
                 applied_config: None,
+                applied_peers: Vec::new(),
             })),
             base_wg_port: 0,
             identity: Arc::new(Identity {

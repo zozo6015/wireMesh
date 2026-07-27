@@ -478,6 +478,103 @@ pub async fn build_snapshot(
     })
 }
 
+/// (Mesh-convergence T6, ops-finding "Relay Finding B") The REVOCATION-SCOPED
+/// snapshot an enrolled RELAY receives when it opens `Sync.Watch` (the
+/// operation the finding reports as wrongly rejected: a relay's leaf CN is
+/// `relay-<secret_hash_hex>`, never a `gateway.name`, so the gateway-only CN
+/// lookup denied it and its offline denylist never refreshed after
+/// enrollment).
+///
+/// A relay is NOT a gateway and must never receive gateway desired-state:
+/// this snapshot carries ONLY what the relay's denylist consumer needs —
+/// `revoked_serials` (its `Denylist::replace_all` input) and the persisted
+/// `revision` — with `peers`, `relay_infos`, and `policy_ir`/`policy_version`
+/// all deliberately EMPTY/`0`. That omission is the security boundary
+/// (`services::sync`'s relay watch branch mirrors it for deltas), not an
+/// optimization: a relay bridges opaque WireGuard datagrams and has no use
+/// for — and must not be told — the mesh's peer set or compiled policy.
+/// `self_cert_pem` is echoed back the same way [`build_snapshot`] echoes a
+/// gateway's, so the relay's consumer sees the identical `StateSnapshot`
+/// shape (first message on the stream) it already expects.
+///
+/// `#[allow(deprecated)]`: constructing `StateSnapshot` requires setting
+/// `deprecated_relays` (see [`build_snapshot`]'s identical note).
+#[allow(deprecated)]
+pub async fn build_relay_revocation_snapshot(
+    db: &DbHandle,
+    self_cert_pem: String,
+) -> anyhow::Result<StateSnapshot> {
+    let revision = db.current_revision().await?;
+    let revoked_serials = db.revoked_serials().await?;
+    Ok(StateSnapshot {
+        revision,
+        self_cert_pem,
+        peers: Vec::new(),
+        deprecated_relays: Vec::new(),
+        relay_infos: Vec::new(),
+        policy_ir: Vec::new(),
+        policy_version: 0,
+        revoked_serials,
+    })
+}
+
+/// (Mesh-convergence T6, ops-finding "Relay Finding B") Turns a
+/// [`ChangeEvent`] into the REVOCATION-ONLY [`Delta`] an enrolled relay's
+/// `Sync.Watch` forwards — or `None` for any event that carries no
+/// revocation, so the relay's stream stays limited to the denylist-relevant
+/// subset.
+///
+/// This is the delta-side twin of [`build_relay_revocation_snapshot`]'s
+/// security boundary. Only two `ChangeEvent`s bear revocation:
+///
+///   * [`ChangeEvent::CertRevoked`] — `Admin.RevokeCert` (the relay's
+///     `Denylist::union` input);
+///   * [`ChangeEvent::GatewayDrained`] — a drain revokes the drained
+///     gateway's cert serial(s); its `revoked_serials` are forwarded, but its
+///     `removed_peer_ids` (gateway peer-set desired-state) are DROPPED — a
+///     relay must never learn peer removals.
+///
+/// Every other event (peer upserts, key rotations, policy updates, relay-set
+/// changes) returns `None` and never reaches a relay. Critically this means a
+/// relay's stream also never carries `upserted_peers`, `policy_ir`, a
+/// `PunchDirective`, or a `RotateDirective` — the last two aren't even
+/// broadcast events (the punch broker and rotation directives are per-gateway
+/// channels the relay watch branch never wires up at all — see
+/// `services::sync`).
+///
+/// `#[allow(deprecated)]`: constructing `Delta` requires setting
+/// `deprecated_relays` (see [`delta_for_change`]'s identical note).
+#[allow(deprecated)]
+pub fn relay_revocation_delta(event: ChangeEvent) -> Option<Delta> {
+    let (revoked_serials, revision) = match event {
+        ChangeEvent::CertRevoked { serial, revision } => (vec![serial], revision),
+        ChangeEvent::GatewayDrained {
+            revoked_serials,
+            revision,
+            ..
+        } => {
+            if revoked_serials.is_empty() {
+                // A drain that revoked nothing has no denylist news for a
+                // relay — don't forward an empty, contentless delta.
+                return None;
+            }
+            (revoked_serials, revision)
+        }
+        _ => return None,
+    };
+    Some(Delta {
+        revision,
+        upserted_peers: Vec::new(),
+        removed_peer_ids: Vec::new(),
+        deprecated_relays: Vec::new(),
+        relay_infos: Vec::new(),
+        relays_updated: false,
+        policy_ir: Vec::new(),
+        policy_version: 0,
+        revoked_serials,
+    })
+}
+
 /// (Key-rotation Task 2; DRY extraction) Re-reads `gateway_id`'s current
 /// segment identity, `allowed_ips`, and FULL current key set (all
 /// epochs/states), then publishes a [`ChangeEvent::KeyRotated`] — the shared

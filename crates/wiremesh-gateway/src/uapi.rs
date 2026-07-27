@@ -27,7 +27,7 @@ use std::time::{Duration, SystemTime};
 /// least as warm).
 pub const PERSISTENT_KEEPALIVE_SECS: u16 = 25;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerConfig {
     pub public_key_b64: String,
     pub endpoint: Option<String>,
@@ -52,24 +52,65 @@ fn key_b64_to_hex(b64: &str) -> anyhow::Result<String> {
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Render one peer's `set` block (public_key + endpoint? + replace_allowed_ips
+/// + allowed_ip* + persistent_keepalive_interval). Shared by [`encode_set`]
+/// (full config) and [`encode_add_peers`] (incremental add-only).
+fn push_peer_block(s: &mut String, p: &PeerConfig) -> anyhow::Result<()> {
+    s.push_str(&format!("public_key={}\n", key_b64_to_hex(&p.public_key_b64)?));
+    if let Some(ep) = &p.endpoint {
+        s.push_str(&format!("endpoint={ep}\n"));
+    }
+    s.push_str("replace_allowed_ips=true\n");
+    for cidr in &p.allowed_ips {
+        s.push_str(&format!("allowed_ip={cidr}\n"));
+    }
+    s.push_str(&format!("persistent_keepalive_interval={}\n", p.keepalive_secs));
+    Ok(())
+}
+
 pub fn encode_set(cfg: &DeviceConfig) -> anyhow::Result<String> {
     let mut s = String::new();
     s.push_str(&format!("private_key={}\n", key_b64_to_hex(&cfg.private_key_b64)?));
     s.push_str(&format!("listen_port={}\n", cfg.listen_port));
     s.push_str("replace_peers=true\n");
     for p in &cfg.peers {
-        s.push_str(&format!("public_key={}\n", key_b64_to_hex(&p.public_key_b64)?));
-        if let Some(ep) = &p.endpoint {
-            s.push_str(&format!("endpoint={ep}\n"));
-        }
-        s.push_str("replace_allowed_ips=true\n");
-        for cidr in &p.allowed_ips {
-            s.push_str(&format!("allowed_ip={cidr}\n"));
-        }
-        s.push_str(&format!("persistent_keepalive_interval={}\n", p.keepalive_secs));
+        push_peer_block(&mut s, p)?;
     }
     s.push('\n'); // blank line terminates the request
     Ok(s)
+}
+
+/// Encode an INCREMENTAL ADD-ONLY `set`: only the given peers' blocks, with
+/// NO `private_key`/`listen_port`/`replace_peers` lines. Applied to a device
+/// that already has those set, this CREATES each peer and leaves every
+/// existing peer's live noise session UNTOUCHED — the make-before-break
+/// peer-add path (mesh-convergence fix cycle, T8 done-bar; finding §2 in
+/// `docs/research/ops-finding-multi-gateway-convergence.md`: a newcomer
+/// enrolling must not interrupt an established pair's traffic).
+///
+/// Safety rests on a boringtun 0.6.0 UAPI fact confirmed from source
+/// (`device/api.rs` top-level `set` loop + `device/mod.rs::update_peer`):
+/// absent a `replace_peers=true` line, a `public_key=` block dispatches to
+/// `api_set_peer`, and `update_peer` for a pubkey NOT already present takes
+/// the CREATE path (`Tunn::new`) — the same code initial peer creation runs.
+/// The panic ("Modifying existing peers is not yet supported") fires ONLY
+/// for an already-present peer, so callers MUST pass only brand-new pubkeys
+/// (the `apply_state` delta guarantees this). Every peer still carries the
+/// T1 persistent keepalive via [`push_peer_block`].
+pub fn encode_add_peers(peers: &[PeerConfig]) -> anyhow::Result<String> {
+    let mut s = String::new();
+    for p in peers {
+        push_peer_block(&mut s, p)?;
+    }
+    s.push('\n'); // blank line terminates the request
+    Ok(s)
+}
+
+/// Apply an incremental add-only set (see [`encode_add_peers`]) to `ifname`.
+/// The caller MUST have verified every peer is brand-new (not already on the
+/// device) — see that function's safety note.
+pub fn add_peers(ifname: &str, peers: &[PeerConfig]) -> anyhow::Result<()> {
+    send_set(ifname, &encode_add_peers(peers)?)
 }
 
 /// Derive the base64 WireGuard public key from a base64 private key.
@@ -97,12 +138,22 @@ pub fn base64_pub_from_priv(priv_b64: &str) -> anyhow::Result<String> {
 /// REJECTED on evidence: exercising boringtun's live `remove_peer`+re-add
 /// path left the re-added peer with traffic flowing but NO current session
 /// reported (relay_matrix case1's real-handshake assertion failed
-/// deterministically), while the full apply passes. Until boringtun is
-/// patched/upgraded, the full apply is the only safe write path; the
-/// finding-§2 consequence (a desired-state change resets established
-/// sessions) is bounded by the change-guard plus the T4 live-endpoint pins,
-/// which at least guarantee the rebuilt peers keep their live endpoints and
-/// re-handshake to the RIGHT place immediately.
+/// deterministically), while the full apply passes.
+///
+/// The PURE-ADDITION case — a newcomer enrolling while established pairs
+/// keep flowing (finding §2 make-before-break, T8 done-bar) — is now handled
+/// WITHOUT this destructive path: `apply_state` diffs the applied peer set
+/// and, when the only change is added peers, uses the incremental
+/// [`add_peers`] set instead, which creates the new peers and leaves every
+/// existing session untouched. This full apply remains for the boot/first
+/// apply (needs `private_key`/`listen_port`) and for any change that
+/// REMOVES or MODIFIES an existing peer (e.g. `set_peer_endpoint`'s endpoint
+/// re-point — a modify, where the session reset is acceptable because the
+/// re-point already expects a fresh handshake). For those, the finding-§2
+/// consequence (an established peer's session reset) is bounded by the
+/// change-guard plus the T4 live-endpoint pins, which guarantee the rebuilt
+/// peers keep their live endpoints and re-handshake to the RIGHT place
+/// immediately.
 pub fn apply(ifname: &str, cfg: &DeviceConfig) -> anyhow::Result<()> {
     send_set(ifname, &encode_set(cfg)?)
 }

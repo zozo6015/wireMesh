@@ -14,10 +14,10 @@ priority: optional
 overrides:
   deb:
     depends:
-      - passwd          # groupadd/useradd (postinstall-server.sh)
+      - passwd          # groupadd/useradd (postinstall-relay.sh)
   rpm:
     depends:
-      - shadow-utils    # groupadd/useradd (postinstall-server.sh)
+      - shadow-utils    # groupadd/useradd (postinstall-relay.sh)
 contents:
   - src: dist/linux-${ARCH}/relay
     dst: /usr/bin/wiremesh-relay
@@ -31,6 +31,10 @@ contents:
     dst: /etc/wiremesh/relay.env
     type: "config|noreplace"
 scripts:
-  postinstall: deploy/packages/scripts/postinstall-server.sh
+  # Relay-specific postinstall: creates the DEDICATED /var/lib/wiremesh-relay
+  # state dir (wiremesh:wiremesh, 0700) in addition to the shared user/group —
+  # the relay must not share the gateway's root-only /var/lib/wiremesh
+  # (ops finding 2026-07-27/28, "Relay Finding A").
+  postinstall: deploy/packages/scripts/postinstall-relay.sh
   preremove: deploy/packages/scripts/preremove-relay.sh
   postremove: deploy/packages/scripts/postremove.sh

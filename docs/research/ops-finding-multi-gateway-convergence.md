@@ -44,6 +44,93 @@ suite reproducing this exact topology.
    no `wiremesh_gateway` metric for per-peer rx/tx deltas or last-handshake,
    which made every diagnosis require UAPI spelunking via debug containers.
 
+## Deeper root cause the T8 done-bar proved (2026-07-28): punch-socket starvation is a SEPARATE bug from the attempt-count storm
+
+The §3 fix (T3 punch back-off) bounds how OFTEN a permanently-undialable
+pair may punch — and the netns done-bar's anti-storm pin confirms it holds
+(attempt COUNT toward a blocked pair stays bounded over a fixed window). But
+the T8 done-bar surfaced that bounding the count is **not sufficient**: the
+harm §3 hinted at ("transient SO_REUSEPORT punchers plausibly steal inbound
+WG packets on :51820") is real and independent of attempt frequency.
+
+**Mechanism (proved under netns):** every punch attempt — even one the
+back-off admits — opens a transient same-port `SO_REUSEPORT` socket on the
+gateway's SHARED WireGuard listen port (:51820). While that puncher is open,
+inbound WireGuard datagrams on :51820 destined for an *already-established,
+unrelated* peer can be delivered to the puncher socket instead of boringtun,
+so that established peer's inbound liveness (keepalives/data) is starved.
+
+**Observable in the done-bar (clean netns run, 2026-07-28):** with gateway C
+permanently un-punchable (its NAT drops peer-sourced inbound UDP) both A and
+B keep issuing bounded punch attempts toward C; each attempt opens a
+transient puncher on that gateway's own :51820. At ~t+8.6s after C enrolls,
+gwA's and gwB's path SMs still both report the A↔B peer `direct` and the A↔B
+WG **endpoints are intact** (the endpoint-preserving add-only apply, commit
+0302d2c, prevents the endpoint clobber of §2 item 2) — yet the ESTABLISHED
+A↔B WG **session** has reset (`latest handshake` back to 0/never, rx frozen
+near zero), so a FRESH workload connection opened across the window cannot
+complete its handshake and times out. The observed fact is:
+**make-before-break at the ENDPOINT level is necessary but not sufficient —
+under a concurrent punch storm toward a permanently-blocked newcomer, the
+established pair still loses its live session for several seconds.** The
+primary cause is the punch-socket starvation above (C-directed punchers on
+gwA/gwB :51820 stealing the A↔B rehandshake response); a secondary
+contributor to disambiguate during the fix is whether adding C also triggers
+a session-rebuilding apply on the A↔B peer despite the add-only path being
+taken for the endpoint — but both point at the same architectural fix
+(§ "Fix direction" below).
+
+Note this refines (does not match) the earlier hand-diagnosis that "on-demand
+A↔B data keeps crossing while only the path SM flaps": in the netns repro the
+session reset does interrupt fresh data-plane connections, not merely the
+liveness SM — a long-lived flow may tolerate the gap better than the
+fresh-connection probe the done-bar uses, but the session reset is real.
+
+**Why T1/T2/T3 don't cover it:** T1 (persistent keepalive) keeps the mapping
+warm but cannot help if the keepalive's inbound reply is stolen before it
+reaches boringtun; T2 (rx-liveness) then *correctly* reports the path as not
+live (rx really did stall) — the SM flap is a true negative, not a false one;
+T3 bounds attempt count but each admitted attempt still opens the thieving
+socket; T4 preserves the endpoint but not, under this contention, the live
+session. The defect is architectural: **the puncher must not share or steal
+the WG listen socket** (and the reconcile path must not rebuild an
+established peer's session when a newcomer is added).
+
+**Fix direction (next cycle):** give the puncher a DEDICATED socket / keep it
+off the WG listen port so a punch in flight can never intercept an
+established peer's inbound WG traffic; alternatively (or additionally)
+resolve the boringtun live `remove_peer`+re-add relay-session bug that
+blocked the surgical single-peer endpoint-update alternative (see
+`crates/wiremesh-gateway/src/main.rs::set_peer_endpoint`'s caveat), which
+would let the reconcile path avoid full-device re-applies that compound the
+contention window.
+
+**Done-bar for it — BOTH tests in
+`crates/wiremesh-gateway/tests/convergence_matrix.rs` are `#[ignore]`d
+against this root cause** (assertions preserved intact and un-weakened as the
+next cycle's executable spec; un-ignore both once the puncher is off the
+shared WG port):
+
+- `t8_convergence_incident_lifecycle` (assertions 1–3): assertions 1 (A↔B
+  direct) and 2 (C settles relayed, bounded punch attempts) PASS; assertion 3
+  (make-before-break session continuity) is blocked — adding C while C
+  punch-storms its blocked pairs resets the established A↔B session (above),
+  so the fresh-connection continuity probe fails ~t+8.6s after C's enrollment
+  even though endpoints/path-state are preserved.
+- `t8_keepalive_holds_path_state_under_punch_contention` (assertion 4): path
+  state must hold through a 90s idle and post-idle traffic must flow without a
+  re-punch cycle — blocked by the same session reset/starvation.
+
+Both go green once the session-preservation gap is closed. What the done-bar
+PROVED, concisely: (a) endpoint-level make-before-break works (endpoints and
+path_state preserved — verified live) but is insufficient; (b) under a
+permanently-blocked newcomer's punch storm, established peers' WG SESSIONS
+reset (handshake→0, rx frozen) even with the add-only apply, so BOTH A3 and
+A4 fail; (c) root cause = the transient SO_REUSEPORT punch socket on the
+shared :51820 stealing other peers' inbound; (d) fix = a dedicated puncher
+socket / stop sharing the WG listen port (and/or resolve the boringtun
+remove+re-add relay-session bug).
+
 ## Relay deployment (mid-incident) — worked, with two findings
 
 `wiremesh-relay` v0.1.1 deployed on the FI host per docs/install.md:
@@ -68,6 +155,10 @@ suite reproducing this exact topology.
    NAT-ed gateways and keeps punch-created mappings warm.
 2. Punch back-off: a pair that repeatedly fails N punches should back off to
    slow retries (and prefer relay when available) instead of a永-storm.
+   **(Done in this cycle as T3 — bounds attempt COUNT. But see "Deeper root
+   cause the T8 done-bar proved" above: bounding count is not enough; the
+   puncher must ALSO stop sharing/stealing the WG listen socket. Carried to
+   the next cycle.)**
 3. Make-before-break peer-set updates: never reset an ESTABLISHED tunnel's
    endpoint when re-applying peers; only add/remove.
 4. Path-liveness: require rx-delta corroboration before reporting `direct`

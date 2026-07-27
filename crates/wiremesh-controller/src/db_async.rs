@@ -282,6 +282,12 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.find_gateway_by_name(&name)).await?
     }
 
+    /// See [`Db::find_relay_by_name`].
+    pub async fn find_relay_by_name(&self, name: String) -> Result<Option<i64>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.find_relay_by_name(&name)).await?
+    }
+
     /// See [`Db::drain_gateway`].
     pub async fn drain_gateway(
         &self,

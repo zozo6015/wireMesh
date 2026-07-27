@@ -2704,6 +2704,39 @@ impl Db {
         .map_err(Into::into)
     }
 
+    /// (Mesh-convergence T6, ops-finding "Relay Finding B") Resolves a Sync
+    /// mTLS client cert's subject CN to an enrolled RELAY's row id, or `None`
+    /// if no `relay` row carries that `name`. The relay analog of
+    /// [`Db::find_gateway_by_name`]: a relay's leaf carries CN
+    /// `relay-<secret_hash_hex>` (see `services::enrollment`'s relay branch),
+    /// which is exactly the value `enroll_relay` stamps into `relay.name` —
+    /// so authorizing a relay's revocation watch is a lookup against THAT
+    /// column, never the SAN (the SAN is the constant `"relay"` kind marker,
+    /// not an identity).
+    ///
+    /// DELIBERATELY not filtered on `status`: unlike a gateway (whose
+    /// `status = 'active'` filter keeps a drained/replaced gateway from
+    /// pulling a full desired-state snapshot of a fabric it no longer belongs
+    /// to — see [`Db::find_gateway_by_name`]'s doc comment), a relay's
+    /// non-`active` status is a HEALTH-eviction state set by the report
+    /// health pipeline (`set_relay_status`), not a revocation/de-enrollment.
+    /// A temporarily-evicted relay must keep receiving revocation updates so
+    /// its offline denylist stays fresh for when it is re-admitted, and the
+    /// stream it is authorized for carries ONLY revocation data (no peers, no
+    /// policy — see `services::sync`'s relay watch branch and
+    /// `projection::build_relay_revocation_snapshot`), so there is no
+    /// desired-state disclosure to guard against here.
+    pub fn find_relay_by_name(&self, name: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM relay WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
     /// (Task 15) The `observe_key` issued to `gateway_id` at enrollment, if
     /// it currently exists AND is `status = 'active'` — `None` for an
     /// unknown gateway_id and for one that's been drained/replaced, so a

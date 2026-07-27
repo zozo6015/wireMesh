@@ -66,10 +66,11 @@ pub struct PunchBackoff {
     /// half-open: if it fails too, the next window doubles.
     consecutive_failures: u32,
     /// The last candidate SET this pair was decided against. Compared as an
-    /// unordered set: `set_peer_endpoint` reorders candidates and a reorder
-    /// is not new information, but a genuinely different set (a fresh
-    /// observed mapping, new local endpoints) is fresh information worth
-    /// punching immediately — it resets the counter and clears any window.
+    /// unordered set: candidate ordering carries no meaning, so a mere
+    /// reordering (or duplicate) of the same members is not new information,
+    /// but a genuinely different set (a fresh observed mapping, new local
+    /// endpoints) is fresh information worth punching immediately — it resets
+    /// the counter and clears any window.
     last_candidates: Option<BTreeSet<String>>,
     /// The open back-off window's end, if one is open.
     window_until: Option<Instant>,
@@ -92,9 +93,9 @@ impl PunchBackoff {
     /// Consulted before EVERY attempt. A candidate set differing from the
     /// last-seen one resets the failure counter, clears any open window,
     /// and allows immediately (fresh candidates = fresh information); the
-    /// SAME set reordered or duplicated is not a change (otherwise
-    /// `set_peer_endpoint`'s candidate reorder would quietly re-arm the
-    /// storm the incident produced).
+    /// SAME set reordered or duplicated is not a change (otherwise a mere
+    /// candidate reordering would quietly re-arm the storm the incident
+    /// produced).
     pub fn decide(&mut self, now: Instant, candidates: &[String]) -> PunchDecision {
         let set: BTreeSet<String> = candidates.iter().cloned().collect();
         match &self.last_candidates {
