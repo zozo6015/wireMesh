@@ -41,7 +41,7 @@ async fn receives_snapshot_and_reports_version() {
         },
     };
 
-    let mut client = sync::connect(h.sync_tcp_addr(), &id).await.expect("mTLS connect");
+    let mut client = sync::connect(&h.sync_tcp_addr().to_string(), &id).await.expect("mTLS connect");
     let mut stream = sync::watch(&mut client).await.expect("watch");
     let mut cur = None;
     // The first Sync message is always a snapshot, surfaced as SyncEvent::State.
