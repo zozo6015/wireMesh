@@ -57,6 +57,17 @@ const SYNC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A record.
 const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound on the DNS lookup in [`resolve_host_port`]. `getaddrinfo` has no
+/// application-level timeout of its own, and [`SYNC_CONNECT_TIMEOUT`] cannot
+/// cover the resolve phase because resolution happens BEFORE the dial — so
+/// without this bound a hung OS resolver (e.g. the DDNS host's configured
+/// nameserver blackholing) would stall the Sync reconnect loop and the
+/// observe tick indefinitely: the same silent-hang class the Sync keepalive
+/// exists to kill (`docs/research/ops-finding-sync-half-open-stream.md`). On
+/// expiry the caller gets an error and retries on its own cadence, each
+/// attempt resolving fresh.
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Resolve a `host:port` dial target — a DNS hostname or an IPv4 literal —
 /// to one `SocketAddr`: the first IPv4 result ([`prefer_ipv4`]). A name that
 /// resolves to only IPv6 is an ERROR, not a fallback — v1 is IPv4-only end
@@ -69,8 +80,9 @@ const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// literals pass through `lookup_host` without touching DNS, so netns tests
 /// and IP-configured deployments never depend on a resolver.
 pub async fn resolve_host_port(s: &str) -> anyhow::Result<SocketAddr> {
-    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(s)
+    let addrs: Vec<SocketAddr> = tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(s))
         .await
+        .map_err(|_| anyhow!("DNS resolution of {s:?} timed out after {RESOLVE_TIMEOUT:?}"))?
         .with_context(|| format!("resolving {s:?}"))?
         .collect();
     prefer_ipv4(&addrs)

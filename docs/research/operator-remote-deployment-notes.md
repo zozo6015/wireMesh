@@ -99,7 +99,10 @@ reconnect and the observe loop re-resolves every tick (the DDNS pickup paths),
 and the Sync channel gained HTTP/2 keepalive so a dead link actually surfaces
 and triggers that re-resolving reconnect (see
 `ops-finding-sync-half-open-stream.md`). `domain_name("127.0.0.1")` unchanged.
-The analysis below is kept as written.
+
+The analysis below is the original pre-fix finding, kept verbatim for the
+record — its present-tense statements ("you must bake a resolved IP…",
+"should land…") no longer apply:
 
 The gateway's `--controller-sync` and `--observe` flags parse straight into a
 `std::net::SocketAddr` (`gateway/src/config.rs:38-39`;
