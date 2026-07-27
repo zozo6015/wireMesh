@@ -202,13 +202,31 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // SO_REUSEPORT alongside boringtun's own live socket on that same port
     // (spec §5.4) — see observe::report_once / observe::reuseport_udp.
     {
-        let observe_addr = cfg.observe_addr;
+        let observe_addr = cfg.observe_addr.clone();
         let key = id.observe_key.clone();
         let gid = id.gateway_id;
         let port = cfg.wg_listen_port;
         tokio::spawn(async move {
             loop {
-                let (k, a) = (key.clone(), observe_addr);
+                // Resolve the observe `host:port` fresh EVERY tick — for a
+                // controller behind a DDNS name this per-tick re-resolution
+                // is what repoints observation at a rotated public IP without
+                // a restart (see `sync::resolve_host_port`). A failed
+                // resolution skips the tick; the next one retries.
+                let a = match sync::resolve_host_port(&observe_addr).await {
+                    Ok(a) => a,
+                    // `{e:#}` (whole anyhow chain) because the io cause is
+                    // the actionable part for a DDNS operator: NXDOMAIN vs
+                    // dead resolver vs timeout. Distinct wording from the
+                    // probe's "observe failed:" below so the two failure
+                    // stages triage apart in logs.
+                    Err(e) => {
+                        eprintln!("wiremesh-gateway: observe resolve failed: {e:#}");
+                        tokio::time::sleep(OBSERVE_PERIOD).await;
+                        continue;
+                    }
+                };
+                let k = key.clone();
                 let res = tokio::task::spawn_blocking(move || observe::report_once(port, a, &k, gid)).await;
                 match res {
                     Ok(Ok(addr)) => eprintln!("wiremesh-gateway: observed endpoint {addr}"),
@@ -338,7 +356,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         base_tun: cfg.tun_ifname.clone(),
         state_dir: cfg.state_dir.clone(),
         identity: Arc::new(id.clone()),
-        controller_sync_addr: cfg.controller_sync_addr,
+        controller_sync_addr: cfg.controller_sync_addr.clone(),
         rotation: Arc::new(std::sync::Mutex::new(Rotation::new())),
         role_a: Arc::new(std::sync::Mutex::new(None)),
         role_b: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -351,7 +369,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
 
     // Sync loop with reconnect.
     loop {
-        match sync::connect(cfg.controller_sync_addr, &id).await {
+        match sync::connect(&cfg.controller_sync_addr, &id).await {
             Ok(mut client) => {
                 let mut stream = match sync::watch(&mut client).await {
                     Ok(s) => s,
@@ -475,7 +493,11 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     }
                 }
             }
-            Err(e) => eprintln!("controller unreachable: {e}; staying fail-static, retrying"),
+            // `{e:#}`: this line now also carries DNS-resolution failures
+            // (`sync::connect` resolves per dial), and the io cause —
+            // NXDOMAIN vs dead resolver vs dial timeout — is what a DDNS
+            // operator needs to act on.
+            Err(e) => eprintln!("controller unreachable: {e:#}; staying fail-static, retrying"),
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -1422,7 +1444,10 @@ struct RotationShared {
     base_tun: String,
     state_dir: PathBuf,
     identity: Arc<Identity>,
-    controller_sync_addr: SocketAddr,
+    /// Controller Sync dial target as `host:port` (hostname or IP literal) —
+    /// kept unresolved so [`send_epoch_ack`]'s short-lived channel, like the
+    /// main sync loop, re-resolves DNS at every dial (`sync::connect`).
+    controller_sync_addr: String,
     /// This gateway's own rotation state machine (Role A). `on_directive`
     /// (sync loop) and `on_new_epoch_session` (tick) both drive it.
     rotation: Arc<std::sync::Mutex<Rotation>>,
@@ -1786,7 +1811,7 @@ async fn read_live_peers(
 /// unary Report neither registers a Watch nor disturbs the open one.
 async fn send_epoch_ack(rot: &RotationShared, ack: EpochAck) -> anyhow::Result<()> {
     let mut client: SyncClient<Channel> =
-        sync::connect(rot.controller_sync_addr, &rot.identity).await?;
+        sync::connect(&rot.controller_sync_addr, &rot.identity).await?;
     sync::report(&mut client, 0, vec![], vec![], vec![ack]).await
 }
 

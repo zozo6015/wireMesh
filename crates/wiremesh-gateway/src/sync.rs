@@ -3,6 +3,7 @@ use crate::identity::Identity;
 use crate::state::DesiredState;
 use anyhow::{anyhow, Context};
 use std::net::SocketAddr;
+use std::time::Duration;
 use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity as TlsIdentity};
 use wiremesh_proto::v1::sync_client::SyncClient;
@@ -27,8 +28,72 @@ pub enum SyncEvent {
     Rotate(RotateDirective),
 }
 
-pub async fn connect(sync_addr: SocketAddr, id: &Identity) -> anyhow::Result<SyncClient<Channel>> {
-    let uri = format!("https://{sync_addr}");
+/// HTTP/2 PING cadence on the Sync channel, sent even while the channel is
+/// otherwise idle (`keep_alive_while_idle`) — and the long-lived `Sync.Watch`
+/// stream IS the idle case: it receives nothing between policy pushes, so
+/// without a keepalive it is completely silent on the wire. A NAT/conntrack
+/// entry that times out on that silence leaves the stream half-open — the
+/// FIN/RST never reaches the gateway, whose blocked stream read waits forever
+/// while it silently misses every policy update, `PunchDirective`, and
+/// `RotateDirective` (observed live for ~3 days on zolab; see
+/// `docs/research/ops-finding-sync-half-open-stream.md`). The PING forces
+/// periodic traffic both to keep middlebox entries warm and, with
+/// [`SYNC_KEEPALIVE_TIMEOUT`], to surface a dead link as a stream error
+/// within ~25s worst case — which the reconnect loop in `main.rs` already
+/// handles correctly (and re-resolves DNS via [`connect`], so a rotated DDNS
+/// address heals too). 15s stays comfortably inside common home-router idle
+/// timeouts (minutes for TCP) without meaningful load on the controller.
+const SYNC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long an unanswered keepalive PING may go unacknowledged before the
+/// channel is declared dead and the error is surfaced to the reconnect loop.
+/// See [`SYNC_KEEPALIVE_INTERVAL`] for the half-open-stream rationale.
+const SYNC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Bound on the TCP/TLS dial itself. Without one, a dial toward a stale DDNS
+/// address that blackholes (no RST) can hang the reconnect loop far longer
+/// than the DNS record's own churn; a bounded dial keeps the
+/// resolve-dial-retry cycle turning so the next attempt picks up the fresh
+/// A record.
+const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Resolve a `host:port` dial target — a DNS hostname or an IP literal — to
+/// one `SocketAddr`, preferring the first IPv4 result (v1 is IPv4-only, spec
+/// §1) and falling back to the first result of any family. Callers resolve
+/// fresh at every dial/tick ON PURPOSE: a DDNS name's A record changes when
+/// the ISP rotates the controller's public IP, and per-reconnect (Sync) /
+/// per-tick (observe) re-resolution is what picks the new address up without
+/// a gateway restart (`docs/research/operator-remote-deployment-notes.md`
+/// Finding 3). IP literals pass through `lookup_host` without touching DNS,
+/// so netns tests and IP-configured deployments never depend on a resolver.
+pub async fn resolve_host_port(s: &str) -> anyhow::Result<SocketAddr> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host(s)
+        .await
+        .with_context(|| format!("resolving {s:?}"))?
+        .collect();
+    prefer_ipv4(&addrs).ok_or_else(|| anyhow!("{s:?} resolved to no addresses"))
+}
+
+/// The pure address-selection policy behind [`resolve_host_port`]: the first
+/// IPv4 result wins (v1 is IPv4-only, spec §1); a list with no IPv4 entry
+/// falls back to its first result; an empty list yields `None`. Factored out
+/// of the resolver so the preference order is deterministic against a
+/// synthetic candidate list, without a resolver in the loop.
+pub fn prefer_ipv4(addrs: &[SocketAddr]) -> Option<SocketAddr> {
+    addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first()).copied()
+}
+
+/// Dial the controller Sync endpoint (`host:port`, hostname or IP literal)
+/// over mTLS. DNS resolution happens HERE, inside every call, so the
+/// reconnect loop's redial after a keepalive-detected dead link also picks up
+/// a rotated DDNS address (see [`resolve_host_port`]). `domain_name` is the
+/// constant `127.0.0.1` regardless of what was dialed: the controller's TLS
+/// is hostname-agnostic by design — trust is anchored in the pinned private
+/// CA + mTLS, not public-PKI hostname validation (see the rationale at
+/// `wiremesh-controller/src/lib.rs` on the server leaf's constant SAN).
+pub async fn connect(sync_addr: &str, id: &Identity) -> anyhow::Result<SyncClient<Channel>> {
+    let resolved = resolve_host_port(sync_addr).await?;
+    let uri = format!("https://{resolved}");
     let tls = ClientTlsConfig::new()
         .identity(TlsIdentity::from_pem(&id.cert_pem, &id.key_pem))
         .ca_certificate(Certificate::from_pem(&id.ca_bundle_pem))
@@ -37,6 +102,10 @@ pub async fn connect(sync_addr: SocketAddr, id: &Identity) -> anyhow::Result<Syn
         .context("controller Sync addr must form a valid URI")?
         .tls_config(tls)
         .context("configuring gateway mTLS")?
+        .connect_timeout(SYNC_CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(SYNC_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(SYNC_KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
         .connect()
         .await
         .context("connecting to controller Sync (mTLS)")?;
