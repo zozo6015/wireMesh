@@ -9,8 +9,14 @@ use std::time::{Duration, Instant};
 
 /// WireGuard persistent-keepalive interval (spec §6.1): every peer sends a
 /// keepalive at this cadence, so authenticated inbound traffic should never
-/// naturally go quiet for longer than this while a path is healthy.
-pub const KEEPALIVE: Duration = Duration::from_secs(15);
+/// naturally go quiet for longer than this while a path is healthy. Tied to
+/// the single source of truth the UAPI writer emits
+/// (`uapi::PERSISTENT_KEEPALIVE_SECS`, 25s since mesh-convergence fix T1)
+/// so this liveness assumption can never drift from what the device is
+/// actually configured to send. Still comfortably inside [`DEGRADED_AFTER`]
+/// (45s), so a healthy path's keepalives always refresh liveness in time.
+pub const KEEPALIVE: Duration =
+    Duration::from_secs(crate::uapi::PERSISTENT_KEEPALIVE_SECS as u64);
 
 /// How long `Connecting` waits for a first WG handshake before deciding it
 /// needs relay help (spec §6.1: "no handshake within 10s").
@@ -147,11 +153,35 @@ impl Path {
         }
     }
 
-    /// A completed WireGuard handshake: recovers to `Direct` from any of
-    /// `Connecting`/`Degraded`/`Relayed` (spec §6.1). Also counts as
-    /// authenticated inbound. A handshake while already `Direct` is a
-    /// harmless no-op transition-wise, but still refreshes the timestamps.
-    pub fn on_handshake(&mut self, now: Instant) {
+    /// A completed WireGuard handshake: with `rx_corroborated == true`,
+    /// recovers to `Direct` from any of `Connecting`/`Degraded`/`Relayed`
+    /// (spec §6.1), also counting as authenticated inbound; a handshake
+    /// while already `Direct` is a harmless no-op transition-wise, but still
+    /// refreshes the timestamps.
+    ///
+    /// `rx_corroborated` is the driver's judgment that an `rx_bytes` delta
+    /// accompanied this handshake evidence within the liveness window
+    /// (mesh-convergence fix T2). A handshake-time advance WITHOUT that
+    /// corroboration is NOT liveness and is ignored outright: this
+    /// project's boringtun advances `last_handshake_time` while retrying an
+    /// unanswered session with `rx_bytes` frozen (the Cycle-4b caveat,
+    /// `docs/research/cycle4b-path-liveness-note.md`), and the 2026-07-27
+    /// incident showed the consequence live — a gateway reported `direct`
+    /// for a dead tunnel whose peer rx stayed 0, with handshakes "13-70s
+    /// ago" (`docs/research/ops-finding-multi-gateway-convergence.md` §4).
+    /// Ignoring the phantom advance means it cannot enter `Direct`, cannot
+    /// revive `Degraded`, cannot tear down a working `Relayed` path via the
+    /// make-before-break cutover, and — because `last_inbound` is untouched
+    /// — the existing silence rules ([`DEGRADED_AFTER`],
+    /// [`DEGRADED_DEAD_AFTER`]) keep running on the real last-corroborated
+    /// instant, so escalation to `Disconnected`/relay-needed still fires on
+    /// schedule. The driver may remember an uncorroborated advance and call
+    /// back with `rx_corroborated == true` once rx moves within the window
+    /// (see `main.rs::run_path_ticks`).
+    pub fn on_handshake(&mut self, now: Instant, rx_corroborated: bool) {
+        if !rx_corroborated {
+            return;
+        }
         self.last_handshake = Some(now);
         self.last_inbound = Some(now);
         self.state = PathState::Direct;
@@ -284,7 +314,7 @@ mod tests {
         assert_eq!(p.state, PathState::Connecting);
 
         let hs_at = t0 + Duration::from_secs(3);
-        p.on_handshake(hs_at);
+        p.on_handshake(hs_at, true);
         assert_eq!(p.state, PathState::Direct);
         assert_eq!(p.last_handshake, Some(hs_at));
         assert_eq!(p.last_inbound, Some(hs_at));
@@ -323,7 +353,7 @@ mod tests {
     fn direct_degrades_after_no_inbound() {
         let t0 = Instant::now();
         let mut p = Path::new(t0);
-        p.on_handshake(t0);
+        p.on_handshake(t0, true);
         assert_eq!(p.state, PathState::Direct);
 
         // Just before the threshold: still Direct.
@@ -341,7 +371,7 @@ mod tests {
     fn keepalive_inbound_prevents_degrade() {
         let t0 = Instant::now();
         let mut p = Path::new(t0);
-        p.on_handshake(t0);
+        p.on_handshake(t0, true);
         // A keepalive arrives inside the window, refreshing liveness.
         p.on_authenticated_inbound(t0 + KEEPALIVE);
         let action = p.tick(t0 + KEEPALIVE + DEGRADED_AFTER - Duration::from_secs(1), false);
@@ -353,11 +383,11 @@ mod tests {
     fn degraded_recovers_to_direct_on_handshake() {
         let t0 = Instant::now();
         let mut p = Path::new(t0);
-        p.on_handshake(t0);
+        p.on_handshake(t0, true);
         p.tick(t0 + DEGRADED_AFTER, false);
         assert_eq!(p.state, PathState::Degraded);
 
-        p.on_handshake(t0 + DEGRADED_AFTER + Duration::from_secs(1));
+        p.on_handshake(t0 + DEGRADED_AFTER + Duration::from_secs(1), true);
         assert_eq!(p.state, PathState::Direct);
     }
 
@@ -365,7 +395,7 @@ mod tests {
     fn degraded_drops_to_disconnected_when_dead_and_no_relay() {
         let t0 = Instant::now();
         let mut p = Path::new(t0);
-        p.on_handshake(t0);
+        p.on_handshake(t0, true);
         p.tick(t0 + DEGRADED_AFTER, false);
         assert_eq!(p.state, PathState::Degraded);
 
@@ -541,7 +571,7 @@ mod tests {
 
         // Recovery: a completed handshake resets backoff to BACKOFF_INITIAL
         // so the next disconnect's retry cadence starts fresh.
-        p.on_handshake(t + Duration::from_secs(1));
+        p.on_handshake(t + Duration::from_secs(1), true);
         assert_eq!(p.backoff, BACKOFF_INITIAL);
     }
 
@@ -558,7 +588,7 @@ mod tests {
         // A completed direct handshake is the make-before-break cutover:
         // recover straight to Direct, refreshing liveness timestamps.
         let hs_at = t0 + CONNECT_TIMEOUT + Duration::from_secs(3);
-        p.on_handshake(hs_at);
+        p.on_handshake(hs_at, true);
         assert_eq!(p.state, PathState::Direct);
         assert_eq!(p.last_handshake, Some(hs_at));
         assert_eq!(p.last_inbound, Some(hs_at));

@@ -42,8 +42,13 @@ impl Tunnel {
         })
     }
 
-    pub fn reconcile(&self, ds: &DesiredState, keepalive_secs: u16) -> anyhow::Result<()> {
-        let dev = reconcile::device_config(ds, &self.private_key_b64, self.listen_port, keepalive_secs);
+    /// Apply the desired peer set. The steady-state keepalive
+    /// (`uapi::PERSISTENT_KEEPALIVE_SECS`) is baked into
+    /// `reconcile::device_config` rather than passed through here
+    /// (mesh-convergence fix T1 — see that builder's doc for the finding §5
+    /// rationale), so no caller can reconcile a device without it.
+    pub fn reconcile(&self, ds: &DesiredState) -> anyhow::Result<()> {
+        let dev = reconcile::device_config(ds, &self.private_key_b64, self.listen_port);
         uapi::apply(&self.ifname, &dev)
     }
 }

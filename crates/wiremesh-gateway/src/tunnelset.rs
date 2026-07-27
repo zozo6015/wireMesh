@@ -97,13 +97,15 @@ impl TunnelSet {
     }
 
     /// Apply the desired peer set to epoch `epoch`'s tun. Bails if the epoch
-    /// is absent.
-    pub fn reconcile(&self, epoch: u32, ds: &DesiredState, keepalive_secs: u16) -> anyhow::Result<()> {
+    /// is absent. Keepalive is not a parameter — `Tunnel::reconcile` builds
+    /// via `reconcile::device_config`, which emits the always-on
+    /// `uapi::PERSISTENT_KEEPALIVE_SECS` on every peer (fix T1).
+    pub fn reconcile(&self, epoch: u32, ds: &DesiredState) -> anyhow::Result<()> {
         let tunnel = self
             .tunnels
             .get(&epoch)
             .ok_or_else(|| anyhow::anyhow!("no tunnel up for epoch {epoch}"))?;
-        tunnel.reconcile(ds, keepalive_secs)
+        tunnel.reconcile(ds)
     }
 }
 

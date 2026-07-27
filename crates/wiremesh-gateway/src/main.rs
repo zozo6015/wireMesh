@@ -27,11 +27,17 @@ use wiremesh_proto::v1::{EpochAck, RelayHealth};
 
 const TUN_MTU: u32 = 1280;
 const MSS: u16 = 1240;
-const KEEPALIVE: u16 = 15;
+
+// The steady-state persistent keepalive is NOT a constant here anymore
+// (mesh-convergence fix T1): `uapi::PERSISTENT_KEEPALIVE_SECS` (25s) is baked
+// into the steady-state `reconcile` builders themselves, so no call site in
+// this file can configure a peer without it — see that constant's doc and
+// `docs/research/ops-finding-multi-gateway-convergence.md` §5 (idle NAT
+// mappings expired because no keepalive was set, sawtoothing working paths).
 
 /// Persistent-keepalive for a rotation's transient overlap Devices
 /// (`wg0e<N>`), deliberately much shorter than the steady-state
-/// [`KEEPALIVE`]. persistent-keepalive is what makes boringtun proactively
+/// `uapi::PERSISTENT_KEEPALIVE_SECS`. persistent-keepalive is what makes boringtun proactively
 /// INITIATE (and retry) a handshake for a peer that has an endpoint but no
 /// data yet — a rotation Device carries no traffic until the cutover, so
 /// without a tight keepalive its session can take a full 15s (or a missed
@@ -56,6 +62,21 @@ const MAX_PUNCH_DELAY: Duration = Duration::from_secs(5);
 /// (spec §6.1). ~1s keeps state transitions responsive without hammering the
 /// UAPI socket.
 const PATH_TICK_PERIOD: Duration = Duration::from_secs(1);
+
+/// How long a remembered-but-uncorroborated handshake-time advance stays
+/// eligible for promotion to a real `on_handshake(_, true)` once an
+/// `rx_bytes` delta arrives (mesh-convergence fix T2). Plan T2's rule is
+/// "an rx delta must accompany the handshake evidence within the liveness
+/// window", so this reuses the path SM's liveness window
+/// (`path::DEGRADED_AFTER`, 45s) verbatim: a promotion can never certify a
+/// handshake older than what the silence rules would already have condemned.
+/// In practice corroboration lands far sooner — with
+/// `uapi::PERSISTENT_KEEPALIVE_SECS` (25s, fix T1) on every peer, a real
+/// completed handshake is followed by authenticated inbound within one
+/// keepalive interval — while a boringtun false-advance (finding §4) refreshes
+/// its pending entry every tick but never sees rx move, so it can never be
+/// promoted no matter the window.
+const HANDSHAKE_CORROBORATION_WINDOW: Duration = wiremesh_gateway::path::DEGRADED_AFTER;
 
 /// Cadence of the rotation observation driver ([`run_rotation_ticks`]).
 /// Deliberately much tighter than [`PATH_TICK_PERIOD`]: the make-before-break
@@ -255,6 +276,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
         wg0_pins: wg0_pins.clone(),
+        peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     // Metrics endpoint (Prometheus scrape) on an ephemeral loopback port,
@@ -304,12 +326,40 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         .collect();
                     let transitions: Vec<((PathState, PathState), u64)> =
                         ctx.transitions.lock().unwrap().iter().map(|(k, v)| (*k, *v)).collect();
+                    // Per-peer rx/tx/handshake-age gauges (fix T5, finding
+                    // §6): rendered from the snapshot `run_path_ticks`
+                    // published off the SAME UAPI fetch the path SM diffed
+                    // (≤1 tick stale). Age is computed at scrape time from
+                    // the absolute handshake instant; a never-handshaked
+                    // peer (or a clock stepped behind the handshake) yields
+                    // `None`, and the renderer omits its age line — absence,
+                    // not a bogus 0, mirroring `uapi::handshake_times_from`.
+                    let peer_stats: Vec<(String, metrics::PeerStats)> = ctx
+                        .peer_stats
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(gid, pl)| {
+                            let age = pl.latest_handshake.and_then(|t| {
+                                SystemTime::now().duration_since(t).ok().map(|d| d.as_secs())
+                            });
+                            (
+                                gid.to_string(),
+                                metrics::PeerStats {
+                                    rx_bytes: pl.rx_bytes,
+                                    tx_bytes: pl.tx_bytes,
+                                    last_handshake_age_secs: age,
+                                },
+                            )
+                        })
+                        .collect();
                     Ok::<_, anyhow::Error>((
                         kind.to_string(),
                         applied_version.load(Ordering::Relaxed),
                         counters,
                         peer_states,
                         transitions,
+                        peer_stats,
                     ))
                 }
             };
@@ -588,6 +638,17 @@ struct PathCtx {
     /// `set_peer_endpoint` builds the same pinned config `apply_state` does and
     /// a punch during a rotation overlap can't rekey `wg0` off the pin.
     wg0_pins: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    /// Latest per-peer UAPI liveness snapshot (rx/tx bytes + latest
+    /// handshake), keyed by peer `gateway_id` — published by `run_path_ticks`
+    /// from the SAME `uapi::get_peer_liveness` fetch that drives the path
+    /// state machine, and read by the metrics scrape to render the per-peer
+    /// `wiremesh_gateway_peer_{rx,tx}_bytes` /
+    /// `..._last_handshake_age_seconds` gauges (mesh-convergence fix T5,
+    /// finding §6: every diagnosis in the incident needed UAPI spelunking via
+    /// debug containers). Sharing the driver's snapshot — rather than the
+    /// scrape doing its own `get=1` — guarantees the metrics describe exactly
+    /// the evidence the path SM acted on, at zero extra UAPI traffic.
+    peer_stats: Arc<std::sync::Mutex<HashMap<u64, uapi::PeerLiveness>>>,
 }
 
 impl PathCtx {
@@ -855,7 +916,7 @@ async fn set_peer_endpoint(
         // below — resolving to an already-applied endpoint is a true no-op that
         // never resets the live session.
         let pins = ctx.wg0_pins.lock().unwrap();
-        reconcile::device_config_pinned(&ds, &priv_key, wg_port, KEEPALIVE, &pins)
+        reconcile::device_config_pinned(&ds, &priv_key, wg_port, &pins)
     };
     apply_device_if_changed(&ifname, &dev, &ctx.active).await?;
     ctx.relay_pointed.lock().unwrap().insert(gid, is_relay);
@@ -992,9 +1053,10 @@ async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
 
 /// Periodic path-state driver (spec §6.1). Every `PATH_TICK_PERIOD`: read the
 /// device's per-peer latest-handshake times AND `rx_bytes`
-/// (`uapi::get_peer_liveness`), advance each peer's `Path` (handshake →
-/// Direct; an `rx_bytes` increase without a handshake advance → refreshed
-/// liveness via `on_authenticated_inbound`, so 15s keepalives count as
+/// (`uapi::get_peer_liveness`), advance each peer's `Path` (rx-corroborated
+/// handshake → Direct, per fix T2 — see the corroboration block below; an
+/// `rx_bytes` increase without a handshake advance → refreshed liveness via
+/// `on_authenticated_inbound`, so 25s keepalives count as
 /// inbound even between ~120s handshake rekeys; time-driven degrade/
 /// disconnect via `tick`), record transitions, and act on the returned
 /// `PathAction`: `StartPunch`/`Retry`/`ProbeDirect` all re-run a bounded
@@ -1048,12 +1110,34 @@ async fn run_path_ticks(ctx: PathCtx) {
     // (a repeated identical timestamp must NOT re-fire `on_handshake`).
     let mut last_seen: HashMap<u64, SystemTime> = HashMap::new();
     // Last rx_bytes we've observed per peer, to detect an *increase* — WG
-    // keepalives (every 15s) bump rx_bytes without advancing the handshake
-    // time (which only moves on ~120s rekey). Without this, `last_inbound`
-    // only ever refreshes off `on_handshake`, so a healthy Direct path goes
-    // stale after `DEGRADED_AFTER` (45s) and spuriously degrades + re-punches
-    // every ~2 minutes. See docs/research/cycle4b-path-liveness-note.md.
+    // keepalives (every `uapi::PERSISTENT_KEEPALIVE_SECS` = 25s) bump
+    // rx_bytes without advancing the handshake time (which only moves on
+    // ~120s rekey). Without this, `last_inbound` only ever refreshes off
+    // `on_handshake`, so a healthy Direct path goes stale after
+    // `DEGRADED_AFTER` (45s) and spuriously degrades + re-punches every ~2
+    // minutes. See docs/research/cycle4b-path-liveness-note.md.
     let mut last_rx: HashMap<u64, u64> = HashMap::new();
+    // Handshake-time advances observed WITHOUT a same-tick rx delta, awaiting
+    // corroboration (mesh-convergence fix T2): {gid -> tick instant of the
+    // most recent uncorroborated advance}. An advance with flat rx is fed to
+    // the machine as `on_handshake(now, false)` — non-evidence — and
+    // remembered here; if rx then moves within
+    // `HANDSHAKE_CORROBORATION_WINDOW`, the entry is promoted to a real
+    // `on_handshake(now, true)`. This replaces the old "first-ever handshake
+    // is trusted unconditionally" exception, which was exactly the hole the
+    // 2026-07-27 incident drove through (gw-home reported `direct` on a first
+    // session whose peer rx stayed 0 — finding §4). The historical reason for
+    // that exception (a genuine first handshake's corroborating data packet
+    // could lag unboundedly, sticking `establish_direct` in Connecting in the
+    // netns nat matrix, because the one-shot `advanced` event was never
+    // re-observed once missed) is addressed by this map plus fix T1: the
+    // advance is no longer one-shot — it stays pending — and with a 25s
+    // persistent keepalive on every peer, a real completed handshake is
+    // followed by authenticated inbound within one keepalive interval, so the
+    // promotion fires promptly. A boringtun false-advance (retrying a dead
+    // session, timestamp climbing every tick with rx frozen) refreshes its
+    // pending entry forever but never sees rx move, so it is never promoted.
+    let mut pending_hs: HashMap<u64, Instant> = HashMap::new();
     loop {
         tokio::time::sleep(PATH_TICK_PERIOD).await;
 
@@ -1119,6 +1203,10 @@ async fn run_path_ticks(ctx: PathCtx) {
         };
 
         let now = Instant::now();
+        // Fresh per-peer stats snapshot for the metrics scrape (fix T5) —
+        // rebuilt from scratch each tick so a peer dropped from desired
+        // state also drops out of the scrape body.
+        let mut stats_snapshot: HashMap<u64, uapi::PeerLiveness> = HashMap::new();
         let mut to_record: Vec<(u64, PathState, PathState)> = Vec::new();
         let mut to_punch: Vec<(u64, Vec<String>)> = Vec::new();
         let mut to_relay_needed: Vec<u64> = Vec::new();
@@ -1132,111 +1220,100 @@ async fn run_path_ticks(ctx: PathCtx) {
                 let path = paths.entry(gid).or_insert_with(|| Path::new(now));
                 let before = path.state;
 
-                if let Some((Some(t), rx)) = liveness.get(&hex).copied() {
-                    let advanced = last_seen.get(&gid).map_or(true, |prev| t > *prev);
-                    if advanced {
-                        last_seen.insert(gid, t);
-                    }
-                    let rx_increased = last_rx.get(&gid).map_or(false, |&prev| rx > prev);
-                    last_rx.insert(gid, rx);
+                if let Some(info) = liveness.get(&hex).copied() {
+                    // Publish this peer's snapshot for the metrics scrape
+                    // (fix T5) — the SAME fetch the state machine is about
+                    // to act on, so the gauges describe exactly the evidence
+                    // the SM saw. Recorded even for a never-handshaked peer:
+                    // rx=0/tx=0 with the age line omitted is the interesting
+                    // diagnostic shape (finding §4's "rx stayed 0").
+                    stats_snapshot.insert(gid, info);
 
-                    // Trust a handshake-time advance unconditionally only for
-                    // this peer's FIRST-EVER handshake (`path.last_handshake
-                    // == None`), i.e. genuine session bootstrap where no
-                    // prior session ever existed to go stale. Once the peer
-                    // HAS had a handshake before (Direct at some point, now
-                    // Degraded/Relayed/Connecting-again), require corroboration
-                    // by an rx_bytes increase this same tick.
-                    //
-                    // Why the split, not a uniform rx requirement: this
-                    // project's boringtun build has been observed (netns
-                    // conformance, Cycle 4b Task 11 — see
-                    // docs/research/cycle4b-nat-matrix-notes.md) to advance
-                    // `last_handshake_time` on EVERY driver tick for a peer
-                    // that is repeatedly RETRYING an established-but-now-stale
-                    // session with no reply ever arriving (`rx_bytes` frozen)
-                    // — i.e. the timestamp climbs in lockstep with wall-clock
-                    // time with no corresponding received byte. The PRIOR
-                    // version of this code trusted the advance unconditionally
-                    // whenever `path.state != Direct`, on the theory that
-                    // "advance while not Direct is always a genuine fresh
-                    // handshake" -- that theory is exactly what the quirk
-                    // contradicts for a Degraded path retrying a dead link:
-                    // the timestamp advances every tick there too, bouncing
-                    // Degraded back to Direct forever and never escalating to
-                    // Disconnected/relay-needed, defeating failover.
-                    //
-                    // A uniform "always require same-tick rx corroboration"
-                    // fix (tried first) is ALSO wrong, though, and for a
-                    // different reason: a genuine WireGuard handshake
-                    // completion is a control-plane event that does NOT
-                    // itself bump `rx_bytes` (only decrypted data-channel
-                    // packets, incl. keepalives, do — see the `last_rx`
-                    // comment above), and for a brand-new peer's first-ever
-                    // handshake, the first corroborating data packet can lag
-                    // the handshake advance by an unbounded amount (any fixed
-                    // grace window can miss it, e.g. under retry/backoff at
-                    // higher layers) -- confirmed empirically: requiring rx
-                    // corroboration (same-tick, or within a several-second
-                    // grace window) for the FIRST handshake made
-                    // `establish_direct` in the netns nat matrix stick in
-                    // `Connecting` forever on one side across cases 1/3/4,
-                    // because that side's one-shot `advanced` event was never
-                    // re-observed once missed. Gating only on "has this peer
-                    // ever had a handshake before" avoids that: a first
-                    // handshake is trusted immediately (matching every
-                    // previously-passing scenario), while a peer that has
-                    // already been Direct once — the ONLY case the documented
-                    // quirk actually needs guarding, since only an established
-                    // session can go stale and enter a retry-with-no-reply
-                    // loop — requires corroboration. Net effect:
-                    //   - genuine first-time connect (Connecting/Relayed ->
-                    //     Direct with no prior handshake) still fires
-                    //     immediately, exactly as before;
-                    //   - genuine recovery on a peer that's had a handshake
-                    //     before (Degraded/Relayed -> Direct on a real
-                    //     completed re-handshake) still fires, since
-                    //     `advanced && rx_increased` both hold once real data
-                    //     resumes;
-                    //   - a healthy keepalive'd Direct path stays Direct (rx
-                    //     increases every keepalive interval -> falls through
-                    //     to on_authenticated_inbound below);
-                    //   - a truly DEAD path that had a handshake before
-                    //     (spurious timestamp advance, rx frozen) no longer
-                    //     gets re-Directed -- it sticks in Degraded and
-                    //     correctly escalates to Disconnected/MarkRelayNeeded
-                    //     after DEGRADED_DEAD_AFTER.
-                    let is_first_handshake = path.last_handshake.is_none();
-                    if advanced && (is_first_handshake || rx_increased) {
-                        // Cycle 4c Task 9 (make-before-break cutover
-                        // gating): a WG handshake CARRIED OVER THE RELAY
-                        // (endpoint currently pointed at
-                        // `ensure_relay_transport`'s local relay socket,
-                        // `ctx.relay_pointed[gid] == true`) is expected
-                        // while `Relayed` and must NOT be mistaken for the
-                        // Direct cutover — that would falsely flip
-                        // `Relayed -> Direct` and tear down a relay path
-                        // that's actually the only thing carrying traffic.
-                        // It only means the relay path itself is alive, so
-                        // treat it as liveness instead. Only once
-                        // `punch_and_apply` has repointed the endpoint at a
-                        // real direct candidate (`relay_pointed[gid] ==
-                        // false`, the ProbeDirect make-before-break probe
-                        // having succeeded) does a completed handshake count
-                        // as the actual cutover.
-                        let relay_pointed =
-                            ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
-                        if relay_pointed {
-                            path.on_authenticated_inbound(now);
-                        } else {
-                            path.on_handshake(now);
+                    if let Some(t) = info.latest_handshake {
+                        let rx = info.rx_bytes;
+                        let advanced = last_seen.get(&gid).map_or(true, |prev| t > *prev);
+                        if advanced {
+                            last_seen.insert(gid, t);
                         }
-                    } else if rx_increased {
-                        // A handshake advance already calls on_handshake or
-                        // on_authenticated_inbound above (both refresh
-                        // last_inbound); only need this for the
-                        // keepalive-only case in between.
-                        path.on_authenticated_inbound(now);
+                        let rx_increased = last_rx.get(&gid).map_or(false, |&prev| rx > prev);
+                        last_rx.insert(gid, rx);
+
+                        // Mesh-convergence fix T2: a handshake-time advance is
+                        // ONLY trusted with rx corroboration — an rx_bytes
+                        // increase this same tick, or (via `pending_hs`) within
+                        // `HANDSHAKE_CORROBORATION_WINDOW`. This project's
+                        // boringtun advances `last_handshake_time` on every
+                        // tick while retrying an established-but-dead session
+                        // with rx frozen (the Cycle-4b quirk,
+                        // docs/research/cycle4b-path-liveness-note.md), and
+                        // the PREVIOUS driver's "first-ever handshake is
+                        // trusted unconditionally" exception let exactly that
+                        // phantom evidence claim `direct` on a first session
+                        // whose peer rx stayed 0 — observed live in the
+                        // 2026-07-27 incident
+                        // (docs/research/ops-finding-multi-gateway-convergence.md
+                        // §4: FI showed handshakes "13-70s ago" with
+                        // rx_bytes=0 sustained while gw-home reported
+                        // direct). The exception's historical justification —
+                        // a genuine first handshake's corroborating data
+                        // packet could lag unboundedly, sticking the netns nat
+                        // matrix in Connecting, because the one-shot
+                        // `advanced` event was never re-observed once missed —
+                        // is answered by remembering the advance in
+                        // `pending_hs` (it is no longer one-shot) and by fix
+                        // T1's 25s persistent keepalive on every peer, which
+                        // guarantees a real completed handshake is followed by
+                        // authenticated inbound within one keepalive interval.
+                        // The machine itself enforces the same rule
+                        // (`Path::on_handshake(_, false)` is non-evidence), so
+                        // this driver cannot weaken it — it can only decide
+                        // WHEN corroboration has been established.
+                        //
+                        // Cycle 4c Task 9 gating is preserved: a corroborated
+                        // handshake CARRIED OVER THE RELAY (`relay_pointed`)
+                        // must not be mistaken for the make-before-break
+                        // Direct cutover — it only proves the relay path is
+                        // alive, so it feeds `on_authenticated_inbound`
+                        // instead; only a handshake completing after
+                        // `punch_and_apply` repointed the endpoint at a real
+                        // direct candidate counts as the cutover.
+                        if advanced && rx_increased {
+                            // Corroborated in the same tick — the genuine
+                            // completed-handshake case (data resumed with it).
+                            pending_hs.remove(&gid);
+                            let relay_pointed =
+                                ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+                            if relay_pointed {
+                                path.on_authenticated_inbound(now);
+                            } else {
+                                path.on_handshake(now, true);
+                            }
+                        } else if advanced {
+                            // Advance with flat rx: NOT liveness (finding §4).
+                            // Remember it for within-window promotion and tell
+                            // the machine, which ignores it by contract.
+                            pending_hs.insert(gid, now);
+                            path.on_handshake(now, false);
+                        } else if rx_increased {
+                            // rx moved without a fresh advance this tick: real
+                            // decrypted inbound. If an uncorroborated advance
+                            // is pending and still inside the window, this is
+                            // its corroboration — promote it to the real
+                            // handshake event; otherwise it's keepalive/data
+                            // liveness as before.
+                            let promoted = matches!(
+                                pending_hs.remove(&gid),
+                                Some(hs_at) if now.saturating_duration_since(hs_at)
+                                    <= HANDSHAKE_CORROBORATION_WINDOW
+                            );
+                            let relay_pointed =
+                                ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+                            if promoted && !relay_pointed {
+                                path.on_handshake(now, true);
+                            } else {
+                                path.on_authenticated_inbound(now);
+                            }
+                        }
                     }
                 }
 
@@ -1261,6 +1338,11 @@ async fn run_path_ticks(ctx: PathCtx) {
                 }
             }
         } // paths guard dropped before the awaits/spawns below
+
+        // Publish this tick's per-peer stats snapshot for the metrics scrape
+        // (fix T5). Whole-map replacement: peers dropped from desired state
+        // vanish from the scrape body the same tick.
+        *ctx.peer_stats.lock().unwrap() = stats_snapshot;
 
         for (gid, before, after) in to_record {
             ctx.record_transition(gid, before, after);
@@ -1347,7 +1429,7 @@ async fn apply_state(
     // then apply it only if it actually changed.
     let dev = {
         let pins = wg0_pins.lock().unwrap();
-        reconcile::device_config_pinned(ds, &priv_key, wg_port, KEEPALIVE, &pins)
+        reconcile::device_config_pinned(ds, &priv_key, wg_port, &pins)
     };
     apply_device_if_changed(&ifname, &dev, active).await?;
     // Apply the current policy IR to EVERY live enforcer (boot tun + every
@@ -1796,8 +1878,8 @@ async fn read_live_peers(
     };
     let mut live = HashSet::new();
     for w in wanted {
-        if let Some((Some(_), rx)) = liveness.get(&w).copied() {
-            if rx > 0 {
+        if let Some(info) = liveness.get(&w) {
+            if info.latest_handshake.is_some() && info.rx_bytes > 0 {
                 live.insert(w);
             }
         }
@@ -1884,7 +1966,7 @@ async fn run_rotation_ticks(rot: RotationShared) {
                                 ds_guard.as_ref().and_then(|ds| {
                                     let pins = rot.wg0_pins.lock().unwrap();
                                     let dev = reconcile::device_config_pinned(
-                                        ds, &a.new_priv, a.new_port, KEEPALIVE, &pins,
+                                        ds, &a.new_priv, a.new_port, &pins,
                                     );
                                     uapi::encode_set(&dev).ok()
                                 })
@@ -2040,6 +2122,7 @@ mod tests {
             relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             wg0_pins: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 

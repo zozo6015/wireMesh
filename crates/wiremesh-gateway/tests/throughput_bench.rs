@@ -56,7 +56,7 @@ fn iperf3_across_tunnel_reports_throughput() {
             candidates: vec!["10.9.0.1:51820".into()],
             allowed_ips: vec!["10.10.1.0/24".into(), "10.10.2.2/32".into()],
         }], ..Default::default() };
-        t.reconcile(&ds, 15).unwrap();
+        t.reconcile(&ds).unwrap();
         std::process::Command::new("ip").args(["addr","add","10.10.2.2/24","dev","wg0"]).status().unwrap();
         routes::add_route("10.10.1.0/24", "wg0").unwrap();
         // iperf3 server: one run, then exit.
@@ -77,7 +77,7 @@ fn iperf3_across_tunnel_reports_throughput() {
         candidates: vec!["10.9.0.2:51820".into()],
         allowed_ips: vec!["10.10.2.0/24".into(), "10.10.1.1/32".into()],
     }], ..Default::default() };
-    ta.reconcile(&ds_a, 15).unwrap();
+    ta.reconcile(&ds_a).unwrap();
     std::process::Command::new("ip").args(["addr","add","10.10.1.1/24","dev","wg0"]).status().unwrap();
     routes::add_route("10.10.2.0/24", "wg0").unwrap();
     std::thread::sleep(Duration::from_secs(2)); // allow handshake + server startup

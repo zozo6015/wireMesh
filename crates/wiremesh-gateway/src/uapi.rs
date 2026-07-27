@@ -8,6 +8,25 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, SystemTime};
 
+/// Steady-state WireGuard `persistent_keepalive_interval`, emitted on EVERY
+/// peer the gateway configures (mesh-convergence fix T1,
+/// `docs/superpowers/plans/2026-07-28-mesh-convergence-fixes.md`).
+///
+/// Rationale (`docs/research/ops-finding-multi-gateway-convergence.md` §5):
+/// the first real 3-segment deployment ran with NO persistent keepalive, so a
+/// NAT-ed peer's UDP mapping expired whenever a tunnel idled — the working
+/// px↔home path died ~20 minutes after forming and then sawtoothed (works
+/// after handshake → NAT forgets → 45s silence → Degraded → punch storm →
+/// occasionally re-forms). 25s is the standard WireGuard answer to NAT
+/// mapping expiry; it also keeps punch-created mappings warm. Always-on for
+/// v1 (tiny overhead, no config knob per the plan) — the steady-state
+/// `reconcile` builders emit this unconditionally so no call site can
+/// configure a peer without it. The rotation-scoped builders keep an explicit
+/// parameter (`main.rs`'s `ROTATION_KEEPALIVE = 3` on transient overlap
+/// devices is a documented design choice, and 3s ≤ 25s keeps mappings at
+/// least as warm).
+pub const PERSISTENT_KEEPALIVE_SECS: u16 = 25;
+
 #[derive(Debug, Clone)]
 pub struct PeerConfig {
     pub public_key_b64: String,
@@ -92,6 +111,12 @@ pub(crate) struct PeerGetInfo {
     pub last_handshake_sec: u64,
     pub last_handshake_nsec: u64,
     pub rx_bytes: u64,
+    /// Parsed for per-peer observability (mesh-convergence fix T5,
+    /// `docs/research/ops-finding-multi-gateway-convergence.md` §6: every
+    /// diagnosis in the incident required UAPI spelunking via debug
+    /// containers because the gateway exposed no per-peer rx/tx/handshake
+    /// metrics). Same `get=1` response the liveness fields come from.
+    pub tx_bytes: u64,
 }
 
 /// Parse a `get=1` UAPI response body into `{pubkey_hex -> PeerGetInfo}`.
@@ -131,6 +156,8 @@ pub(crate) fn parse_get_response(resp: &str) -> HashMap<String, PeerGetInfo> {
             info.last_handshake_nsec = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("rx_bytes=") {
             info.rx_bytes = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("tx_bytes=") {
+            info.tx_bytes = v.parse().unwrap_or(0);
         }
     }
     if let Some((key, info)) = current.take() {
@@ -166,34 +193,56 @@ pub fn get_latest_handshakes(ifname: &str) -> anyhow::Result<HashMap<String, Sys
     Ok(handshake_times_from(&peers))
 }
 
-/// Reduce parsed `get=1` peer info to `{pubkey_hex -> (latest_handshake,
-/// rx_bytes)}`. `latest_handshake` is `None` for a never-handshaked peer,
-/// per [`handshake_times_from`]'s epoch-ambiguity rationale; `rx_bytes` is
-/// always present (0 for a peer with no traffic yet).
+/// One peer's liveness + traffic snapshot from a single `get=1` round-trip —
+/// the feed the path-state driver (and, via it, the per-peer metrics of
+/// mesh-convergence fix T5) consumes. `latest_handshake` is `None` for a
+/// never-handshaked peer, per [`handshake_times_from`]'s epoch-ambiguity
+/// rationale; `rx_bytes`/`tx_bytes` are always present (0 for a peer with no
+/// traffic yet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PeerLiveness {
+    pub latest_handshake: Option<SystemTime>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+/// Reduce parsed `get=1` peer info to `{pubkey_hex -> PeerLiveness}`.
 ///
-/// `rx_bytes` is the point of this reducer (review finding, Cycle 4b Task
-/// 10): the path-state driver's ~1s tick only ever called `on_handshake`,
-/// but WG handshakes advance only ~every 120s (rekey) while keepalives (15s)
-/// bump `rx_bytes` without touching the handshake time. Watching
+/// `rx_bytes` is the original point of this reducer (review finding, Cycle
+/// 4b Task 10): the path-state driver's ~1s tick only ever called
+/// `on_handshake`, but WG handshakes advance only ~every 120s (rekey) while
+/// keepalives bump `rx_bytes` without touching the handshake time. Watching
 /// `rx_bytes` for an increase since the previous tick gives the driver a
 /// keepalive-visible liveness signal (`Path::on_authenticated_inbound`), so
 /// a healthy `Direct` path no longer oscillates to `Degraded` every ~45s.
-/// See `docs/research/cycle4b-path-liveness-note.md`.
+/// See `docs/research/cycle4b-path-liveness-note.md`. `tx_bytes` rides along
+/// for the T5 per-peer observability gauges (finding §6) so the metrics are
+/// sourced from the exact same UAPI fetch the path SM diffs — one snapshot,
+/// no second socket dance.
 pub(crate) fn peer_liveness_from(
     peers: &HashMap<String, PeerGetInfo>,
-) -> HashMap<String, (Option<SystemTime>, u64)> {
+) -> HashMap<String, PeerLiveness> {
     let times = handshake_times_from(peers);
     peers
         .iter()
-        .map(|(k, info)| (k.clone(), (times.get(k).copied(), info.rx_bytes)))
+        .map(|(k, info)| {
+            (
+                k.clone(),
+                PeerLiveness {
+                    latest_handshake: times.get(k).copied(),
+                    rx_bytes: info.rx_bytes,
+                    tx_bytes: info.tx_bytes,
+                },
+            )
+        })
         .collect()
 }
 
-/// Read the WireGuard device's per-peer latest-handshake time AND `rx_bytes`
-/// via UAPI `get=1` in a single round-trip — the liveness feed the
-/// path-state driver uses (see [`peer_liveness_from`]). Returns
-/// `{pubkey_hex -> (latest_handshake, rx_bytes)}`.
-pub fn get_peer_liveness(ifname: &str) -> anyhow::Result<HashMap<String, (Option<SystemTime>, u64)>> {
+/// Read the WireGuard device's per-peer latest-handshake time AND
+/// `rx_bytes`/`tx_bytes` via UAPI `get=1` in a single round-trip — the
+/// liveness feed the path-state driver uses (see [`peer_liveness_from`]).
+/// Returns `{pubkey_hex -> PeerLiveness}`.
+pub fn get_peer_liveness(ifname: &str) -> anyhow::Result<HashMap<String, PeerLiveness>> {
     let peers = read_get_response(ifname)?;
     Ok(peer_liveness_from(&peers))
 }
@@ -343,6 +392,11 @@ errno=0\n\
         assert_eq!(a.last_handshake_sec, 1700000000);
         assert_eq!(a.last_handshake_nsec, 500000000);
         assert_eq!(a.rx_bytes, 12345);
+        // T5 pin (mesh-convergence fix cycle): `tx_bytes` is extracted from
+        // the same `get=1` block. The fixture deliberately carries DISTINCT
+        // rx/tx values (12345 vs 6789) so a swapped- or shared-prefix parse
+        // bug (tx landing in rx or vice versa) cannot pass.
+        assert_eq!(a.tx_bytes, 6789, "peer a's tx_bytes extracted, distinct from rx");
 
         let b = parsed
             .get("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -350,6 +404,7 @@ errno=0\n\
         assert_eq!(b.last_handshake_sec, 0);
         assert_eq!(b.last_handshake_nsec, 0);
         assert_eq!(b.rx_bytes, 0);
+        assert_eq!(b.tx_bytes, 0, "zero-traffic peer's tx_bytes parsed as 0, not left unset");
     }
 
     #[test]
@@ -372,25 +427,31 @@ errno=0\n\
     }
 
     #[test]
-    fn peer_liveness_from_preserves_rx_bytes_for_both_peers() {
+    fn peer_liveness_from_preserves_traffic_counters_for_both_peers() {
         let parsed = parse_get_response(GET_RESPONSE_FIXTURE);
         let liveness = peer_liveness_from(&parsed);
         assert_eq!(liveness.len(), 2, "both peers present, unlike handshake_times_from: {liveness:?}");
 
-        let (a_time, a_rx) = liveness
+        let a = liveness
             .get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .expect("peer a present");
         assert_eq!(
-            *a_time,
+            a.latest_handshake,
             Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000) + Duration::from_nanos(500000000))
         );
-        assert_eq!(*a_rx, 12345, "handshaked peer's rx_bytes preserved");
+        assert_eq!(a.rx_bytes, 12345, "handshaked peer's rx_bytes preserved");
+        // T5 pin: `tx_bytes` rides the same reducer into `PeerLiveness` —
+        // the single snapshot both the path SM and the per-peer metrics
+        // gauges are sourced from (finding §6: one UAPI fetch, no second
+        // socket dance).
+        assert_eq!(a.tx_bytes, 6789, "handshaked peer's tx_bytes preserved, distinct from rx");
 
-        let (b_time, b_rx) = liveness
+        let b = liveness
             .get("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
             .expect("peer b present even though never handshaked");
-        assert_eq!(*b_time, None, "never-handshaked peer still has no handshake time");
-        assert_eq!(*b_rx, 0, "never-handshaked peer's rx_bytes preserved (0)");
+        assert_eq!(b.latest_handshake, None, "never-handshaked peer still has no handshake time");
+        assert_eq!(b.rx_bytes, 0, "never-handshaked peer's rx_bytes preserved (0)");
+        assert_eq!(b.tx_bytes, 0, "never-handshaked peer's tx_bytes preserved (0)");
     }
 
     #[test]
