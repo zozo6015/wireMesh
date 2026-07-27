@@ -57,30 +57,35 @@ const SYNC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
 /// A record.
 const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Resolve a `host:port` dial target — a DNS hostname or an IP literal — to
-/// one `SocketAddr`, preferring the first IPv4 result (v1 is IPv4-only, spec
-/// §1) and falling back to the first result of any family. Callers resolve
-/// fresh at every dial/tick ON PURPOSE: a DDNS name's A record changes when
-/// the ISP rotates the controller's public IP, and per-reconnect (Sync) /
-/// per-tick (observe) re-resolution is what picks the new address up without
-/// a gateway restart (`docs/research/operator-remote-deployment-notes.md`
-/// Finding 3). IP literals pass through `lookup_host` without touching DNS,
-/// so netns tests and IP-configured deployments never depend on a resolver.
+/// Resolve a `host:port` dial target — a DNS hostname or an IPv4 literal —
+/// to one `SocketAddr`: the first IPv4 result ([`prefer_ipv4`]). A name that
+/// resolves to only IPv6 is an ERROR, not a fallback — v1 is IPv4-only end
+/// to end (spec §1; the controller itself binds an `Ipv4Addr`), so an IPv6
+/// address can never reach a v1 controller. Callers resolve fresh at every
+/// dial/tick ON PURPOSE: a DDNS name's A record changes when the ISP rotates
+/// the controller's public IP, and per-reconnect (Sync) / per-tick (observe)
+/// re-resolution is what picks the new address up without a gateway restart
+/// (`docs/research/operator-remote-deployment-notes.md` Finding 3). IP
+/// literals pass through `lookup_host` without touching DNS, so netns tests
+/// and IP-configured deployments never depend on a resolver.
 pub async fn resolve_host_port(s: &str) -> anyhow::Result<SocketAddr> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host(s)
         .await
         .with_context(|| format!("resolving {s:?}"))?
         .collect();
-    prefer_ipv4(&addrs).ok_or_else(|| anyhow!("{s:?} resolved to no addresses"))
+    prefer_ipv4(&addrs)
+        .ok_or_else(|| anyhow!("{s:?} resolved to no IPv4 addresses (v1 is IPv4-only)"))
 }
 
 /// The pure address-selection policy behind [`resolve_host_port`]: the first
-/// IPv4 result wins (v1 is IPv4-only, spec §1); a list with no IPv4 entry
-/// falls back to its first result; an empty list yields `None`. Factored out
-/// of the resolver so the preference order is deterministic against a
+/// IPv4 result, `None` when the list has none. Deliberately NO cross-family
+/// fallback: v1 is IPv4-only end to end (spec §1 — the controller binds an
+/// `Ipv4Addr`), so an IPv6 candidate is a dead end and "falling back" to one
+/// would only trade a clear resolution error for an unreachable-dial loop.
+/// Factored out of the resolver so the selection is checkable against a
 /// synthetic candidate list, without a resolver in the loop.
 pub fn prefer_ipv4(addrs: &[SocketAddr]) -> Option<SocketAddr> {
-    addrs.iter().find(|a| a.is_ipv4()).or_else(|| addrs.first()).copied()
+    addrs.iter().find(|a| a.is_ipv4()).copied()
 }
 
 /// Dial the controller Sync endpoint (`host:port`, hostname or IP literal)

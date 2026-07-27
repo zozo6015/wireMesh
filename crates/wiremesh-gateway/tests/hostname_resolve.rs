@@ -40,17 +40,35 @@ fn prefer_ipv4_picks_first_ipv4_from_mixed_list() {
     );
 }
 
+/// v1 is IPv4-only end to end, so there is NO cross-family fallback: a list
+/// with no IPv4 entry selects nothing (the caller turns this into a clear
+/// resolution error instead of an unreachable-dial loop).
 #[test]
-fn prefer_ipv4_falls_back_to_first_ipv6_when_no_ipv4() {
+fn prefer_ipv4_returns_none_for_v6_only_list() {
     let addrs: Vec<SocketAddr> = vec![
         "[2001:db8::1]:9500".parse().unwrap(),
         "[2001:db8::2]:9500".parse().unwrap(),
     ];
     assert_eq!(
         sync::prefer_ipv4(&addrs),
-        Some("[2001:db8::1]:9500".parse::<SocketAddr>().unwrap()),
-        "a v6-only list falls back to its FIRST entry"
+        None,
+        "a v6-only list must select NOTHING — no cross-family fallback in v1"
     );
+}
+
+/// The v6-only resolution error, pinned deterministically WITHOUT a resolver:
+/// an IPv6 literal passes through `lookup_host` untouched (no DNS), yielding
+/// exactly one v6 candidate, so `resolve_host_port` must error — naming the
+/// input and saying no IPv4 addresses — rather than hand back an address a
+/// v1 (IPv4-only) controller can never be reached at.
+#[tokio::test]
+async fn resolve_v6_only_target_errors_with_no_ipv4_message() {
+    let err = sync::resolve_host_port("[::1]:9500")
+        .await
+        .expect_err("a target with only IPv6 candidates must error, not fall back");
+    let chain = format!("{err:#}");
+    assert!(chain.contains("[::1]:9500"), "error must name the input, got: {chain}");
+    assert!(chain.contains("no IPv4 addresses"), "error must say no IPv4 addresses, got: {chain}");
 }
 
 #[test]

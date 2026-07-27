@@ -102,10 +102,19 @@ enrollment with `--kind relay`) at `/var/lib/wiremesh/` — the certificate,
 private-key, and CA identity files EACH require mode 0600 individually (not
 just the containing directory).
 
+The gateway's `--controller-sync`/`--observe` accept `host:port` with a DNS
+hostname (DDNS controllers), re-resolved on every Sync reconnect and observe
+tick; dial targets are IPv4-only (v1) and IPv6 literals are rejected at boot.
+The gateway Sync channel runs HTTP/2 keepalive (15s/10s, while-idle) + a 10s
+connect timeout — fixes a live-found silently-half-open Watch stream (see
+`docs/research/ops-finding-sync-half-open-stream.md`); the relay Sync client
+and the controller-side keepalive mirror are still-open follow-ups there.
+
 Next action: the Cycle-4c fast-follows (make-before-break direct cutover;
 `relay_pair_id` width + per-relay connection multiplexing) and the
 key-rotation fast-follow (carried from 4a). Also pending: Cycle 2b fast-follow
-(OpenBao provider driver). Update this section as phases complete.
+(OpenBao provider driver); relay/controller Sync-keepalive mirrors (see
+above). Update this section as phases complete.
 
 ## Agent workflow rules
 

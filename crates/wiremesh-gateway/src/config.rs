@@ -33,22 +33,26 @@ pub struct GatewayConfig {
 }
 
 /// Syntax-only validation of a `host:port` dial target: split on the LAST
-/// `:` (so a bracketed IPv6 literal's inner colons don't confuse it), require
-/// a non-empty host part and a valid `u16` port. Deliberately does NO DNS
-/// lookup — a hostname that doesn't resolve right now must still parse,
-/// because the gateway boots fail-static with the controller (and possibly
-/// the resolver) unreachable; actual resolution is deferred to dial time
-/// (`sync::resolve_host_port`).
+/// `:`, require a non-empty host part and a valid `u16` port. Deliberately
+/// does NO DNS lookup — a hostname that doesn't resolve right now must still
+/// parse, because the gateway boots fail-static with the controller (and
+/// possibly the resolver) unreachable; actual resolution is deferred to dial
+/// time (`sync::resolve_host_port`).
 ///
-/// One deliberate exception to "syntax only": a host that is an IP-literal
-/// ATTEMPT — it parses as an [`std::net::IpAddr`], is bracketed (`[…]`), or
-/// is IPv4-shaped (digits and dots only; an all-numeric TLD is not a legal
-/// DNS name, so such a string can never be a resolvable hostname) — must
-/// make the WHOLE input parse as a [`SocketAddr`]. Without this, a typo'd
-/// literal like `10.0.0.300:9500` would be waved through as a "hostname" and
-/// the process would run forever logging resolution failures, where the old
-/// `SocketAddr`-typed flag exited non-zero at boot. This costs no DNS and
-/// doesn't touch the genuine-hostname path.
+/// Two deliberate exceptions to "syntax only", both so a misconfigured unit
+/// fails at boot instead of at every dial:
+/// - An IPv6 dial-target literal — bracketed (`[…]:port`) or a host that
+///   parses as an IPv6 [`std::net::IpAddr`] — is rejected outright: v1 is
+///   IPv4-only end to end (the controller binds an `Ipv4Addr`), so an IPv6
+///   target can never be reached and would otherwise just fail at every
+///   dial forever.
+/// - An IPv4-shaped host (digits and dots only; an all-numeric TLD is not a
+///   legal DNS name, so such a string can never be a resolvable hostname)
+///   must make the WHOLE input parse as a [`SocketAddr`]. Without this, a
+///   typo'd literal like `10.0.0.300:9500` would be waved through as a
+///   "hostname" and the process would run forever logging resolution
+///   failures, where the old `SocketAddr`-typed flag exited non-zero at
+///   boot. This costs no DNS and doesn't touch the genuine-hostname path.
 pub fn validate_host_port(s: &str) -> anyhow::Result<()> {
     let (host, port) = s
         .rsplit_once(':')
@@ -59,10 +63,10 @@ pub fn validate_host_port(s: &str) -> anyhow::Result<()> {
     port.parse::<u16>()
         .map(|_| ())
         .with_context(|| format!("invalid port in {s:?}"))?;
-    let ip_literal_attempt = host.parse::<std::net::IpAddr>().is_ok()
-        || host.starts_with('[')
-        || host.chars().all(|c| c.is_ascii_digit() || c == '.');
-    if ip_literal_attempt {
+    if host.starts_with('[') || matches!(host.parse(), Ok(std::net::IpAddr::V6(_))) {
+        return Err(anyhow!("IPv6 dial target {s:?} is unsupported (v1 is IPv4-only)"));
+    }
+    if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
         s.parse::<SocketAddr>()
             .map(|_| ())
             .with_context(|| format!("invalid IP literal in {s:?}"))?;
@@ -241,13 +245,30 @@ mod tests {
     }
 
     #[test]
-    fn validate_host_port_accepts_hostnames_and_ip_literals() {
+    fn validate_host_port_accepts_hostnames_and_ipv4_literals() {
         assert!(validate_host_port("127.0.0.1:6000").is_ok());
         assert!(validate_host_port("controller.example.com:9500").is_ok());
         assert!(validate_host_port("localhost:1").is_ok());
-        // Split is on the LAST colon, so a bracketed IPv6 literal's inner
-        // colons must not confuse it.
-        assert!(validate_host_port("[::1]:9500").is_ok());
+    }
+
+    /// v1 is IPv4-only end to end, so IPv6 dial-target literals — bracketed
+    /// or any host parsing as an IPv6 `IpAddr` — are rejected at parse time
+    /// (boot), with an error that says so, instead of failing at every dial.
+    #[test]
+    fn validate_host_port_rejects_ipv6_dial_targets() {
+        for target in ["[::1]:9500", "[2001:db8::1]:9500", "::1:9500", "2001:db8::1:9500"] {
+            let err = validate_host_port(target)
+                .expect_err(&format!("IPv6 dial target {target:?} must be rejected"));
+            let chain = format!("{err:#}");
+            assert!(
+                chain.contains("IPv6") || chain.contains("IPv4-only"),
+                "rejection of {target:?} must mention IPv6/v1-IPv4-only, got: {chain}"
+            );
+        }
+        // Bracketed-but-invalid is likewise rejected (bracket = IPv6 attempt).
+        assert!(validate_host_port("[::zz]:9500").is_err());
+        // And the same boot-time behavior end-to-end through `parse`.
+        assert!(parse_with_sync_value("[::1]:9500").is_err());
     }
 
     /// IP-literal ATTEMPTS must fast-fail at parse time: a host that is
@@ -259,7 +280,6 @@ mod tests {
     fn validate_host_port_rejects_malformed_ip_literal_attempts() {
         assert!(validate_host_port("10.0.0.300:9500").is_err(), "IPv4-shaped host, invalid octet");
         assert!(validate_host_port("999.1.2.3:1").is_err(), "IPv4-shaped host, out-of-range octets");
-        assert!(validate_host_port("[::zz]:9500").is_err(), "bracketed but invalid IPv6 literal");
     }
 
     /// The fast-fail must not eat genuine hostnames: names mixing digits and
