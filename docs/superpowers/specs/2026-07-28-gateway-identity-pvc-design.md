@@ -1,0 +1,95 @@
+# PVC-backed gateway identity + idempotent enroll — design
+
+**Status:** approved 2026-07-28. **Branch:** `feat/gateway-identity-pvc`.
+**Motivation:** the operator-deployed gateway keeps its identity
+(`identity.json`, `wg_private.key`, `epoch_keys.json`, `state.json`) in an
+**emptyDir**, so ANY pod recreation — image upgrade, reschedule, node reboot —
+destroys it. The enroll init-container then re-runs `wiremesh-gateway enroll`
+against a spent single-use token and crash-loops, forcing the manual
+drain → delete-token-Secret → re-mint → new-id dance (hit ≥3× in production).
+This is an availability bug, not just an upgrade annoyance: a node outage
+currently forces a gateway re-enrollment.
+
+## Fix — two independent changes
+
+### 1. Persist the identity on a small per-gateway PVC (operator)
+
+- New `gateway_pvc(name, spec) -> PersistentVolumeClaim`, mirroring the existing
+  `controller_pvc` (`crates/wiremesh-operator/src/workloads.rs`): RWO, small
+  default (**128Mi** — the state is KB; huge margin), `storageClassName` and
+  size overridable from the `WiremeshGateway` CR (add optional
+  `storageClass` / `storageSize` fields to the CRD + spec type, matching
+  `WiremeshController`'s existing fields + `crdgen`).
+- The gateway Deployment's `state` volume changes from `EmptyDirVolumeSource`
+  to a `PersistentVolumeClaimVolumeSource` referencing `<name>-data` (name
+  scheme consistent with the controller's `<name>-data`).
+- The gateway RECONCILER creates/owns the PVC (owner-ref, so it's GC'd with the
+  CR — same pattern as the controller reconciler owning `controller_pvc`).
+  Verify the operator RBAC already covers PVC create (the controller path does).
+- Node-pinning note: the gateway is already node-pinned (`nodeName`/
+  `nodeSelector`), so a node-local RWO PVC (k3s `local-path`,
+  WaitForFirstConsumer) binds on that node — correct and intended. True
+  cross-node failover is explicitly OUT OF SCOPE (needs networked storage +
+  routing follow — a separate, larger effort).
+
+### 2. Idempotent enroll (gateway binary)
+
+- `wiremesh-gateway enroll` (`crates/wiremesh-gateway/src/enroll.rs`): BEFORE
+  redeeming the token, check `--state-dir` for a VALID existing identity (the
+  same `Identity::load` the runtime uses at boot). If it loads successfully,
+  **skip enrollment**: log `wiremesh-gateway: already enrolled (identity present
+  in <state-dir>), skipping` and exit 0. Otherwise enroll as today.
+- This makes the init-container safe to run on EVERY boot: first boot enrolls
+  into the fresh PVC; every later boot finds the persisted identity and skips.
+- Idempotency belongs IN the enroll command (not a shell guard in the
+  init-container) so it is robust for the k8s init-container, systemd, and
+  manual invocation alike — no `/bin/sh -c`, consistent with the existing
+  no-shell init-container design.
+- Edge case (documented, not handled specially): if an operator changes the
+  gateway's bound segment/CIDRs, the persisted identity is now stale; forcing a
+  fresh enroll requires clearing the PVC (or a future rebind flow). Out of
+  scope here — the common path (same gateway, same segment) is what this fixes.
+
+## One-time adoption cost
+
+The FIRST rollout to the PVC version starts with an empty PVC (the current
+identity is in the ephemeral emptyDir and cannot be migrated), so gw-home
+re-enrolls ONCE (new id). After that, its identity is durable and no pod
+recreation ever re-enrolls again. Call this out in the PR/release notes.
+
+## Scope
+
+- **Changed:** `workloads.rs` (gateway volume emptyDir→PVC + `gateway_pvc`),
+  the gateway reconciler (own the PVC), the `WiremeshGateway` CRD + spec
+  (`storageClass`/`storageSize`) + `crdgen` regen, `enroll.rs` (idempotent
+  skip). Helm/kustomize CRD manifests regenerated.
+- **Unchanged:** the enrollment protocol, token minting, the drain-on-CR-delete
+  finalizer (still drains the id; the owned PVC is GC'd with the CR), the
+  gateway run/data path.
+- **Out of scope:** cross-node failover / networked storage; the bound-segment
+  change/rebind flow; the bare-metal (systemd) gateway already persists to
+  `/var/lib/wiremesh` on disk, but it ALSO benefits from idempotent enroll
+  (a restart no longer needs a fresh token) — that's a free win, keep it.
+
+## Done-bar / tests
+
+- **operator unit tests**: `gateway_pvc` shape (RWO, size, name); the gateway
+  Deployment mounts the PVC (not emptyDir); the reconciler emits/owns the PVC;
+  CRD carries `storageClass`/`storageSize` with the 128Mi default.
+- **enroll idempotency test**: `wiremesh-gateway enroll` with a pre-existing
+  valid identity in `--state-dir` skips (exit 0, no controller call, identity
+  untouched); with no identity it enrolls as before (existing enroll_cmd
+  coverage stays green). A stub/injected controller confirms "no enroll RPC
+  issued when identity present".
+- Full workspace green; operator lib + `enroll_cmd` suites; no regression to the
+  netns gateway suites (they don't use the operator, but run mesh_milestone as
+  a guard since enroll.rs changed).
+
+## Release
+
+Availability fix → patch bump (**v0.2.1**) per the release-every-fix rule.
+
+## Execution
+
+Per-task test-author / implementer / dedicated runner / reviewer (CLAUDE.md
+agent workflow); CodeRabbit before push. Dev container for builds/tests.
