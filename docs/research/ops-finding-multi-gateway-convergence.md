@@ -1,9 +1,14 @@
 # Ops finding: 3-gateway mesh fails to converge — NAT-blocked peer destabilizes the whole fabric
 
-**Date:** 2026-07-27/28 (first real 3-segment production deployment: zolab k8s
-gateway `home`, bare-metal FI `aether`, bare-metal px `aether-dev`).
-**Status:** OPEN — needs a dedicated hardening cycle with a netns conformance
-suite reproducing this exact topology.
+**Date observed:** night of 2026-07-27, continuing past midnight into
+2026-07-28 (a single session — the first real 3-segment production deployment:
+zolab k8s gateway `home`, bare-metal FI `aether`, bare-metal px `aether-dev`).
+**Status:** PARTIALLY RESOLVED (2026-07-28). The mesh-convergence fix cycle
+(branch `fix/mesh-convergence`) delivered T1–T7 (see "Suggested fast-follows"
+below, each now marked with its landed/carried state). The deeper punch-socket
+starvation root cause remains OPEN — carried to a dedicated puncher-socket
+isolation cycle, with the two `#[ignore]`d `convergence_matrix` tests as its
+executable done-bar.
 
 ## Topology
 
@@ -134,18 +139,22 @@ remove+re-add relay-session bug).
 ## Relay deployment (mid-incident) — worked, with two findings
 
 `wiremesh-relay` v0.1.1 deployed on the FI host per docs/install.md:
-- **Finding A (packaging bug):** the .deb's unit runs `User=wiremesh`, but
-  `wiremesh-relay-enroll` (documented as sudo) writes root-owned 0600 files,
-  and the documented `--certdir /var/lib/wiremesh` collides with the
-  GATEWAY's root-only state dir when both run on one host. Service crash-loops
-  on `Permission denied` until the identity is moved to a dedicated dir
-  (`/var/lib/wiremesh-relay`, chown wiremesh:wiremesh). Packaging should use
-  separate StateDirectory + a matching enroll default, or chown on enroll.
-- **Finding B:** the relay's revocation Sync watch is rejected by the
-  controller: `PermissionDenied: client certificate's CN does not match any
-  enrolled gateway` — the Sync service does not authorize relay certs, so the
-  offline denylist never updates post-enrollment. (Compounds the relay
-  keepalive gap already listed in ops-finding-sync-half-open-stream.md.)
+- **Finding A (packaging bug) — RESOLVED (T7, this cycle):** the .deb's unit
+  ran `User=wiremesh`, but `wiremesh-relay-enroll` (documented as sudo) writes
+  root-owned 0600 files, and the documented `--certdir /var/lib/wiremesh`
+  collided with the GATEWAY's root-only state dir when both run on one host —
+  the service crash-looped on `Permission denied`. Fixed: dedicated
+  `StateDirectory=/var/lib/wiremesh-relay` in the unit + `relay.env`/docs
+  default, a `postinstall-relay.sh`, and chown-when-root in the enroll binary.
+- **Finding B — RESOLVED (T6, this cycle):** the relay's revocation Sync watch
+  was rejected by the controller (`PermissionDenied: client certificate's CN
+  does not match any enrolled gateway`) because the Sync service authorized
+  only gateway certs, so the offline denylist never updated post-enrollment.
+  Fixed: the controller now authorizes enrolled relay certs on a
+  revocation-scoped watch (`watch_relay`, revoked_serials only, no
+  peers/policy, structurally out of the punch broker). (The relay Sync
+  channel's own keepalive gap remains tracked in
+  ops-finding-sync-half-open-stream.md.)
 - Within seconds of start, px registered a relay pair (`owner=gw-6 peer=gw-5`
   from its real source) — advertisement + gateway pickup works.
 
@@ -154,17 +163,23 @@ remove+re-add relay-session bug).
 1. `persistent_keepalive` (~25s) on peers — cheapest, kills the sawtooth for
    NAT-ed gateways and keeps punch-created mappings warm.
 2. Punch back-off: a pair that repeatedly fails N punches should back off to
-   slow retries (and prefer relay when available) instead of a永-storm.
-   **(Done in this cycle as T3 — bounds attempt COUNT. But see "Deeper root
-   cause the T8 done-bar proved" above: bounding count is not enough; the
-   puncher must ALSO stop sharing/stealing the WG listen socket. Carried to
-   the next cycle.)**
+   slow retries (and prefer relay when available) instead of a storm.
+   **(DONE as T3 — bounds attempt COUNT. But see "Deeper root cause the T8
+   done-bar proved" above: bounding count is not enough; the puncher must ALSO
+   stop sharing/stealing the WG listen socket. That part is CARRIED to the
+   next cycle.)**
 3. Make-before-break peer-set updates: never reset an ESTABLISHED tunnel's
-   endpoint when re-applying peers; only add/remove.
+   endpoint when re-applying peers; only add/remove. **(DONE as T4 +
+   incremental add-only apply — endpoint level. NOTE: proven necessary but
+   NOT sufficient — session-level continuity under punch contention is the
+   carried punch-socket item above.)**
 4. Path-liveness: require rx-delta corroboration before reporting `direct`
-   (re-open the cycle-4b note's rule with this evidence).
-5. Per-peer rx/tx/handshake metrics.
+   (re-open the cycle-4b note's rule with this evidence). **(DONE as T2; the
+   boringtun elapsed-vs-absolute handshake-timestamp bug was the real cause —
+   see "boringtun" note.)**
+5. Per-peer rx/tx/handshake metrics. **(DONE as T5.)**
 6. Relay packaging (Finding A) + relay Sync authorization (Finding B).
+   **(DONE as T7 + T6.)**
 7. Netns conformance case: 3 gateways, one inbound-blocked NAT, relay
    present — assert full convergence and no regression of the working pair
    when the third enrolls.

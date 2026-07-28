@@ -416,6 +416,13 @@ impl Enrollment for EnrollmentSvc {
                         new_gateway_id: identity.id,
                         segment_name: identity.segment_name,
                         allowed_ips,
+                        // (Mesh-convergence T6, CodeRabbit) On a `rebind` this
+                        // carries the replaced gateway's just-revoked cert
+                        // serial(s) (empty for an ordinary enroll) so an
+                        // already-open Sync.Watch — gateway AND relay —
+                        // denylists them immediately rather than only on its
+                        // next reconnect. See `EnrollOutcome::revoked_serials`.
+                        revoked_serials: outcome.revoked_serials.clone(),
                         revision,
                     });
                 }

@@ -34,7 +34,9 @@ scripts:
   # Relay-specific postinstall: creates the DEDICATED /var/lib/wiremesh-relay
   # state dir (wiremesh:wiremesh, 0700) in addition to the shared user/group —
   # the relay must not share the gateway's root-only /var/lib/wiremesh
-  # (ops finding 2026-07-27/28, "Relay Finding A").
+  # (ops finding 2026-07-27/28, "Relay Finding A"). Also migrates a legacy
+  # identity (older .deb defaulted --certdir to /var/lib/wiremesh) to the new
+  # dir when safe — idempotent, non-destructive, preserves a custom certdir.
   postinstall: deploy/packages/scripts/postinstall-relay.sh
   preremove: deploy/packages/scripts/preremove-relay.sh
   postremove: deploy/packages/scripts/postremove.sh

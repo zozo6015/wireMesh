@@ -52,10 +52,55 @@ fn key_b64_to_hex(b64: &str) -> anyhow::Result<String> {
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Validate an `ip:port` endpoint as IPv4 before it reaches the UAPI wire.
+/// v1 is IPv4-only end to end (spec §1 — the controller binds an `Ipv4Addr`;
+/// matches `config.rs`'s IPv6-reject-at-boot policy), so a bracketed
+/// (`[…]:port`) or otherwise non-IPv4 endpoint is a hard error rather than a
+/// silently-written line boringtun would choke on later.
+fn validate_ipv4_endpoint(ep: &str) -> anyhow::Result<()> {
+    match ep.parse::<std::net::SocketAddr>() {
+        Ok(std::net::SocketAddr::V4(_)) => Ok(()),
+        Ok(std::net::SocketAddr::V6(_)) => {
+            Err(anyhow!("IPv6 endpoint {ep:?} is unsupported (v1 is IPv4-only)"))
+        }
+        Err(e) => Err(anyhow!("invalid endpoint {ep:?}: {e}")),
+    }
+}
+
+/// Validate an allowed-ips entry as an IPv4 CIDR (`a.b.c.d/len`) before it
+/// reaches the UAPI wire — same IPv4-only rationale as
+/// [`validate_ipv4_endpoint`]. An IPv6 CIDR (or malformed entry) is a hard
+/// error.
+fn validate_ipv4_cidr(cidr: &str) -> anyhow::Result<()> {
+    let (ip, len) =
+        cidr.split_once('/').ok_or_else(|| anyhow!("allowed_ip {cidr:?} is not CIDR (a.b.c.d/len)"))?;
+    let addr = ip
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| anyhow!("allowed_ip {cidr:?} is not an IPv4 CIDR (v1 is IPv4-only)"))?;
+    let prefix: u8 = len.parse().map_err(|_| anyhow!("allowed_ip {cidr:?} has a non-numeric prefix"))?;
+    if prefix > 32 {
+        return Err(anyhow!("allowed_ip {cidr:?} prefix /{prefix} exceeds /32"));
+    }
+    let _ = addr;
+    Ok(())
+}
+
 /// Render one peer's `set` block (public_key + endpoint? + replace_allowed_ips
 /// + allowed_ip* + persistent_keepalive_interval). Shared by [`encode_set`]
-/// (full config) and [`encode_add_peers`] (incremental add-only).
+/// (full config) and [`encode_add_peers`] (incremental add-only). Fallible:
+/// the endpoint and every allowed-ips CIDR are validated as IPv4 before ANY
+/// field is written (v1 is IPv4-only — see [`validate_ipv4_endpoint`] /
+/// [`validate_ipv4_cidr`]), so a non-IPv4/invalid peer fails the whole encode
+/// rather than emitting a partial, boringtun-rejected block.
 fn push_peer_block(s: &mut String, p: &PeerConfig) -> anyhow::Result<()> {
+    // Validate first, mutate second: a bad CIDR must not leave a half-written
+    // peer block in `s`.
+    if let Some(ep) = &p.endpoint {
+        validate_ipv4_endpoint(ep)?;
+    }
+    for cidr in &p.allowed_ips {
+        validate_ipv4_cidr(cidr)?;
+    }
     s.push_str(&format!("public_key={}\n", key_b64_to_hex(&p.public_key_b64)?));
     if let Some(ep) = &p.endpoint {
         s.push_str(&format!("endpoint={ep}\n"));

@@ -2,8 +2,14 @@
 
 **Source of truth:** `docs/research/ops-finding-multi-gateway-convergence.md`
 (2026-07-27 live 3-segment deployment failure cascade, evidence-backed).
-**Branch:** `fix/mesh-convergence`. **Release:** ships as v0.1.2 (patch — all
-fixes, no new surface) per the release-every-fix rule.
+**Branch:** `fix/mesh-convergence`. **Release:** intended as v0.1.2 (patch, no
+new surface) per the release-every-fix rule — but a **PARTIAL** convergence
+release: it ships T1–T7 (verified green on all existing conformance suites +
+the new relay-authz tests), while the 3-gateway convergence done-bar (T8)
+remains INCOMPLETE — assertions 3–4 are `#[ignore]`d, blocked on the carried
+punch-socket-starvation root cause (session continuity / keepalive under a
+blocked peer's punch storm). The release notes must state this known
+limitation explicitly; it is not a full fix of the 2026-07-27 incident.
 
 Execution per CLAUDE.md: separate test-author / implementer / dedicated
 test-runner / reviewer agents per task; all builds/tests in the dev container

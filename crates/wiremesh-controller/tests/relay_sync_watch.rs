@@ -528,3 +528,125 @@ async fn gateway_watch_still_receives_full_desired_state() {
         .expect("Admin.RevokeCert must succeed");
     let _ = drain_until_revocation(&mut stream, &serial).await;
 }
+
+/// (e) Rebind path (CodeRabbit follow-up): rebinding a segment's gateway
+/// does NOT go through `Admin.RevokeCert` — the replacement's enrollment
+/// itself revokes the replaced gateway's old cert, and the controller now
+/// propagates that serial onto the revocation stream via
+/// `ChangeEvent::GatewayEnrolled.revoked_serials` (with a matching
+/// `GatewayEnrolled` arm in the relay-revocation delta projection). Without
+/// this, a rebind's revocation would reach GATEWAY watches (whose
+/// `GatewayEnrolled` delta already upserts the new peer) but NEVER a relay's
+/// revocation-scoped watch — the same staleness class as Relay Finding B,
+/// just triggered by rebind instead of `Admin.RevokeCert`.
+///
+/// Mirrors `tests/rebind.rs`'s setup (enroll a gateway, mint a `rebind`
+/// token bound to its `segment_id`, redeem it declaring the same CIDRs) and
+/// reuses this file's own relay helpers. Asserts BOTH halves: the replaced
+/// gateway's old serial reaches the relay's revocation stream (delta, or
+/// snapshot if timing lands there), AND — the same security boundary as
+/// test (c) — the relay's messages carry NONE of the rebind's peer
+/// upsert/policy/desired-state (a rebind's `GatewayEnrolled` event upserts
+/// the replacement peer to gateway watchers; the relay must see only the
+/// revocation).
+#[tokio::test]
+async fn relay_watch_receives_rebind_revocation_without_peer_state() {
+    let h = TestController::start().await;
+
+    // Original gateway for segment "aws", plus a relay whose revocation
+    // watch is open BEFORE the rebind happens.
+    let original = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
+    let old_serial = original
+        .cert_serial()
+        .expect("parsing the original gateway's cert serial");
+    let seg_id = original.segment_id();
+
+    let relay = enroll_relay_with_key(&h, "203.0.113.9:4443").await;
+    let mut stream = open_relay_watch(&h, &relay)
+        .await
+        .expect("an enrolled relay's Sync.Watch must be authorized (test (a) pins this)");
+
+    // Drain the relay's opening snapshot — the rebind hasn't happened yet,
+    // so the old serial must NOT already be here (it proves the delta path,
+    // not a pre-existing revocation, carries it).
+    let snap = match next_msg(&mut stream).await.body {
+        Some(sync_message::Body::Snapshot(s)) => s,
+        other => panic!("expected the relay's first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+    };
+    assert!(
+        !snap.revoked_serials.contains(&old_serial),
+        "precondition: the relay's opening snapshot must predate the rebind and so must \
+         NOT already contain the soon-to-be-revoked serial {old_serial}, got: {:?}",
+        snap.revoked_serials
+    );
+
+    // Rebind: a `rebind` token bound to aws's segment, redeemed by a
+    // REPLACEMENT gateway declaring aws's own CIDRs — this enrollment
+    // revokes `original`'s cert as a side effect (see tests/rebind.rs).
+    let tok = h
+        .admin_client()
+        .await
+        .mint_token(MintTokenRequest {
+            kind: "rebind".into(),
+            bound_cidrs: vec![],
+            rebind_segment_id: seg_id,
+        })
+        .await
+        .expect("minting a rebind token bound to segment aws")
+        .into_inner()
+        .token;
+
+    let replacement = StubGateway::enroll(&h, &tok, &["10.0.0.0/16"])
+        .await
+        .expect(
+            "the replacement gateway enrolling with a rebind token on its own segment's \
+             CIDRs must succeed",
+        );
+    let new_serial = replacement
+        .cert_serial()
+        .expect("parsing the replacement gateway's cert serial");
+    assert_ne!(
+        new_serial, old_serial,
+        "the replacement gateway must receive a freshly issued, distinct cert"
+    );
+
+    // The relay's revocation stream must carry the replaced gateway's old
+    // serial — the whole point of the follow-up fix. `drain_until_revocation`
+    // panics (with everything seen) if it never arrives.
+    let seen = drain_until_revocation(&mut stream, &old_serial).await;
+
+    // SECURITY BOUNDARY (same as test (c)): a rebind's `GatewayEnrolled`
+    // event upserts the REPLACEMENT peer to gateway watchers — the relay
+    // must receive the revocation ONLY, never that peer change or any other
+    // desired-state.
+    for msg in &seen {
+        match &msg.body {
+            Some(sync_message::Body::Delta(d)) => {
+                assert!(
+                    d.upserted_peers.is_empty(),
+                    "a relay's watch must never carry the rebind's peer upsert (gateway \
+                     desired-state), got delta: {d:?}"
+                );
+                assert!(
+                    d.removed_peer_ids.is_empty(),
+                    "a relay's watch must never carry peer removals, got delta: {d:?}"
+                );
+                assert!(
+                    d.policy_ir.is_empty() && d.policy_version == 0,
+                    "a relay's watch must never carry compiled policy, got delta: {d:?}"
+                );
+            }
+            Some(sync_message::Body::Punch(p)) => {
+                panic!("a relay's watch must never receive a PunchDirective, got: {p:?}")
+            }
+            Some(sync_message::Body::Rotate(r)) => {
+                panic!("a relay's watch must never receive a RotateDirective, got: {r:?}")
+            }
+            Some(sync_message::Body::Snapshot(s)) => panic!(
+                "the relay's stream must not deliver a second StateSnapshot mid-stream, \
+                 got: {s:?}"
+            ),
+            None => panic!("SyncMessage with an empty body on the relay's watch"),
+        }
+    }
+}

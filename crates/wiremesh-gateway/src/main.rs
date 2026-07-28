@@ -1790,11 +1790,16 @@ async fn apply_state(
     // force every pair to re-handshake). Any removal/modification, or the
     // boot/first apply (no prior config, so `private_key`/`listen_port` must
     // be sent), falls through to the full apply.
-    let prior = {
+    // Snapshot BOTH guard fields we classify against, so after the (awaiting)
+    // incremental UAPI write we can detect a concurrent `set_peer_endpoint`
+    // (spawned punch/relay task) that mutated the guard in between and refuse
+    // to clobber it with our now-stale view — a TOCTOU on the `active` mutex,
+    // which is deliberately only ever held in tight non-await scopes.
+    let snapshot: Option<(String, Vec<uapi::PeerConfig>)> = {
         let a = active.lock().unwrap();
-        a.applied_config.as_ref().map(|_| a.applied_peers.clone())
+        a.applied_config.clone().map(|cfg| (cfg, a.applied_peers.clone()))
     };
-    match prior.as_deref().map(|prev| classify_peer_delta(prev, &dev.peers)) {
+    match snapshot.as_ref().map(|(_, prev)| classify_peer_delta(prev, &dev.peers)) {
         Some(PeerSetDelta::Unchanged) => {
             // No peer change at all — the full-apply guard would no-op too,
             // but classifying here also correctly skips a pure REORDER (same
@@ -1804,20 +1809,36 @@ async fn apply_state(
         Some(PeerSetDelta::PureAdditions(added)) => {
             let encoded =
                 uapi::encode_set(&dev).context("encoding active-tun device config")?;
+            let added_n = added.len();
             let ifn = ifname.clone();
             tokio::task::spawn_blocking(move || uapi::add_peers(&ifn, &added))
                 .await
                 .context("incremental add-peers UAPI task panicked")??;
-            // The device now holds the previous (untouched) peers plus the
-            // added ones — exactly the set `encoded` describes; record both
-            // guard fields so a later re-reconcile/re-point stays consistent.
+            // TOCTOU re-check: only write the guard back if it STILL equals the
+            // snapshot we classified against. A concurrent `set_peer_endpoint`
+            // full apply across the await would otherwise have its guard state
+            // clobbered by our stale `encoded`/`dev.peers`. On a mismatch,
+            // leave the guard as the concurrent writer set it and let the next
+            // reconcile re-derive (our incremental add is already on the
+            // device; the byte-guard/classify on the next apply reconciles any
+            // drift). The uncontended fast path is unchanged.
+            let (snap_cfg, snap_peers) =
+                snapshot.as_ref().expect("PureAdditions implies a Some snapshot");
             let mut a = active.lock().unwrap();
-            a.applied_config = Some(encoded);
-            a.applied_peers = dev.peers.clone();
-            eprintln!(
-                "wiremesh-gateway: incremental add of {} new peer(s) — existing sessions preserved",
-                dev.peers.len().saturating_sub(prior.as_deref().map_or(0, <[_]>::len)),
-            );
+            if a.applied_config.as_ref() == Some(snap_cfg) && a.applied_peers == *snap_peers {
+                a.applied_config = Some(encoded);
+                a.applied_peers = dev.peers.clone();
+                drop(a);
+                eprintln!(
+                    "wiremesh-gateway: incremental add of {added_n} new peer(s) — existing sessions preserved",
+                );
+            } else {
+                drop(a);
+                eprintln!(
+                    "wiremesh-gateway: guard changed during incremental add of {added_n} peer(s) \
+                     (concurrent endpoint re-point); leaving guard for the next reconcile to re-derive",
+                );
+            }
         }
         // Removal/modification, or boot/first apply (`None`): full apply.
         Some(PeerSetDelta::NeedsFullApply) | None => {

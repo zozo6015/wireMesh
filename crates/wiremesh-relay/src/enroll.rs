@@ -91,6 +91,9 @@ pub const SERVICE_USER: &str = "wiremesh";
 /// [`run_enroll`], which stays a pure library step for the K8s operator's
 /// init-container and the tests).
 ///
+/// The three identity files [`run_enroll`] generates inside `certdir`.
+const IDENTITY_FILES: [&str; 3] = ["ca.pem", "relay.pem", "relay.key"];
+
 /// Rationale (ops finding 2026-07-27/28, "Relay Finding A",
 /// `docs/research/ops-finding-multi-gateway-convergence.md`):
 /// `wiremesh-relay-enroll` is documented as a `sudo` step, so the identity
@@ -98,20 +101,33 @@ pub const SERVICE_USER: &str = "wiremesh";
 /// `User=wiremesh`, which crash-looped on "Permission denied" until the
 /// operator chown'd them by hand. When this process can (it's root and the
 /// `wiremesh` account exists — i.e. exactly the packaged bare-metal flow),
-/// `chown -R wiremesh:wiremesh <certdir>` completes the handoff
-/// automatically; otherwise (unprivileged run, a container image without
-/// the account, macOS) it prints the exact command to run instead of
-/// failing — enrollment itself already succeeded, and a non-systemd
-/// deployment may legitimately run the relay as someone else. Shelling out
-/// to `chown` follows the project idiom (`ip`/`nft`/`sysctl`/`conntrack`
-/// are shelled elsewhere) and sidesteps a uid lookup: `chown`'s own exit
-/// status already answers "am I root AND does the user exist".
+/// this completes the handoff automatically; otherwise (unprivileged run, a
+/// container image without the account, macOS) it prints the exact command
+/// to run instead of failing — enrollment itself already succeeded, and a
+/// non-systemd deployment may legitimately run the relay as someone else.
+/// Shelling out to `chown` follows the project idiom
+/// (`ip`/`nft`/`sysctl`/`conntrack` are shelled elsewhere) and sidesteps a
+/// uid lookup: `chown`'s own exit status already answers "am I root AND does
+/// the user exist".
+///
+/// SCOPE: chowns ONLY the directory itself and the three known generated
+/// identity files ([`IDENTITY_FILES`]) — NOT `-R`. A recursive chown would
+/// re-own any unrelated descendants an operator's `--certdir` might contain
+/// (e.g. a shared state dir), which is not this tool's business.
 pub fn chown_identity_best_effort(certdir: &Path) {
     let target = format!("{SERVICE_USER}:{SERVICE_USER}");
+    // The directory plus each generated file that actually exists — never a
+    // recursive descent.
+    let mut targets: Vec<std::ffi::OsString> = vec![certdir.as_os_str().to_owned()];
+    for name in IDENTITY_FILES {
+        let p = certdir.join(name);
+        if p.exists() {
+            targets.push(p.into_os_string());
+        }
+    }
     let status = std::process::Command::new("chown")
-        .arg("-R")
         .arg(&target)
-        .arg(certdir)
+        .args(&targets)
         .status();
     match status {
         Ok(s) if s.success() => {
@@ -121,10 +137,15 @@ pub fn chown_identity_best_effort(certdir: &Path) {
             );
         }
         _ => {
+            let files = IDENTITY_FILES
+                .iter()
+                .map(|f| certdir.join(f).display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
             eprintln!(
                 "wiremesh-relay: NOTE identity left owned by the invoking user. If the relay \
                  runs as the packaged systemd unit (User={SERVICE_USER}), run: \
-                 chown -R {target} {}",
+                 chown {target} {} {files}",
                 certdir.display()
             );
         }
