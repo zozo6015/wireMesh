@@ -37,6 +37,22 @@ fn admin_from_env(client: kube::Client, namespace: &str) -> AdminExec {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Live-deployment diagnostics: answer `-h`/`--help` and `-V`/`--version`
+    // before the operator-admin/idle dispatch and before starting reconcilers
+    // (see `cli`). Runs before tracing init so the manual/version go cleanly to
+    // stdout.
+    match wiremesh_operator::cli::cli_action(std::env::args()) {
+        wiremesh_operator::cli::CliAction::Help(m) => {
+            print!("{m}");
+            return Ok(());
+        }
+        wiremesh_operator::cli::CliAction::Version(s) => {
+            println!("{s}");
+            return Ok(());
+        }
+        wiremesh_operator::cli::CliAction::Run => {}
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),

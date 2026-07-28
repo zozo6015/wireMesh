@@ -152,6 +152,103 @@ pub fn chown_identity_best_effort(certdir: &Path) {
     }
 }
 
+/// The binary name reported by `--version` / the usage synopsis. The enroll
+/// tool ships as its own binary (`wiremesh-relay-enroll`) even though it lives
+/// in the `wiremesh-relay` crate, so its `env!("CARGO_PKG_VERSION")` is the
+/// relay crate's version.
+const ENROLL_BIN: &str = "wiremesh-relay-enroll";
+
+/// Pre-parse CLI intent for the `wiremesh-relay-enroll` binary — the
+/// live-deployment DIAGNOSTICS feature (plan
+/// `docs/superpowers/plans/2026-07-28-cli-help-version.md`). Lives beside
+/// [`parse_args`] so the bin can intercept `-h`/`--help`/`-V`/`--version`
+/// BEFORE `parse_args`' required-flag validation runs. INFALLIBLE by design.
+pub enum CliAction {
+    /// `-h`/`--help` seen: the fully rendered usage manual.
+    Help(String),
+    /// `-V`/`--version` seen: the rendered "`<bin> <version>`" line.
+    Version(String),
+    /// Neither: proceed with the normal `parse_args`/`run_enroll` path.
+    Run,
+}
+
+/// Decide the [`CliAction`]. Unlike the controller/gateway/operator variants,
+/// this receives the args iterator ALREADY positioned at `argv[1..]` — the bin
+/// hands it `std::env::args().skip(1)`, matching [`parse_args`] — so it does
+/// NOT skip a leading token. Help wins if both flags appear.
+pub fn cli_action(args: impl Iterator<Item = String>) -> CliAction {
+    let mut help = false;
+    let mut version = false;
+    for tok in args {
+        match tok.as_str() {
+            "-h" | "--help" => help = true,
+            "-V" | "--version" => version = true,
+            _ => {}
+        }
+    }
+    if help {
+        CliAction::Help(enroll_manual())
+    } else if version {
+        CliAction::Version(format!("{ENROLL_BIN} {}", env!("CARGO_PKG_VERSION")))
+    } else {
+        CliAction::Run
+    }
+}
+
+/// The full usage manual: synopsis, description, every flag (placeholder +
+/// required/optional + default + description), the deployment note, and a
+/// concrete example. Descriptions mirror [`EnrollArgs`] / [`parse_args`].
+fn enroll_manual() -> String {
+    format!(
+        "\
+{version}
+Relay identity bootstrap: redeem a kind=relay enrollment token and write the
+ca.pem / relay.pem / relay.key layout the relay server loads from its certdir.
+Run once (the operator's enroll init-container, or a bare-metal sudo step)
+before the relay starts. On the packaged host it best-effort chowns the
+identity to the User=wiremesh service account.
+
+USAGE (supply the token inline with --token):
+    {ENROLL_BIN} --token <token> --controller <host:port> --ca <path> \\
+                         --certdir <path> --endpoint <ip:port>
+
+USAGE (read the token from a file with --token-file):
+    {ENROLL_BIN} --token-file <path> --controller <host:port> --ca <path> \\
+                         --certdir <path> --endpoint <ip:port>
+
+    {ENROLL_BIN} --help
+    {ENROLL_BIN} --version
+
+FLAGS:
+    --token <token>          (required*) Enrollment token to redeem. *Exactly
+                             one of --token or --token-file.
+    --token-file <path>      (required*) Read the token from a file instead
+                             (keeps it out of argv; the K8s init-container
+                             mounts it).
+    --controller <host:port> (required) Controller Enrollment RPC address.
+    --ca <path>              (required) Controller CA bundle PEM to trust.
+    --certdir <path>         (required) Directory the relay identity
+                             (ca.pem/relay.pem/relay.key, each mode 0600) is
+                             written to.
+    --endpoint <ip:port>     (required) The relay's publicly-advertised IPv4
+                             endpoint (the controller rejects non-IPv4).
+    -h, --help               Print this manual and exit.
+    -V, --version            Print the version and exit.
+
+DEPLOYMENT:
+    The packaged systemd flow runs this as a sudo step before starting
+    wiremesh-relay; RELAY_ARGS in /etc/wiremesh/relay.env then configures the
+    relay service itself. The K8s operator runs it as an enroll init-container.
+
+EXAMPLE:
+    {ENROLL_BIN} --token-file /run/token --controller controller.example.com:9400 \\
+                         --ca /etc/wiremesh/ca.pem --certdir /var/lib/wiremesh \\
+                         --endpoint 203.0.113.7:4443
+",
+        version = format!("{ENROLL_BIN} {}", env!("CARGO_PKG_VERSION"))
+    )
+}
+
 /// Parse the `enroll` flags from the args iterator (positioned past argv[0]).
 pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<EnrollArgs> {
     let mut token = None;
