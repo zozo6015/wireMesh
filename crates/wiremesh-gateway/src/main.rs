@@ -531,16 +531,23 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 d.candidates.len(),
                                 d.go_unix_ms
                             );
-                            // Fix T3 (finding §3): consult the pair's punch
-                            // back-off BEFORE the concurrency guard. While
-                            // backed off, directives are skipped SILENTLY —
-                            // the state change was logged when the window
-                            // opened, and the incident's directive storm
-                            // re-fired every few seconds (once per directive
-                            // would flood the log).
-                            if ctx.punch_allowed(gid, &d.candidates) {
-                                match ctx.try_start_punch(gid) {
-                                    Some(guard) => {
+                            // Fix T3 (finding §3): acquire the CONCURRENCY
+                            // guard FIRST, and only then consult the pair's
+                            // punch back-off. `punch_allowed` has a side
+                            // effect — on an EXPIRED window it clears the
+                            // back-off and returns Allow (consuming the
+                            // window) — so it must not run when no attempt
+                            // will actually start. If the guard is already
+                            // held (a punch in flight), we skip WITHOUT
+                            // touching the back-off. While backed off,
+                            // directives are skipped SILENTLY (the state
+                            // change was logged when the window opened; the
+                            // incident's directive storm re-fired every few
+                            // seconds, so once-per-directive would flood the
+                            // log).
+                            match ctx.try_start_punch(gid) {
+                                Some(guard) => {
+                                    if ctx.punch_allowed(gid, &d.candidates) {
                                         tokio::spawn(punch_and_apply(
                                             ctx.clone(),
                                             gid,
@@ -549,11 +556,13 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                             guard,
                                         ));
                                     }
-                                    None => eprintln!(
-                                        "wiremesh-gateway: punch already in flight for peer={gid}; \
-                                         skipping controller directive"
-                                    ),
+                                    // else: backed off — drop the guard (it
+                                    // releases on scope exit) without spawning.
                                 }
+                                None => eprintln!(
+                                    "wiremesh-gateway: punch already in flight for peer={gid}; \
+                                     skipping controller directive"
+                                ),
                             }
                         }
                         Ok(Some(sync::SyncEvent::Rotate(d))) => {
@@ -1632,21 +1641,24 @@ async fn run_path_ticks(ctx: PathCtx) {
             tokio::spawn(ensure_relay_transport(ctx.clone(), gid, ds.relays.clone()));
         }
         for (gid, candidates) in to_punch {
-            // Fix T3 (finding §3): the pair's punch back-off is consulted
-            // before EVERY attempt — the path SM's own backoff bounds how
-            // often StartPunch fires per DISCONNECT cycle, but an undialable
-            // pair re-enters that cycle forever (and ProbeDirect re-fires
-            // per `PROBE_DIRECT_INTERVAL` indefinitely while Relayed), which
-            // is exactly the incident's indefinite storm. Skips are silent:
-            // the state change was logged when the window opened.
-            if !ctx.punch_allowed(gid, &candidates) {
-                continue;
-            }
-            // Dedup against a concurrent controller-directed punch — or
-            // another StartPunch/ProbeDirect tick — for the same peer (Fix 3).
+            // Fix T3 (finding §3): acquire the CONCURRENCY guard FIRST, THEN
+            // consult the pair's punch back-off — same ordering as the
+            // controller-`Punch` arm. `punch_allowed` consumes an expired
+            // back-off window (clears it, returns Allow), so it must only run
+            // when an attempt will actually start; if a punch is already in
+            // flight, skip without touching the back-off. The path SM's own
+            // backoff bounds how often StartPunch fires per DISCONNECT cycle,
+            // but an undialable pair re-enters that cycle forever (and
+            // ProbeDirect re-fires per `PROBE_DIRECT_INTERVAL` while
+            // Relayed) — the indefinite storm this back-off exists to bound.
+            // Skips are silent: the state change was logged when the window
+            // opened.
             match ctx.try_start_punch(gid) {
                 Some(guard) => {
-                    tokio::spawn(punch_and_apply(ctx.clone(), gid, candidates, None, guard));
+                    if ctx.punch_allowed(gid, &candidates) {
+                        tokio::spawn(punch_and_apply(ctx.clone(), gid, candidates, None, guard));
+                    }
+                    // else: backed off — drop the guard without spawning.
                 }
                 None => eprintln!(
                     "wiremesh-gateway: punch already in flight for peer={gid}; skipping tick-driven StartPunch/ProbeDirect"
@@ -1745,6 +1757,20 @@ fn classify_peer_delta(prev: &[uapi::PeerConfig], next: &[uapi::PeerConfig]) -> 
     }
 }
 
+/// The NON-peer device header of an `encode_set` string — everything before
+/// the first peer block, i.e. the `private_key=<hex>\nlisten_port=<n>\n
+/// replace_peers=true\n` lines. Used to decide whether the incremental
+/// add-only fast path is safe: `classify_peer_delta` only inspects the peer
+/// SET, so a change to `private_key`/`listen_port` (which `add_peers` does
+/// NOT emit) would otherwise be silently skipped. Comparing this prefix
+/// against the applied config's makes the header change force a full apply.
+fn device_header(encoded: &str) -> &str {
+    match encoded.find("public_key=") {
+        Some(i) => &encoded[..i],
+        None => encoded, // no peers — the whole string is header
+    }
+}
+
 /// Apply one desired state to the data plane (tunnel peers, enforcer, routes).
 ///
 /// The WG device peers, the change-guard, and the peer-segment routes ALL
@@ -1799,16 +1825,30 @@ async fn apply_state(
         let a = active.lock().unwrap();
         a.applied_config.clone().map(|cfg| (cfg, a.applied_peers.clone()))
     };
-    match snapshot.as_ref().map(|(_, prev)| classify_peer_delta(prev, &dev.peers)) {
-        Some(PeerSetDelta::Unchanged) => {
-            // No peer change at all — the full-apply guard would no-op too,
-            // but classifying here also correctly skips a pure REORDER (same
-            // set, different order) that the byte-guard would otherwise treat
-            // as a change and destructively re-apply.
+    // Encode the freshly built device up front: needed both for the non-peer
+    // header compare below and (on the PureAdditions path) for the guard
+    // write-back. `encode_set` is the same renderer `apply_device_if_changed`
+    // uses, so a header/byte match here is authoritative.
+    let encoded_dev = uapi::encode_set(&dev).context("encoding active-tun device config")?;
+    // The incremental fast paths (Unchanged / PureAdditions) only inspect the
+    // peer SET; they are trustworthy ONLY when the NON-peer device config
+    // (private_key + listen_port) also equals the applied snapshot — else the
+    // header change would be silently skipped, since `add_peers` emits no
+    // `private_key`/`listen_port` lines. A header mismatch (or no prior
+    // config) forces the full replace_peers apply.
+    let header_matches = snapshot
+        .as_ref()
+        .is_some_and(|(cfg, _)| device_header(cfg) == device_header(&encoded_dev));
+    let delta = snapshot.as_ref().map(|(_, prev)| classify_peer_delta(prev, &dev.peers));
+    match delta {
+        Some(PeerSetDelta::Unchanged) if header_matches => {
+            // No peer change AND the header (private_key/listen_port) matches —
+            // a true no-op. Classifying here also correctly skips a pure
+            // REORDER (same set, different order) that the byte-guard would
+            // otherwise treat as a change and destructively re-apply.
         }
-        Some(PeerSetDelta::PureAdditions(added)) => {
-            let encoded =
-                uapi::encode_set(&dev).context("encoding active-tun device config")?;
+        Some(PeerSetDelta::PureAdditions(added)) if header_matches => {
+            let encoded = encoded_dev;
             let added_n = added.len();
             let ifn = ifname.clone();
             tokio::task::spawn_blocking(move || uapi::add_peers(&ifn, &added))
@@ -1840,8 +1880,12 @@ async fn apply_state(
                 );
             }
         }
-        // Removal/modification, or boot/first apply (`None`): full apply.
-        Some(PeerSetDelta::NeedsFullApply) | None => {
+        // Everything else needs the full replace_peers apply: a peer
+        // removal/modification (`NeedsFullApply`), boot/first apply (`None`),
+        // OR an Unchanged/PureAdditions peer-set whose NON-peer header
+        // (private_key/listen_port) changed (`!header_matches`) — the latter
+        // must not take an incremental path that would drop the header change.
+        _ => {
             apply_device_if_changed(&ifname, &dev, active).await?;
         }
     }

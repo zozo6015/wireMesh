@@ -45,8 +45,13 @@ if have_legacy_identity && new_dir_empty && env_uses_old_dir; then
     chown wiremesh:wiremesh "$NEW_DIR/$f"
     chmod 0600 "$NEW_DIR/$f"
   done
-  # Repoint RELAY_ARGS' cert-dir at the new path (leave every other token as-is).
-  sed -i "s#\\(^RELAY_ARGS=.*\\)$OLD_DIR\\([[:space:]]\\)#\\1$NEW_DIR\\2#" "$RELAY_ENV" || true
+  # Repoint RELAY_ARGS' cert-dir at the new path (leave every other token
+  # as-is). Anchor OLD_DIR on BOTH sides with the SAME word boundary the
+  # `env_uses_old_dir` grep uses — a leading space/tab and a trailing
+  # space/tab/EOL — so it rewrites only a bare `$OLD_DIR` token and never a
+  # `$OLD_DIR-relay` / `$OLD_DIR-foo` suffix or an unrelated path containing
+  # the string. Boundaries are captured (\1, \2) and preserved.
+  sed -i -E "s#(RELAY_ARGS=.*[[:space:]])$OLD_DIR([[:space:]]|\$)#\\1$NEW_DIR\\2#" "$RELAY_ENV" || true
   echo "WireMesh relay: identity migrated; RELAY_ARGS cert-dir updated to $NEW_DIR"
 elif have_legacy_identity && ! new_dir_empty; then
   echo "WireMesh relay: NOTE legacy identity still present in $OLD_DIR but $NEW_DIR is already" \

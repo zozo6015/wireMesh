@@ -1,14 +1,22 @@
 # Mesh-convergence hardening — fix cycle plan
 
-**Source of truth:** `docs/research/ops-finding-multi-gateway-convergence.md`
-(2026-07-27 live 3-segment deployment failure cascade, evidence-backed).
-**Branch:** `fix/mesh-convergence`. **Release:** intended as v0.1.2 (patch, no
-new surface) per the release-every-fix rule — but a **PARTIAL** convergence
-release: it ships T1–T7 (verified green on all existing conformance suites +
-the new relay-authz tests), while the 3-gateway convergence done-bar (T8)
-remains INCOMPLETE — assertions 3–4 are `#[ignore]`d, blocked on the carried
-punch-socket-starvation root cause (session continuity / keepalive under a
-blocked peer's punch storm). The release notes must state this known
+**Authority order** (per `CLAUDE.md`): the approved engineering design
+(`docs/superpowers/specs/2026-07-15-wiremesh-engineering-design.md`, its §1
+decision record and §11 amendments) > PRD > plans; this plan sits at the
+plan tier and does not override them. **Requirements source for this cycle:**
+`docs/research/ops-finding-multi-gateway-convergence.md` (the night-of
+2026-07-27→28 live 3-segment deployment failure cascade, evidence-backed) —
+it enumerates the concrete defects this cycle fixes.
+
+**Branch:** `fix/mesh-convergence`. **Release:** intended as v0.1.2 — a *patch*
+in the semver sense (no incompatible public-API/wire changes; behavior does
+change, e.g. persistent keepalive is now emitted), per the release-every-fix
+rule — but a **PARTIAL** convergence release: it ships T1–T7 (which passed all
+existing conformance suites + the new relay-authz tests at the time they were
+run), while the 3-gateway convergence done-bar (T8) remains INCOMPLETE —
+assertions 3–4 are `#[ignore]`d (and therefore NOT run in CI), blocked on the
+carried punch-socket-starvation root cause (session continuity / keepalive
+under a blocked peer's punch storm). The release notes must state this known
 limitation explicitly; it is not a full fix of the 2026-07-27 incident.
 
 Execution per CLAUDE.md: separate test-author / implementer / dedicated
@@ -79,12 +87,17 @@ test-runner / reviewer agents per task; all builds/tests in the dev container
   traffic still flows A↔B and to C (keepalive holds mappings). Mandatory
   netem latency per harness convention.
 
-  **STATUS (2026-07-28): PARTIAL — assertions 1-2 achieved; assertions 3-4
-  carried to a follow-up cycle.** Delivered as
+  **STATUS (2026-07-28): INCOMPLETE — NOT a passing done-bar.** Delivered as
   `crates/wiremesh-gateway/tests/convergence_matrix.rs` (two tests:
   `t8_convergence_incident_lifecycle` = assertions 1,3,2;
-  `t8_keepalive_holds_path_state_under_punch_contention` = assertion 4). The
-  done-bar CAUGHT TWO REAL BUGS and thereby did its job: (a) it drove the
+  `t8_keepalive_holds_path_state_under_punch_contention` = assertion 4), but
+  **BOTH are `#[ignore]`d, so NOTHING here runs in CI and no assertion is
+  continuously verified.** Assertions 1–2 were *observed* passing during
+  development runs; assertion 3 does NOT hold (see below), so the combined
+  `t8_convergence_incident_lifecycle` cannot be un-ignored as-is — it fails at
+  assertion 3. Do not read "assertions 1–2" as a durable guarantee; they are
+  not gated. The done-bar's VALUE this cycle was diagnostic — it CAUGHT TWO
+  REAL BUGS: (a) it drove the
   add-only make-before-break peer apply (T4), which fixes endpoint-level
   clobber — verified: at the failure point endpoints and path_state ARE
   preserved; and (b) it proved that endpoint-level make-before-break is NOT
@@ -104,9 +117,11 @@ test-runner / reviewer agents per task; all builds/tests in the dev container
 
 ## Cycle status (2026-07-28)
 
-T1-T7 **delivered**. T8 **partial**: assertions 1-2 met; assertions 3-4
-carried to the puncher-socket-isolation follow-up cycle (ignored tests are
-its done-bar).
+T1-T7 **delivered** (verified against the existing conformance suites + new
+relay-authz tests). T8 **INCOMPLETE**: both convergence tests are `#[ignore]`d
+and un-gated — assertion 3 does not hold and 4 is unrun; the whole convergence
+done-bar is carried to the puncher-socket-isolation follow-up cycle (the two
+ignored tests, un-ignored, are its done-bar).
 
 ## Sequencing
 
