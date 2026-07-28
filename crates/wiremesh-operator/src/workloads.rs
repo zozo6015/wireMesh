@@ -354,6 +354,35 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
 // Gateway
 // --------------------------------------------------------------------------
 
+/// Scheduler-aware node pinning for the gateway pod.
+///
+/// The gateway now mounts a per-gateway PVC (`gateway_pvc`). Default storage
+/// classes — k3s `local-path`, most NFS/CSI provisioners — use
+/// `volumeBindingMode: WaitForFirstConsumer`, which binds a PVC only AFTER the
+/// scheduler has placed the consuming pod onto a node. Setting `spec.nodeName`
+/// directly (the old pinning) BYPASSES the scheduler entirely, so a WFC PVC never
+/// gets its "first consumer" scheduling event → the PVC stays `Pending` → the pod
+/// hangs `Pending` forever (observed live: `gw-home` pinned to `zolab-worker1`).
+///
+/// The fix keeps the SAME node pin but expresses it as a
+/// `kubernetes.io/hostname` nodeSelector, which the scheduler honors — so the pod
+/// is placed (triggering WFC binding) yet still lands only on the chosen node. An
+/// explicit CR `nodeSelector` is preserved, and an explicit `kubernetes.io/hostname`
+/// key in it WINS over the folded-in `nodeName` (`or_insert`). Cross-node failover
+/// remains out of scope (a node-local RWO PVC still binds on one node).
+fn scheduler_aware_node_selector(spec: &WiremeshGatewaySpec) -> Option<BTreeMap<String, String>> {
+    let mut sel = spec.node_selector.clone().unwrap_or_default();
+    if let Some(n) = &spec.node_name {
+        // `or_insert`: an explicit hostname key in the CR's nodeSelector wins.
+        sel.entry("kubernetes.io/hostname".to_string()).or_insert_with(|| n.clone());
+    }
+    if sel.is_empty() {
+        None
+    } else {
+        Some(sel)
+    }
+}
+
 /// The gateway's identity PVC (`<name>-gateway-data`, kind-specific so it never
 /// collides with the controller's `<name>-data`), mounted at `/var/lib/wiremesh`.
 /// Persists the enrolled `Identity` (`identity.json`/`wg_private.key`) across pod
@@ -459,8 +488,12 @@ pub fn gateway_deployment(
         // no cluster DNS). Use ClusterFirstWithHostNet so cluster names still
         // resolve — belt-and-suspenders even though we now pass ClusterIPs.
         dns_policy: Some("ClusterFirstWithHostNet".to_string()),
-        node_name: gw.spec.node_name.clone(),
-        node_selector: gw.spec.node_selector.clone(),
+        // Never set `nodeName` directly — it bypasses the scheduler and a
+        // WaitForFirstConsumer PVC would never bind. Pin via a
+        // `kubernetes.io/hostname` nodeSelector instead (see
+        // `scheduler_aware_node_selector`).
+        node_name: None,
+        node_selector: scheduler_aware_node_selector(&gw.spec),
         init_containers: Some(vec![enroll]),
         containers: vec![main],
         volumes: Some(vec![
@@ -677,6 +710,95 @@ mod tests {
             storage_class,
             storage_size,
         }
+    }
+
+    fn gw_spec_pinned(
+        node_name: Option<String>,
+        node_selector: Option<BTreeMap<String, String>>,
+    ) -> WiremeshGatewaySpec {
+        WiremeshGatewaySpec {
+            segment_ref: "aws".into(),
+            node_name,
+            node_selector,
+            wg_port: None,
+            tun: None,
+            image: None,
+            storage_class: None,
+            storage_size: None,
+        }
+    }
+
+    #[test]
+    fn gateway_pinning_is_scheduler_aware() {
+        // FUNCTIONAL BUG: the gateway pod now mounts a PVC. Default storage
+        // classes (k3s local-path, nfs) are WaitForFirstConsumer, which binds the
+        // PVC only once a POD IS SCHEDULED onto a node. Setting `spec.nodeName`
+        // directly BYPASSES the scheduler, so a WFC PVC never binds → PVC Pending →
+        // pod stuck forever. The operator must instead fold the CR's `nodeName`
+        // into a `kubernetes.io/hostname` nodeSelector so the scheduler places the
+        // pod (and the WFC PVC binds) while still pinning it to the chosen node.
+        const HOSTNAME_KEY: &str = "kubernetes.io/hostname";
+        let build = |spec: WiremeshGatewaySpec| {
+            let gw = WiremeshGateway::new("gw-aws", spec);
+            let d = gateway_deployment(
+                &gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token",
+                &["10.10.0.0/16".to_string()],
+            );
+            d.spec.unwrap().template.spec.unwrap()
+        };
+
+        // 1. CR nodeName only → pod.node_name is None; nodeName folded into a
+        //    kubernetes.io/hostname selector.
+        let p = build(gw_spec_pinned(Some("zolab-worker1".into()), None));
+        assert_eq!(
+            p.node_name, None,
+            "spec.nodeName must NOT be set directly (it bypasses the scheduler → a WaitForFirstConsumer PVC never binds)"
+        );
+        let sel = p.node_selector.expect("nodeName must be folded into a nodeSelector");
+        assert_eq!(
+            sel.get(HOSTNAME_KEY).map(String::as_str),
+            Some("zolab-worker1"),
+            "nodeName is pinned via a kubernetes.io/hostname nodeSelector so the scheduler places the pod"
+        );
+
+        // 2. CR nodeName + explicit nodeSelector → hostname added AND the explicit
+        //    selector keys preserved.
+        let mut extra = BTreeMap::new();
+        extra.insert("disktype".to_string(), "ssd".to_string());
+        let p = build(gw_spec_pinned(Some("zolab-worker1".into()), Some(extra)));
+        assert_eq!(p.node_name, None, "still no direct nodeName");
+        let sel = p.node_selector.expect("selector present");
+        assert_eq!(
+            sel.get(HOSTNAME_KEY).map(String::as_str),
+            Some("zolab-worker1"),
+            "hostname selector folded in alongside the explicit selector"
+        );
+        assert_eq!(
+            sel.get("disktype").map(String::as_str),
+            Some("ssd"),
+            "the CR's explicit nodeSelector keys are preserved"
+        );
+
+        // 3. CR nodeSelector only (no nodeName) → passed through unchanged; no
+        //    hostname key synthesized; node_name None.
+        let mut only = BTreeMap::new();
+        only.insert("disktype".to_string(), "ssd".to_string());
+        let p = build(gw_spec_pinned(None, Some(only)));
+        assert_eq!(p.node_name, None);
+        let sel = p.node_selector.expect("explicit selector passed through");
+        assert_eq!(sel.get("disktype").map(String::as_str), Some("ssd"));
+        assert!(
+            !sel.contains_key(HOSTNAME_KEY),
+            "no hostname selector synthesized when the CR sets no nodeName"
+        );
+
+        // 4. CR neither → no pinning at all.
+        let p = build(gw_spec_pinned(None, None));
+        assert_eq!(p.node_name, None, "no nodeName");
+        assert!(
+            p.node_selector.as_ref().map(|m| m.is_empty()).unwrap_or(true),
+            "no nodeSelector when the CR pins nothing"
+        );
     }
 
     #[test]

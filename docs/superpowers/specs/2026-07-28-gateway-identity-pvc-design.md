@@ -27,11 +27,17 @@ currently forces a gateway re-enrollment.
 - The gateway RECONCILER creates/owns the PVC (owner-ref, so it's GC'd with the
   CR — same pattern as the controller reconciler owning `controller_pvc`).
   Verify the operator RBAC already covers PVC create (the controller path does).
-- Node-pinning note: the gateway is already node-pinned (`nodeName`/
-  `nodeSelector`), so a node-local RWO PVC (k3s `local-path`,
-  WaitForFirstConsumer) binds on that node — correct and intended. True
-  cross-node failover is explicitly OUT OF SCOPE (needs networked storage +
-  routing follow — a separate, larger effort).
+- Node-pinning note: the gateway is node-pinned, but the operator MUST NOT set
+  `spec.nodeName` directly once the pod mounts a PVC. Default storage classes
+  (k3s `local-path`, most NFS/CSI) are `WaitForFirstConsumer`, which binds a PVC
+  only after the SCHEDULER places the consuming pod; a direct `nodeName` bypasses
+  the scheduler, so the WFC PVC never binds and the pod hangs `Pending` forever
+  (observed live: `gw-home` on `zolab-worker1`). Instead the operator folds the
+  CR's `nodeName` into a `kubernetes.io/hostname` nodeSelector (an explicit CR
+  `nodeSelector` is preserved; an explicit hostname key wins) — same node pin,
+  but the scheduler places the pod so the WFC PVC binds. True cross-node failover
+  is explicitly OUT OF SCOPE (a node-local RWO PVC still binds on one node; real
+  failover needs networked storage + routing follow — a separate, larger effort).
 
 ### 2. Idempotent enroll (gateway binary)
 
