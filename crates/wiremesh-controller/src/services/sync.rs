@@ -38,6 +38,7 @@ use wiremesh_proto::v1::{
 };
 
 use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
+use crate::db::GatewayIdentity;
 use crate::db_async::DbHandle;
 use crate::projection::{self, ChangeEvent};
 use crate::rotation::{self, RotationDecision, RotationState};
@@ -570,27 +571,22 @@ impl Stream for GuardedWatchStream {
     }
 }
 
-#[tonic::async_trait]
-impl Sync for SyncSvc {
-    type WatchStream = WatchStream;
-
-    async fn watch(
+/// (Mesh-convergence T6) The two `Sync.Watch` code paths, split out of the
+/// trait `watch` dispatcher below so a GATEWAY's full desired-state watch and
+/// a RELAY's revocation-scoped watch share NOTHING structurally — in
+/// particular the relay path never touches the punch broker or the rotation
+/// machinery the gateway path wires up (see `watch_relay`'s doc comment for
+/// the id-collision hazard that makes that separation load-bearing).
+impl SyncSvc {
+    /// A GATEWAY's `Sync.Watch`: the full desired-state stream (snapshot with
+    /// peers + policy + relays, then live deltas + broker-driven punches).
+    /// Behavior is byte-for-byte what the pre-T6 `watch` method did once the
+    /// CN resolved to a gateway — only its home moved.
+    async fn watch_gateway(
         &self,
-        request: Request<WatchRequest>,
-    ) -> Result<Response<Self::WatchStream>, Status> {
-        let (gateway_name, self_cert_pem) = peer_identity(&request)?;
-
-        let gw = self
-            .db
-            .find_gateway_by_name(gateway_name)
-            .await
-            .map_err(|e| Status::internal(format!("looking up gateway by cert CN: {e}")))?
-            .ok_or_else(|| {
-                Status::permission_denied(
-                    "client certificate's CN does not match any enrolled gateway",
-                )
-            })?;
-
+        gw: GatewayIdentity,
+        self_cert_pem: String,
+    ) -> Result<Response<WatchStream>, Status> {
         // Subscribe BEFORE building the snapshot. `build_snapshot` has
         // internal `await` points (each `DbHandle` call hops onto
         // `spawn_blocking`), so a `ChangeEvent` published in the window
@@ -689,7 +685,7 @@ impl Sync for SyncSvc {
         let punch_stream = ReceiverStream::new(punch_rx).map(Ok::<SyncMessage, Status>);
         let merged = delta_stream.merge(punch_stream);
 
-        let inner: Self::WatchStream =
+        let inner: WatchStream =
             Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(merged));
 
         // (Cycle-4b Task 5) Trigger (a): now that this connection is registered,
@@ -703,11 +699,142 @@ impl Sync for SyncSvc {
             broker.on_gateway_connected(self_gateway_id).await;
         });
 
-        let stream: Self::WatchStream = Box::pin(GuardedWatchStream {
+        let stream: WatchStream = Box::pin(GuardedWatchStream {
             _guard: guard,
             inner,
         });
         Ok(Response::new(stream))
+    }
+
+    /// (Mesh-convergence T6, ops-finding "Relay Finding B") The
+    /// REVOCATION-SCOPED `Sync.Watch` an enrolled RELAY is authorized for —
+    /// the fix for the finding's "the relay's revocation Sync watch is
+    /// rejected by the controller" (its offline denylist never refreshing
+    /// after enrollment).
+    ///
+    /// Structurally DISJOINT from [`SyncSvc::watch_gateway`]: a relay does not
+    /// punch, does not `Report`, and does not rotate keys, so this path shares
+    /// NONE of the gateway broker/rotation wiring. In particular it must NOT
+    /// call `broker.register(..)` / `broker.on_gateway_connected(..)` — relay
+    /// row ids and gateway row ids are SEPARATE sqlite sequences that DO
+    /// collide (relay id 1 == gateway id 1), so registering a relay under its
+    /// numeric id would pollute `Broker::connected_gateway_ids` (which
+    /// rotation's expected-peer set reads) and mis-route a real gateway's
+    /// `PunchDirective` channel. This method therefore never touches the
+    /// broker at all, and there is no `RegistrationGuard` to drop.
+    ///
+    /// The stream opens with a revocation-only `StateSnapshot`
+    /// ([`projection::build_relay_revocation_snapshot`] — empty peers/policy/
+    /// relays) and thereafter forwards ONLY revocation-bearing deltas
+    /// ([`projection::relay_revocation_delta`], which returns `None` for every
+    /// peer/policy/relay-set/key-rotation event). Lag handling matches the
+    /// gateway path: a receiver that falls behind the broadcast ring gets one
+    /// terminal `Unavailable` and the stream ends, forcing a reconnect + fresh
+    /// consistent revocation snapshot rather than a silently-gapped denylist.
+    async fn watch_relay(
+        &self,
+        relay_id: i64,
+        self_cert_pem: String,
+    ) -> Result<Response<WatchStream>, Status> {
+        // Subscribe BEFORE snapshotting for the same reason the gateway path
+        // does (see `watch_gateway`): a revocation published in the window
+        // between the snapshot's DB read and here must be buffered in `rx`,
+        // not lost. At worst the relay sees a serial once in the snapshot and
+        // again in a delta — harmless, its denylist is a set.
+        let rx = self.change_tx.subscribe();
+
+        let snapshot = projection::build_relay_revocation_snapshot(&self.db, self_cert_pem)
+            .await
+            .map_err(|e| Status::internal(format!("building relay revocation snapshot: {e}")))?;
+        let snapshot_msg = SyncMessage {
+            body: Some(Body::Snapshot(snapshot)),
+        };
+
+        let mut lagged = false;
+        let delta_stream = BroadcastStream::new(rx)
+            .map_while(move |item| {
+                if lagged {
+                    return None;
+                }
+                match item {
+                    // Forward ONLY revocation-bearing events; every other
+                    // event (peer upserts, policy, relay-set, key rotation)
+                    // maps to `None` and is dropped here (`Some(None)` keeps
+                    // the stream open). This is the delta-side security
+                    // boundary — a relay never receives gateway desired-state
+                    // (no `upserted_peers`/`removed_peer_ids`, no policy, and —
+                    // since the broker/rotation channels are never wired up
+                    // above — no `PunchDirective`/`RotateDirective` either).
+                    Ok(event) => match projection::relay_revocation_delta(event) {
+                        Some(delta) => Some(Some(Ok(SyncMessage {
+                            body: Some(Body::Delta(delta)),
+                        }))),
+                        None => Some(None),
+                    },
+                    Err(BroadcastStreamRecvError::Lagged(skipped)) => {
+                        eprintln!(
+                            "wiremesh-controller: relay Sync.Watch (relay {relay_id}) lagged \
+                             behind the change broadcast by {skipped} event(s); terminating the \
+                             stream so the relay reconnects and re-snapshots its denylist"
+                        );
+                        lagged = true;
+                        Some(Some(Err(Status::unavailable(format!(
+                            "Sync.Watch lagged behind the change broadcast by {skipped} event(s); \
+                             reconnect to receive a fresh, consistent snapshot"
+                        )))))
+                    }
+                }
+            })
+            .filter_map(|opt| opt);
+
+        // No broker registration, no punch stream, no `on_gateway_connected`
+        // — see this method's doc comment. Nothing to guard on drop (there is
+        // no registry entry), so the raw stream is returned directly.
+        let inner: WatchStream =
+            Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(delta_stream));
+        Ok(Response::new(inner))
+    }
+}
+
+#[tonic::async_trait]
+impl Sync for SyncSvc {
+    type WatchStream = WatchStream;
+
+    /// Authorizes and dispatches a `Sync.Watch`. Identity comes EXCLUSIVELY
+    /// from the mTLS peer cert's subject CN (see `peer_identity`): a gateway's
+    /// CN is a `gateway.name`; a relay's is `relay-<secret_hash_hex>` == its
+    /// `relay.name` (see `services::enrollment`). Resolve GATEWAY first (the
+    /// common case — full desired-state watch); on a miss, try RELAY
+    /// (revocation-scoped watch — ops-finding "Relay Finding B": before T6 the
+    /// relay's watch was rejected outright and its offline denylist never
+    /// refreshed post-enrollment). Only a CN that matches NEITHER is denied.
+    async fn watch(
+        &self,
+        request: Request<WatchRequest>,
+    ) -> Result<Response<Self::WatchStream>, Status> {
+        let (identity_cn, self_cert_pem) = peer_identity(&request)?;
+
+        if let Some(gw) = self
+            .db
+            .find_gateway_by_name(identity_cn.clone())
+            .await
+            .map_err(|e| Status::internal(format!("looking up gateway by cert CN: {e}")))?
+        {
+            return self.watch_gateway(gw, self_cert_pem).await;
+        }
+
+        if let Some(relay_id) = self
+            .db
+            .find_relay_by_name(identity_cn)
+            .await
+            .map_err(|e| Status::internal(format!("looking up relay by cert CN: {e}")))?
+        {
+            return self.watch_relay(relay_id, self_cert_pem).await;
+        }
+
+        Err(Status::permission_denied(
+            "client certificate's CN does not match any enrolled gateway or relay",
+        ))
     }
 
     async fn report(

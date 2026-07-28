@@ -12,12 +12,22 @@ EnvironmentFile=/etc/wiremesh/relay.env
 ExecStart=/usr/bin/wiremesh-relay $RELAY_ARGS
 Restart=on-failure
 RestartSec=5
-WorkingDirectory=/var/lib/wiremesh
+# Dedicated relay state dir (ops finding 2026-07-27/28, "Relay Finding A",
+# docs/research/ops-finding-multi-gateway-convergence.md): the relay must NOT
+# share /var/lib/wiremesh with the gateway — on a shared host that directory
+# is the gateway's root-only (0700 root) state dir, so this User=wiremesh
+# service crash-looped on "Permission denied" reading its own relay.pem.
+# StateDirectory= makes systemd create /var/lib/wiremesh-relay owned by the
+# service User/Group before start (fixing up ownership on mismatch), and
+# grants it write access despite ProtectSystem=strict — mirroring the
+# controller unit's RuntimeDirectory= rationale.
+StateDirectory=wiremesh-relay
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/wiremesh-relay
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/wiremesh
 
 [Install]
 WantedBy=multi-user.target

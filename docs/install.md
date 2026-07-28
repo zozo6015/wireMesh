@@ -74,9 +74,24 @@ sudo systemctl enable --now wiremesh-gateway
 # Relay:
 sudo wiremesh-relay-enroll --token-file /etc/wiremesh/relay.token \
   --controller CONTROLLER_HOST:9400 --ca /etc/wiremesh/ca.pem \
-  --certdir /var/lib/wiremesh --endpoint PUBLIC_IP:4443
+  --certdir /var/lib/wiremesh-relay --endpoint PUBLIC_IP:4443
 sudo systemctl enable --now wiremesh-relay
 ```
+
+**The relay's cert dir is `/var/lib/wiremesh-relay` — its own dedicated state
+dir, never `/var/lib/wiremesh`.** A relay and a gateway can share a host, but
+they must not share a state dir: `/var/lib/wiremesh` is the gateway's
+root-only (0700 root) directory, while the relay service runs as the
+`wiremesh` user — an identity enrolled into the gateway's dir is unreadable
+by the relay, which then crash-loops on "Permission denied". The package and
+the unit (`StateDirectory=wiremesh-relay`) create `/var/lib/wiremesh-relay`
+owned `wiremesh:wiremesh` mode 0700, and `wiremesh-relay-enroll` (run under
+`sudo` as documented) chowns the identity it writes to the `wiremesh` service
+user automatically — if it can't (it tells you), run
+`chown -R wiremesh:wiremesh /var/lib/wiremesh-relay` yourself. The three
+identity files (`ca.pem`, `relay.pem`, `relay.key`) must EACH be mode 0600
+individually (the enroll tool writes them that way; keep them so — a
+directory-level 0700 alone is not sufficient).
 
 (WireMesh itself hosts no package repository — it ships the `.deb`/`.rpm` as
 Release downloads. If you want `apt`/`dnf` to resolve `wiremesh-*` directly, you

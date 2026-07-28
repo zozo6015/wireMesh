@@ -72,6 +72,16 @@ pub enum ChangeEvent {
         /// The new gateway's segment's CIDRs — becomes the upserted peer's
         /// `allowed_ips`.
         allowed_ips: Vec<String>,
+        /// (Mesh-convergence T6, CodeRabbit) The cert serial(s) this
+        /// enrollment revoked — non-empty ONLY for a `rebind` (which replaces
+        /// the segment's prior gateway and revokes its cert), empty for an
+        /// ordinary enrollment. Folded into this event's `Delta.revoked_serials`
+        /// so an already-open `Sync.Watch` — GATEWAY *and* RELAY — denylists
+        /// the replaced gateway's serial immediately (mirroring
+        /// `GatewayDrained`, which carries both a peer change and its
+        /// `revoked_serials` in one delta). Without this a relay's offline
+        /// denylist would silently miss rebind revocations until it reconnects.
+        revoked_serials: Vec<String>,
         /// The persisted revision the mutation bumped to
         /// ([`crate::db_async::DbHandle::current_revision`], read AFTER the
         /// mutation's transaction committed) — strictly greater than any
@@ -244,6 +254,7 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             new_gateway_id,
             segment_name,
             allowed_ips,
+            revoked_serials,
             revision,
         } => Delta {
             revision,
@@ -268,7 +279,11 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             relays_updated: false,
             policy_ir: Vec::new(),
             policy_version: 0,
-            revoked_serials: Vec::new(),
+            // (Mesh-convergence T6, CodeRabbit) Empty for an ordinary enroll
+            // (wire shape unchanged); on a `rebind` this carries the replaced
+            // gateway's revoked serial(s) so a GATEWAY watcher denylists them
+            // in the same delta that upserts the replacement peer.
+            revoked_serials,
         },
         ChangeEvent::KeyRotated {
             gateway_id,
@@ -474,6 +489,119 @@ pub async fn build_snapshot(
         relay_infos,
         policy_ir,
         policy_version,
+        revoked_serials,
+    })
+}
+
+/// (Mesh-convergence T6, ops-finding "Relay Finding B") The REVOCATION-SCOPED
+/// snapshot an enrolled RELAY receives when it opens `Sync.Watch` (the
+/// operation the finding reports as wrongly rejected: a relay's leaf CN is
+/// `relay-<secret_hash_hex>`, never a `gateway.name`, so the gateway-only CN
+/// lookup denied it and its offline denylist never refreshed after
+/// enrollment).
+///
+/// A relay is NOT a gateway and must never receive gateway desired-state:
+/// this snapshot carries ONLY what the relay's denylist consumer needs —
+/// `revoked_serials` (its `Denylist::replace_all` input) and the persisted
+/// `revision` — with `peers`, `relay_infos`, and `policy_ir`/`policy_version`
+/// all deliberately EMPTY/`0`. That omission is the security boundary
+/// (`services::sync`'s relay watch branch mirrors it for deltas), not an
+/// optimization: a relay bridges opaque WireGuard datagrams and has no use
+/// for — and must not be told — the mesh's peer set or compiled policy.
+/// `self_cert_pem` is echoed back the same way [`build_snapshot`] echoes a
+/// gateway's, so the relay's consumer sees the identical `StateSnapshot`
+/// shape (first message on the stream) it already expects.
+///
+/// `#[allow(deprecated)]`: constructing `StateSnapshot` requires setting
+/// `deprecated_relays` (see [`build_snapshot`]'s identical note).
+#[allow(deprecated)]
+pub async fn build_relay_revocation_snapshot(
+    db: &DbHandle,
+    self_cert_pem: String,
+) -> anyhow::Result<StateSnapshot> {
+    // (CodeRabbit) `revision` and `revoked_serials` MUST come from one atomic
+    // read — a revocation committing between two separate reads would hand the
+    // relay a `revision`/`revoked_serials` pair from different instants. See
+    // `Db::revocation_snapshot`.
+    let (revision, revoked_serials) = db.revocation_snapshot().await?;
+    Ok(StateSnapshot {
+        revision,
+        self_cert_pem,
+        peers: Vec::new(),
+        deprecated_relays: Vec::new(),
+        relay_infos: Vec::new(),
+        policy_ir: Vec::new(),
+        policy_version: 0,
+        revoked_serials,
+    })
+}
+
+/// (Mesh-convergence T6, ops-finding "Relay Finding B") Turns a
+/// [`ChangeEvent`] into the REVOCATION-ONLY [`Delta`] an enrolled relay's
+/// `Sync.Watch` forwards — or `None` for any event that carries no
+/// revocation, so the relay's stream stays limited to the denylist-relevant
+/// subset.
+///
+/// This is the delta-side twin of [`build_relay_revocation_snapshot`]'s
+/// security boundary. Three `ChangeEvent`s bear revocation:
+///
+///   * [`ChangeEvent::CertRevoked`] — `Admin.RevokeCert` (the relay's
+///     `Denylist::union` input);
+///   * [`ChangeEvent::GatewayDrained`] — a drain revokes the drained
+///     gateway's cert serial(s); its `revoked_serials` are forwarded, but its
+///     `removed_peer_ids` (gateway peer-set desired-state) are DROPPED — a
+///     relay must never learn peer removals.
+///   * [`ChangeEvent::GatewayEnrolled`] with a non-empty `revoked_serials` —
+///     a `rebind` enrollment replaces the segment's prior gateway and revokes
+///     its cert (CodeRabbit T6 finding). Its `revoked_serials` are forwarded,
+///     but its `upserted_peers` (the replacement gateway's identity —
+///     desired-state) are DROPPED, exactly as `GatewayDrained`'s peer-removal
+///     is. An ordinary (non-rebind) enroll carries no serials and returns
+///     `None`, so nothing peer-shaped ever reaches a relay.
+///
+/// Every other event (key rotations, policy updates, relay-set changes,
+/// endpoint observations) returns `None` and never reaches a relay. Critically
+/// this means a relay's stream also never carries `upserted_peers`,
+/// `policy_ir`, a `PunchDirective`, or a `RotateDirective` — the last two
+/// aren't even broadcast events (the punch broker and rotation directives are
+/// per-gateway channels the relay watch branch never wires up at all — see
+/// `services::sync`).
+///
+/// `#[allow(deprecated)]`: constructing `Delta` requires setting
+/// `deprecated_relays` (see [`delta_for_change`]'s identical note).
+#[allow(deprecated)]
+pub fn relay_revocation_delta(event: ChangeEvent) -> Option<Delta> {
+    let (revoked_serials, revision) = match event {
+        ChangeEvent::CertRevoked { serial, revision } => (vec![serial], revision),
+        ChangeEvent::GatewayDrained {
+            revoked_serials,
+            revision,
+            ..
+        }
+        | ChangeEvent::GatewayEnrolled {
+            revoked_serials,
+            revision,
+            ..
+        } => {
+            if revoked_serials.is_empty() {
+                // A drain that revoked nothing, or an ordinary (non-rebind)
+                // enroll, has no denylist news for a relay — don't forward an
+                // empty, contentless delta.
+                return None;
+            }
+            (revoked_serials, revision)
+        }
+        _ => return None,
+    };
+    Some(Delta {
+        revision,
+        upserted_peers: Vec::new(),
+        removed_peer_ids: Vec::new(),
+        deprecated_relays: Vec::new(),
+        relay_infos: Vec::new(),
+        relays_updated: false,
+        policy_ir: Vec::new(),
+        policy_version: 0,
         revoked_serials,
     })
 }

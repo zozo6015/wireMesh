@@ -1,9 +1,20 @@
 //! Pure reconciliation: turn desired state into a WG device config and a route
 //! add/remove diff, and decide when the enforcer needs re-`apply` (spec §5.2).
 use crate::state::DesiredState;
-use crate::uapi::{DeviceConfig, PeerConfig};
+use crate::uapi::{DeviceConfig, PeerConfig, PERSISTENT_KEEPALIVE_SECS};
 
-pub fn peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerConfig> {
+/// Steady-state peer builder. Every peer it emits carries
+/// [`PERSISTENT_KEEPALIVE_SECS`] unconditionally — deliberately NOT a caller
+/// parameter (mesh-convergence fix T1): the incident deployment shipped with
+/// no persistent keepalive at all, so NAT-ed peers' UDP mappings expired on
+/// idle and working paths sawtoothed
+/// (`docs/research/ops-finding-multi-gateway-convergence.md` §5). Baking the
+/// keepalive into the builder means no call site can configure a peer
+/// without it, and the value cannot drift per-caller. The rotation-scoped
+/// builders ([`pending_peer_configs`], [`device_config_at_port`]) keep their
+/// explicit parameter — their transient overlap devices use a deliberately
+/// tighter cadence (see `main.rs`'s `ROTATION_KEEPALIVE`).
+pub fn peer_configs(ds: &DesiredState) -> Vec<PeerConfig> {
     ds.peers
         .iter()
         .filter_map(|p| {
@@ -12,7 +23,7 @@ pub fn peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerConfig> {
                 public_key_b64,
                 endpoint: p.primary_endpoint().cloned(),
                 allowed_ips: p.allowed_ips.clone(),
-                keepalive_secs,
+                keepalive_secs: PERSISTENT_KEEPALIVE_SECS,
             })
         })
         .collect()
@@ -46,16 +57,14 @@ pub fn pending_peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerC
         .collect()
 }
 
-pub fn device_config(
-    ds: &DesiredState,
-    private_key_b64: &str,
-    listen_port: u16,
-    keepalive_secs: u16,
-) -> DeviceConfig {
+/// Steady-state full-device builder — peers via [`peer_configs`], which
+/// emits the always-on [`PERSISTENT_KEEPALIVE_SECS`] on every peer (fix T1;
+/// see [`peer_configs`] for the rationale and the finding citation).
+pub fn device_config(ds: &DesiredState, private_key_b64: &str, listen_port: u16) -> DeviceConfig {
     DeviceConfig {
         private_key_b64: private_key_b64.to_string(),
         listen_port,
-        peers: peer_configs(ds, keepalive_secs),
+        peers: peer_configs(ds),
     }
 }
 
@@ -73,12 +82,43 @@ pub fn device_config(
 /// entry to the epoch this gateway originally brought `wg0` up against holds
 /// the old receive path open across the peer's promote — the "break" never
 /// happens on the base tun.
+///
+/// Steady-state surface too (fix T1): `apply_state` AND `set_peer_endpoint`
+/// (the punch-success / relay re-point path — i.e. exactly how a
+/// later-enrolled peer's entry is (re)written after boot) both build through
+/// here, so like [`peer_configs`] it emits [`PERSISTENT_KEEPALIVE_SECS`] on
+/// every peer unconditionally rather than taking a caller value (finding §5:
+/// idle NAT mappings expired because no keepalive was ever set).
+///
+/// Make-before-break peer application (mesh-convergence fix T4):
+/// `live_endpoints` holds, for every peer whose tunnel currently shows
+/// liveness (the post-T2 rx-corroborated notion — `Direct`, or `Relayed`
+/// pointing at the relay-transport local socket), the endpoint that tunnel
+/// is actually using (`gateway_id -> "ip:port"`). A peer present in the map
+/// is emitted with EXACTLY that endpoint — never `primary_endpoint()`'s
+/// static candidate. Rationale
+/// (`docs/research/ops-finding-multi-gateway-convergence.md` §2): in the
+/// 2026-07-27 incident, enrolling a third gateway re-applied the peer set
+/// and reset FI's ESTABLISHED `home` endpoint back to the static candidate
+/// `79.119.133.77:51820` — then-undialable — breaking a WORKING pair that
+/// never re-formed on its own. A newcomer must not break existing tunnels:
+/// re-applying desired state may add/remove peers and update
+/// keys/allowed-ips, but never rewrite a live tunnel's endpoint. A peer
+/// ABSENT from the map (a new peer, or an existing peer with no live
+/// tunnel) gets `primary_endpoint()` exactly as before — that IS the
+/// recovery path (a dead pair must keep chasing fresh candidates). A stale
+/// entry for a peer no longer in `ds.peers` is ignored: pins never
+/// resurrect a removed peer. The endpoint pin and the Role-B pubkey pin
+/// compose independently. Extending THIS builder (rather than adding a
+/// sibling) means no call site can rebuild the steady-state device without
+/// deciding about live endpoints — the same "no call site can drift"
+/// rationale as T1's keepalive.
 pub fn device_config_pinned(
     ds: &DesiredState,
     private_key_b64: &str,
     listen_port: u16,
-    keepalive_secs: u16,
     pinned_pubkeys: &std::collections::HashMap<u64, String>,
+    live_endpoints: &std::collections::HashMap<u64, String>,
 ) -> DeviceConfig {
     let peers = ds
         .peers
@@ -88,11 +128,18 @@ pub fn device_config_pinned(
                 Some(pinned) => pinned.clone(),
                 None => p.active_pubkey_b64.clone()?,
             };
+            let endpoint = match live_endpoints.get(&p.gateway_id) {
+                // Live tunnel: keep the endpoint it is actually using
+                // (make-before-break, finding §2).
+                Some(live) => Some(live.clone()),
+                // No live tunnel: dial the advertised candidate (recovery).
+                None => p.primary_endpoint().cloned(),
+            };
             Some(PeerConfig {
                 public_key_b64,
-                endpoint: p.primary_endpoint().cloned(),
+                endpoint,
                 allowed_ips: p.allowed_ips.clone(),
-                keepalive_secs,
+                keepalive_secs: PERSISTENT_KEEPALIVE_SECS,
             })
         })
         .collect();
@@ -199,10 +246,12 @@ mod tests {
     #[test]
     fn peer_configs_skip_peers_without_active_key() {
         let ds = ds_with(vec![p(2, Some("K2"), "10.10.2.0/24"), p(3, None, "10.10.3.0/24")], 0);
-        let cfgs = peer_configs(&ds, 15);
+        let cfgs = peer_configs(&ds);
         assert_eq!(cfgs.len(), 1);
         assert_eq!(cfgs[0].public_key_b64, "K2");
-        assert_eq!(cfgs[0].keepalive_secs, 15);
+        // Plumbing pin only — the 25s value contract itself is pinned by the
+        // T1 suite (`tests/keepalive_emission.rs`).
+        assert_eq!(cfgs[0].keepalive_secs, PERSISTENT_KEEPALIVE_SECS);
         assert_eq!(cfgs[0].allowed_ips, vec!["10.10.2.0/24".to_string()]);
     }
 

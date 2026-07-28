@@ -9,6 +9,7 @@ pub mod netif;
 pub mod observe;
 pub mod path;
 pub mod punch;
+pub mod punch_backoff;
 pub mod relay;
 pub mod reconcile;
 pub mod rotation;

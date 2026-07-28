@@ -70,6 +70,52 @@ pub fn render_path_transitions(counts: &[((PathState, PathState), u64)]) -> Stri
     s
 }
 
+/// One peer's traffic/handshake snapshot for the per-peer observability
+/// gauges (mesh-convergence fix T5,
+/// `docs/research/ops-finding-multi-gateway-convergence.md` §6: every
+/// diagnosis in the 2026-07-27 incident required UAPI spelunking via debug
+/// containers because the gateway exposed no per-peer rx/tx/last-handshake
+/// metrics — e.g. spotting FI's "handshake 28s ago with rx frozen at 0"
+/// false-liveness signature took a shell inside the pod). Sourced from the
+/// same UAPI `get=1` snapshot the path state machine diffs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerStats {
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    /// `None` for a peer that has never handshaked — the age line is then
+    /// OMITTED entirely (mirroring `uapi::handshake_times_from`'s
+    /// epoch-ambiguity rule: absence, not a bogus huge/zero age — an
+    /// explicit 0 would be indistinguishable from "handshaked just now").
+    pub last_handshake_age_secs: Option<u64>,
+}
+
+/// Render per-peer traffic/handshake gauges, one line per peer, labeled by
+/// peer id — the same `peer="<gateway_id>"` label
+/// `wiremesh_gateway_path_state` uses, so the metric families join on it.
+/// rx/tx are always emitted (0 is the interesting diagnostic value — finding
+/// §4's "rx stayed 0"); the handshake-age line is omitted for a
+/// never-handshaked peer (see [`PeerStats::last_handshake_age_secs`]).
+pub fn render_peer_stats(peers: &[(String, PeerStats)]) -> String {
+    let mut s = String::new();
+    s.push_str("# TYPE wiremesh_gateway_peer_rx_bytes gauge\n");
+    for (peer, stats) in peers {
+        s.push_str(&format!("wiremesh_gateway_peer_rx_bytes{{peer=\"{peer}\"}} {}\n", stats.rx_bytes));
+    }
+    s.push_str("# TYPE wiremesh_gateway_peer_tx_bytes gauge\n");
+    for (peer, stats) in peers {
+        s.push_str(&format!("wiremesh_gateway_peer_tx_bytes{{peer=\"{peer}\"}} {}\n", stats.tx_bytes));
+    }
+    s.push_str("# TYPE wiremesh_gateway_peer_last_handshake_age_seconds gauge\n");
+    for (peer, stats) in peers {
+        if let Some(age) = stats.last_handshake_age_secs {
+            s.push_str(&format!(
+                "wiremesh_gateway_peer_last_handshake_age_seconds{{peer=\"{peer}\"}} {age}\n"
+            ));
+        }
+    }
+    s
+}
+
 /// Wrap a Prometheus text body in a minimal HTTP/1.1 response.
 fn http_response(body: &str) -> String {
     format!(
@@ -82,15 +128,28 @@ fn http_response(body: &str) -> String {
 /// Serve one Prometheus scrape per accepted TCP connection on `listener`,
 /// forever (until `listener` errors). `fetch` is called once per connection
 /// to obtain `(backend_kind, applied_policy_version, counters, peer_states,
-/// transition_counts)`, which is rendered via [`render`] +
-/// [`render_path_state`] + [`render_path_transitions`] and written back
-/// verbatim (any HTTP request line the client sent is drained and ignored —
-/// this is a scrape-only stub server, not a general HTTP server).
+/// transition_counts, peer_stats)`, which is rendered via [`render`] +
+/// [`render_path_state`] + [`render_path_transitions`] +
+/// [`render_peer_stats`] and written back verbatim (any HTTP request line
+/// the client sent is drained and ignored — this is a scrape-only stub
+/// server, not a general HTTP server). `peer_stats` is the sixth element
+/// (mesh-convergence fix T5), threaded through the fetch tuple — rather
+/// than rendered by a caller elsewhere — so the per-peer gauges provably
+/// reach the real scrape body (the same wiring failure mode the path-state
+/// gauges once had).
 pub async fn serve_metrics<F, Fut>(listener: TcpListener, fetch: F) -> anyhow::Result<()>
 where
     F: Fn() -> Fut + Clone + Send + 'static,
-    Fut: Future<Output = anyhow::Result<(String, u64, Counters, Vec<(String, PathState)>, Vec<((PathState, PathState), u64)>)>>
-        + Send
+    Fut: Future<
+            Output = anyhow::Result<(
+                String,
+                u64,
+                Counters,
+                Vec<(String, PathState)>,
+                Vec<((PathState, PathState), u64)>,
+                Vec<(String, PeerStats)>,
+            )>,
+        > + Send
         + 'static,
 {
     loop {
@@ -102,10 +161,11 @@ where
             let mut buf = [0u8; 512];
             let _ = stream.read(&mut buf).await;
             let body = match fetch().await {
-                Ok((kind, version, counters, peer_states, transitions)) => {
+                Ok((kind, version, counters, peer_states, transitions, peer_stats)) => {
                     let mut body = render(&kind, version, &counters);
                     body.push_str(&render_path_state(&peer_states));
                     body.push_str(&render_path_transitions(&transitions));
+                    body.push_str(&render_peer_stats(&peer_stats));
                     body
                 }
                 Err(e) => format!("# error collecting counters: {e:#}\n"),
@@ -174,7 +234,17 @@ mod tests {
                 Counters { by_rule: BTreeMap::from([("r9".to_string(), 2u64)]), default_deny: 1 };
             let peer_states = vec![("42".to_string(), PathState::Direct)];
             let transitions = vec![((PathState::Connecting, PathState::Direct), 3u64)];
-            Ok::<_, anyhow::Error>(("ebpf".to_string(), 9u64, counters, peer_states, transitions))
+            // Mechanical +1 tuple element (fix T5); the per-peer-gauge
+            // scrape assertions live in `tests/peer_metrics.rs`.
+            let peer_stats: Vec<(String, PeerStats)> = vec![];
+            Ok::<_, anyhow::Error>((
+                "ebpf".to_string(),
+                9u64,
+                counters,
+                peer_states,
+                transitions,
+                peer_stats,
+            ))
         }));
 
         let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect to metrics listener");

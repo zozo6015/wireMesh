@@ -263,6 +263,13 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.revoked_serials()).await?
     }
 
+    /// See [`Db::revocation_snapshot`]. Reads the persisted revision and the
+    /// revoked-serial denylist as ONE atomic pair (single lock hold).
+    pub async fn revocation_snapshot(&self) -> Result<(u64, Vec<String>)> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.revocation_snapshot()).await?
+    }
+
     /// See [`Db::current_revision`].
     pub async fn current_revision(&self) -> Result<u64> {
         let db = self.inner.clone();
@@ -280,6 +287,12 @@ impl DbHandle {
     pub async fn find_gateway_by_name(&self, name: String) -> Result<Option<GatewayIdentity>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.find_gateway_by_name(&name)).await?
+    }
+
+    /// See [`Db::find_relay_by_name`].
+    pub async fn find_relay_by_name(&self, name: String) -> Result<Option<i64>> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.find_relay_by_name(&name)).await?
     }
 
     /// See [`Db::drain_gateway`].

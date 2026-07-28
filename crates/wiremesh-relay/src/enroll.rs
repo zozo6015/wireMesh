@@ -66,6 +66,12 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
 
     fs::create_dir_all(&args.certdir)
         .with_context(|| format!("creating {}", args.certdir.display()))?;
+    // Tighten the identity dir itself to 0700 (create_dir_all leaves it at
+    // the umask default): the three files inside are each 0600, but a
+    // world-traversable directory needlessly leaks their names/existence.
+    // Matches the packaged StateDirectoryMode=0700 / postinstall chmod.
+    fs::set_permissions(&args.certdir, fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", args.certdir.display()))?;
     write_0600(&args.certdir.join("ca.pem"), out.ca_bundle_pem.as_bytes())?;
     write_0600(&args.certdir.join("relay.pem"), out.cert_pem.as_bytes())?;
     write_0600(&args.certdir.join("relay.key"), out.key_pem.as_bytes())?;
@@ -74,6 +80,76 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
         args.certdir.display()
     );
     Ok(())
+}
+
+/// The unix account the packaged systemd unit runs the relay as
+/// (`User=wiremesh` in `deploy/packages/systemd/wiremesh-relay.service`).
+pub const SERVICE_USER: &str = "wiremesh";
+
+/// Best-effort handoff of the enrolled identity to the packaged service
+/// user — called by the `wiremesh-relay-enroll` BINARY (not by
+/// [`run_enroll`], which stays a pure library step for the K8s operator's
+/// init-container and the tests).
+///
+/// The three identity files [`run_enroll`] generates inside `certdir`.
+const IDENTITY_FILES: [&str; 3] = ["ca.pem", "relay.pem", "relay.key"];
+
+/// Rationale (ops finding 2026-07-27/28, "Relay Finding A",
+/// `docs/research/ops-finding-multi-gateway-convergence.md`):
+/// `wiremesh-relay-enroll` is documented as a `sudo` step, so the identity
+/// files land root-owned 0600 — unreadable by the packaged unit's
+/// `User=wiremesh`, which crash-looped on "Permission denied" until the
+/// operator chown'd them by hand. When this process can (it's root and the
+/// `wiremesh` account exists — i.e. exactly the packaged bare-metal flow),
+/// this completes the handoff automatically; otherwise (unprivileged run, a
+/// container image without the account, macOS) it prints the exact command
+/// to run instead of failing — enrollment itself already succeeded, and a
+/// non-systemd deployment may legitimately run the relay as someone else.
+/// Shelling out to `chown` follows the project idiom
+/// (`ip`/`nft`/`sysctl`/`conntrack` are shelled elsewhere) and sidesteps a
+/// uid lookup: `chown`'s own exit status already answers "am I root AND does
+/// the user exist".
+///
+/// SCOPE: chowns ONLY the directory itself and the three known generated
+/// identity files ([`IDENTITY_FILES`]) — NOT `-R`. A recursive chown would
+/// re-own any unrelated descendants an operator's `--certdir` might contain
+/// (e.g. a shared state dir), which is not this tool's business.
+pub fn chown_identity_best_effort(certdir: &Path) {
+    let target = format!("{SERVICE_USER}:{SERVICE_USER}");
+    // The directory plus each generated file that actually exists — never a
+    // recursive descent.
+    let mut targets: Vec<std::ffi::OsString> = vec![certdir.as_os_str().to_owned()];
+    for name in IDENTITY_FILES {
+        let p = certdir.join(name);
+        if p.exists() {
+            targets.push(p.into_os_string());
+        }
+    }
+    let status = std::process::Command::new("chown")
+        .arg(&target)
+        .args(&targets)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            eprintln!(
+                "wiremesh-relay: identity chowned to {target} (the packaged systemd unit runs \
+                 User={SERVICE_USER})"
+            );
+        }
+        _ => {
+            let files = IDENTITY_FILES
+                .iter()
+                .map(|f| certdir.join(f).display().to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            eprintln!(
+                "wiremesh-relay: NOTE identity left owned by the invoking user. If the relay \
+                 runs as the packaged systemd unit (User={SERVICE_USER}), run: \
+                 chown {target} {} {files}",
+                certdir.display()
+            );
+        }
+    }
 }
 
 /// Parse the `enroll` flags from the args iterator (positioned past argv[0]).

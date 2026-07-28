@@ -495,6 +495,18 @@ pub struct EnrollOutcome {
     /// committed by the time this is returned), not that call, is
     /// authoritative.
     pub revoked_issuer_handles: Vec<String>,
+    /// (Mesh-convergence T6, CodeRabbit) The `serial`(s) of any gateway
+    /// cert(s) this call revoked as part of a `rebind` — empty for an ordinary
+    /// `gateway`-kind enrollment. Distinct from `revoked_issuer_handles`
+    /// (which the caller feeds to `CertificateIssuer::revoke` for in-memory
+    /// bookkeeping): these are the wire-level denylist serials the caller
+    /// carries on the `GatewayEnrolled` `ChangeEvent` so an already-open
+    /// `Sync.Watch` — GATEWAY *and* RELAY — learns the rebind-revoked
+    /// serial(s) as a delta immediately, rather than only on its next
+    /// reconnect/fresh snapshot. Without this a relay's offline denylist would
+    /// silently miss rebind revocations (the same staleness class T6 fixed for
+    /// `Admin.RevokeCert`).
+    pub revoked_serials: Vec<String>,
     /// (Task 15) The random `observe_key` freshly generated and stored for
     /// this gateway — the caller (`EnrollmentSvc`) returns it to the gateway
     /// once, in `EnrollResponse.observe_key`. See `crate::observe`'s module
@@ -1386,6 +1398,7 @@ impl Db {
         // Per-kind scope/occupancy check, now that the target segment is
         // known:
         let mut revoked_issuer_handles: Vec<String> = Vec::new();
+        let mut revoked_serials: Vec<String> = Vec::new();
         if is_rebind {
             // A rebind token is only authorized for the ONE segment it was
             // minted bound to — declaring a DIFFERENT (even if real,
@@ -1427,6 +1440,7 @@ impl Db {
                         "UPDATE certificate SET revoked_at = ?1 WHERE serial = ?2",
                         params![now, serial],
                     )?;
+                    revoked_serials.push(serial);
                     revoked_issuer_handles.push(handle);
                 }
                 tx.execute(
@@ -1527,6 +1541,7 @@ impl Db {
             segment_id,
             gateway_id,
             revoked_issuer_handles,
+            revoked_serials,
             observe_key,
         })
     }
@@ -2209,6 +2224,39 @@ impl Db {
         Ok(rows)
     }
 
+    /// (Mesh-convergence T6, CodeRabbit) Atomic combination of
+    /// [`Db::current_revision`] + [`Db::revoked_serials`]: acquires the
+    /// connection `Mutex` guard exactly ONCE and reads BOTH the persisted
+    /// revision AND the full revoked-serial denylist while holding it, so the
+    /// pair is a single consistent snapshot — mirroring
+    /// [`Db::relays_snapshot`]'s identical TOCTOU rationale. The relay
+    /// revocation snapshot (`projection::build_relay_revocation_snapshot`)
+    /// previously read these as TWO separate `DbHandle` calls (two lock
+    /// acquisitions, each hopping onto its own `spawn_blocking`), leaving a
+    /// window where a revocation committing between them could be reflected in
+    /// one read but not the other — a relay's opening snapshot would then pair
+    /// a `revision` with a `revoked_serials` set from a different instant
+    /// (revision-before / serials-after, or vice versa). Since a reconnecting
+    /// relay compares nothing across that boundary the worst case is mild, but
+    /// there's no reason to hand it a provably-inconsistent pair when reading
+    /// both under one lock hold (no `.await`/lock-release between them, this
+    /// function runs synchronously to completion before the guard drops)
+    /// closes the window for free.
+    pub fn revocation_snapshot(&self) -> Result<(u64, Vec<String>)> {
+        let conn = self.conn.lock().unwrap();
+        let revision: i64 = conn.query_row(
+            "SELECT revision FROM state_revision WHERE id = 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let mut stmt = conn
+            .prepare("SELECT serial FROM certificate WHERE revoked_at IS NOT NULL ORDER BY serial")?;
+        let revoked_serials = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok((revision as u64, revoked_serials))
+    }
+
     /// Records the policy version `gateway_id` has applied and acked via
     /// `Sync.Report` (Task 8) — just the `gateway.applied_version` column;
     /// the richer `policy_status` history table is a later task's scope
@@ -2699,6 +2747,61 @@ impl Db {
                     segment_name: row.get(2)?,
                 })
             },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// (Mesh-convergence T6, ops-finding "Relay Finding B") Resolves a Sync
+    /// mTLS client cert's subject CN to an enrolled RELAY's row id, or `None`
+    /// if no `relay` row carries that `name`. The relay analog of
+    /// [`Db::find_gateway_by_name`]: a relay's leaf carries CN
+    /// `relay-<secret_hash_hex>` (see `services::enrollment`'s relay branch),
+    /// which is exactly the value `enroll_relay` stamps into `relay.name` —
+    /// so authorizing a relay's revocation watch is a lookup against THAT
+    /// column, never the SAN (the SAN is the constant `"relay"` kind marker,
+    /// not an identity).
+    ///
+    /// DELIBERATELY not filtered on `status`: unlike a gateway (whose
+    /// `status = 'active'` filter keeps a drained/replaced gateway from
+    /// pulling a full desired-state snapshot of a fabric it no longer belongs
+    /// to — see [`Db::find_gateway_by_name`]'s doc comment), a relay's
+    /// non-`active` status is a HEALTH-eviction state set by the report
+    /// health pipeline (`set_relay_status`), not a revocation/de-enrollment.
+    /// A temporarily-evicted relay must keep receiving revocation updates so
+    /// its offline denylist stays fresh for when it is re-admitted, and the
+    /// stream it is authorized for carries ONLY revocation data (no peers, no
+    /// policy — see `services::sync`'s relay watch branch and
+    /// `projection::build_relay_revocation_snapshot`), so there is no
+    /// desired-state disclosure to guard against here.
+    ///
+    /// Also NOT joined to `certificate.revoked_at` — i.e. a relay whose leaf
+    /// was revoked (via `Admin.RevokeCert` on its serial) can still open this
+    /// watch. This is DELIBERATELY CONSISTENT with the gateway watch path,
+    /// which likewise does not reject a revoked cert: `find_gateway_by_name`
+    /// gates only on the gateway ROW's `status = 'active'`, and a plain
+    /// `Db::revoke_cert` sets `certificate.revoked_at` WITHOUT flipping any
+    /// row status (only `drain_gateway`/rebind flip status — and those are
+    /// gateway-only; relays have no drain/de-enrollment path at all). Neither
+    /// the mTLS layer (rustls checks chain-to-CA + expiry, no CRL/OCSP) nor
+    /// the app layer rejects a revoked-but-not-drained cert on `Sync.Watch`
+    /// for either identity kind. `revoked_serials` is a DATA-PLANE peer
+    /// denylist (gateways and the relay bridge stop trusting a revoked party's
+    /// WireGuard/relay traffic), not a control-plane watch gate. Adding a
+    /// `revoked_at IS NULL` check HERE only would be an inconsistent one-off:
+    /// it would enforce revocation on the LOW-sensitivity relay watch
+    /// (revocation-list only) while leaving the HIGH-sensitivity gateway watch
+    /// (full peers + policy) unguarded — backwards from a risk standpoint. If
+    /// the project decides control-plane watches should reject revoked certs,
+    /// that belongs as a UNIFORM change across both `watch_gateway` and
+    /// `watch_relay` (threading the leaf serial from `peer_identity`), not a
+    /// relay-only patch — see the T6 security report.
+    pub fn find_relay_by_name(&self, name: &str) -> Result<Option<i64>> {
+        let conn = self.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id FROM relay WHERE name = ?1",
+            params![name],
+            |row| row.get(0),
         )
         .optional()
         .map_err(Into::into)
