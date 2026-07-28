@@ -19,6 +19,11 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Parser)]
+// `version` makes clap emit `-V`/`--version` (the crate version) and `about`
+// gives `--help` a one-line description — the live-deployment diagnostics
+// feature (plan `docs/superpowers/plans/2026-07-28-cli-help-version.md`).
+// Without `version` clap rejects `--version` as an unexpected argument.
+#[command(version, about = "WireMesh relay: mTLS QUIC-datagram bridge for NAT-traversal fallback")]
 struct Args {
     /// UDP address to bind the QUIC endpoint on, e.g. 127.0.0.1:4443.
     bind: SocketAddr,

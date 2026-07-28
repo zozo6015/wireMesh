@@ -10,6 +10,7 @@
 
 pub mod apply;
 pub mod auth;
+pub mod cli;
 pub mod broker;
 pub mod db;
 pub mod db_async;

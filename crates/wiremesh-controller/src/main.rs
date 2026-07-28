@@ -29,6 +29,20 @@ fn port_env(var: &str, default: u16) -> Result<u16> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Live-deployment diagnostics: answer `-h`/`--help` and `-V`/`--version`
+    // before reading any WIREMESH_* var or calling `serve` (see `cli`).
+    match wiremesh_controller::cli::cli_action(std::env::args()) {
+        wiremesh_controller::cli::CliAction::Help(m) => {
+            print!("{m}");
+            return Ok(());
+        }
+        wiremesh_controller::cli::CliAction::Version(s) => {
+            println!("{s}");
+            return Ok(());
+        }
+        wiremesh_controller::cli::CliAction::Run => {}
+    }
+
     let data_dir = std::env::var("WIREMESH_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/lib/wiremesh"));

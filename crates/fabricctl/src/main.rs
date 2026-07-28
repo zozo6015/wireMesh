@@ -31,7 +31,11 @@ use wiremesh_proto::v1::{
 };
 
 #[derive(Parser)]
-#[command(name = "fabricctl", about = "WireMesh controller Admin CLI")]
+// `version` makes clap emit `-V`/`--version` (the crate version) — the
+// live-deployment diagnostics feature (plan
+// `docs/superpowers/plans/2026-07-28-cli-help-version.md`); without it clap
+// rejects `--version` as an unexpected argument.
+#[command(name = "fabricctl", version, about = "WireMesh controller Admin CLI")]
 struct Cli {
     /// Connect over the controller's Unix socket (implicit admin). Mutually
     /// exclusive with `--token`/`--addr`.

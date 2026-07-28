@@ -4,6 +4,7 @@
 
 pub mod admin;
 pub mod admin_exec;
+pub mod cli;
 pub mod controllers;
 pub mod crd;
 pub mod fabric;

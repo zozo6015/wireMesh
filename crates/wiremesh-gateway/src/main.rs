@@ -142,6 +142,22 @@ struct ActiveTunInfo {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Live-deployment diagnostics: `-h`/`--help` and `-V`/`--version` are
+    // resolved at the VERY TOP of arg handling — before the enroll-vs-run
+    // dispatch below and before any required-flag validation — so they work
+    // with no other args and never error (see `cli::cli_action`).
+    match wiremesh_gateway::cli::cli_action(std::env::args()) {
+        wiremesh_gateway::cli::CliAction::Help(m) => {
+            print!("{m}");
+            return Ok(());
+        }
+        wiremesh_gateway::cli::CliAction::Version(s) => {
+            println!("{s}");
+            return Ok(());
+        }
+        wiremesh_gateway::cli::CliAction::Run => {}
+    }
+
     // `enroll` subcommand: one-shot token->Identity bootstrap, then exit. Any
     // other argv is the normal data-plane path (GatewayConfig::from_env reads
     // std::env::args() itself, so the normal path is unaffected).
