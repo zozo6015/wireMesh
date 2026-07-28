@@ -208,10 +208,16 @@ Run once (the operator's enroll init-container, or a bare-metal sudo step)
 before the relay starts. On the packaged host it best-effort chowns the
 identity to the User=wiremesh service account.
 
-USAGE:
-    {ENROLL_BIN} --token <t> --controller <host:port> --ca <path> \\
+USAGE (supply the token inline with --token):
+    {ENROLL_BIN} --token <token> --controller <host:port> --ca <path> \\
                          --certdir <path> --endpoint <ip:port>
-    {ENROLL_BIN} --help | --version
+
+USAGE (read the token from a file with --token-file):
+    {ENROLL_BIN} --token-file <path> --controller <host:port> --ca <path> \\
+                         --certdir <path> --endpoint <ip:port>
+
+    {ENROLL_BIN} --help
+    {ENROLL_BIN} --version
 
 FLAGS:
     --token <token>          (required*) Enrollment token to redeem. *Exactly

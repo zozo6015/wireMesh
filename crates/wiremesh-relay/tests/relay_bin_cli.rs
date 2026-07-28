@@ -1,13 +1,12 @@
-//! VERIFY-only tests (test-author cycle 2026-07-28) for the clap-based `relay`
+//! Guard tests (test-author cycle 2026-07-28) for the clap-based `relay`
 //! binary's `--version`/`--help` (plan
 //! `docs/superpowers/plans/2026-07-28-cli-help-version.md`).
 //!
-//! `relay` uses `#[derive(clap::Parser)]`. clap does NOT emit `--version`
-//! unless the command carries a `version`/`#[command(version)]` attribute —
-//! today `Args` has none, so `--version` currently exits non-zero with an
-//! "unexpected argument" error: the `version_flag_*` test below is RED until
-//! the implementer adds `#[command(version)]`. `--help` already works in clap,
-//! so `help_flag_*` guards against it regressing.
+//! `relay` uses `#[derive(clap::Parser)]` with `#[command(version, ...)]` on
+//! its `Args`. clap only emits `--version`/`-V` when a `version` attribute is
+//! present, so `version_flag_*` guards that attribute against being dropped;
+//! `--help`/`-h` is clap-built-in, and `help_flag_*` guards it against
+//! regressing.
 //!
 //! These are spawned-binary tests (`env!("CARGO_BIN_EXE_relay")`) because the
 //! clap parser exits the process on `--help`/`--version`; there is no pure

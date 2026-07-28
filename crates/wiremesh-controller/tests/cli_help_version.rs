@@ -1,16 +1,15 @@
-//! FAILING tests (test-author cycle 2026-07-28) for `wiremesh-controller`'s
-//! `-h`/`--help` and `-V`/`--version` handling (plan
-//! `docs/superpowers/plans/2026-07-28-cli-help-version.md`).
+//! Tests for `wiremesh-controller`'s `-h`/`--help` and `-V`/`--version`
+//! handling (plan `docs/superpowers/plans/2026-07-28-cli-help-version.md`).
 //!
 //! The controller binary is configured purely by environment variables (no
-//! flags today), but it must STILL answer help/version for live-deployment
+//! flags today), but it must still answer help/version for live-deployment
 //! diagnostics — and its manual must document the env-var mechanism.
 //!
-//! # Pure surface required from the implementer
+//! # Contract under test
 //!
 //! Integration tests link only the `wiremesh_controller` library, so the
-//! interception lives there and `main.rs` calls it at the very top of `main`,
-//! before it reads any `WIREMESH_*` var or calls `serve`:
+//! help/version interception lives there and `main.rs` calls it at the very
+//! top of `main`, before it reads any `WIREMESH_*` var or calls `serve`:
 //!
 //! ```ignore
 //! pub mod cli {
@@ -20,9 +19,10 @@
 //! }
 //! ```
 //!
-//! `env!("CARGO_PKG_VERSION")` here is the controller crate version (lib and
-//! bin are the same crate). Until `cli` exists this file FAILS TO COMPILE —
-//! the intended RED.
+//! `cli_action` is infallible: `Help`/`Version` are resolved before any
+//! required-flag/env handling, and `Run` (returned only when neither flag is
+//! present) defers to the normal env-driven boot. `env!("CARGO_PKG_VERSION")`
+//! here is the controller crate version (lib and bin are the same crate).
 
 use wiremesh_controller::cli::{cli_action, CliAction};
 

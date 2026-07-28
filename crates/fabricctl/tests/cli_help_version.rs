@@ -1,14 +1,13 @@
-//! VERIFY-only tests (test-author cycle 2026-07-28) for the clap-based
-//! `fabricctl` binary's `--version`/`--help` (plan
+//! Guard tests (test-author cycle 2026-07-28) for the clap-based `fabricctl`
+//! binary's `--version`/`--help` (plan
 //! `docs/superpowers/plans/2026-07-28-cli-help-version.md`).
 //!
 //! `fabricctl`'s top-level `Cli` derives `clap::Parser` with
-//! `#[command(name = "fabricctl", about = "...")]` but NO `version` attribute,
-//! so clap does not emit `--version` — `--version` currently exits non-zero
-//! with "unexpected argument". `version_flag_prints_crate_version` is therefore
-//! RED until the implementer adds `#[command(version)]`;
-//! `help_flag_prints_nonempty_usage` guards clap's built-in `--help` against
-//! regressing.
+//! `#[command(name = "fabricctl", version, about = "...")]`. clap only emits
+//! `--version`/`-V` when a `version` attribute is present, so
+//! `version_flag_prints_crate_version` guards that attribute against being
+//! dropped; `help_flag_prints_nonempty_usage` guards clap's built-in
+//! `--help`/`-h` against regressing.
 //!
 //! Spawned-binary tests (`env!("CARGO_BIN_EXE_fabricctl")`) — clap exits the
 //! process for `--help`/`--version`, so there is no pure surface. `fabricctl`
