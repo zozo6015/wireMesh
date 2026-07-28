@@ -59,6 +59,35 @@ relay (unchanged). **The one risk to prove: boringtun must emit its handshake
 init promptly enough on endpoint-set — de-risked by the spike before any
 gateway change.**
 
+## De-risk spike RESULT (2026-07-29): GO-WITH-NUDGE — approach B works
+
+`spike/natpunch2` ran **4/4 green** (after hardening its own wedging harness:
+`wg show` UAPI reads can deadlock, so the spike uses ground-truth ping as the
+authoritative liveness signal). **Boringtun-endpoint-driven punching reliably
+completes a direct WG handshake through a port-restricted NAT with NO separate
+`SO_REUSEPORT` socket** — the core premise is proven. Two findings the
+productionization MUST incorporate:
+
+1. **The prompt-init NUDGE is required.** boringtun 0.6.0 emits handshake inits
+   only on its persistent-keepalive tick (measured ~26s at keepalive=25, ~6s at
+   keepalive=5) — setting the peer endpoint via UAPI does NOT trigger an
+   immediate init, so a punch would otherwise take ~26s to establish. The
+   productionized path must NUDGE boringtun to init promptly right after setting
+   the endpoint at the broker "go", WITHOUT adding a competing socket. The
+   clean nudge: **write a packet through the `wg0` tun toward the peer's overlay
+   IP** (boringtun sees "data to send, no session" → initiates the handshake
+   immediately) — the standard WireGuard "ping to trigger handshake" technique,
+   which uses the tun, not a UDP socket. (Do NOT rely on lowering
+   persistent_keepalive as the nudge — it changes keepalive semantics and is
+   still tick-bounded.)
+2. **Avoid the two-step peer-config panic.** A real gateway bug the spike hit:
+   configuring a peer in two steps (add, then modify) panics boringtun 0.6.0's
+   `update_peer` ("Modifying existing peers is not yet supported"). The
+   endpoint-driven punch must set the peer's endpoint in a way that does not
+   trigger an in-place modify of an existing boringtun peer — configure the
+   endpoint atomically with the peer, or via the make-before-break/incremental
+   apply already in the gateway (v0.1.2), never a modify.
+
 ## De-risk spike (gates the productionization)
 
 `spike/natpunch2` — a standalone crate (no root workspace, per the spike
