@@ -113,6 +113,23 @@ pub fn adoption_needs_stale_drain(
     }
 }
 
+/// FRESH PRE-DRAIN re-validation gate (TOCTOU narrowing). `adoption_needs_stale_drain`
+/// decides the drain from a snapshot read near the top of the reconcile; this gate is
+/// re-checked from a SECOND, fresh roster + CR-list read taken immediately before the
+/// drain call, so the drain fires only if nothing drifted in between.
+///
+/// Returns `true` — authorize the drain — ONLY when BOTH still hold on the fresh read:
+///   * the segment's currently-active roster id is STILL present AND STILL exactly the
+///     `stale_id` we snapshotted (`active_id_now == Some(stale_id)`); and
+///   * this CR is STILL the sole gateway CR for the segment (`recount_now == 1`).
+/// Any drift — a DIFFERENT active id, NO active id, or a peer CR now sharing the
+/// segment — returns `false`, aborting the drain. (A fresh-read FAILURE is handled at
+/// the call site by likewise aborting; a missed drain is a manual cleanup, a wrong
+/// drain is a live-peer outage.)
+fn drain_still_authorized(recount_now: usize, active_id_now: Option<u64>, stale_id: u64) -> bool {
+    recount_now == 1 && active_id_now == Some(stale_id)
+}
+
 async fn reconcile(gw: Arc<WiremeshGateway>, ctx: Arc<Context>) -> Result<Action, Error> {
     let api = Api::<WiremeshGateway>::all(ctx.client.clone());
     finalizer(&api, GATEWAY_FINALIZER, gw, |event| async {
@@ -228,12 +245,70 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
             None,
             sole_gateway_for_segment,
         ) {
-            tracing::info!(
-                "gateway {name}: adoption: draining stale gateway id {stale_id} to free segment \
-                 {segment} (emptyDir→PVC transition; the new pod will enroll fresh)",
-                segment = seg.spec.segment_name,
-            );
-            ctx.admin.drain(stale_id).await.map_err(Error::Admin)?;
+            // TOCTOU NARROWING (CodeRabbit MAJOR). `stale_id` was derived from the
+            // roster + CR-list snapshots read earlier in this reconcile. Between those
+            // reads and this drain, a CONCURRENT reconcile of a SECOND WiremeshGateway
+            // on the same segment could enroll a new active gateway — so the id we are
+            // about to drain might no longer be a stale predecessor but a live peer.
+            // kube-rs offers NO segment-lock primitive, and a distributed lock for a
+            // one-time adoption path is disproportionate. Instead we RE-VALIDATE against
+            // a FRESH read taken immediately before the drain: re-fetch the controller
+            // roster (the same source `seg_row` came from) and re-count this segment's
+            // CRs, and drain ONLY IF the segment's active id is STILL exactly `stale_id`
+            // AND this CR is STILL the sole gateway CR for the segment. If the active id
+            // changed, vanished, a peer CR appeared, OR either re-read fails — ABORT
+            // (warn + skip): a missed drain is manual cleanup, a wrong drain is an
+            // outage. The fresh CR recount is the LAST async read before the drain, and
+            // the `drain_still_authorized` check is pure (no `.await`), so nothing races
+            // between the re-read and the drain call itself.
+            //
+            // This closes the window between the original snapshot and the drain down to
+            // the drain call itself. The residual — an inherent controller cross-task
+            // race that no in-process check can fully eliminate without a real lock — is
+            // ACCEPTED, and is bounded by the one-gateway-per-segment design invariant
+            // plus the fail-safe (any error or drift → never drain).
+            let roster_recheck = ctx.admin.list_gateways().await;
+            // Fresh CR recount — deliberately the FINAL async read before the drain.
+            let recount_recheck = Api::<WiremeshGateway>::all(client.clone())
+                .list(&ListParams::default())
+                .await
+                .map(|list| {
+                    list.items
+                        .iter()
+                        .filter(|g| g.spec.segment_ref == gw.spec.segment_ref)
+                        .count()
+                });
+            match (roster_recheck, recount_recheck) {
+                (Ok(rows_now), Ok(recount_now)) => {
+                    let active_id_now =
+                        rows_now.iter().find(|g| g.segment == seg.spec.segment_name).map(|g| g.id);
+                    if drain_still_authorized(recount_now, active_id_now, stale_id) {
+                        tracing::info!(
+                            "gateway {name}: adoption: draining stale gateway id {stale_id} to free \
+                             segment {segment} (emptyDir→PVC transition; the new pod will enroll \
+                             fresh)",
+                            segment = seg.spec.segment_name,
+                        );
+                        ctx.admin.drain(stale_id).await.map_err(Error::Admin)?;
+                    } else {
+                        tracing::warn!(
+                            "gateway {name}: adoption drain of stale id {stale_id} ABORTED — fresh \
+                             pre-drain re-check no longer authorizes it (active_id_now={active_id_now:?}, \
+                             sole-gateway recount={recount_now}); leaving the id for manual cleanup (a \
+                             missed drain is safe; a wrong drain would be a live-peer outage)"
+                        );
+                    }
+                }
+                (roster_res, recount_res) => {
+                    tracing::warn!(
+                        "gateway {name}: adoption drain of stale id {stale_id} ABORTED — fresh \
+                         pre-drain re-read failed (roster_ok={roster_ok}, recount_ok={recount_ok}); \
+                         fail-safe skip (a missed drain is manual cleanup, a wrong drain is an outage)",
+                        roster_ok = roster_res.is_ok(),
+                        recount_ok = recount_res.is_ok(),
+                    );
+                }
+            }
         }
     }
 
@@ -581,5 +656,51 @@ mod tests {
             None,
             "existing PVC → NEVER drain regardless of the roster id (only adoption drains)"
         );
+    }
+
+    #[test]
+    fn drain_still_authorized_gates_on_fresh_predrain_recheck() {
+        // TOCTOU NARROWING (CodeRabbit MAJOR): `adoption_needs_stale_drain` picks the
+        // drain target from an EARLY snapshot; `drain_still_authorized` re-checks it
+        // against a FRESH roster + CR-list read taken immediately before the drain, so
+        // a concurrent reconcile that changed the segment's active gateway can no longer
+        // make us drain a live peer. Authorize ONLY when the segment's active id is
+        // STILL exactly the snapshotted stale id AND this CR is STILL the sole gateway
+        // CR (recount == 1); any drift → false → abort.
+        //
+        // Pure fn contract:
+        //   drain_still_authorized(recount_now, active_id_now, stale_id)
+        //       == (recount_now == 1 && active_id_now == Some(stale_id))
+
+        // Happy path: nothing drifted — the snapshotted stale id is still the sole
+        // segment's active id and this CR is still alone → authorize the drain.
+        assert!(
+            drain_still_authorized(1, Some(8), 8),
+            "recount still 1 AND active id still == stale id → authorize drain"
+        );
+
+        // The active id CHANGED between snapshot and drain (a peer enrolled a new
+        // gateway) → the id we'd drain may be live → ABORT.
+        assert!(
+            !drain_still_authorized(1, Some(9), 8),
+            "active id now differs from the stale id → abort (may be a live peer)"
+        );
+
+        // The active id VANISHED (already drained elsewhere / withdrawn) → nothing to
+        // drain → ABORT.
+        assert!(
+            !drain_still_authorized(1, None, 8),
+            "no active id on the fresh read → nothing to drain → abort"
+        );
+
+        // A peer CR now shares the segment (recount grew) → the active id could be the
+        // peer's live gateway → ABORT even if the id still matches.
+        assert!(
+            !drain_still_authorized(2, Some(8), 8),
+            "recount no longer 1 (peer CR appeared) → abort even if the id matches"
+        );
+
+        // Both drifted → ABORT.
+        assert!(!drain_still_authorized(0, None, 8), "recount 0 and no active id → abort");
     }
 }
