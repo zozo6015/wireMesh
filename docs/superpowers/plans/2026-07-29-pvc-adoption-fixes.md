@@ -41,9 +41,15 @@ When the pod is recreated onto a fresh empty PVC, the OLD gateway id (enrolled
 from the now-gone emptyDir) is still `active` in the roster, so the new pod's
 plain-token enroll is rejected: `AlreadyExists: segment already has an active
 gateway; use a rebind token`. And `identity_persisted = pvc_exists AND
-gateway_active` is `true` during adoption (fresh PVC + old id active) →
+gateway_active` — where `pvc_exists` is the pre-reconcile `existing_pvc.is_some()`
+snapshot — is `true` during adoption (fresh PVC + old id active) →
 `should_mint_token` is `false` → no fresh token minted. Adoption stalls in
 `Init:Error`.
+
+The chosen fix does NOT mint a rebind token: on the fresh-PVC path
+`existing_pvc.is_none()` makes `pvc_exists` false → `identity_persisted` false →
+`should_mint_token` true, so a PLAIN token is minted, and the stale-id drain (below)
+frees the segment so that plain-token enroll is accepted.
 
 **Fix (chosen + implemented):** the operator DETECTS adoption and drains the
 stale gateway so the segment is freed and the new pod's plain-token enroll is no
@@ -82,9 +88,10 @@ gateway, and the sole-gateway guard also protects a healthy peer sharing the
 segment.
 
 **Done-bar:** a test pinning the adoption decision (fresh PVC + stale active
-roster id → drain/rebind; steady-state PVC-has-identity + own active id → NO
-drain). Update the design doc's "automatic one-time re-enroll" claim to match
-the real behavior.
+roster id → drain the stale id, then the new pod enrolls with a freshly minted
+PLAIN token; steady-state PVC-has-identity + own active id → NO drain, no mint —
+enroll is skipped). No rebind-token minting is involved. Update the design doc's
+"automatic one-time re-enroll" claim to match the real behavior.
 
 ## Non-regression + validation
 
