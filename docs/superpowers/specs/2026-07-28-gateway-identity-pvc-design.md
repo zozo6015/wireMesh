@@ -124,7 +124,10 @@ healthy gateway. See `docs/research/ops-finding-pvc-adoption-migration.md`
 
 ## Release
 
-Availability fix → patch bump (**v0.2.1**) per the release-every-fix rule.
+Availability fix → patch bump per the release-every-fix rule. Shipped in two
+steps: the PVC-backed identity + idempotent enroll feature released as **v0.2.1**;
+the hands-off *adoption* automation (detect + drain the stale id) described in the
+"One-time adoption cost" section released as **v0.2.2**.
 
 ## Execution
 
