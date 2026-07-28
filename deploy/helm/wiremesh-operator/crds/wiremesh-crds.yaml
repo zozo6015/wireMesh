@@ -267,6 +267,14 @@ spec:
               segmentRef:
                 description: The `WiremeshSegment` (by `.metadata.name`) this gateway fronts.
                 type: string
+              storageClass:
+                description: StorageClass for the per-gateway identity PVC (`<name>-data`). Omitted → the cluster default class. Parity with `WiremeshControllerSpec`.
+                nullable: true
+                type: string
+              storageSize:
+                description: Size of the per-gateway identity PVC. Omitted → the 128Mi default (the persisted identity is a few KB). Parity with `WiremeshControllerSpec`.
+                nullable: true
+                type: string
               tun:
                 nullable: true
                 type: string

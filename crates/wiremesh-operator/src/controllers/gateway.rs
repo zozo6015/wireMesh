@@ -7,7 +7,7 @@ use crate::crd::{Condition, WiremeshGateway, WiremeshGatewayStatus, WiremeshSegm
 use crate::workloads;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret};
 use k8s_openapi::ByteString;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
@@ -31,6 +31,17 @@ pub fn needs_token(existing: Option<&Secret>) -> bool {
         None => true,
         Some(s) => !s.data.as_ref().map(|d| d.contains_key("token")).unwrap_or(false),
     }
+}
+
+/// Whether to mint a fresh enrollment token, tying token freshness to the
+/// identity PVC's freshness. A fresh (absent) PVC holds no persisted identity,
+/// so the enroll init must redeem an UNSPENT token — even if a stale populated
+/// token Secret from a prior generation still lingers (reusing that spent
+/// single-use token is the adoption-path crash-loop bug). Once the PVC exists
+/// (steady state) the identity is durable, so we defer to `needs_token` and
+/// never re-mint on a plain pod recreation.
+pub fn should_mint_token(pvc_exists: bool, token_secret: Option<&Secret>) -> bool {
+    !pvc_exists || needs_token(token_secret)
 }
 
 async fn reconcile(gw: Arc<WiremeshGateway>, ctx: Arc<Context>) -> Result<Action, Error> {
@@ -58,13 +69,26 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
         .await?;
     let cidrs = seg.spec.cidrs.clone();
 
-    // Mint the enrollment token ONCE (guarded on the token Secret's existence).
+    // Observe the identity PVC's PRE-reconcile existence BEFORE we create it, so
+    // token minting can be tied to PVC freshness (see should_mint_token). The
+    // PVC is `<name>-data` (workloads::gateway_pvc).
+    let pvc_api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns);
+    let pvc_name = format!("{name}-data");
+    let pvc_exists = pvc_api.get_opt(&pvc_name).await?.is_some();
+
+    // Mint the enrollment token when the token Secret is absent/empty OR the PVC
+    // is fresh (absent). A fresh empty PVC has no persisted identity, so the
+    // enroll init must redeem an UNSPENT token — reusing the stale single-use
+    // token from a leftover Secret would crash-loop (the adoption-path bug). An
+    // existing PVC (steady state) already holds the identity, so pod recreation
+    // never re-mints. The force-apply below replaces any stale token Secret.
+    //
     // NOTE on idempotency: a crash between the mint and the Secret write below
     // orphans that token — the next reconcile mints a fresh one. This is
     // low-harm by design: enrollment tokens are single-use AND expiring, so an
     // unredeemed orphan simply lapses. A stronger guarantee would need a
     // controller-side idempotency key on MintToken (a possible follow-up).
-    if needs_token(secrets.get_opt(&token_secret).await?.as_ref()) {
+    if should_mint_token(pvc_exists, secrets.get_opt(&token_secret).await?.as_ref()) {
         let token = ctx.admin.mint_gateway_token(&cidrs).await.map_err(Error::Admin)?;
         let mut data = BTreeMap::new();
         data.insert("token".to_string(), ByteString(token.into_bytes()));
@@ -81,6 +105,15 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
         sec.type_ = Some("Opaque".into());
         apply(&secrets, &sec).await?;
     }
+
+    // Persist the gateway identity on a per-gateway PVC (owner-referenced → GC'd
+    // with the CR). This is what survives pod recreation so an upgrade/reschedule/
+    // reboot never wipes the identity and forces a re-enroll. Namespace is stamped
+    // here since the builder is namespace-free (mirrors the controller reconciler).
+    let mut pvc = workloads::gateway_pvc(&name, &gw.spec);
+    pvc.metadata.namespace = Some(ns.clone());
+    pvc.metadata.owner_references = Some(vec![owner_ref(gw)?]);
+    apply(&pvc_api, &pvc).await?;
 
     // Deploy the gateway. The enroll token is bound to `cidrs`, so those MUST
     // be passed through to the enroll init-container (--cidr).
@@ -161,6 +194,7 @@ pub async fn run(ctx: Arc<Context>) {
     let client = ctx.client.clone();
     Controller::new(Api::<WiremeshGateway>::all(client.clone()), watcher::Config::default())
         .owns(Api::<Deployment>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
+        .owns(Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
             if let Err(e) = res {
@@ -189,5 +223,36 @@ mod tests {
         data.insert("token".to_string(), ByteString(b"wiremesh://...".to_vec()));
         let populated = Secret { data: Some(data), ..Default::default() };
         assert!(!needs_token(Some(&populated)), "populated token → skip mint");
+    }
+
+    #[test]
+    fn should_mint_token_ties_freshness_to_pvc() {
+        // ADOPTION-PATH BUG: recreating the gateway pod onto a FRESH empty PVC
+        // makes the enroll init redeem the already-spent token from the existing
+        // Secret and crash-loop, because `needs_token(Some(populated))` is false
+        // so no fresh token is minted. Token freshness must be tied to PVC
+        // freshness: a fresh (absent) PVC needs a new unspent token even when a
+        // stale populated token Secret still exists; a PVC that already exists
+        // (steady state) must NOT trigger a re-mint.
+        let mut data = BTreeMap::new();
+        data.insert("token".to_string(), ByteString(b"wiremesh://spent".to_vec()));
+        let populated = Secret { data: Some(data), ..Default::default() };
+
+        // Fresh PVC (absent) + stale populated token → MUST re-mint.
+        assert!(
+            should_mint_token(false, Some(&populated)),
+            "fresh/absent PVC + stale populated token → re-mint (the empty volume needs an unspent token)"
+        );
+        // Steady state: PVC exists + token present → do NOT re-mint.
+        assert!(
+            !should_mint_token(true, Some(&populated)),
+            "existing PVC + populated token → no re-mint"
+        );
+        // Token Secret absent → mint regardless of PVC existence.
+        assert!(should_mint_token(true, None), "no token secret → mint (even if PVC exists)");
+        assert!(should_mint_token(false, None), "no token secret + fresh PVC → mint");
+        // Token Secret present but without the token key → mint.
+        let empty = Secret::default();
+        assert!(should_mint_token(true, Some(&empty)), "token secret without token key → mint");
     }
 }

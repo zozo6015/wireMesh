@@ -30,7 +30,29 @@ pub struct EnrollArgs {
 // at enroll time. Hence no `--endpoint` flag here (relays have their own bin).
 
 /// Generate a WG keypair, enroll, and persist the identity.
+///
+/// **Idempotent** (design 2026-07-28, §2): if a parseable, structurally-complete
+/// identity already exists in `--state-dir` (the same `Identity::load` the runtime
+/// reads at boot — a structural JSON parse, NOT a crypto/expiry validity check),
+/// enroll is a no-op — it logs a skip and returns `Ok(())` WITHOUT generating a
+/// keypair, reading the CA, or dialing the controller. This retires the old
+/// drain → delete-token → re-mint → new-id re-enroll dance and makes a single
+/// `enroll` command safe to run on EVERY boot: the K8s init-container enrolls once
+/// into a fresh PVC and skips on every later boot; systemd and manual invocations
+/// get the same "enroll once, then no-op" guarantee. Only the "no/unparseable
+/// identity" path proceeds to the real enrollment flow below (unchanged).
 pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
+    // Skip if a parseable, structurally-complete identity is already persisted
+    // (idempotent enroll). This MUST come before keypair gen / CA read /
+    // controller dial so a re-run never redeems a (now spent) single-use token.
+    if Identity::load(&args.state_dir).is_ok() {
+        eprintln!(
+            "wiremesh-gateway: already enrolled (identity present in {}), skipping",
+            args.state_dir.display()
+        );
+        return Ok(());
+    }
+
     // Fresh WireGuard static key — same method as `epochkeys::generate_next`
     // (x25519 clamps on use, so raw random bytes are correct).
     let mut raw = [0u8; 32];
