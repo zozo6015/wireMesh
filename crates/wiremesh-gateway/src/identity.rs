@@ -46,30 +46,45 @@ fn unique_tmp_path(path: &Path) -> PathBuf {
 /// identity. The rename installs the temp file's *new* inode at `path`, replacing
 /// any pre-existing file and its (possibly looser) mode.
 fn write_atomic_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
-
     let tmp = unique_tmp_path(path);
 
     // `create_new(true)` => O_EXCL: create a brand-new file or fail. Never open an
-    // existing object at the temp path (defends against a symlink/collision).
+    // existing object at the temp path (defends against a symlink/collision). If
+    // this open itself fails, no temp exists yet — nothing to clean up.
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
     let mut f = opts.open(&tmp).with_context(|| format!("creating temp {}", tmp.display()))?;
-    // Enforce 0600 on the temp explicitly (defends a looser umask) BEFORE it is
-    // renamed into place, so the installed file is 0600 the instant it becomes
-    // visible at `path`.
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
-    f.write_all(bytes).with_context(|| format!("writing {}", tmp.display()))?;
-    // PROPAGATE fsync failures — swallowing them (`.ok()`) would let a rename
-    // publish data the kernel never durably committed.
-    f.sync_all().with_context(|| format!("fsync {}", tmp.display()))?;
-    drop(f);
 
-    fs::rename(&tmp, path)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))?;
-    Ok(())
+    // Once the temp exists, ANY subsequent failure (chmod / write / fsync /
+    // rename) must best-effort unlink it so a crash-free error path leaves no
+    // residue — while preserving the ORIGINAL error and its context (the cleanup
+    // unlink's own result is discarded so it can never mask the real failure). The
+    // success path renames the temp away, so there is nothing to remove there.
+    let result = (|| {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        // Enforce 0600 on the temp explicitly (defends a looser umask) BEFORE it is
+        // renamed into place, so the installed file is 0600 the instant it becomes
+        // visible at `path`.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
+        f.write_all(bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        // PROPAGATE fsync failures — swallowing them (`.ok()`) would let a rename
+        // publish data the kernel never durably committed.
+        f.sync_all().with_context(|| format!("fsync {}", tmp.display()))?;
+        drop(f);
+        fs::rename(&tmp, path)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
+    })();
+
+    if result.is_err() {
+        // Best-effort: the temp may still be at `tmp` (any pre-rename failure) or
+        // already renamed away (impossible here — rename is the last step and a
+        // failed rename leaves the temp in place). Discard this result to preserve
+        // the original error.
+        let _ = fs::remove_file(&tmp);
+    }
+    result
 }
 
 impl Identity {
