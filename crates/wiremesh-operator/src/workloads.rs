@@ -90,6 +90,50 @@ fn recreate_strategy() -> DeploymentStrategy {
     DeploymentStrategy { type_: Some("Recreate".into()), rolling_update: None, ..Default::default() }
 }
 
+/// Build the JSON body to hand to `Patch::Apply` for a Deployment, clearing the
+/// API-server defaulter's `rollingUpdate` block when the strategy is `Recreate`.
+///
+/// WHY (see `docs/research/ops-finding-pvc-adoption-migration.md`, bug 1): the
+/// typed builders set `strategy.type: Recreate` with `rolling_update: None`, but
+/// a typed `None` serializes to an OMITTED field, not a JSON `null`. When the
+/// operator server-side-applies that body over a Deployment that was originally
+/// created with the default RollingUpdate strategy, the `rollingUpdate` block is
+/// owned by the API-server DEFAULTER (a different field manager). SSA leaves a
+/// field the apply body omits in place, so the merged object ends up with BOTH
+/// `type: Recreate` AND a `rollingUpdate` block, which the API server rejects:
+/// `spec.strategy.rollingUpdate: Forbidden ... when type is 'Recreate'` (422).
+/// The reconcile then loops on that 422 and never rolls out the new pod spec.
+///
+/// The fix is to emit an EXPLICIT `spec.strategy.rollingUpdate: null` in the
+/// apply body — a present null is what tells SSA to REMOVE the defaulter's
+/// field. The typed builders keep returning `type: Recreate`; this null
+/// injection happens only at the apply boundary. Idempotent: re-applying a
+/// Deployment already at `Recreate` (with no `rollingUpdate`) still injects the
+/// same null, and a Deployment on some other strategy is passed through
+/// untouched.
+pub fn deployment_apply_body(dep: &Deployment) -> serde_json::Value {
+    let mut body = serde_json::to_value(dep)
+        .expect("a k8s-openapi Deployment always serializes to JSON");
+    let is_recreate = body
+        .get("spec")
+        .and_then(|s| s.get("strategy"))
+        .and_then(|s| s.get("type"))
+        .and_then(|t| t.as_str())
+        == Some("Recreate");
+    if is_recreate {
+        if let Some(strategy) = body
+            .get_mut("spec")
+            .and_then(|s| s.get_mut("strategy"))
+            .and_then(|s| s.as_object_mut())
+        {
+            // An EXPLICIT null (present key) — not an omitted field — so SSA
+            // removes the defaulter's rollingUpdate block.
+            strategy.insert("rollingUpdate".to_string(), serde_json::Value::Null);
+        }
+    }
+    body
+}
+
 fn tcp_port(name: &str, port: i32) -> ContainerPort {
     ContainerPort {
         name: Some(name.to_string()),
@@ -1171,5 +1215,80 @@ mod tests {
                 "the CA private key (tls.key) must NEVER reach a gateway/relay"
             );
         }
+    }
+
+    // ---- T1: strategy:Recreate apply must clear the defaulter's rollingUpdate ----
+
+    /// Assert the strategy carried by an APPLY BODY is `Recreate` AND explicitly
+    /// nulls `rollingUpdate` — a JSON `null` that IS PRESENT, not an omitted key.
+    ///
+    /// The distinction is load-bearing: a typed `rolling_update: None` serializes
+    /// to an OMITTED field, so a server-side apply leaves the API-server
+    /// defaulter's `rollingUpdate` block in place → the merged object has
+    /// `type: Recreate` AND a `rollingUpdate` block → the API server 422s
+    /// (`spec.strategy.rollingUpdate: Forbidden ... when type is 'Recreate'`).
+    /// Only an explicit `null` in the apply body tells SSA to REMOVE the
+    /// defaulter's field. `Value::index` returns `Value::Null` for a MISSING key
+    /// too, so `.is_null()` alone can't tell "present null" from "absent" — the
+    /// `contains_key` check is what actually pins the fix.
+    fn assert_strategy_nulls_rolling_update(body: &serde_json::Value, what: &str) {
+        let strat = body
+            .get("spec")
+            .and_then(|s| s.get("strategy"))
+            .unwrap_or_else(|| panic!("{what} apply body must carry spec.strategy: {body:#}"));
+        assert_eq!(
+            strat.get("type").and_then(|t| t.as_str()),
+            Some("Recreate"),
+            "{what} apply body strategy.type must be Recreate"
+        );
+        let obj = strat
+            .as_object()
+            .unwrap_or_else(|| panic!("{what} strategy must be a JSON object: {strat:#}"));
+        assert!(
+            obj.contains_key("rollingUpdate"),
+            "{what} apply body must include an EXPLICIT strategy.rollingUpdate key (an omitted \
+             field lets SSA keep the API-server defaulter's block → 422): {strat:#}"
+        );
+        assert!(
+            strat["rollingUpdate"].is_null(),
+            "{what} apply body strategy.rollingUpdate must be JSON null so SSA removes the \
+             defaulter's block: {strat:#}"
+        );
+    }
+
+    #[test]
+    fn gateway_apply_body_nulls_rolling_update_under_recreate() {
+        // BUG (zolab e2e): applying `strategy.type: Recreate` over an existing
+        // RollingUpdate Deployment 422s because a typed `rolling_update: None`
+        // serializes to OMITTED, so SSA won't remove the defaulter's rollingUpdate
+        // block. The applied body must set `spec.strategy.rollingUpdate = null`.
+        //
+        // IMPLEMENTER SURFACE (must be added — this test won't compile until then):
+        //   pub fn deployment_apply_body(dep: &Deployment) -> serde_json::Value
+        // returning the JSON body to hand to `Patch::Apply`, with
+        // `spec.strategy.rollingUpdate` injected as `Value::Null` whenever
+        // `spec.strategy.type == "Recreate"`. The gateway reconciler's apply of
+        // `gateway_deployment(...)` must route through this helper. Keep the typed
+        // builder returning `type: Recreate`; the null-injection is at the apply
+        // boundary. Must be idempotent (re-null-ing an already-null field is a
+        // no-op).
+        let gw = WiremeshGateway::new("gw-aws", gw_spec("aws", None, None));
+        let d = gateway_deployment(
+            &gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token",
+            &["10.10.0.0/16".to_string()],
+        );
+        let body = deployment_apply_body(&d);
+        assert_strategy_nulls_rolling_update(&body, "gateway");
+    }
+
+    #[test]
+    fn controller_apply_body_nulls_rolling_update_under_recreate() {
+        // Same defaulter-conflict bug on the controller Deployment's apply path.
+        // The controller reconciler's apply of `controller_deployment(...)` must
+        // route through `deployment_apply_body` so the applied body nulls
+        // `spec.strategy.rollingUpdate`.
+        let d = controller_deployment("wm", &ctrl_spec(), "op:test");
+        let body = deployment_apply_body(&d);
+        assert_strategy_nulls_rolling_update(&body, "controller");
     }
 }

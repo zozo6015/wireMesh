@@ -68,6 +68,32 @@ identity is in the ephemeral emptyDir and cannot be migrated), so gw-home
 re-enrolls ONCE (new id). After that, its identity is durable and no pod
 recreation ever re-enrolls again. Call this out in the PR/release notes.
 
+**Adoption is automatic as of v0.2.2 (hands-off, no manual step).** The v0.2.1
+e2e on zolab found the transition was NOT actually hands-off — the old gateway
+id (enrolled from the now-gone emptyDir) stays `active` in the roster, so the
+new pod's plain-token enroll is rejected until the old id is drained. v0.2.2
+makes the operator DETECT adoption and DRAIN the stale gateway id itself, which
+frees the segment so the plain-token enroll is no longer rejected (the fresh
+token is minted independently because the freshly created PVC makes
+`identity_persisted` false → `should_mint_token` true); the new pod then enrolls
+into the freed segment automatically.
+
+The drain is guarded by the COMPLETE condition — it occurs ONLY when BOTH hold:
+(1) the gateway PVC is freshly created this reconcile (`existing_pvc.is_none()`)
+AND (2) this CR is the SOLE `WiremeshGateway` for the segment. Guard (2) is
+required because the controller roster matches a gateway to its segment by NAME
+only, so if a second `WiremeshGateway` targets the same segment the "active"
+roster id could be that peer's LIVE gateway — draining it would be an outage;
+the operator counts the `WiremeshGateway` CRs referencing the segment and drains
+only when the count is 1. The CR-list query is issued only on the fresh-PVC path
+(skipped in steady state), and it FAILS SAFE: if the list query errors, the
+operator treats this CR as NOT the sole gateway and does NOT drain (a missed
+drain is a manual cleanup; a wrong drain kills a live peer). In steady state
+(PVC already present, own id legitimately active) the operator never drains a
+healthy gateway. See `docs/research/ops-finding-pvc-adoption-migration.md`
+(`adoption_needs_stale_drain`, and the companion `Recreate`-strategy
+`rollingUpdate` fix).
+
 ## Scope
 
 - **Changed:** `workloads.rs` (gateway volume emptyDir→PVC + `gateway_pvc`),
@@ -98,7 +124,10 @@ recreation ever re-enrolls again. Call this out in the PR/release notes.
 
 ## Release
 
-Availability fix → patch bump (**v0.2.1**) per the release-every-fix rule.
+Availability fix → patch bump per the release-every-fix rule. Shipped in two
+steps: the PVC-backed identity + idempotent enroll feature released as **v0.2.1**;
+the hands-off *adoption* automation (detect + drain the stale id) described in the
+"One-time adoption cost" section released as **v0.2.2**.
 
 ## Execution
 
