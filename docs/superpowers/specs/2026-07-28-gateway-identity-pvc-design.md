@@ -68,6 +68,20 @@ identity is in the ephemeral emptyDir and cannot be migrated), so gw-home
 re-enrolls ONCE (new id). After that, its identity is durable and no pod
 recreation ever re-enrolls again. Call this out in the PR/release notes.
 
+**Adoption is automatic as of v0.2.2 (hands-off, no manual step).** The v0.2.1
+e2e on zolab found the transition was NOT actually hands-off — the old gateway
+id (enrolled from the now-gone emptyDir) stays `active` in the roster, so the
+new pod's plain-token enroll is rejected until the old id is drained. v0.2.2
+makes the operator DETECT adoption (the gateway PVC is freshly created this
+reconcile) and DRAIN the stale gateway id itself, which frees the segment and
+lets `should_mint_token` mint a fresh unspent token; the new pod then enrolls
+into the freed segment automatically. The drain fires ONLY on the fresh-PVC
+path — in steady state (PVC already present, own id legitimately active) the
+operator never drains a healthy gateway. See
+`docs/research/ops-finding-pvc-adoption-migration.md`
+(`adoption_needs_stale_drain`, and the companion `Recreate`-strategy
+`rollingUpdate` fix).
+
 ## Scope
 
 - **Changed:** `workloads.rs` (gateway volume emptyDir→PVC + `gateway_pvc`),

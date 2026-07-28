@@ -1,9 +1,37 @@
 # Ops finding: gateway PVC-identity ADOPTION path (two bugs the v0.2.1 e2e caught)
 
 **Date:** 2026-07-28/29 (v0.2.1 end-to-end validation on the zolab k3s cluster).
-**Status:** OPEN — two operator bugs in the emptyDir→PVC *adoption* transition,
-targeted for **v0.2.2**. The STEADY-STATE feature (identity persists across pod
-recreation; enroll skips) is VALIDATED and works — see below.
+**Status:** ADDRESSED in **v0.2.2** — both operator bugs in the emptyDir→PVC
+*adoption* transition are fixed (see "Resolution (v0.2.2)" below). The
+STEADY-STATE feature (identity persists across pod recreation; enroll skips) was
+already VALIDATED in v0.2.1 and is untouched.
+
+## Resolution (v0.2.2)
+
+Both bugs below are fixed operator-side and covered by unit done-bars:
+
+- **Bug 1** (`Recreate` apply 422): the operator now builds the Deployment apply
+  body via `workloads::deployment_apply_body`, which injects an EXPLICIT
+  `spec.strategy.rollingUpdate: null` whenever the strategy is `Recreate`, so
+  server-side apply removes the API-server defaulter's `rollingUpdate` block
+  instead of leaving it to conflict. Both the gateway and controller reconcilers
+  route their Deployment apply through it (`controllers::apply_deployment`).
+- **Bug 2** (adoption doesn't free the segment): the gateway reconciler now
+  DETECTS adoption (`adoption_needs_stale_drain`) and drains the stale gateway id
+  itself — automatically, no manual step. The drain's purpose is to FREE THE
+  SEGMENT so the new pod's plain-token enroll is no longer rejected; it does NOT
+  (within the reconcile) flip the `gateway_active` snapshot, which is read before
+  the drain and not re-read. The fresh token is minted independently: the freshly
+  created PVC makes `pvc_exists` false → `identity_persisted` false →
+  `should_mint_token` true. The drain fires ONLY on the fresh-PVC path
+  (`existing_pvc.is_none()`) AND only when this CR is the SOLE `WiremeshGateway`
+  for the segment — the roster matches a gateway to its segment by NAME only, so
+  with two CRs on a segment the "active" id could be a healthy peer's live
+  gateway; the guard refuses to drain (and fails safe to "not sole" if the CR
+  list query fails). In steady state it returns `None`, so a healthy running
+  gateway is never drained. This replaces the earlier "re-enrolls ONCE
+  automatically" wording with the real behavior: the operator drains the stale
+  gateway on adoption, then the new pod enrolls fresh.
 
 ## What v0.2.1 shipped and what the e2e proved GREEN
 
@@ -84,7 +112,9 @@ steady-state feature works perfectly.
 
 The v0.2.1 feature is correct and validated for its purpose (steady-state pod
 recreation no longer re-enrolls). The ADOPTION transition (one-time,
-emptyDir→PVC) needs the two operator fixes above before it is hands-off; until
-v0.2.2, adopting a gateway requires the two manual steps used here (patch the
-strategy, drain the old id). The design doc's "automatic one-time re-enroll"
-wording is corrected by this note.
+emptyDir→PVC) needed the two operator fixes above to be hands-off; both are
+implemented in **v0.2.2** (see "Resolution (v0.2.2)" at the top), so the two
+manual steps used in the e2e (patch the strategy, drain the old id) are no
+longer required — the operator does both automatically now. The design doc's
+"automatic one-time re-enroll" wording is corrected accordingly (the operator
+drains the stale gateway on adoption, then the new pod enrolls fresh).

@@ -2,14 +2,14 @@
 //! store it in a Secret, deploy the privileged hostNetwork gateway, and report
 //! `status.enrolled`/`gateway_id`. Finalizer drains the gateway on delete.
 
-use super::{apply, owner_ref, Context, Error};
+use super::{apply, apply_deployment, owner_ref, Context, Error};
 use crate::crd::{Condition, WiremeshGateway, WiremeshGatewayStatus, WiremeshSegment};
 use crate::workloads;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret};
 use k8s_openapi::ByteString;
-use kube::api::{Patch, PatchParams};
+use kube::api::{ListParams, Patch, PatchParams};
 use kube::runtime::controller::{Action, Controller};
 use kube::runtime::finalizer::{finalizer, Event};
 use kube::runtime::watcher;
@@ -64,6 +64,55 @@ pub fn pvc_needs_create(existing: Option<&PersistentVolumeClaim>) -> bool {
     existing.is_none()
 }
 
+/// Decide whether a genuine emptyDir→PVC ADOPTION requires draining a stale
+/// gateway from the controller roster before the new pod can enroll.
+///
+/// WHY (see `docs/research/ops-finding-pvc-adoption-migration.md`, bug 2): when a
+/// gateway pod is recreated onto a FRESH empty PVC, the OLD gateway id (enrolled
+/// from the now-gone emptyDir) is still `active` in the roster, so the new pod's
+/// plain-token enroll is rejected ("segment already has an active gateway; use a
+/// rebind token"). The operator must detect adoption and drain that stale id to
+/// free the segment; but it must do so ONLY on a genuine adoption — NEVER on a
+/// healthy steady-state gateway.
+///
+/// The `!pvc_freshly_created` gate is the load-bearing safety property: an
+/// existing PVC (steady state) short-circuits to `None`, so a running gateway
+/// whose own id is legitimately active is never drained. On the fresh-PVC path,
+/// drain only when a roster id is active for the segment AND it is not this
+/// gateway's own enrolled id. During real adoption the caller passes
+/// `own_enrolled_id = None` (a fresh PVC holds no identity this pod can prove is
+/// its own); the equality guard is defense-in-depth for an inconsistent
+/// fresh-PVC-with-known-own-id case only.
+///
+/// SOLE-GATEWAY GUARD (`sole_gateway_for_segment`): the controller roster keys a
+/// gateway to its segment by NAME only, so if TWO `WiremeshGateway` CRs target
+/// the same segment, the roster's "active" id for that segment may belong to a
+/// healthy PEER's live gateway, not a stale predecessor of THIS CR. Draining it
+/// would kill a running peer. So we refuse to drain unless this CR is the SOLE
+/// gateway CR for the segment — only then is an active roster id on the fresh-PVC
+/// path unambiguously this CR's own stale predecessor. With a peer present, the
+/// safe action is to leave the id alone (a missed drain is a manual cleanup; a
+/// wrong drain is an outage).
+pub fn adoption_needs_stale_drain(
+    pvc_freshly_created: bool,
+    active_roster_id_for_segment: Option<u64>,
+    own_enrolled_id: Option<u64>,
+    sole_gateway_for_segment: bool,
+) -> Option<u64> {
+    if !pvc_freshly_created {
+        return None; // steady state: NEVER drain a healthy gateway.
+    }
+    if !sole_gateway_for_segment {
+        // A peer CR shares this segment — the active roster id (matched by
+        // segment NAME) may be the peer's LIVE gateway. Never risk draining it.
+        return None;
+    }
+    match active_roster_id_for_segment {
+        Some(id) if Some(id) != own_enrolled_id => Some(id),
+        _ => None,
+    }
+}
+
 async fn reconcile(gw: Arc<WiremeshGateway>, ctx: Arc<Context>) -> Result<Action, Error> {
     let api = Api::<WiremeshGateway>::all(ctx.client.clone());
     finalizer(&api, GATEWAY_FINALIZER, gw, |event| async {
@@ -116,7 +165,67 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
             Vec::new()
         }
     };
-    let gateway_active = roster.iter().any(|g| g.segment == seg.spec.segment_name);
+    // Find THIS CR's segment row in the roster ONCE and reuse it for the mint
+    // decision, the adoption-drain decision, and the status below (matched by
+    // segment NAME — the only key the roster carries).
+    let seg_row = roster.iter().find(|g| g.segment == seg.spec.segment_name);
+    let gateway_active = seg_row.is_some();
+
+    // ADOPTION DETECTION (v0.2.2 — see docs/research/ops-finding-pvc-adoption-
+    // migration.md, bug 2). On the one-time emptyDir→PVC transition the pod is
+    // recreated onto a FRESH empty PVC, but the OLD gateway id (enrolled from the
+    // now-gone emptyDir) is STILL `active` in the roster. The new pod's plain-token
+    // enroll is then rejected ("segment already has an active gateway; use a rebind
+    // token") → adoption stalls in Init:Error. Detect it and drain the stale id to
+    // FREE THE SEGMENT so the plain-token enroll is no longer rejected. (The fresh
+    // token is minted regardless because the fresh PVC makes `pvc_exists` false →
+    // `identity_persisted` false → `should_mint_token` true; the drain does NOT
+    // flip `gateway_active` within this reconcile — that snapshot was read above
+    // and is not re-read. The drain's SOLE purpose is unblocking the enroll.)
+    //
+    // SAFETY (load-bearing): `adoption_needs_stale_drain` fires ONLY when the PVC is
+    // freshly created THIS reconcile (`existing_pvc.is_none()`) AND this CR is the
+    // sole gateway for the segment. In steady state the PVC already exists, so the
+    // fn returns None unconditionally — a healthy running gateway is NEVER drained.
+    // On the fresh-PVC path this pod has no persisted identity it can prove is its
+    // own, so `own_enrolled_id` is `None` — NOT `status.gateway_id`, which during
+    // adoption still holds the stale old id and would (via the equality guard)
+    // DEFEAT the drain and re-introduce the bug. The equality guard in the pure fn
+    // is defense-in-depth only.
+    //
+    // SOLE-GATEWAY GUARD: the roster matches a gateway to its segment by NAME only,
+    // so if a SECOND WiremeshGateway CR targets this segment, the active roster id
+    // could be that PEER's LIVE gateway — draining it would be an outage. Count the
+    // WiremeshGateway CRs referencing this segment (by `segment_ref`); == 1 means
+    // this CR is the only one, so an active roster id is unambiguously this CR's own
+    // stale predecessor. SAFE FALLBACK on a list failure: `false` (never drain) — a
+    // missed drain is a manual cleanup, a false positive kills a live peer.
+    let sole_gateway_for_segment = match Api::<WiremeshGateway>::all(client.clone())
+        .list(&ListParams::default())
+        .await
+    {
+        Ok(list) => list.items.iter().filter(|g| g.spec.segment_ref == gw.spec.segment_ref).count() == 1,
+        Err(e) => {
+            tracing::warn!(
+                "gateway {name}: listing WiremeshGateway CRs failed ({e}); treating as NOT the \
+                 sole gateway for the segment (conservative: skip the adoption drain)"
+            );
+            false
+        }
+    };
+    if let Some(stale_id) = adoption_needs_stale_drain(
+        existing_pvc.is_none(),
+        seg_row.map(|g| g.id),
+        None,
+        sole_gateway_for_segment,
+    ) {
+        tracing::info!(
+            "gateway {name}: adoption: draining stale gateway id {stale_id} to free segment \
+             {segment} (emptyDir→PVC transition; the new pod will enroll fresh)",
+            segment = seg.spec.segment_name,
+        );
+        ctx.admin.drain(stale_id).await.map_err(Error::Admin)?;
+    }
 
     // The identity is durably persisted ONLY when the PVC exists AND the gateway
     // is active in the roster — a PVC alone can hold no identity (a first enroll
@@ -170,10 +279,13 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     );
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![owner_ref(gw)?]);
-    apply(&Api::<Deployment>::namespaced(client.clone(), &ns), &dep).await?;
+    // Route through deployment_apply_body so the Recreate strategy explicitly
+    // nulls the defaulter's rollingUpdate (avoids the 422 on apply-over-existing;
+    // ops-finding-pvc-adoption-migration.md bug 1).
+    apply_deployment(&Api::<Deployment>::namespaced(client.clone(), &ns), &dep).await?;
 
-    // Status from the controller's gateway roster (reuse the snapshot read above).
-    let row = roster.iter().find(|g| g.segment == seg.spec.segment_name);
+    // Status from the controller's gateway roster (reuse `seg_row` from above).
+    let row = seg_row;
     let enrolled = row.is_some();
     let status = WiremeshGatewayStatus {
         enrolled,
@@ -342,6 +454,122 @@ mod tests {
         assert!(
             !pvc_needs_create(Some(&existing)),
             "existing PVC → do NOT re-apply/patch (storage fields are immutable after bind)"
+        );
+    }
+
+    #[test]
+    fn adoption_drains_stale_gateway_but_never_a_healthy_one() {
+        // ADOPTION BUG (v0.2.1 zolab e2e): on the one-time emptyDir→PVC transition
+        // the pod is recreated onto a FRESH empty PVC, but the OLD gateway id
+        // (enrolled from the now-gone emptyDir) is STILL `active` in the roster, so
+        // the new pod's plain-token enroll is rejected ("segment already has an
+        // active gateway; use a rebind token"), and `identity_persisted` is true
+        // (fresh PVC + old id active) so no fresh token is minted either → adoption
+        // stalls in Init:Error. The operator must DETECT adoption and drain the
+        // stale id (freeing the segment + flipping identity_persisted→false so a
+        // fresh token mints) — but NEVER touch a healthy steady-state gateway.
+        //
+        // IMPLEMENTER SURFACE (must be added — this test won't compile until then):
+        //   pub fn adoption_needs_stale_drain(
+        //       pvc_freshly_created: bool,
+        //       active_roster_id_for_segment: Option<u64>,
+        //       own_enrolled_id: Option<u64>,
+        //       sole_gateway_for_segment: bool,
+        //   ) -> Option<u64>
+        // Returns Some(stale_id) to drain ONLY when the PVC is freshly created
+        // (no persisted identity this reconcile) AND a roster id is active for the
+        // segment that is NOT this gateway's own enrolled id AND THIS CR is the
+        // SOLE gateway CR for the segment; otherwise None.
+        //
+        // Reference logic that satisfies the truth table:
+        //   if !pvc_freshly_created { return None; }        // steady state: NEVER drain
+        //   if !sole_gateway_for_segment { return None; }   // shared segment: NEVER drain a peer
+        //   match active_roster_id_for_segment {
+        //       Some(id) if Some(id) != own_enrolled_id => Some(id),
+        //       _ => None,
+        //   }
+        //
+        // WIRING (specify exactly for the implementer):
+        //   - pvc_freshly_created  ← existing_pvc.is_none()  (== pvc_needs_create,
+        //     the PRE-reconcile PVC observation already computed as !pvc_exists).
+        //   - active_roster_id_for_segment ← the roster row id for this CR's
+        //     segment: roster.iter().find(|g| g.segment == seg.spec.segment_name)
+        //         .map(|g| g.id)  (the same `row` used for status).
+        //   - own_enrolled_id ← the id this pod can PROVE is its own. A freshly
+        //     created PVC has NO persisted identity, so on the fresh-PVC path this
+        //     MUST be None. Do NOT source it from `status.gateway_id`: during
+        //     adoption status still holds the STALE old id (== the active roster
+        //     id), so passing it would make Some(id)==own → None and DEFEAT the
+        //     drain, re-introducing the bug. The equality guard in the pure fn is
+        //     only defense-in-depth for an inconsistent fresh-PVC-with-own-id case.
+        //   - sole_gateway_for_segment ← count the WiremeshGateway CRs whose
+        //     spec.segment_ref resolves to this segment; == 1 means only THIS CR
+        //     references it. The roster match is by SEGMENT NAME only, so a roster
+        //     id "active for the segment" could belong to a DIFFERENT CR that also
+        //     mis-references the same segment — draining it would kill a healthy
+        //     peer gateway. List all WiremeshGateway CRs in apply_gateway
+        //     (Api::<WiremeshGateway>::all(...).list(&ListParams::default()), or the
+        //     controller runtime's store if exposed) and count segment_ref matches;
+        //     if listing is unavailable, fall back to the SAFE default
+        //     `sole_gateway_for_segment = false` (never drain) and log — a
+        //     conservative miss just leaves the stale id for a manual drain, whereas
+        //     a false positive kills a live peer.
+
+        // 1. Fresh PVC + a stale active roster id, our own id unknown, SOLE CR for
+        //    the segment → drain it (the real adoption case).
+        assert_eq!(
+            adoption_needs_stale_drain(true, Some(8), None, true),
+            Some(8),
+            "genuine adoption (fresh PVC, sole CR for the segment) with a stale active roster id → drain"
+        );
+        // 1b. Fresh PVC + active id that differs from a (differently) known own id,
+        //     sole CR → still a stale id, drain it.
+        assert_eq!(
+            adoption_needs_stale_drain(true, Some(8), Some(5), true),
+            Some(8),
+            "fresh PVC + active roster id != own id + sole CR → drain the stale id"
+        );
+
+        // 2. CRITICAL SAFETY CASE: steady state (existing PVC, own id active) →
+        //    NEVER drain. This is the load-bearing assertion — a regression here
+        //    would drain a healthy running gateway.
+        assert_eq!(
+            adoption_needs_stale_drain(false, Some(9), Some(9), true),
+            None,
+            "steady state (existing PVC, own id active) → NEVER drain a healthy gateway"
+        );
+
+        // 2b. CRITICAL SAFETY CASE (shared segment): fresh PVC + stale active id but
+        //     TWO CRs reference the segment (sole=false). The "active for the
+        //     segment" id could be CR-A's HEALTHY live gateway (roster matches by
+        //     segment NAME only), so CR-B's adoption must NOT drain it.
+        assert_eq!(
+            adoption_needs_stale_drain(true, Some(8), None, false),
+            None,
+            "two CRs on the same segment (sole=false) → NEVER drain a possibly-healthy peer, even on a fresh PVC"
+        );
+
+        // 3. Fresh PVC but no active roster id for the segment → nothing to drain
+        //    (first-ever deploy).
+        assert_eq!(
+            adoption_needs_stale_drain(true, None, None, true),
+            None,
+            "fresh PVC + no active roster id → first-ever deploy, nothing to drain"
+        );
+
+        // 4. Existing PVC + active id == own id → None (steady-state, redundant
+        //    with case 2 but pins that an existing PVC never drains).
+        assert_eq!(
+            adoption_needs_stale_drain(false, Some(9), Some(9), true),
+            None,
+            "existing PVC + active id == own id → no drain"
+        );
+        // 4b. Existing PVC never drains even if the active id looks unfamiliar
+        //     (only the fresh-PVC path may ever drain).
+        assert_eq!(
+            adoption_needs_stale_drain(false, Some(7), Some(9), true),
+            None,
+            "existing PVC → NEVER drain regardless of the roster id (only adoption drains)"
         );
     }
 }

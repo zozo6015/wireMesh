@@ -21,6 +21,7 @@ pub mod gateway;
 pub mod relay;
 
 use crate::crd::WiremeshController;
+use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::Service;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::api::{ListParams, Patch, PatchParams};
@@ -87,6 +88,21 @@ where
     let name = obj.meta().name.clone().ok_or(Error::MissingField(".metadata.name"))?;
     let pp = PatchParams::apply(FIELD_MANAGER).force();
     Ok(api.patch(&name, &pp, &Patch::Apply(obj)).await?)
+}
+
+/// Server-side-apply a Deployment through its JSON apply body
+/// (`workloads::deployment_apply_body`) rather than the typed object, so a
+/// `Recreate` strategy explicitly nulls the API-server defaulter's
+/// `rollingUpdate` block. Applying the typed Deployment directly (via `apply`)
+/// omits the field, leaving the defaulter's block in place → the merged object
+/// 422s (`rollingUpdate: Forbidden ... when type is 'Recreate'`). See
+/// `docs/research/ops-finding-pvc-adoption-migration.md` (bug 1).
+pub async fn apply_deployment(api: &Api<Deployment>, dep: &Deployment) -> Result<(), Error> {
+    let name = dep.meta().name.clone().ok_or(Error::MissingField(".metadata.name"))?;
+    let pp = PatchParams::apply(FIELD_MANAGER).force();
+    let body = crate::workloads::deployment_apply_body(dep);
+    api.patch(&name, &pp, &Patch::Apply(body)).await?;
+    Ok(())
 }
 
 /// The controller's control-plane endpoints gateways/relays dial, as **numeric

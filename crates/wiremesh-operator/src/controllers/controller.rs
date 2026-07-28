@@ -2,7 +2,7 @@
 //! Deployment (with the admin-token bootstrap sidecar), waits for it to be
 //! available and the admin token minted, and reports `status.ready`.
 
-use super::{apply, owner_ref, service_dns, Context, Error};
+use super::{apply, apply_deployment, owner_ref, service_dns, Context, Error};
 use crate::crd::{Condition, WiremeshController, WiremeshControllerStatus};
 use crate::workloads;
 use futures::StreamExt;
@@ -38,7 +38,10 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
     let mut dep = workloads::controller_deployment(&name, &cr.spec, &operator_image);
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![oref.clone()]);
-    apply(&Api::<Deployment>::namespaced(client.clone(), &ns), &dep).await?;
+    // Route through deployment_apply_body so the Recreate strategy explicitly
+    // nulls the defaulter's rollingUpdate (avoids the 422 on apply-over-existing;
+    // ops-finding-pvc-adoption-migration.md bug 1).
+    apply_deployment(&Api::<Deployment>::namespaced(client.clone(), &ns), &dep).await?;
 
     // Ready iff the Deployment reports an available replica. (No admin-token
     // bootstrap: the operator reaches Admin over the pod-local implicit-admin
