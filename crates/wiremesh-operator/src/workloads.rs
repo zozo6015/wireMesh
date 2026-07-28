@@ -21,9 +21,9 @@
 
 use anyhow::Context;
 use crate::crd::{
-    WiremeshControllerSpec, WiremeshGateway, WiremeshRelay,
+    WiremeshControllerSpec, WiremeshGateway, WiremeshGatewaySpec, WiremeshRelay,
 };
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
+use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EmptyDirVolumeSource, EnvVar, HostPathVolumeSource, KeyToPath,
     PodSpec, PodTemplateSpec, PersistentVolumeClaim, PersistentVolumeClaimSpec,
@@ -80,6 +80,14 @@ fn labels(name: &str) -> BTreeMap<String, String> {
 
 fn env(name: &str, value: impl Into<String>) -> EnvVar {
     EnvVar { name: name.to_string(), value: Some(value.into()), ..Default::default() }
+}
+
+/// The `Recreate` Deployment strategy: kill the old pod before starting the new
+/// one. Both the controller and gateway own an RWO PVC (and the gateway is also
+/// hostNetwork), so a default RollingUpdate would surge a second pod that cannot
+/// mount the RWO PVC (or bind the host net), wedging the rollout.
+fn recreate_strategy() -> DeploymentStrategy {
+    DeploymentStrategy { type_: Some("Recreate".into()), rolling_update: None, ..Default::default() }
 }
 
 fn tcp_port(name: &str, port: i32) -> ContainerPort {
@@ -330,6 +338,7 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
         },
         spec: Some(DeploymentSpec {
             replicas: Some(1),
+            strategy: Some(recreate_strategy()),
             selector: LabelSelector { match_labels: Some(labels(name)), ..Default::default() },
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta { labels: Some(pod_labels), ..Default::default() }),
@@ -345,9 +354,71 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
 // Gateway
 // --------------------------------------------------------------------------
 
+/// Scheduler-aware node pinning for the gateway pod.
+///
+/// The gateway now mounts a per-gateway PVC (`gateway_pvc`). Default storage
+/// classes — k3s `local-path`, most NFS/CSI provisioners — use
+/// `volumeBindingMode: WaitForFirstConsumer`, which binds a PVC only AFTER the
+/// scheduler has placed the consuming pod onto a node. Setting `spec.nodeName`
+/// directly (the old pinning) BYPASSES the scheduler entirely, so a WFC PVC never
+/// gets its "first consumer" scheduling event → the PVC stays `Pending` → the pod
+/// hangs `Pending` forever (observed live: `gw-home` pinned to `zolab-worker1`).
+///
+/// The fix keeps the SAME node pin but expresses it as a
+/// `kubernetes.io/hostname` nodeSelector, which the scheduler honors — so the pod
+/// is placed (triggering WFC binding) yet still lands only on the chosen node. An
+/// explicit CR `nodeSelector` is preserved, and an explicit `kubernetes.io/hostname`
+/// key in it WINS over the folded-in `nodeName` (`or_insert`). Cross-node failover
+/// remains out of scope (a node-local RWO PVC still binds on one node).
+fn scheduler_aware_node_selector(spec: &WiremeshGatewaySpec) -> Option<BTreeMap<String, String>> {
+    let mut sel = spec.node_selector.clone().unwrap_or_default();
+    if let Some(n) = &spec.node_name {
+        // `or_insert`: an explicit hostname key in the CR's nodeSelector wins.
+        sel.entry("kubernetes.io/hostname".to_string()).or_insert_with(|| n.clone());
+    }
+    if sel.is_empty() {
+        None
+    } else {
+        Some(sel)
+    }
+}
+
+/// The gateway's identity PVC (`<name>-gateway-data`, kind-specific so it never
+/// collides with the controller's `<name>-data`), mounted at `/var/lib/wiremesh`.
+/// Persists the enrolled `Identity` (`identity.json`/`wg_private.key`) across pod
+/// recreation so an upgrade/reschedule/reboot never destroys it (which would
+/// force a re-enroll against a spent single-use token). Mirrors `controller_pvc`:
+/// RWO (node-local, single writer), instance labels, a small default (128Mi —
+/// the state is a few KB) overridable via `storageClass`/`storageSize` on the CR.
+pub fn gateway_pvc(name: &str, spec: &WiremeshGatewaySpec) -> PersistentVolumeClaim {
+    let mut requests = BTreeMap::new();
+    requests.insert(
+        "storage".to_string(),
+        Quantity(spec.storage_size.clone().unwrap_or_else(|| "128Mi".to_string())),
+    );
+    PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(format!("{name}-gateway-data")),
+            labels: Some(labels(name)),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(requests),
+                ..Default::default()
+            }),
+            storage_class_name: spec.storage_class.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// A privileged, hostNetwork gateway Deployment for one segment. An `enroll`
 /// init-container turns the mounted token + CA into an on-disk `Identity`
-/// (shared `state` volume); the main container runs the data plane.
+/// (shared `state` volume, PVC-backed so it survives pod recreation); the main
+/// container runs the data plane.
 pub fn gateway_deployment(
     gw: &WiremeshGateway,
     controller_sync: &str,
@@ -417,12 +488,27 @@ pub fn gateway_deployment(
         // no cluster DNS). Use ClusterFirstWithHostNet so cluster names still
         // resolve — belt-and-suspenders even though we now pass ClusterIPs.
         dns_policy: Some("ClusterFirstWithHostNet".to_string()),
-        node_name: gw.spec.node_name.clone(),
-        node_selector: gw.spec.node_selector.clone(),
+        // Never set `nodeName` directly — it bypasses the scheduler and a
+        // WaitForFirstConsumer PVC would never bind. Pin via a
+        // `kubernetes.io/hostname` nodeSelector instead (see
+        // `scheduler_aware_node_selector`).
+        node_name: None,
+        node_selector: scheduler_aware_node_selector(&gw.spec),
         init_containers: Some(vec![enroll]),
         containers: vec![main],
         volumes: Some(vec![
-            Volume { name: "state".to_string(), empty_dir: Some(EmptyDirVolumeSource::default()), ..Default::default() },
+            // Identity lives on a per-gateway PVC (`<name>-gateway-data`,
+            // kind-specific to avoid colliding with the controller's
+            // `<name>-data`), NOT an emptyDir — an emptyDir is destroyed on every
+            // pod recreation, forcing a re-enroll against a spent single-use token.
+            Volume {
+                name: "state".to_string(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: format!("{name}-gateway-data"),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             Volume {
                 name: "tun".to_string(),
                 host_path: Some(HostPathVolumeSource { path: "/dev/net/tun".to_string(), type_: Some("CharDevice".to_string()) }),
@@ -457,6 +543,7 @@ pub fn gateway_deployment(
         metadata: ObjectMeta { name: Some(name.clone()), labels: Some(labels(&name)), ..Default::default() },
         spec: Some(DeploymentSpec {
             replicas: Some(1),
+            strategy: Some(recreate_strategy()),
             selector: LabelSelector { match_labels: Some(labels(&name)), ..Default::default() },
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta { labels: Some(labels(&name)), ..Default::default() }),
@@ -612,6 +699,181 @@ mod tests {
         }
     }
 
+    fn gw_spec(segment: &str, storage_class: Option<String>, storage_size: Option<String>) -> WiremeshGatewaySpec {
+        WiremeshGatewaySpec {
+            segment_ref: segment.into(),
+            node_name: None,
+            node_selector: None,
+            wg_port: None,
+            tun: None,
+            image: None,
+            storage_class,
+            storage_size,
+        }
+    }
+
+    fn gw_spec_pinned(
+        node_name: Option<String>,
+        node_selector: Option<BTreeMap<String, String>>,
+    ) -> WiremeshGatewaySpec {
+        WiremeshGatewaySpec {
+            segment_ref: "aws".into(),
+            node_name,
+            node_selector,
+            wg_port: None,
+            tun: None,
+            image: None,
+            storage_class: None,
+            storage_size: None,
+        }
+    }
+
+    #[test]
+    fn gateway_pinning_is_scheduler_aware() {
+        // FUNCTIONAL BUG: the gateway pod now mounts a PVC. Default storage
+        // classes (k3s local-path, nfs) are WaitForFirstConsumer, which binds the
+        // PVC only once a POD IS SCHEDULED onto a node. Setting `spec.nodeName`
+        // directly BYPASSES the scheduler, so a WFC PVC never binds → PVC Pending →
+        // pod stuck forever. The operator must instead fold the CR's `nodeName`
+        // into a `kubernetes.io/hostname` nodeSelector so the scheduler places the
+        // pod (and the WFC PVC binds) while still pinning it to the chosen node.
+        const HOSTNAME_KEY: &str = "kubernetes.io/hostname";
+        let build = |spec: WiremeshGatewaySpec| {
+            let gw = WiremeshGateway::new("gw-aws", spec);
+            let d = gateway_deployment(
+                &gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token",
+                &["10.10.0.0/16".to_string()],
+            );
+            d.spec.unwrap().template.spec.unwrap()
+        };
+
+        // 1. CR nodeName only → pod.node_name is None; nodeName folded into a
+        //    kubernetes.io/hostname selector.
+        let p = build(gw_spec_pinned(Some("zolab-worker1".into()), None));
+        assert_eq!(
+            p.node_name, None,
+            "spec.nodeName must NOT be set directly (it bypasses the scheduler → a WaitForFirstConsumer PVC never binds)"
+        );
+        let sel = p.node_selector.expect("nodeName must be folded into a nodeSelector");
+        assert_eq!(
+            sel.get(HOSTNAME_KEY).map(String::as_str),
+            Some("zolab-worker1"),
+            "nodeName is pinned via a kubernetes.io/hostname nodeSelector so the scheduler places the pod"
+        );
+
+        // 2. CR nodeName + explicit nodeSelector → hostname added AND the explicit
+        //    selector keys preserved.
+        let mut extra = BTreeMap::new();
+        extra.insert("disktype".to_string(), "ssd".to_string());
+        let p = build(gw_spec_pinned(Some("zolab-worker1".into()), Some(extra)));
+        assert_eq!(p.node_name, None, "still no direct nodeName");
+        let sel = p.node_selector.expect("selector present");
+        assert_eq!(
+            sel.get(HOSTNAME_KEY).map(String::as_str),
+            Some("zolab-worker1"),
+            "hostname selector folded in alongside the explicit selector"
+        );
+        assert_eq!(
+            sel.get("disktype").map(String::as_str),
+            Some("ssd"),
+            "the CR's explicit nodeSelector keys are preserved"
+        );
+
+        // 3. CR nodeSelector only (no nodeName) → passed through unchanged; no
+        //    hostname key synthesized; node_name None.
+        let mut only = BTreeMap::new();
+        only.insert("disktype".to_string(), "ssd".to_string());
+        let p = build(gw_spec_pinned(None, Some(only)));
+        assert_eq!(p.node_name, None);
+        let sel = p.node_selector.expect("explicit selector passed through");
+        assert_eq!(sel.get("disktype").map(String::as_str), Some("ssd"));
+        assert!(
+            !sel.contains_key(HOSTNAME_KEY),
+            "no hostname selector synthesized when the CR sets no nodeName"
+        );
+
+        // 4. CR neither → no pinning at all.
+        let p = build(gw_spec_pinned(None, None));
+        assert_eq!(p.node_name, None, "no nodeName");
+        assert!(
+            p.node_selector.as_ref().map(|m| m.is_empty()).unwrap_or(true),
+            "no nodeSelector when the CR pins nothing"
+        );
+    }
+
+    #[test]
+    fn gateway_pvc_shape() {
+        // The gateway persists its identity on a small per-gateway PVC so pod
+        // recreation (upgrade/reschedule/reboot) never destroys it. Mirrors
+        // controller_pvc: RWO, `<name>-data`, instance labels, a small default
+        // (128Mi — the state is KB) overridable via storageClass/storageSize.
+        let pvc = gateway_pvc("gw-aws", &gw_spec("aws", None, None));
+        assert_eq!(
+            pvc.metadata.name.as_deref(),
+            Some("gw-aws-gateway-data"),
+            "gateway PVC uses the kind-specific <name>-gateway-data scheme (must NOT collide with the controller's <name>-data)"
+        );
+        let spec = pvc.spec.as_ref().expect("PVC spec");
+        assert_eq!(
+            spec.access_modes.as_ref().unwrap(),
+            &vec!["ReadWriteOnce".to_string()],
+            "gateway identity PVC is RWO (node-local, single writer)"
+        );
+        let req = spec.resources.as_ref().unwrap().requests.as_ref().unwrap();
+        assert_eq!(req.get("storage").unwrap().0, "128Mi", "default gateway PVC size is 128Mi");
+        assert!(spec.storage_class_name.is_none(), "no storageClass unless the CR sets one");
+        // Instance label parity with controller_pvc (GC/selection).
+        let labels = pvc.metadata.labels.as_ref().expect("labels");
+        assert_eq!(
+            labels.get("app.kubernetes.io/instance").map(String::as_str),
+            Some("gw-aws"),
+            "PVC carries the instance label"
+        );
+
+        // storageClass / storageSize overrides flow through from the CR.
+        let pvc2 = gateway_pvc("gw-aws", &gw_spec("aws", Some("fast-ssd".into()), Some("256Mi".into())));
+        let spec2 = pvc2.spec.as_ref().unwrap();
+        assert_eq!(spec2.storage_class_name.as_deref(), Some("fast-ssd"), "storageClass override honored");
+        assert_eq!(
+            spec2.resources.as_ref().unwrap().requests.as_ref().unwrap().get("storage").unwrap().0,
+            "256Mi",
+            "storageSize override honored"
+        );
+    }
+
+    #[test]
+    fn gateway_state_volume_is_pvc_not_emptydir() {
+        // AVAILABILITY INVARIANT: the gateway's identity (identity.json /
+        // wg_private.key) must survive pod recreation. The `state` volume MUST be
+        // a PersistentVolumeClaim referencing `<name>-data`, NOT an emptyDir
+        // (emptyDir is destroyed on every pod recreation → forced re-enroll).
+        let gw = WiremeshGateway::new("gw-aws", gw_spec("aws", None, None));
+        let d = gateway_deployment(
+            &gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token",
+            &["10.10.0.0/16".to_string()],
+        );
+        let pod = d.spec.unwrap().template.spec.unwrap();
+        let state = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "state")
+            .expect("state volume");
+        assert!(
+            state.empty_dir.is_none(),
+            "state volume must NOT be an emptyDir (identity would be lost on pod recreation)"
+        );
+        let claim = state
+            .persistent_volume_claim
+            .as_ref()
+            .expect("state volume must be a PersistentVolumeClaim");
+        assert_eq!(
+            claim.claim_name, "gw-aws-gateway-data",
+            "state PVC references the gateway's kind-specific <name>-gateway-data claim (not the controller's <name>-data)"
+        );
+    }
+
     #[test]
     fn controller_deployment_has_pvc_and_admin_exec_sidecar() {
         let d = controller_deployment("wm", &ctrl_spec(), "ghcr.io/x/wiremesh-operator:test");
@@ -653,6 +915,32 @@ mod tests {
     }
 
     #[test]
+    fn gateway_and_controller_use_recreate_strategy() {
+        // Both workloads own an RWO PVC (and the gateway is also hostNetwork), so
+        // the Deployment must use the `Recreate` strategy — a RollingUpdate would
+        // surge a second pod that cannot mount the RWO PVC (or bind the host net),
+        // wedging the rollout. Kill the old pod first, then start the new one.
+        let gw = WiremeshGateway::new("gw-aws", gw_spec("aws", None, None));
+        let gd = gateway_deployment(
+            &gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token",
+            &["10.10.0.0/16".to_string()],
+        );
+        let cd = controller_deployment("wm", &ctrl_spec(), "op:test");
+        for (d, what) in [(gd, "gateway"), (cd, "controller")] {
+            let strat = d
+                .spec
+                .unwrap()
+                .strategy
+                .unwrap_or_else(|| panic!("{what} Deployment must set a strategy"));
+            assert_eq!(
+                strat.type_.as_deref(),
+                Some("Recreate"),
+                "{what} Deployment must use the Recreate strategy (RWO PVC / hostNetwork must not surge a 2nd pod)"
+            );
+        }
+    }
+
+    #[test]
     fn gateway_is_privileged_hostnetwork() {
         let gw = WiremeshGateway::new(
             "gw-aws",
@@ -663,6 +951,8 @@ mod tests {
                 wg_port: None,
                 tun: None,
                 image: None,
+                storage_class: None,
+                storage_size: None,
             },
         );
         let d = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token", &["10.10.0.0/16".to_string()]);
@@ -709,6 +999,8 @@ mod tests {
                 wg_port: None,
                 tun: None,
                 image: None,
+                storage_class: None,
+                storage_size: None,
             },
         );
         let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
@@ -852,6 +1144,8 @@ mod tests {
                 wg_port: None,
                 tun: None,
                 image: None,
+                storage_class: None,
+                storage_size: None,
             },
         );
         let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);

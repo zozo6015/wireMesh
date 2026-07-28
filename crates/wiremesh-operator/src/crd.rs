@@ -149,6 +149,14 @@ pub struct WiremeshGatewaySpec {
     pub tun: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// StorageClass for the per-gateway identity PVC (`<name>-data`). Omitted →
+    /// the cluster default class. Parity with `WiremeshControllerSpec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    /// Size of the per-gateway identity PVC. Omitted → the 128Mi default (the
+    /// persisted identity is a few KB). Parity with `WiremeshControllerSpec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_size: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
@@ -219,10 +227,54 @@ mod tests {
         let _ = WiremeshController::new("wm", WiremeshControllerSpec::default_for_test());
         let _ = WiremeshSegment::new("s", WiremeshSegmentSpec { segment_name: "s".into(), cidrs: vec![] });
         let _ = WiremeshPolicy::new("p", WiremeshPolicySpec { from: "a".into(), to: "b".into(), rules: vec![] });
-        let _ = WiremeshGateway::new("g", WiremeshGatewaySpec { segment_ref: "s".into(), node_name: None, node_selector: None, wg_port: None, tun: None, image: None });
+        let _ = WiremeshGateway::new("g", WiremeshGatewaySpec { segment_ref: "s".into(), node_name: None, node_selector: None, wg_port: None, tun: None, image: None, storage_class: None, storage_size: None });
         let _ = WiremeshRelay::new("r", WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None });
         // Kind names are what the apiserver registers.
         assert_eq!(WiremeshSegment::kind(&()), "WiremeshSegment");
+    }
+
+    #[test]
+    fn gateway_spec_carries_storage_fields_camel_case() {
+        // The gateway persists its identity on a per-gateway PVC. Its size/class
+        // must be overridable from the CR via `storageClass`/`storageSize` —
+        // matching WiremeshController's existing fields (camelCase serde, both
+        // Option, omitted when unset via skip_serializing_if).
+        let spec = WiremeshGatewaySpec {
+            segment_ref: "aws".into(),
+            node_name: None,
+            node_selector: None,
+            wg_port: None,
+            tun: None,
+            image: None,
+            storage_class: Some("fast-ssd".into()),
+            storage_size: Some("256Mi".into()),
+        };
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            v.get("storageClass").and_then(|x| x.as_str()),
+            Some("fast-ssd"),
+            "storageClass must serialize camelCase (parity with WiremeshController)"
+        );
+        assert_eq!(
+            v.get("storageSize").and_then(|x| x.as_str()),
+            Some("256Mi"),
+            "storageSize must serialize camelCase (parity with WiremeshController)"
+        );
+
+        // Both omitted when unset (skip_serializing_if = "Option::is_none").
+        let bare = WiremeshGatewaySpec {
+            segment_ref: "aws".into(),
+            node_name: None,
+            node_selector: None,
+            wg_port: None,
+            tun: None,
+            image: None,
+            storage_class: None,
+            storage_size: None,
+        };
+        let vb = serde_json::to_value(&bare).unwrap();
+        assert!(vb.get("storageClass").is_none(), "storageClass omitted when unset");
+        assert!(vb.get("storageSize").is_none(), "storageSize omitted when unset");
     }
 
     #[test]
