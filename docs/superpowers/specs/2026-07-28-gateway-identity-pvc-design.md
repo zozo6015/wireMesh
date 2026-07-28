@@ -21,8 +21,9 @@ currently forces a gateway re-enrollment.
   `storageClass` / `storageSize` fields to the CRD + spec type, matching
   `WiremeshController`'s existing fields + `crdgen`).
 - The gateway Deployment's `state` volume changes from `EmptyDirVolumeSource`
-  to a `PersistentVolumeClaimVolumeSource` referencing `<name>-data` (name
-  scheme consistent with the controller's `<name>-data`).
+  to a `PersistentVolumeClaimVolumeSource` referencing `<name>-gateway-data`
+  (kind-specific name, so it never collides with the controller PVC's
+  `<name>-data`).
 - The gateway RECONCILER creates/owns the PVC (owner-ref, so it's GC'd with the
   CR — same pattern as the controller reconciler owning `controller_pvc`).
   Verify the operator RBAC already covers PVC create (the controller path does).

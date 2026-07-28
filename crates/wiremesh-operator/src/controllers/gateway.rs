@@ -91,9 +91,11 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
 
     // Observe the identity PVC's PRE-reconcile state BEFORE we create it. Its
     // existence gates both the mint decision (via identity_persisted) and the
-    // create-only guard below. The PVC is `<name>-data` (workloads::gateway_pvc).
+    // create-only guard below. The PVC is `<name>-gateway-data`
+    // (workloads::gateway_pvc) — kind-specific, distinct from the controller's
+    // `<name>-data`.
     let pvc_api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns);
-    let pvc_name = format!("{name}-data");
+    let pvc_name = format!("{name}-gateway-data");
     let existing_pvc = pvc_api.get_opt(&pvc_name).await?;
     let pvc_exists = existing_pvc.is_some();
 

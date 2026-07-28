@@ -354,7 +354,8 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
 // Gateway
 // --------------------------------------------------------------------------
 
-/// The gateway's identity PVC (`<name>-data`), mounted at `/var/lib/wiremesh`.
+/// The gateway's identity PVC (`<name>-gateway-data`, kind-specific so it never
+/// collides with the controller's `<name>-data`), mounted at `/var/lib/wiremesh`.
 /// Persists the enrolled `Identity` (`identity.json`/`wg_private.key`) across pod
 /// recreation so an upgrade/reschedule/reboot never destroys it (which would
 /// force a re-enroll against a spent single-use token). Mirrors `controller_pvc`:
@@ -368,7 +369,7 @@ pub fn gateway_pvc(name: &str, spec: &WiremeshGatewaySpec) -> PersistentVolumeCl
     );
     PersistentVolumeClaim {
         metadata: ObjectMeta {
-            name: Some(format!("{name}-data")),
+            name: Some(format!("{name}-gateway-data")),
             labels: Some(labels(name)),
             ..Default::default()
         },
@@ -463,13 +464,14 @@ pub fn gateway_deployment(
         init_containers: Some(vec![enroll]),
         containers: vec![main],
         volumes: Some(vec![
-            // Identity lives on a per-gateway PVC (`<name>-data`), NOT an
-            // emptyDir — an emptyDir is destroyed on every pod recreation, which
-            // would force a re-enroll against a spent single-use token.
+            // Identity lives on a per-gateway PVC (`<name>-gateway-data`,
+            // kind-specific to avoid colliding with the controller's
+            // `<name>-data`), NOT an emptyDir — an emptyDir is destroyed on every
+            // pod recreation, forcing a re-enroll against a spent single-use token.
             Volume {
                 name: "state".to_string(),
                 persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                    claim_name: format!("{name}-data"),
+                    claim_name: format!("{name}-gateway-data"),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -684,7 +686,11 @@ mod tests {
         // controller_pvc: RWO, `<name>-data`, instance labels, a small default
         // (128Mi — the state is KB) overridable via storageClass/storageSize.
         let pvc = gateway_pvc("gw-aws", &gw_spec("aws", None, None));
-        assert_eq!(pvc.metadata.name.as_deref(), Some("gw-aws-data"), "PVC uses the <name>-data scheme");
+        assert_eq!(
+            pvc.metadata.name.as_deref(),
+            Some("gw-aws-gateway-data"),
+            "gateway PVC uses the kind-specific <name>-gateway-data scheme (must NOT collide with the controller's <name>-data)"
+        );
         let spec = pvc.spec.as_ref().expect("PVC spec");
         assert_eq!(
             spec.access_modes.as_ref().unwrap(),
@@ -740,7 +746,10 @@ mod tests {
             .persistent_volume_claim
             .as_ref()
             .expect("state volume must be a PersistentVolumeClaim");
-        assert_eq!(claim.claim_name, "gw-aws-data", "state PVC references the gateway's <name>-data claim");
+        assert_eq!(
+            claim.claim_name, "gw-aws-gateway-data",
+            "state PVC references the gateway's kind-specific <name>-gateway-data claim (not the controller's <name>-data)"
+        );
     }
 
     #[test]
