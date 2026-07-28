@@ -42,10 +42,15 @@ pub struct EnrollArgs {
 /// get the same "enroll once, then no-op" guarantee. Only the "no/unparseable
 /// identity" path proceeds to the real enrollment flow below (unchanged).
 pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
-    // Skip if a parseable, structurally-complete identity is already persisted
-    // (idempotent enroll). This MUST come before keypair gen / CA read /
-    // controller dial so a re-run never redeems a (now spent) single-use token.
-    if Identity::load(&args.state_dir).is_ok() {
+    // Classify the on-disk identity into three outcomes (idempotent enroll). This
+    // MUST come before keypair gen / CA read / controller dial so a re-run never
+    // redeems a (now spent) single-use token:
+    //   * present   → skip (return Ok — never dial the controller)
+    //   * absent/malformed → fall through to the real enrollment below
+    //   * other IO error (EACCES/EIO/EISDIR) → PROPAGATE (never enroll: an
+    //     unreadable-but-possibly-present identity must not be silently clobbered
+    //     by redeeming the single-use token).
+    if Identity::probe(&args.state_dir)? {
         eprintln!(
             "wiremesh-gateway: already enrolled (identity present in {}), skipping",
             args.state_dir.display()

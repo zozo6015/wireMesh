@@ -35,10 +35,14 @@ currently forces a gateway re-enrollment.
 ### 2. Idempotent enroll (gateway binary)
 
 - `wiremesh-gateway enroll` (`crates/wiremesh-gateway/src/enroll.rs`): BEFORE
-  redeeming the token, check `--state-dir` for a VALID existing identity (the
-  same `Identity::load` the runtime uses at boot). If it loads successfully,
-  **skip enrollment**: log `wiremesh-gateway: already enrolled (identity present
-  in <state-dir>), skipping` and exit 0. Otherwise enroll as today.
+  redeeming the token, check `--state-dir` for a parseable, structurally complete
+  existing identity (the same `Identity::load` the runtime uses at boot — a
+  structural JSON load, NOT cryptographic cert/key validation). If it loads
+  successfully, **skip enrollment**: log `wiremesh-gateway: already enrolled
+  (identity present in <state-dir>), skipping` and exit 0. A missing or malformed
+  identity falls through to enrollment as today; a read that fails with any other
+  IO error (EACCES/EIO) must PROPAGATE (do not treat it as absent and redeem the
+  token).
 - This makes the init-container safe to run on EVERY boot: first boot enrolls
   into the fresh PVC; every later boot finds the persisted identity and skips.
 - Idempotency belongs IN the enroll command (not a shell guard in the

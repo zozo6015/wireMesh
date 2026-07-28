@@ -33,15 +33,35 @@ pub fn needs_token(existing: Option<&Secret>) -> bool {
     }
 }
 
-/// Whether to mint a fresh enrollment token, tying token freshness to the
-/// identity PVC's freshness. A fresh (absent) PVC holds no persisted identity,
-/// so the enroll init must redeem an UNSPENT token — even if a stale populated
-/// token Secret from a prior generation still lingers (reusing that spent
-/// single-use token is the adoption-path crash-loop bug). Once the PVC exists
-/// (steady state) the identity is durable, so we defer to `needs_token` and
-/// never re-mint on a plain pod recreation.
-pub fn should_mint_token(pvc_exists: bool, token_secret: Option<&Secret>) -> bool {
-    !pvc_exists || needs_token(token_secret)
+/// Whether the gateway's identity is durably PERSISTED. Requires BOTH the PVC to
+/// exist (somewhere to persist to) AND the gateway to be active in the controller
+/// roster (proof an identity was actually written and enrolled). The PVC alone is
+/// NOT proof: a first enroll can crash AFTER spending its single-use token but
+/// BEFORE writing `identity.json`, leaving an empty PVC that still needs a fresh
+/// token. Keying token freshness off this (not raw `pvc_exists`) is the fix for
+/// the CodeRabbit adoption-path crash-loop finding.
+pub fn identity_persisted(pvc_exists: bool, gateway_active: bool) -> bool {
+    pvc_exists && gateway_active
+}
+
+/// Whether to mint a fresh enrollment token, tied to whether the identity is
+/// durably PERSISTED (see `identity_persisted`) — NOT to the bare PVC's
+/// existence. When the identity is not persisted (fresh/empty PVC, or a first
+/// enroll that crashed after spending its token), a fresh UNSPENT token is
+/// required even if a stale populated token Secret lingers (reusing that spent
+/// single-use token is the adoption-path crash-loop bug). Once the identity is
+/// persisted (steady state) we defer to `needs_token` and never re-mint on a
+/// plain pod recreation.
+pub fn should_mint_token(identity_persisted: bool, token_secret: Option<&Secret>) -> bool {
+    !identity_persisted || needs_token(token_secret)
+}
+
+/// The gateway identity PVC is CREATE-ONLY: create it when absent, and NEVER
+/// apply/patch an existing one. A bound PVC's `storageClassName` and
+/// `resources.requests.storage` are immutable, so re-applying them on every
+/// reconcile churns or errors. Mirrors the `needs_token` create-once guard.
+pub fn pvc_needs_create(existing: Option<&PersistentVolumeClaim>) -> bool {
+    existing.is_none()
 }
 
 async fn reconcile(gw: Arc<WiremeshGateway>, ctx: Arc<Context>) -> Result<Action, Error> {
@@ -69,26 +89,46 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
         .await?;
     let cidrs = seg.spec.cidrs.clone();
 
-    // Observe the identity PVC's PRE-reconcile existence BEFORE we create it, so
-    // token minting can be tied to PVC freshness (see should_mint_token). The
-    // PVC is `<name>-data` (workloads::gateway_pvc).
+    // Observe the identity PVC's PRE-reconcile state BEFORE we create it. Its
+    // existence gates both the mint decision (via identity_persisted) and the
+    // create-only guard below. The PVC is `<name>-data` (workloads::gateway_pvc).
     let pvc_api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns);
     let pvc_name = format!("{name}-data");
-    let pvc_exists = pvc_api.get_opt(&pvc_name).await?.is_some();
+    let existing_pvc = pvc_api.get_opt(&pvc_name).await?;
+    let pvc_exists = existing_pvc.is_some();
 
-    // Mint the enrollment token when the token Secret is absent/empty OR the PVC
-    // is fresh (absent). A fresh empty PVC has no persisted identity, so the
-    // enroll init must redeem an UNSPENT token — reusing the stale single-use
-    // token from a leftover Secret would crash-loop (the adoption-path bug). An
-    // existing PVC (steady state) already holds the identity, so pod recreation
-    // never re-mints. The force-apply below replaces any stale token Secret.
+    // Read the controller roster ONCE and reuse it for both the mint decision and
+    // the status below. `gateway_active` = is THIS CR's segment present in the
+    // roster (the same "enrolled" signal the status uses)? CONSERVATIVE on a
+    // roster-query failure: treat as NOT active → identity NOT persisted → mint a
+    // fresh token. That is harmless — a spare token simply goes unused once the
+    // persisted identity makes the enroll init skip — and it avoids wedging the
+    // reconcile on a transient controller hiccup.
+    let roster = match ctx.admin.list_gateways().await {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(
+                "gateway {name}: controller roster query failed ({e}); treating gateway as \
+                 not-active (conservative: mint a spare enrollment token)"
+            );
+            Vec::new()
+        }
+    };
+    let gateway_active = roster.iter().any(|g| g.segment == seg.spec.segment_name);
+
+    // The identity is durably persisted ONLY when the PVC exists AND the gateway
+    // is active in the roster — a PVC alone can hold no identity (a first enroll
+    // that crashed after spending its token). Mint whenever it is NOT persisted OR
+    // the token Secret is absent/empty. The force-apply below replaces any stale
+    // token Secret.
     //
     // NOTE on idempotency: a crash between the mint and the Secret write below
     // orphans that token — the next reconcile mints a fresh one. This is
     // low-harm by design: enrollment tokens are single-use AND expiring, so an
     // unredeemed orphan simply lapses. A stronger guarantee would need a
     // controller-side idempotency key on MintToken (a possible follow-up).
-    if should_mint_token(pvc_exists, secrets.get_opt(&token_secret).await?.as_ref()) {
+    let identity_persisted = identity_persisted(pvc_exists, gateway_active);
+    if should_mint_token(identity_persisted, secrets.get_opt(&token_secret).await?.as_ref()) {
         let token = ctx.admin.mint_gateway_token(&cidrs).await.map_err(Error::Admin)?;
         let mut data = BTreeMap::new();
         data.insert("token".to_string(), ByteString(token.into_bytes()));
@@ -108,12 +148,17 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
 
     // Persist the gateway identity on a per-gateway PVC (owner-referenced → GC'd
     // with the CR). This is what survives pod recreation so an upgrade/reschedule/
-    // reboot never wipes the identity and forces a re-enroll. Namespace is stamped
-    // here since the builder is namespace-free (mirrors the controller reconciler).
-    let mut pvc = workloads::gateway_pvc(&name, &gw.spec);
-    pvc.metadata.namespace = Some(ns.clone());
-    pvc.metadata.owner_references = Some(vec![owner_ref(gw)?]);
-    apply(&pvc_api, &pvc).await?;
+    // reboot never wipes the identity and forces a re-enroll. CREATE-ONLY: a bound
+    // PVC's storageClassName/requests.storage are immutable, so we never patch an
+    // existing one (reusing the get_opt above — no double-get). Namespace is
+    // stamped here since the builder is namespace-free (mirrors the controller
+    // reconciler).
+    if pvc_needs_create(existing_pvc.as_ref()) {
+        let mut pvc = workloads::gateway_pvc(&name, &gw.spec);
+        pvc.metadata.namespace = Some(ns.clone());
+        pvc.metadata.owner_references = Some(vec![owner_ref(gw)?]);
+        apply(&pvc_api, &pvc).await?;
+    }
 
     // Deploy the gateway. The enroll token is bound to `cidrs`, so those MUST
     // be passed through to the enroll init-container (--cidr).
@@ -125,9 +170,8 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     dep.metadata.owner_references = Some(vec![owner_ref(gw)?]);
     apply(&Api::<Deployment>::namespaced(client.clone(), &ns), &dep).await?;
 
-    // Status from the controller's gateway roster.
-    let gateways = ctx.admin.list_gateways().await.map_err(Error::Admin)?;
-    let row = gateways.iter().find(|g| g.segment == seg.spec.segment_name);
+    // Status from the controller's gateway roster (reuse the snapshot read above).
+    let row = roster.iter().find(|g| g.segment == seg.spec.segment_name);
     let enrolled = row.is_some();
     let status = WiremeshGatewayStatus {
         enrolled,
@@ -226,33 +270,76 @@ mod tests {
     }
 
     #[test]
-    fn should_mint_token_ties_freshness_to_pvc() {
-        // ADOPTION-PATH BUG: recreating the gateway pod onto a FRESH empty PVC
-        // makes the enroll init redeem the already-spent token from the existing
-        // Secret and crash-loop, because `needs_token(Some(populated))` is false
-        // so no fresh token is minted. Token freshness must be tied to PVC
-        // freshness: a fresh (absent) PVC needs a new unspent token even when a
-        // stale populated token Secret still exists; a PVC that already exists
-        // (steady state) must NOT trigger a re-mint.
+    fn should_mint_token_keys_off_identity_persisted_not_raw_pvc_exists() {
+        // ADOPTION-PATH / CRASH-LOOP BUG (CodeRabbit findings 5+6): raw
+        // `pvc_exists` is NOT proof of a persisted identity. A PVC can exist while
+        // holding NO valid identity — e.g. the first enroll crashed AFTER the
+        // single-use token was spent but BEFORE identity.json was written. Such a
+        // gateway still needs a FRESH token, yet `pvc_exists == true` would wrongly
+        // suppress minting → crash-loop. The mint decision must key off a SEMANTIC
+        // `identity_persisted` signal, not the bare PVC's existence.
+        //
+        // Pure fn contract:
+        //   should_mint_token(identity_persisted, token_secret)
+        //       == !identity_persisted || needs_token(token_secret)
         let mut data = BTreeMap::new();
         data.insert("token".to_string(), ByteString(b"wiremesh://spent".to_vec()));
         let populated = Secret { data: Some(data), ..Default::default() };
 
-        // Fresh PVC (absent) + stale populated token → MUST re-mint.
+        // Not persisted (fresh/empty PVC OR failed-enroll) + stale populated token
+        // → MUST re-mint (the volume needs an unspent token to enroll).
         assert!(
             should_mint_token(false, Some(&populated)),
-            "fresh/absent PVC + stale populated token → re-mint (the empty volume needs an unspent token)"
+            "identity NOT persisted + stale populated token → re-mint"
         );
-        // Steady state: PVC exists + token present → do NOT re-mint.
+        // Persisted (PVC holds a valid identity, gateway active in roster) + token
+        // present → do NOT re-mint (steady state).
         assert!(
             !should_mint_token(true, Some(&populated)),
-            "existing PVC + populated token → no re-mint"
+            "identity persisted + populated token → no re-mint"
         );
-        // Token Secret absent → mint regardless of PVC existence.
-        assert!(should_mint_token(true, None), "no token secret → mint (even if PVC exists)");
-        assert!(should_mint_token(false, None), "no token secret + fresh PVC → mint");
+        // Token Secret absent → mint regardless of persistence.
+        assert!(should_mint_token(true, None), "no token secret → mint even if identity persisted");
+        assert!(should_mint_token(false, None), "no token secret + not persisted → mint");
         // Token Secret present but without the token key → mint.
         let empty = Secret::default();
         assert!(should_mint_token(true, Some(&empty)), "token secret without token key → mint");
+    }
+
+    #[test]
+    fn identity_persisted_requires_both_pvc_and_roster_active() {
+        // The SEMANTIC signal `should_mint_token` must consume is NOT raw
+        // `pvc_exists` — a PVC can exist while holding no valid identity (a first
+        // enroll that crashed after spending its token). "Identity persisted" is
+        // true ONLY when BOTH hold: the PVC exists AND the gateway is active in the
+        // controller roster (proof an identity was actually written and enrolled).
+        //
+        // Pure fn contract: identity_persisted(pvc_exists, gateway_active)
+        //     == pvc_exists && gateway_active
+        assert!(identity_persisted(true, true), "PVC present AND active in roster → persisted");
+        assert!(!identity_persisted(true, false), "PVC present but NOT enrolled/active → NOT persisted (mint)");
+        assert!(!identity_persisted(false, true), "no PVC → NOT persisted even if a stale roster row exists");
+        assert!(!identity_persisted(false, false), "neither → NOT persisted");
+        // Implementer wiring: identity_persisted = pvc_exists && gateway_active,
+        // where gateway_active comes from the controller roster (list_gateways for
+        // this CR's segment). On a roster-query FAILURE, be CONSERVATIVE — treat as
+        // NOT active (→ not persisted → mint a spare token, which simply goes unused
+        // once the real identity skips enroll). Then feed the result to
+        // `should_mint_token(identity_persisted, token_secret)`.
+    }
+
+    #[test]
+    fn pvc_needs_create_is_create_only() {
+        // IMMUTABILITY (CodeRabbit finding): a bound PVC's storageClassName /
+        // resources.requests.storage are immutable — re-applying (patching) them on
+        // every reconcile churns/errors. The gateway PVC must be CREATE-ONLY:
+        // created when absent, never patched when it already exists. Mirror the
+        // `needs_token` create-once guard with a pure `pvc_needs_create`.
+        assert!(pvc_needs_create(None), "absent PVC → create it");
+        let existing = PersistentVolumeClaim::default();
+        assert!(
+            !pvc_needs_create(Some(&existing)),
+            "existing PVC → do NOT re-apply/patch (storage fields are immutable after bind)"
+        );
     }
 }
