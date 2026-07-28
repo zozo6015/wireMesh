@@ -61,7 +61,7 @@ server-side apply that omits `rollingUpdate` leaves the defaulter's block in
 place, so the merged object has `type: Recreate` AND `rollingUpdate` →
 Kubernetes rejects it:
 
-```
+```text
 Deployment.apps "gw-home" is invalid: spec.strategy.rollingUpdate:
 Forbidden: may not be specified when strategy `type` is 'Recreate'
 ```
@@ -86,7 +86,7 @@ the pod is recreated onto a fresh empty PVC, the OLD gateway id (enrolled from
 the now-gone emptyDir) is STILL `active` in the controller roster. A plain
 enrollment token can't enroll into an occupied segment:
 
-```
+```text
 status: AlreadyExists, "segment already has an active gateway; use a rebind
 token to replace it"
 ```

@@ -72,13 +72,25 @@ recreation ever re-enrolls again. Call this out in the PR/release notes.
 e2e on zolab found the transition was NOT actually hands-off — the old gateway
 id (enrolled from the now-gone emptyDir) stays `active` in the roster, so the
 new pod's plain-token enroll is rejected until the old id is drained. v0.2.2
-makes the operator DETECT adoption (the gateway PVC is freshly created this
-reconcile) and DRAIN the stale gateway id itself, which frees the segment and
-lets `should_mint_token` mint a fresh unspent token; the new pod then enrolls
-into the freed segment automatically. The drain fires ONLY on the fresh-PVC
-path — in steady state (PVC already present, own id legitimately active) the
-operator never drains a healthy gateway. See
-`docs/research/ops-finding-pvc-adoption-migration.md`
+makes the operator DETECT adoption and DRAIN the stale gateway id itself, which
+frees the segment so the plain-token enroll is no longer rejected (the fresh
+token is minted independently because the freshly created PVC makes
+`identity_persisted` false → `should_mint_token` true); the new pod then enrolls
+into the freed segment automatically.
+
+The drain is guarded by the COMPLETE condition — it occurs ONLY when BOTH hold:
+(1) the gateway PVC is freshly created this reconcile (`existing_pvc.is_none()`)
+AND (2) this CR is the SOLE `WiremeshGateway` for the segment. Guard (2) is
+required because the controller roster matches a gateway to its segment by NAME
+only, so if a second `WiremeshGateway` targets the same segment the "active"
+roster id could be that peer's LIVE gateway — draining it would be an outage;
+the operator counts the `WiremeshGateway` CRs referencing the segment and drains
+only when the count is 1. The CR-list query is issued only on the fresh-PVC path
+(skipped in steady state), and it FAILS SAFE: if the list query errors, the
+operator treats this CR as NOT the sole gateway and does NOT drain (a missed
+drain is a manual cleanup; a wrong drain kills a live peer). In steady state
+(PVC already present, own id legitimately active) the operator never drains a
+healthy gateway. See `docs/research/ops-finding-pvc-adoption-migration.md`
 (`adoption_needs_stale_drain`, and the companion `Recreate`-strategy
 `rollingUpdate` fix).
 

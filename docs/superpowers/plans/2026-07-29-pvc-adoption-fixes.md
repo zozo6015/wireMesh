@@ -45,26 +45,41 @@ gateway_active` is `true` during adoption (fresh PVC + old id active) →
 `should_mint_token` is `false` → no fresh token minted. Adoption stalls in
 `Init:Error`.
 
-**Fix (chosen):** the operator DETECTS adoption and drains the stale gateway so
-the segment is free and a fresh token is minted. Precisely — in the gateway
-reconciler, when the identity is NOT persisted on the current PVC but the
-roster has an active gateway for this segment that is NOT this deployment's
-current pod (i.e. a stale/adopted id), the operator should:
-1. drain that stale gateway id (frees the segment), which flips
-   `gateway_active` → false → `identity_persisted` false → mints a fresh token;
-2. proceed with the deployment so the new pod enrolls into the freed segment.
+**Fix (chosen + implemented):** the operator DETECTS adoption and drains the
+stale gateway so the segment is freed and the new pod's plain-token enroll is no
+longer rejected. Precisely — in the gateway reconciler the operator drains a
+stale active roster id ONLY when ALL of the following hold:
+1. the gateway PVC is **freshly created** this reconcile
+   (`existing_pvc.is_none()`) — genuine adoption, no persisted identity; AND
+2. this CR is the **sole `WiremeshGateway` for the segment** — the operator
+   lists the `WiremeshGateway` CRs and counts those referencing this segment
+   (`segment_ref`); the drain is allowed only when the count is 1; AND
+3. a roster id is active for the segment that is not this CR's own id (on the
+   fresh-PVC path own-id is `None`, so any active id qualifies).
 
-CAUTION: this must fire ONLY on genuine adoption (identity absent on a fresh
-PVC), NEVER in steady state (where the PVC has the identity, enroll skips, and
-the active roster id is legitimately this gateway). Distinguishing "stale id to
-drain" from "our own current id" is the crux — options for the implementer to
-evaluate: (a) drain only when the PVC is freshly created (pvc_needs_create was
-true this reconcile) AND a roster id is active for the segment; (b) track the
-enrolled id in the CR status and drain a roster id that differs from it; (c) if
-neither is safe, mint a REBIND token (bound to the segment id) for the adoption
-enroll instead of draining. Prefer the SAFEST option that cannot drain a
-healthy steady-state gateway. Report the approach chosen with its safety
-argument.
+It then drains that stale id (freeing the segment) and proceeds with the
+deployment so the new pod enrolls into the freed segment. NOTE: the drain does
+NOT flip `gateway_active` within the reconcile (that snapshot is read before the
+drain and not re-read); the fresh token is minted because the freshly created
+PVC makes `identity_persisted` false → `should_mint_token` true.
+
+Guard 2 is load-bearing because the controller roster matches a gateway to its
+segment by **NAME only**: with two CRs on one segment, the "active" id could be
+a healthy peer's LIVE gateway, and draining it would be an outage. The CR-list
+query runs ONLY on the fresh-PVC path (skipped in steady state to avoid an API
+call every reconcile) and **fails safe**: on a list-query error the operator
+treats this CR as NOT sole → does NOT drain (a missed drain is a manual cleanup;
+a wrong drain kills a live peer).
+
+CAUTION: this fires ONLY on genuine adoption (fresh PVC + sole gateway), NEVER
+in steady state (where the PVC has the identity, enroll skips, and the active
+roster id is legitimately this gateway). Options considered: (a) drain only when
+the PVC is freshly created AND a roster id is active — CHOSEN, hardened with the
+sole-gateway guard; (b) track the enrolled id in CR status and drain a differing
+roster id — rejected (during adoption status still holds the stale id); (c) mint
+a REBIND token — deferred. The chosen path cannot drain a healthy steady-state
+gateway, and the sole-gateway guard also protects a healthy peer sharing the
+segment.
 
 **Done-bar:** a test pinning the adoption decision (fresh PVC + stale active
 roster id → drain/rebind; steady-state PVC-has-identity + own active id → NO

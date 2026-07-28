@@ -200,31 +200,41 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // this CR is the only one, so an active roster id is unambiguously this CR's own
     // stale predecessor. SAFE FALLBACK on a list failure: `false` (never drain) — a
     // missed drain is a manual cleanup, a false positive kills a live peer.
-    let sole_gateway_for_segment = match Api::<WiremeshGateway>::all(client.clone())
-        .list(&ListParams::default())
-        .await
-    {
-        Ok(list) => list.items.iter().filter(|g| g.spec.segment_ref == gw.spec.segment_ref).count() == 1,
-        Err(e) => {
-            tracing::warn!(
-                "gateway {name}: listing WiremeshGateway CRs failed ({e}); treating as NOT the \
-                 sole gateway for the segment (conservative: skip the adoption drain)"
+    //
+    // The CR list + count runs ONLY on the fresh-PVC (adoption) path: in steady
+    // state `existing_pvc.is_some()` → `adoption_needs_stale_drain` returns None
+    // regardless of this flag, so computing it would waste an API list call on
+    // every reconcile. Guard it behind the fresh-PVC condition and pass `false`
+    // otherwise (harmless — the drain can't fire when the PVC already exists).
+    if existing_pvc.is_none() {
+        let sole_gateway_for_segment = match Api::<WiremeshGateway>::all(client.clone())
+            .list(&ListParams::default())
+            .await
+        {
+            Ok(list) => {
+                list.items.iter().filter(|g| g.spec.segment_ref == gw.spec.segment_ref).count() == 1
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "gateway {name}: listing WiremeshGateway CRs failed ({e}); treating as NOT the \
+                     sole gateway for the segment (conservative: skip the adoption drain)"
+                );
+                false
+            }
+        };
+        if let Some(stale_id) = adoption_needs_stale_drain(
+            true, // existing_pvc.is_none() — we are inside the fresh-PVC branch.
+            seg_row.map(|g| g.id),
+            None,
+            sole_gateway_for_segment,
+        ) {
+            tracing::info!(
+                "gateway {name}: adoption: draining stale gateway id {stale_id} to free segment \
+                 {segment} (emptyDir→PVC transition; the new pod will enroll fresh)",
+                segment = seg.spec.segment_name,
             );
-            false
+            ctx.admin.drain(stale_id).await.map_err(Error::Admin)?;
         }
-    };
-    if let Some(stale_id) = adoption_needs_stale_drain(
-        existing_pvc.is_none(),
-        seg_row.map(|g| g.id),
-        None,
-        sole_gateway_for_segment,
-    ) {
-        tracing::info!(
-            "gateway {name}: adoption: draining stale gateway id {stale_id} to free segment \
-             {segment} (emptyDir→PVC transition; the new pod will enroll fresh)",
-            segment = seg.spec.segment_name,
-        );
-        ctx.admin.drain(stale_id).await.map_err(Error::Admin)?;
     }
 
     // The identity is durably persisted ONLY when the PVC exists AND the gateway
