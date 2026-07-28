@@ -2774,6 +2774,28 @@ impl Db {
     /// policy — see `services::sync`'s relay watch branch and
     /// `projection::build_relay_revocation_snapshot`), so there is no
     /// desired-state disclosure to guard against here.
+    ///
+    /// Also NOT joined to `certificate.revoked_at` — i.e. a relay whose leaf
+    /// was revoked (via `Admin.RevokeCert` on its serial) can still open this
+    /// watch. This is DELIBERATELY CONSISTENT with the gateway watch path,
+    /// which likewise does not reject a revoked cert: `find_gateway_by_name`
+    /// gates only on the gateway ROW's `status = 'active'`, and a plain
+    /// `Db::revoke_cert` sets `certificate.revoked_at` WITHOUT flipping any
+    /// row status (only `drain_gateway`/rebind flip status — and those are
+    /// gateway-only; relays have no drain/de-enrollment path at all). Neither
+    /// the mTLS layer (rustls checks chain-to-CA + expiry, no CRL/OCSP) nor
+    /// the app layer rejects a revoked-but-not-drained cert on `Sync.Watch`
+    /// for either identity kind. `revoked_serials` is a DATA-PLANE peer
+    /// denylist (gateways and the relay bridge stop trusting a revoked party's
+    /// WireGuard/relay traffic), not a control-plane watch gate. Adding a
+    /// `revoked_at IS NULL` check HERE only would be an inconsistent one-off:
+    /// it would enforce revocation on the LOW-sensitivity relay watch
+    /// (revocation-list only) while leaving the HIGH-sensitivity gateway watch
+    /// (full peers + policy) unguarded — backwards from a risk standpoint. If
+    /// the project decides control-plane watches should reject revoked certs,
+    /// that belongs as a UNIFORM change across both `watch_gateway` and
+    /// `watch_relay` (threading the leaf serial from `peer_identity`), not a
+    /// relay-only patch — see the T6 security report.
     pub fn find_relay_by_name(&self, name: &str) -> Result<Option<i64>> {
         let conn = self.conn.lock().unwrap();
         conn.query_row(

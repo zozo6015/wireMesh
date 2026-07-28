@@ -184,6 +184,27 @@ remove+re-add relay-session bug).
    present — assert full convergence and no regression of the working pair
    when the third enrolls.
 
+## Security follow-up (surfaced during T6 review — separate, cross-cutting)
+
+`Admin.RevokeCert` sets `certificate.revoked_at` and bumps the revision (so the
+serial enters the data-plane `revoked_serials` denylist), but it does NOT sever
+an already-open control-plane `Sync.Watch`: neither `find_gateway_by_name` nor
+`find_relay_by_name` joins to `certificate.revoked_at` — gateway/relay watch
+authorization gates on ROW status (`active`, and drain/rebind flip it), not on
+cert revocation. So a cert revoked WITHOUT a drain/rebind keeps its holder's
+control-plane watch open (for a gateway: full topology + policy; for a relay:
+the revoked_serials denylist only). The relay path (T6) is deliberately
+CONSISTENT with the gateway path here — guarding only the relay watch would
+protect the low-sensitivity surface while leaving the high-sensitivity gateway
+watch open, which is backwards. The real de-authorization control today is
+data-plane (peers/relay reject the revoked serial). If control-plane watches
+should reject revoked certs, that is a UNIFORM change across `watch_gateway` +
+`watch_relay` (thread the leaf serial from `peer_identity()`, add a shared
+`revoked_at IS NULL` check) — a distinct security-hardening item with its own
+test surface (it would contradict the current `rebind.rs` expectation that
+revocation surfaces via the denylist, not the watch gate). NOT done in this
+cycle; recommended if revocation is meant to cut active control-plane access.
+
 ## Also hit today (operator, second occurrence)
 
 `kubectl rollout restart` of the gateway deployment destroyed the emptyDir
