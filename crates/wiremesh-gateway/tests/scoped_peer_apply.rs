@@ -1,6 +1,7 @@
 //! Behavioral pin for the gateway's SCOPED single-peer endpoint update
-//! (`uapi::set_one_peer` / `uapi::encode_set_one_peer`) — the make-before-break
-//! re-point used by NAT-punch and relay-endpoint install.
+//! (`uapi::set_one_peer`, built from `uapi::encode_remove_peer` +
+//! `uapi::encode_add_peers`) — the make-before-break re-point used by NAT-punch
+//! and relay-endpoint install.
 //!
 //! CONTRACT UNDER TEST: the gateway must change ONE peer's WireGuard endpoint
 //! WITHOUT disturbing any OTHER peer's session or config. boringtun 0.6.0

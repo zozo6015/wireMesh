@@ -58,9 +58,11 @@ use std::time::{Duration, Instant};
 /// candidate `ip:port` — the nudge is an inner packet; the punch it triggers is
 /// boringtun's own outbound handshake init from the WG socket.
 ///
-/// - For a subnet CIDR (`/0`..`/31`) it is the first host, `network | 1`
+/// - For a subnet CIDR (`/1`..`/31`) it is the first host, `network | 1`
 ///   (conventionally the peer gateway's own segment address).
 /// - For a `/32` host route it is the address itself — there is no lower host.
+/// - A `/0` CIDR is SKIPPED (a default route toward `0.0.0.1` is never a real
+///   overlay peer target; no gateway advertises `0.0.0.0/0` as its allowed-ips).
 /// - Malformed leading entries are skipped in favor of the first VALID CIDR;
 ///   an empty or all-malformed list yields `None` (nothing to nudge toward).
 pub fn nudge_target(allowed_ips: &[String]) -> Option<Ipv4Addr> {
@@ -71,13 +73,18 @@ pub fn nudge_target(allowed_ips: &[String]) -> Option<Ipv4Addr> {
         if prefix > 32 {
             continue;
         }
+        // Skip a `/0` default route (NIT-8): its first host is `0.0.0.1`, never
+        // a real overlay peer — no gateway advertises `0.0.0.0/0`.
+        if prefix == 0 {
+            continue;
+        }
         // First VALID CIDR wins.
         if prefix == 32 {
             // Host route: the address itself is the (only) host.
             return Some(addr);
         }
         let base = u32::from(addr);
-        let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+        let mask = u32::MAX << (32 - prefix);
         let network = base & mask;
         return Some(Ipv4Addr::from(network.wrapping_add(1)));
     }
@@ -146,8 +153,11 @@ pub struct CandidateTrial {
     idx: usize,
     /// Whether the current candidate has already been emitted as `Punch`.
     punched_current: bool,
-    /// When the current candidate's window began (the instant it was punched,
-    /// or `new`'s `now` for the first candidate).
+    /// When the current candidate's window began — the instant it was actually
+    /// punched (the `now` of the `poll` that returned its `Punch`), NOT `new`'s
+    /// `now`. Seeded to `new`'s `now` only as a placeholder; the FIRST `Punch`
+    /// overwrites it so candidate 0 gets its full `per_candidate_timeout` window
+    /// even when the first `poll` lands after construction (MAJOR-4).
     current_started: Instant,
     /// Terminal flag: set once every candidate has been tried (or there were
     /// no dialable candidates to begin with).
@@ -164,7 +174,13 @@ impl CandidateTrial {
         let candidates: Vec<SocketAddr> = candidates
             .iter()
             .filter_map(|c| c.parse::<SocketAddr>().ok())
-            .filter(|addr| !addr.ip().is_unspecified() && !addr.ip().is_loopback())
+            // v1 is IPv4-only end to end (spec §1; `uapi::validate_ipv4_endpoint`
+            // rejects a non-IPv4 endpoint at the wire). Drop any IPv6 candidate
+            // here too so a punch can NEVER target an IPv6 address (MAJOR-5),
+            // alongside the unspecified/loopback exclusions.
+            .filter(|addr| {
+                addr.is_ipv4() && !addr.ip().is_unspecified() && !addr.ip().is_loopback()
+            })
             .collect();
         let exhausted = candidates.is_empty();
         CandidateTrial { candidates, idx: 0, punched_current: false, current_started: now, exhausted }
@@ -179,9 +195,13 @@ impl CandidateTrial {
         if self.exhausted {
             return TrialStep::Exhausted;
         }
-        // First presentation of the current candidate: punch it once.
+        // First presentation of the current candidate: punch it once. Begin
+        // its timeout window HERE (MAJOR-4) — at the instant the `Punch` is
+        // actually returned — not in `new`, so candidate 0 gets the full
+        // `per_candidate_timeout` even if this first `poll` runs after `new`.
         if !self.punched_current {
             self.punched_current = true;
+            self.current_started = now;
             return TrialStep::Punch(self.candidates[self.idx]);
         }
         // Current candidate already punched — is its window still open?

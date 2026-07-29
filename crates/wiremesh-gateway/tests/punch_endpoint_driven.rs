@@ -155,6 +155,15 @@ fn nudge_target_skips_malformed_and_is_none_without_a_cidr() {
         Some(Ipv4Addr::new(10, 10, 9, 1)),
         "the first VALID CIDR is used when earlier entries are malformed"
     );
+    // NIT-8: a `/0` default route is skipped (its first host `0.0.0.1` is never
+    // a real overlay peer), in favor of the next valid CIDR — or None if it's
+    // the only entry.
+    assert_eq!(nudge_target(&["0.0.0.0/0".to_string()]), None, "a lone /0 yields no target");
+    assert_eq!(
+        nudge_target(&["0.0.0.0/0".to_string(), "10.10.9.0/24".to_string()]),
+        Some(Ipv4Addr::new(10, 10, 9, 1)),
+        "a leading /0 is skipped in favor of the next real CIDR"
+    );
 }
 
 /// The core T2 pin: `nudge_peer` emits EXACTLY ONE nudge, through the injected
@@ -237,6 +246,57 @@ fn trial_advances_through_candidates_one_at_a_time() {
     assert!(trial.is_exhausted(), "all candidates tried without a handshake");
     // Stays exhausted on further polls (idempotent terminal state).
     assert_eq!(trial.poll(t0 + Duration::from_secs(30), TO), TrialStep::Exhausted);
+}
+
+/// MAJOR-4 regression: candidate 0's per-candidate window must begin when its
+/// `Punch` is ACTUALLY returned (the first `poll`), NOT at `CandidateTrial::new`.
+/// The driver builds the trial and only polls it a moment later (after the
+/// backoff/guard checks), so seeding the window in `new` would shave that gap
+/// off the first candidate and let it advance/exhaust early. Here the trial is
+/// built at `t0` but first polled at `t0 + 3s`; candidate 0 must still get its
+/// FULL `TO` window measured from `t0 + 3s`.
+#[test]
+fn trial_first_candidate_gets_full_window_from_first_punch() {
+    let t0 = Instant::now();
+    let mut trial = CandidateTrial::new(
+        &["198.51.100.1:51820".to_string(), "198.51.100.2:51820".to_string()],
+        t0,
+    );
+
+    // First poll happens 3s AFTER construction: this is when candidate 0 is
+    // punched, so its window is [t0+3, t0+3+TO).
+    let first_punch = t0 + Duration::from_secs(3);
+    assert_eq!(trial.poll(first_punch, TO), TrialStep::Punch(cand("198.51.100.1:51820")));
+
+    // Just before the window (measured from first_punch, NOT t0) elapses:
+    // still waiting on candidate 0 — a `new`-seeded window would have advanced
+    // by now (t0 + 3 + 4 = t0 + 7 > t0 + TO=5).
+    assert_eq!(trial.poll(first_punch + TO - Duration::from_secs(1), TO), TrialStep::Waiting);
+    // Exactly at the full window from first_punch: advance to candidate 1.
+    assert_eq!(trial.poll(first_punch + TO, TO), TrialStep::Punch(cand("198.51.100.2:51820")));
+}
+
+/// MAJOR-5 regression: v1 is IPv4-only, so an IPv6 `SocketAddr` candidate must
+/// be filtered out and can NEVER produce a `Punch` — a trial with only IPv6
+/// candidates is immediately `Exhausted`, and a mixed list trials only the IPv4
+/// ones.
+#[test]
+fn trial_rejects_ipv6_candidates() {
+    let t0 = Instant::now();
+
+    // IPv6-only: nothing dialable → immediately exhausted, never a Punch.
+    let mut ipv6_only =
+        CandidateTrial::new(&["[2001:db8::1]:51820".to_string()], t0);
+    assert_eq!(ipv6_only.poll(t0, TO), TrialStep::Exhausted);
+    assert!(ipv6_only.is_exhausted(), "an IPv6 candidate must never be punched");
+
+    // Mixed: the IPv6 entry is dropped, the IPv4 one is trialed.
+    let mut mixed = CandidateTrial::new(
+        &["[2001:db8::2]:51820".to_string(), "198.51.100.9:51820".to_string()],
+        t0,
+    );
+    assert_eq!(mixed.poll(t0, TO), TrialStep::Punch(cand("198.51.100.9:51820")));
+    assert_eq!(mixed.poll(t0 + TO, TO), TrialStep::Exhausted);
 }
 
 /// A single valid candidate: punched once, then exhausted after its window.

@@ -336,6 +336,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
         relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
         wg0_pins: wg0_pins.clone(),
         peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
         live_endpoints: live_endpoints.clone(),
@@ -715,6 +716,22 @@ struct PathCtx {
     /// default for a peer that has never been relayed at all, preserving
     /// every pre-4c-Task-9 direct-only scenario's behavior unchanged.
     relay_pointed: Arc<std::sync::Mutex<HashMap<u64, bool>>>,
+    /// Serializes the endpoint-commit critical section — the scoped WG
+    /// remove+re-add write plus the `relay_pointed` publish — across BOTH the
+    /// direct-punch (`punch_and_apply` → `set_peer_endpoint(is_relay=false)`)
+    /// and the relay-install (`ensure_relay_transport` →
+    /// `set_peer_endpoint(is_relay=true)`) paths (MAJOR-1). Held across the
+    /// `spawn_blocking` UAPI write, so it is a `tokio::sync::Mutex`: while it is
+    /// held the two paths are mutually exclusive and CANNOT interleave. Under it
+    /// the direct path re-checks `path.state == Connecting` (and that no relay
+    /// endpoint is already installed) and ABORTS the write rather than clobber a
+    /// freshly installed relay socket — the make-before-break race that
+    /// otherwise leaves WG pointed at a dead direct candidate with a healthy
+    /// relay transport that `ensure_relay_transport` won't re-point (silent dead
+    /// relay path). `run_path_ticks` mutates `paths` to leave `Connecting`
+    /// BEFORE it spawns `ensure_relay_transport`, so `state != Connecting` is
+    /// the earliest signal a relay install is in play.
+    endpoint_commit: Arc<tokio::sync::Mutex<()>>,
     /// Shared Role-B `wg0` pin map (peer `gateway_id` -> old-epoch pubkey) — so
     /// `set_peer_endpoint` builds the same pinned config `apply_state` does and
     /// a punch during a rotation overlap can't rekey `wg0` off the pin.
@@ -1184,25 +1201,36 @@ async fn punch_and_apply(
         // yielded), so neither success nor failure should feed the pair's
         // back-off. This is the regression fix for the endpoint-driven punch
         // clobbering the relay path (relay_matrix 0/2, convergence A4).
-        let on_relay = {
-            let relayed = ctx
-                .paths
-                .lock()
-                .unwrap()
-                .get(&gid)
-                .map(|p| p.state == PathState::Relayed)
-                .unwrap_or(false);
+        // MAJOR-1: a StartPunch trial is only meaningful while the path is
+        // `Connecting`. The moment it has LEFT `Connecting`, the driver is (or
+        // is about to be) establishing a relay path — `run_path_ticks` mutates
+        // the `Path` state to `Relayed`/`Disconnected` under `paths` BEFORE it
+        // spawns `ensure_relay_transport`, so `state != Connecting` is the
+        // earliest signal a relay install is in flight. Yielding here (and,
+        // ATOMICALLY, in `set_peer_endpoint`'s commit below) is the
+        // make-before-break guard that stops a slow multi-candidate trial from
+        // clobbering a freshly installed relay socket (WG left pointed at a dead
+        // direct candidate with a healthy relay transport that
+        // `ensure_relay_transport` then refuses to re-point → silent dead relay
+        // path). This subsumes the old `Relayed || relay_pointed` guard: the
+        // `Relayed` `ProbeDirect` case still yields (state != Connecting), and
+        // the `Disconnected` window this bug drove through is now covered too. A
+        // completed direct handshake returns via the `is_direct` check below, so
+        // reaching this point in any non-`Connecting` state means yield.
+        let connecting = {
+            let state = ctx.paths.lock().unwrap().get(&gid).map(|p| p.state);
             let pointed = ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
-            relayed || pointed
+            state == Some(PathState::Connecting) && !pointed
         };
-        if on_relay {
+        if !connecting {
             // Low-noise, and deliberately NOT worded with any of the four
             // attempt-counting prefixes (`punch to peer=`, `no candidate
             // confirmed`, `punch confirmed`, `punch task for peer=`) — yielding
-            // to the relay is not a punch attempt.
+            // is not a punch attempt, so it must not feed the anti-storm tally.
+            // Return WITHOUT recording an outcome: no dialability was tested.
             eprintln!(
-                "wiremesh-gateway: peer={gid} on active relay path; deferring direct punch \
-                 (make-before-break, relay kept flowing)"
+                "wiremesh-gateway: peer={gid} path no longer connecting; deferring direct punch \
+                 (make-before-break, relay path kept flowing)"
             );
             return;
         }
@@ -1214,9 +1242,22 @@ async fn punch_and_apply(
                 // break: only THIS peer's session resets, spike finding 2 — no
                 // boringtun in-place modify), then nudge it to handshake NOW.
                 match set_peer_endpoint(&ctx, gid, addr, false).await {
-                    // Nudge boringtun to initiate its handshake NOW (spike
-                    // finding 1) — the scoped re-add left the peer sessionless.
-                    Ok(()) => poke_peer_overlay(&ctx, gid).await,
+                    // Committed: nudge boringtun to initiate its handshake NOW
+                    // (spike finding 1) — the scoped re-add left the peer
+                    // sessionless.
+                    Ok(true) => poke_peer_overlay(&ctx, gid).await,
+                    // MAJOR-1: the atomic commit guard saw the peer leave
+                    // `Connecting` (or a relay endpoint already installed) and
+                    // SKIPPED the write, yielding to the relay path. No
+                    // dialability was tested, so return WITHOUT recording an
+                    // outcome — and do NOT use an attempt-counting prefix.
+                    Ok(false) => {
+                        eprintln!(
+                            "wiremesh-gateway: peer={gid} left connecting during punch commit; \
+                             deferring to relay path (make-before-break)"
+                        );
+                        return;
+                    }
                     // NB: deliberately NOT worded with a "punch to peer=" /
                     // "no candidate confirmed" / "punch confirmed" prefix — this
                     // is a mid-trial, per-candidate error, NOT one of the four
@@ -1290,7 +1331,16 @@ async fn punch_and_apply(
 /// keeps this endpoint. Shared by [`punch_and_apply`] (a hole-punched direct
 /// candidate, `is_relay=false`) and [`ensure_relay_transport`] (pointing a peer
 /// at its `RelayTransport`'s local relay socket, Cycle 4c Task 8,
-/// `is_relay=true`); both nudge after this returns `Ok`.
+/// `is_relay=true`); both nudge after this returns `Ok(true)`.
+///
+/// Returns `Ok(true)` when the endpoint was committed to the device, and
+/// `Ok(false)` when the DIRECT path YIELDED without writing (MAJOR-1): the whole
+/// guard+write runs under [`PathCtx::endpoint_commit`] (held across the
+/// `spawn_blocking` UAPI write) so the direct-punch and relay-install writes are
+/// mutually exclusive; under it the direct path aborts the moment the peer has
+/// left `Connecting` or a relay endpoint is already installed, rather than
+/// clobber a freshly installed relay socket. The relay path (`is_relay=true`)
+/// never yields — it returns `Ok(true)` or an `Err`.
 ///
 /// `is_relay` records into `ctx.relay_pointed` (Cycle 4c Task 9) whether
 /// `endpoint` is the local relay-transport socket or a real direct
@@ -1313,7 +1363,7 @@ async fn set_peer_endpoint(
     gid: u64,
     endpoint: SocketAddr,
     is_relay: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<bool> {
     // Resolve the ACTIVE tun (ifname + priv key + port), captured together so
     // the device we build and the ifname we apply it to are consistent even if
     // a cutover flips `active` concurrently.
@@ -1321,12 +1371,46 @@ async fn set_peer_endpoint(
         let a = ctx.active.lock().unwrap();
         (a.ifname.clone(), a.priv_key.clone(), a.wg_port)
     };
-    // Record the live-endpoint pin FIRST (fix T4): from here on, every
-    // steady-state rebuild — this one and any concurrent/later `apply_state`
-    // — emits this endpoint for `gid` instead of the static candidate. (If
-    // the apply below fails, the pin still describes where the tunnel SHOULD
-    // point; the next apply retries it, and `run_path_ticks` clears the pin
-    // if no live path ever materializes.)
+
+    // MAJOR-1: hold the endpoint-commit lock across the ENTIRE guard+write, so
+    // the direct-punch and relay-install endpoint writes are mutually exclusive
+    // and cannot interleave. A `tokio::sync::Mutex`, so it is safe to hold
+    // across the `spawn_blocking` UAPI write inside `apply_peer_endpoint_scoped`.
+    let _commit = ctx.endpoint_commit.lock().await;
+
+    // MAJOR-1 atomic guard (DIRECT path only): abort — WITHOUT touching the
+    // device or any pin — the moment the peer has left `Connecting` or a relay
+    // endpoint is already installed. `run_path_ticks` mutates `paths` out of
+    // `Connecting` BEFORE it spawns `ensure_relay_transport`, so this is the
+    // earliest signal a relay install is (about to be) in flight; and because
+    // the relay install takes the SAME `endpoint_commit` lock for its own
+    // commit, one that already ran is visible here (relay endpoint installed +
+    // `relay_pointed=true`) and one that hasn't cannot slip between this check
+    // and the write below. Yielding here is what stops a slow multi-candidate
+    // trial from clobbering a freshly installed relay socket.
+    if !is_relay {
+        let connecting = ctx
+            .paths
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .map(|p| p.state == PathState::Connecting)
+            .unwrap_or(false);
+        let relay_installed =
+            ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+        if !connecting || relay_installed {
+            return Ok(false);
+        }
+    }
+
+    // Record the live-endpoint pin (fix T4): from here on, every steady-state
+    // rebuild — this one and any concurrent/later `apply_state` — emits this
+    // endpoint for `gid` instead of the static candidate. (If the apply below
+    // fails, the pin still describes where the tunnel SHOULD point; the next
+    // apply retries it, and `run_path_ticks` clears the pin if no live path
+    // ever materializes.) Deliberately recorded AFTER the MAJOR-1 yield check:
+    // a yielded direct punch must NOT leave a stale direct pin behind, or a
+    // later `apply_state` rebuild would use it to clobber the relay endpoint.
     ctx.live_endpoints.lock().unwrap().insert(gid, endpoint.to_string());
     // Build the full pinned desired device (for the change-guard and the
     // `applied_peers` bookkeeping `apply_state` diffs against) AND resolve the
@@ -1365,7 +1449,7 @@ async fn set_peer_endpoint(
     // silent and degraded (convergence A4). See `apply_peer_endpoint_scoped`.
     apply_peer_endpoint_scoped(&ifname, &dev, target_pubkey.as_deref(), &ctx.active).await?;
     ctx.relay_pointed.lock().unwrap().insert(gid, is_relay);
-    Ok(())
+    Ok(true)
 }
 
 /// Re-point ONE peer's endpoint on `ifname` via a scoped remove+re-add
@@ -1377,48 +1461,79 @@ async fn set_peer_endpoint(
 /// contention (convergence A4: peerB degraded whenever a permanently-blocked
 /// peerC was punched/relayed).
 ///
-/// `dev` is the full pinned desired device, used ONLY for the change-guard (so
-/// re-confirming an already-applied endpoint stays a true no-op) and to keep
-/// `applied_config`/`applied_peers` consistent with the logical device state
-/// that `apply_state`'s incremental-add diff compares against. `target_pubkey`
-/// selects which single peer block to push. The scoped remove+re-add resets
-/// only the target's session (boringtun can't modify a peer in place); the
-/// caller nudges it to re-handshake promptly (`poke_peer_overlay`).
+/// `dev` is the full pinned desired device; only its `private_key`/`listen_port`
+/// (to re-encode the guard's `applied_config`) and the ONE peer block selected
+/// by `target_pubkey` are used. The scoped remove+re-add resets only the
+/// target's session (boringtun can't modify a peer in place); the caller nudges
+/// it to re-handshake promptly (`poke_peer_overlay`).
+///
+/// CHANGE-GUARD SCOPE (MAJOR-3): this writes ONLY the target peer, so it must
+/// only claim the target as applied — never the whole `dev`. The former code
+/// set `applied_peers = dev.peers.clone()` and compared `encode_set(full dev)`,
+/// which FABRICATED guard state for every unrelated peer: an unrelated peer with
+/// a still-un-applied change would be silently recorded as applied, so a later
+/// `apply_state` (which diffs `applied_peers`) would skip reconciling it. Here
+/// the guard's `applied_peers` is the current set with ONLY the target
+/// replaced-or-added, and `applied_config` is re-derived from that set — so
+/// `classify_peer_delta` / `apply_device_if_changed` stay consistent for every
+/// OTHER peer. When `target_pubkey` is `None` or no matching peer exists, there
+/// is nothing to write and the guard is left UNCHANGED (no phantom adoption).
 async fn apply_peer_endpoint_scoped(
     ifname: &str,
     dev: &DeviceConfig,
     target_pubkey: Option<&str>,
     active: &Arc<std::sync::Mutex<ActiveTunInfo>>,
 ) -> anyhow::Result<()> {
-    let encoded = uapi::encode_set(dev).context("encoding active-tun device config")?;
-    // Change-guard: a re-confirm of an already-applied endpoint is a no-op
-    // (the controller re-brokers punches every few seconds; without this it
-    // would needlessly reset the target's session on every one).
-    if active.lock().unwrap().applied_config.as_deref() == Some(encoded.as_str()) {
-        return Ok(());
-    }
     // The single peer whose endpoint we're setting. Absent (target not keyed,
-    // or dropped from desired state) → nothing to push to the device; still
-    // sync the change-guard to the logical device state so a later reconcile
-    // doesn't see phantom drift.
-    let peer = target_pubkey
-        .and_then(|pk| dev.peers.iter().find(|p| p.public_key_b64 == pk).cloned());
-    if let Some(peer) = peer {
-        let ifn = ifname.to_string();
-        tokio::task::spawn_blocking(move || uapi::set_one_peer(&ifn, &peer))
-            .await
-            .context("scoped set-one-peer UAPI task panicked")??;
+    // or dropped from desired state) → nothing to push to the device, and —
+    // unlike the old code — DON'T fabricate guard state for the whole device:
+    // leave `applied_config`/`applied_peers` untouched so a later reconcile
+    // sees the true drift.
+    let Some(peer) = target_pubkey
+        .and_then(|pk| dev.peers.iter().find(|p| p.public_key_b64 == pk).cloned())
+    else {
+        return Ok(());
+    };
+
+    // Scoped change-guard, compared to ONLY the target peer: a re-confirm of an
+    // already-applied endpoint is a true no-op (the controller re-brokers
+    // punches every few seconds; without this it would needlessly reset the
+    // target's session on every one). If the exact target block is already in
+    // `applied_peers`, the device already holds it — skip the write.
+    {
+        let a = active.lock().unwrap();
+        if a.applied_peers.iter().any(|p| *p == peer) {
+            return Ok(());
+        }
     }
-    // Keep the change-guard consistent with the logical full-device state:
-    // after the scoped remove+re-add boringtun holds exactly `dev`'s peers
-    // (target re-pointed, others unchanged), so `apply_state`'s
-    // `classify_peer_delta` (which diffs `applied_peers`) correctly sees the
-    // new endpoint and stays on its Unchanged/incremental-add fast paths
-    // rather than forcing a session-destructive full apply.
+
+    let ifn = ifname.to_string();
+    let peer_for_write = peer.clone();
+    tokio::task::spawn_blocking(move || uapi::set_one_peer(&ifn, &peer_for_write))
+        .await
+        .context("scoped set-one-peer UAPI task panicked")??;
+
+    // Update the guard to reflect ONLY the target peer just written: replace it
+    // in (or add it to) the CURRENT applied peer set — unrelated peers keep
+    // their real recorded state — and re-derive `applied_config` from the
+    // resulting set (with `dev`'s device header). Recomputed here from the live
+    // `applied_peers` (not a snapshot) so a concurrent apply can't be lost.
+    // Runs only after a SUCCESSFUL write: on a `set_one_peer` error the `?`
+    // above returns first, leaving the guard un-updated (MAJOR-2) so the next
+    // `apply_state` reconciles the peer that was left removed.
     {
         let mut a = active.lock().unwrap();
-        a.applied_config = Some(encoded);
-        a.applied_peers = dev.peers.clone();
+        match a.applied_peers.iter_mut().find(|p| p.public_key_b64 == peer.public_key_b64) {
+            Some(existing) => *existing = peer.clone(),
+            None => a.applied_peers.push(peer.clone()),
+        }
+        let device = DeviceConfig {
+            private_key_b64: dev.private_key_b64.clone(),
+            listen_port: dev.listen_port,
+            peers: a.applied_peers.clone(),
+        };
+        a.applied_config =
+            Some(uapi::encode_set(&device).context("re-encoding scoped active-tun device config")?);
     }
     Ok(())
 }
@@ -1527,6 +1642,7 @@ async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_pro
         map.insert(gid, PeerRelay { transport, relay_id });
     }
 
+    // The relay path never yields (is_relay=true → always `Ok(true)` or `Err`).
     if let Err(e) = set_peer_endpoint(&ctx, gid, local_addr, true).await {
         eprintln!("wiremesh-gateway: pointing peer={gid} at relay={relay_id} endpoint failed: {e}");
     } else {
@@ -1704,6 +1820,16 @@ async fn run_path_ticks(ctx: PathCtx) {
         // orphaned back-off entry behind.
         ctx.live_endpoints.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
         ctx.punch_backoff.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
+        // MINOR-6: this loop's OWN per-peer bookkeeping maps must be pruned on
+        // the same desired-peer set too — unlike the `ctx`-level maps above they
+        // are task-local, but a peer dropped from the fabric (or a reused gid)
+        // would otherwise leave stale entries here forever (unbounded growth
+        // under peer churn, and a resurfaced `last_hs_age`/`last_rx` baseline
+        // for a reused id).
+        last_hs_age.retain(|gid, _| desired_gids.contains(gid));
+        last_rx.retain(|gid, _| desired_gids.contains(gid));
+        pending_hs.retain(|gid, _| desired_gids.contains(gid));
+        last_probe.retain(|gid, _| desired_gids.contains(gid));
 
         // Snapshot which peers currently have a healthy relay transport
         // (single `tokio::sync::Mutex` acquisition for the whole tick, ahead
@@ -2911,6 +3037,7 @@ mod tests {
             relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
             relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
             wg0_pins: Arc::new(std::sync::Mutex::new(HashMap::new())),
             peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
             live_endpoints: Arc::new(std::sync::Mutex::new(HashMap::new())),

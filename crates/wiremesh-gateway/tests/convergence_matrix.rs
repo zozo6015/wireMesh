@@ -3,13 +3,14 @@
 //! incident `docs/research/ops-finding-multi-gateway-convergence.md`,
 //! 2026-07-27 3-segment production failure cascade).
 //!
-//! **STATUS (2026-07-28): T8 INCOMPLETE — assertions 1-2 met; assertions 3
-//! and 4 are UNRUN (both tests `#[ignore]`d) and carried to the
-//! puncher-socket-isolation follow-up cycle.** This is NOT a passing/complete
-//! milestone: it reproduces the incident and pins the specification, but the
-//! two guarantees it was meant to prove (3 and 4) do not yet hold — see the
-//! per-test docs and finding §3 below. Nothing here should be read as "T8
-//! done".
+//! **STATUS (2026-07-29): T8 COMPLETE — all four assertions met; both tests
+//! are ACTIVE (no longer `#[ignore]`d) and pass under `--features
+//! netns-tests`.** The puncher-socket-isolation follow-up cycle resolved the
+//! finding-§3 root cause (the SO_REUSEPORT puncher on the shared WG :51820 is
+//! gone; punching is now boringtun-endpoint-driven), so the established
+//! A<->B session survives C's join (assertion 3, make-before-break) and path
+//! state holds through the idle (assertion 4, keepalive). See the
+//! puncher-socket-isolation design/notes and finding §3.
 //!
 //! Reproduces the incident topology under netns with THREE real
 //! `wiremesh-gateway` binaries and a real controller-enrolled relay, and
@@ -21,26 +22,23 @@
 //! IS the act of C joining the mesh 1 built, 2 observes the settle that join
 //! causes, 4 idles the settled mesh), factored into
 //! [`converge_incident_mesh`]. They are split across TWO tests, and — as of
-//! 2026-07-28 — **BOTH are `#[ignore]`d**, carried to the puncher-socket-
-//! isolation cycle. Assertions 1-2 pass; assertions 3 and 4 are both blocked
-//! by ONE deeper architectural root cause (finding §3 punch-socket
-//! starvation: while the permanently-blocked newcomer C punch-storms its
-//! pairs, each C-directed puncher opens a transient SO_REUSEPORT socket on
-//! the SHARED WG listen port :51820 that resets/starves already-established
-//! peers' WG sessions — handshake→0, rx frozen). Per the spike rule every
-//! assertion is preserved intact and un-weakened as that cycle's executable
-//! spec. See `docs/research/ops-finding-multi-gateway-convergence.md` §3
-//! "deeper root cause".
+//! 2026-07-29 — **BOTH are ACTIVE and pass**. The finding-§3 root cause
+//! (while the permanently-blocked newcomer C punch-stormed its pairs, each
+//! C-directed puncher opened a transient SO_REUSEPORT socket on the SHARED WG
+//! listen port :51820 that reset/starved already-established peers' WG
+//! sessions — handshake→0, rx frozen) was eliminated by the
+//! puncher-socket-isolation cycle: punching is boringtun-endpoint-driven with
+//! no separate socket, and a periodic visible overlay liveness probe holds
+//! rx-corroborated liveness through a keepalive-only idle. See
+//! `docs/research/ops-finding-multi-gateway-convergence.md` §3 "deeper root
+//! cause".
 //!
-//!  * [`t8_convergence_incident_lifecycle`] (`#[ignore]`d) — assertions 1, 3,
-//!    2. 1 (A<->B direct) and 2 (C settles relayed, bounded punch attempts)
-//!    pass; 3 (make-before-break session continuity) is blocked — endpoints
-//!    and path_state are preserved but the established A<->B *session* resets
-//!    under C's punch storm, so the fresh-connection continuity probe fails
-//!    ~t+8.6s after C enrolls.
-//!  * [`t8_keepalive_holds_path_state_under_punch_contention`] (`#[ignore]`d)
-//!    — assertion 4: path state must hold through a 90s idle. Blocked by the
-//!    same session reset/starvation.
+//!  * [`t8_convergence_incident_lifecycle`] — assertions 1, 3, 2. 1 (A<->B
+//!    direct), 2 (C settles relayed, bounded punch attempts), and 3
+//!    (make-before-break session continuity — the established A<->B session
+//!    now survives C's join) all pass.
+//!  * [`t8_keepalive_holds_path_state_under_punch_contention`] — assertion 4:
+//!    path state holds through the 90s idle. Passes.
 //!
 //!  * **ASSERTION 1** (plan T8.1): A<->B — both dialable — reach a DIRECT
 //!    tunnel carrying real workload traffic.
@@ -968,7 +966,7 @@ async fn build_scenario(prefix: &str) -> Scenario {
 /// Drives an already-built scenario to the fully-settled 3-gateway incident
 /// mesh and returns C's gateway_id — the common prefix BOTH T8 done-bar
 /// tests need (the lifecycle test and the punch-contention test; both are
-/// `#[ignore]`d). It runs, in the incident's own causal order, assertions **1**
+/// ACTIVE and passing). It runs, in the incident's own causal order, assertions **1**
 /// (A<->B direct), **3** (C enrolls without breaking the established A<->B
 /// pair — the pump brackets the enrollment), and **2 part 1** (all of C's
 /// pairs settle relayed with flowing workload traffic). It does NOT run the
@@ -1184,34 +1182,28 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
     id_c
 }
 
-/// **T8 done-bar test — INCOMPLETE / `#[ignore]`d (blocked, carried to the
-/// next cycle).** The incident lifecycle through assertions 1 -> 3 -> 2:
-/// drives the 3-gateway incident scenario to the settled mesh via
-/// [`converge_incident_mesh`] (assertion 1: A<->B direct; assertion 3: C
-/// enrolls without breaking the established pair; assertion 2 part 1: C's
-/// pairs settle relayed with flowing traffic), then adds the anti-storm pin
-/// (assertion 2 part 2).
+/// **T8 done-bar test — COMPLETE / ACTIVE (passing).** The incident lifecycle
+/// through assertions 1 -> 3 -> 2: drives the 3-gateway incident scenario to
+/// the settled mesh via [`converge_incident_mesh`] (assertion 1: A<->B direct;
+/// assertion 3: C enrolls without breaking the established pair; assertion 2
+/// part 1: C's pairs settle relayed with flowing traffic), then adds the
+/// anti-storm pin (assertion 2 part 2).
 ///
-/// Assertions 1-2 pass; assertion 3 does NOT hold, on the SAME deeper root
-/// cause as the ignored assertion-4 test below — so this test is `#[ignore]`d
-/// and assertion 3 (and everything after it) is UNRUN by default. The done-bar proved (clean netns run, 2026-07-28) that
-/// endpoint-level make-before-break (T4 / add-only apply) IS necessary and
-/// works — at the ~t+8.6s continuity break both sides still report the A<->B
-/// peer `direct` and the A<->B WG endpoints are intact — but it is NOT
-/// sufficient: while the permanently-blocked newcomer C punch-storms its
-/// pairs, each C-directed puncher opens a transient SO_REUSEPORT socket on
-/// gwA's/gwB's SHARED WG listen port (:51820) that resets/starves the
-/// ESTABLISHED A<->B session (`latest handshake` back to 0, rx frozen), so a
-/// fresh workload connection opened across that window cannot complete its
-/// handshake and times out. Fixing it is a separate architectural cycle (the
-/// puncher must not share/steal the WG listen socket); per the spike rule the
-/// assertions here are preserved intact and un-weakened as that cycle's
-/// executable spec. See `docs/research/ops-finding-multi-gateway-convergence.md`
-/// §3 "deeper root cause".
+/// All assertions pass. Endpoint-level make-before-break (T4 / add-only apply)
+/// was necessary but NOT sufficient: the original failure was that while the
+/// permanently-blocked newcomer C punch-stormed its pairs, each C-directed
+/// puncher opened a transient SO_REUSEPORT socket on gwA's/gwB's SHARED WG
+/// listen port (:51820) that reset/starved the ESTABLISHED A<->B session
+/// (`latest handshake` back to 0, rx frozen), so a fresh workload connection
+/// opened across that window could not complete its handshake. The
+/// puncher-socket-isolation cycle removed that shared socket — punching is now
+/// boringtun-endpoint-driven with a scoped single-peer apply that never resets
+/// other peers' sessions — so the established A<->B session survives C's join.
+/// See `docs/research/ops-finding-multi-gateway-convergence.md` §3 "deeper
+/// root cause".
 ///
 /// Assertion 4 (keepalive-holds-path-state under the same contention) is
-/// split into [`t8_keepalive_holds_path_state_under_punch_contention`] below,
-/// also ignored against the same root cause.
+/// split into [`t8_keepalive_holds_path_state_under_punch_contention`] below.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn t8_convergence_incident_lifecycle() {
     let mut sc = build_scenario("cvg").await;
@@ -1260,45 +1252,38 @@ async fn t8_convergence_incident_lifecycle() {
     eprintln!("ASSERTION 2 PASS: C settled relayed AND blocked-pair punch attempts are bounded");
 
     // NOTE (2026-07-28): this line is currently UNREACHABLE — assertion 3
-    // (inside `converge_incident_mesh`, above) panics at ~t+8.6s on the
-    // session reset under C's punch storm, so the test never gets here. It is
-    // the spec for what green looks like once the puncher-socket-isolation
-    // fix lands and this test is un-ignored.
+    // Reaching here means the puncher-socket-isolation fix holds: the
+    // established A<->B session survives C's punch activity (no shared
+    // SO_REUSEPORT socket to steal its handshakes).
     eprintln!(
-        "T8 DONE-BAR (assertions 1-3) would PASS here: ({:?} total) (1) A<->B direct; \
+        "T8 DONE-BAR (assertions 1-3) PASS: ({:?} total) (1) A<->B direct; \
          (2) C settled relayed with bounded punch attempts; (3) A<->B unbroken across C's \
-         join. Assertion 4 (keepalive holds path-state through idle) is the sibling ignored \
-         t8_keepalive_holds_path_state_under_punch_contention. Both blocked on finding §3 \
-         punch-socket starvation.",
+         join. Assertion 4 (keepalive holds path-state through idle) is the sibling \
+         t8_keepalive_holds_path_state_under_punch_contention.",
         t0.elapsed()
     );
 }
 
-/// **Ignored T8 done-bar — the NEXT cycle's target.** The keepalive-holds-
-/// path-state guarantee (plan T8.4, finding §5): after the incident mesh
-/// settles, 90s of workload-idle must not sawtooth — every pair's path state
-/// must hold (`direct` for A-B, `relayed` for the C pairs), and workload must
-/// flow again promptly afterwards WITHOUT a re-punch cycle (T1's 25s
-/// persistent keepalive keeping NAT mappings and rx-liveness warm).
+/// **T8 done-bar — ACTIVE (passing).** The keepalive-holds-path-state
+/// guarantee (plan T8.4, finding §5): after the incident mesh settles, 90s of
+/// workload-idle must not sawtooth — every pair's path state must hold
+/// (`direct` for A-B, `relayed` for the C pairs), and workload must flow again
+/// promptly afterwards WITHOUT a re-punch cycle.
 ///
-/// **Why ignored (carried, not weakened):** the done-bar proved this fails on
-/// a separate, DEEPER root cause than T1 addresses — finding §3 punch-socket
-/// starvation. Gateway C's pairs are permanently un-punchable (rc drops
-/// peer-sourced inbound UDP), so C keeps issuing hole-punch attempts;
-/// although T3's back-off correctly BOUNDS the attempt count (the lifecycle
-/// test's anti-storm pin, assertion 2, passes), each attempt still opens a
-/// transient `SO_REUSEPORT` puncher on the SHARED WG listen port (:51820),
-/// which steals inbound WireGuard packets destined for gwA's ESTABLISHED
-/// A<->B peer and RESETS that established session (`latest handshake` back to
-/// 0, rx frozen). This breaks BOTH the lifecycle test's assertion 3 (a fresh
-/// workload connection across the window can't complete its handshake) AND
-/// this test's assertion 4 (the idle path-state hold). The real fix is
-/// architectural — the puncher must not share or steal the WG listen socket
-/// (a dedicated puncher socket / off the WG port), or resolve boringtun's
-/// remove+re-add relay-session bug that blocked the surgical single-peer
-/// alternative (see `main.rs::set_peer_endpoint`'s caveat) — and is out of
-/// this cycle's scope. The assertions below are preserved intact and correct
-/// as that cycle's target; they are NOT relaxed.
+/// **How it now holds:** the original failure was a DEEPER root cause than T1's
+/// keepalive addresses — finding §3 punch-socket starvation. Gateway C's pairs
+/// are permanently un-punchable (rc drops peer-sourced inbound UDP), so C keeps
+/// issuing hole-punch attempts; although T3's back-off BOUNDS the attempt count
+/// (the lifecycle test's anti-storm pin, assertion 2), each attempt used to open
+/// a transient `SO_REUSEPORT` puncher on the SHARED WG listen port (:51820),
+/// which stole inbound WireGuard packets destined for gwA's ESTABLISHED A<->B
+/// peer and RESET that established session (`latest handshake` back to 0, rx
+/// frozen). The puncher-socket-isolation cycle removed that shared socket
+/// (boringtun-endpoint-driven punch via a scoped single-peer apply — no
+/// SO_REUSEPORT, no other-peer reset) and added a periodic visible overlay
+/// liveness probe (bare keepalives are invisible to boringtun's rx accounting),
+/// so both the lifecycle test's assertion 3 and this test's assertion 4 (the
+/// idle path-state hold) now pass.
 ///
 /// Runs the exact same [`converge_incident_mesh`] prefix the lifecycle test
 /// does (a fresh scenario with a distinct lab prefix so it never collides
@@ -1446,9 +1431,9 @@ async fn t8_keepalive_holds_path_state_under_punch_contention() {
 
     eprintln!(
         "ASSERTION 4 PASS: keepalive held every path through the 90s idle and post-idle \
-         traffic flowed without a re-punch cycle ({:?} total). NOTE: this test is \
-         `#[ignore]`d pending the finding-§3 punch-socket-starvation fix — reaching this \
-         line means that fix has landed and both T8 tests can be un-ignored.",
+         traffic flowed without a re-punch cycle ({:?} total). The finding-§3 \
+         punch-socket-starvation fix (puncher-socket-isolation) has landed; both T8 tests \
+         are active and green.",
         t0.elapsed()
     );
 }

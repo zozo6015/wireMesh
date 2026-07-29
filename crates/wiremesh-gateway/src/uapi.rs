@@ -199,7 +199,25 @@ pub fn set_one_peer(ifname: &str, peer: &PeerConfig) -> anyhow::Result<()> {
     // Op 1: remove the existing peer (no replace_peers → others untouched).
     send_set(ifname, &encode_remove_peer(&peer.public_key_b64)?)?;
     // Op 2: clean add of the now-absent peer with its new endpoint.
-    send_set(ifname, &encode_add_peers(std::slice::from_ref(peer))?)?;
+    //
+    // PARTIAL-FAILURE SAFETY (MAJOR-2): the remove already succeeded, so if the
+    // ADD send fails the peer is now REMOVED from the device. Silently
+    // returning would let the caller's change-guard record the re-point as
+    // applied while the peer is actually GONE (traffic to it black-holes until
+    // some later full apply). So retry the add ONCE, and if it STILL fails
+    // propagate the error (never swallow) — the scoped caller then leaves its
+    // change-guard un-updated, so the next `apply_state` reconciles and re-adds
+    // the peer.
+    let add_body = encode_add_peers(std::slice::from_ref(peer))?;
+    if let Err(first) = send_set(ifname, &add_body) {
+        eprintln!(
+            "wiremesh-gateway: scoped peer re-add failed after remove succeeded ({first}); \
+             retrying the add once (peer is currently REMOVED)"
+        );
+        send_set(ifname, &add_body).with_context(|| {
+            format!("re-adding peer after remove (peer left REMOVED; first attempt: {first})")
+        })?;
+    }
     Ok(())
 }
 

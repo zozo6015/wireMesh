@@ -74,7 +74,8 @@ pub fn report_once(
 /// (one probe per `OBSERVE_PERIOD`, not the near-continuous §3 punch-socket
 /// culprit) and genuinely needs its own socket to receive a non-WG reply —
 /// explicitly kept out of scope by the puncher-socket-isolation cycle, which
-/// removed the punch's use of it. `pub(crate)` for `report_once` above.
+/// removed the punch's use of it. This helper is `pub(crate)`; its only caller,
+/// `report_once` above, is `pub`.
 pub(crate) fn reuseport_udp(port: u16) -> anyhow::Result<UdpSocket> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
