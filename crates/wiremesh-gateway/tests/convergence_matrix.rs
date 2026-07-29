@@ -1213,7 +1213,6 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
 /// split into [`t8_keepalive_holds_path_state_under_punch_contention`] below,
 /// also ignored against the same root cause.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "3-gateway convergence done-bar: assertions 1-2 pass; make-before-break session continuity (A3) and keepalive-under-contention (A4) both blocked by finding §3 punch-socket starvation — C's SO_REUSEPORT puncher on shared WG :51820 resets/starves established peers' sessions. Carried to the puncher-socket-isolation cycle. See docs/research/ops-finding-multi-gateway-convergence.md"]
 async fn t8_convergence_incident_lifecycle() {
     let mut sc = build_scenario("cvg").await;
     let t0 = Instant::now();
@@ -1305,7 +1304,6 @@ async fn t8_convergence_incident_lifecycle() {
 /// does (a fresh scenario with a distinct lab prefix so it never collides
 /// with a concurrent lifecycle run), then the full assertion-4 body.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "finding §3 punch-socket starvation: C's SO_REUSEPORT puncher steals A<->B liveness → path-SM flaps under contention though data flows; needs the puncher off the shared WG port. See docs/research/ops-finding-multi-gateway-convergence.md"]
 async fn t8_keepalive_holds_path_state_under_punch_contention() {
     let mut sc = build_scenario("cvgka").await;
     let t0 = Instant::now();

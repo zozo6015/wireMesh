@@ -49,9 +49,47 @@ const MSS: u16 = 1240;
 const ROTATION_KEEPALIVE: u16 = 3;
 const OBSERVE_PERIOD: Duration = Duration::from_secs(20);
 
-/// How long each hole-punch session blasts candidates before giving up — the
-/// de-risked punch window (spec §3, `punch::punch_candidates`).
-const PUNCH_WINDOW: Duration = Duration::from_secs(6);
+/// How long the endpoint-driven punch waits for ONE candidate's WG handshake to
+/// land before advancing to the next (`punch::CandidateTrial`'s per-candidate
+/// window). Chosen ≥ boringtun 0.6.0's ~5s handshake-retry cadence (spike
+/// finding): a correct candidate, once nudged, completes its handshake within a
+/// single RTT — well inside this window — so 5s is the time a WRONG candidate
+/// costs before we move on, and one retry cycle is enough to be sure it is
+/// wrong. See the reconciliation note on [`punch_and_apply`] for why this is
+/// safe against `path::CONNECT_TIMEOUT` (the `Connecting` budget).
+const PER_CANDIDATE_PUNCH_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often [`punch_and_apply`] re-polls its [`punch::CandidateTrial`] and
+/// checks whether the peer's path has reached `Direct` (the rx-corroborated
+/// liveness signal published by `run_path_ticks`). Sub-second so a completed
+/// handshake is acted on promptly, without busy-spinning.
+const PUNCH_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How often the gateway sends a small VISIBLE overlay data probe to each peer
+/// currently in a live state (`Direct`/`Relayed`), so the peer's `rx_bytes`
+/// advances and the path SM's rx-corroborated liveness holds.
+///
+/// REQUIRED because boringtun 0.6.0 does NOT count a bare WireGuard
+/// persistent-keepalive in `rx_bytes`: `noise/mod.rs::validate_decapsulated_
+/// packet` returns early on a 0-length decrypted packet ("This is keepalive,
+/// and not an error") BEFORE `self.rx_bytes += computed_len`. So keepalives
+/// keep the NAT mapping warm but are INVISIBLE to `uapi::get_peer_liveness`,
+/// and a keepalive-only-idle `Direct` path degrades exactly `DEGRADED_AFTER`
+/// (45s) after the last real DATA packet even though the tunnel is perfectly
+/// alive (convergence A4: `gwA[peer B]` left `direct` at t+36.9s ≈ 45s − the
+/// pre-idle traffic gap). A one-byte overlay datagram decrypts to a NON-empty
+/// inner packet, so it DOES bump the receiver's `rx_bytes` (counted before the
+/// device's allowed-ips filter, so a dropped inner packet still counts). Every
+/// gateway runs this, so each live pair exchanges a visible datagram every
+/// interval and BOTH sides corroborate.
+///
+/// 20s is comfortably under `DEGRADED_AFTER` (45s) — each side refreshes the
+/// other within one interval, ≥2 chances before the 45s threshold — and it
+/// does NOT mask a genuinely dead peer: the probe only bumps rx on RECEIPT, so
+/// a cut-off peer (nat_matrix case4's real silence) still shows flat rx and
+/// degrades on schedule. It is also under the routers' 30s conntrack timeout,
+/// so like the WG keepalive it keeps the NAT mapping warm.
+const LIVENESS_PROBE_INTERVAL: Duration = Duration::from_secs(20);
 
 /// Cap on how long we'll sleep waiting for a `PunchDirective`'s `go_unix_ms`
 /// fire instant. The controller broker's back-to-back sends are the primary
@@ -289,7 +327,6 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // why these are std (not tokio) mutexes.
     let ctx = PathCtx {
         active: active.clone(),
-        base_wg_port: cfg.wg_listen_port,
         identity: Arc::new(id.clone()),
         desired: Arc::new(std::sync::Mutex::new(applied.clone())),
         paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -622,14 +659,6 @@ struct PathCtx {
     /// after a Role-A cutover both follow the new epoch's tun rather than the
     /// drained/torn-down `wg0`.
     active: Arc<std::sync::Mutex<ActiveTunInfo>>,
-    /// The BASE WireGuard listen port (`wg0`'s), fixed for the process lifetime.
-    /// The transient hole-punch socket (`punch::punch_candidates`) binds this —
-    /// NOT the active port — because it shares the port via `SO_REUSEPORT` with
-    /// boringtun's socket, and post-cutover the live traffic is on the new tun's
-    /// offset port: binding the base (now-idle/retired) port keeps a punch from
-    /// stealing the new tun's inbound datagrams. In steady state (no rotation)
-    /// base == active port, so this is identical to the pre-rotation behavior.
-    base_wg_port: u16,
     /// This gateway's own identity (mTLS cert/key/CA PEMs + `gateway_id`),
     /// needed to mint a `RelayTransport` connection on this peer's behalf
     /// (Cycle 4c Task 8). `Arc`-wrapped since `Identity` holds several PEM
@@ -979,19 +1008,131 @@ fn pubkey_b64_to_hex(b64: &str) -> Option<String> {
     Some(out.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// Sleep until `go_unix_ms` (best-effort, clamped to `MAX_PUNCH_DELAY`), run
-/// ONE hole-punch to `candidates`, and on a confirmed candidate re-reconcile
-/// the WG device with that endpoint preferred for peer `gid`. Records the
-/// attempt in the peer's path SM (created `Connecting` if absent). Every
-/// blocking call (`punch::punch_candidates`, `uapi::apply`) runs inside
-/// `spawn_blocking`; no mutex guard is ever held across an `.await`.
+/// Production [`punch::NudgeSink`]: sends ONE datagram from a fresh EPHEMERAL
+/// UDP socket toward the peer's overlay IP, so the kernel routes it through
+/// `wg0` and boringtun (seeing "data to send, no session") initiates its WG
+/// handshake immediately rather than waiting ~26s for its persistent-keepalive
+/// tick (spike finding 1). The socket binds `0.0.0.0:0` — NOT the WG listen
+/// port, NOT `SO_REUSEPORT` — and is dropped at once, so it can never share or
+/// steal boringtun's inbound datagrams (the whole point of the §3 fix). The
+/// datagram's destination PORT is irrelevant (the packet is tunnelled whole);
+/// its destination IP is what selects the peer and fires the handshake.
+struct TunNudgeSink;
+
+/// Arbitrary destination port for the nudge datagram. Only the destination IP
+/// matters (it routes the packet through `wg0` and selects the peer by
+/// allowed-ips longest-prefix match); the port rides inside the tunnelled
+/// packet and is never interpreted by anything on the underlay. `9` is the
+/// standard discard port.
+const NUDGE_DST_PORT: u16 = 9;
+
+impl punch::NudgeSink for TunNudgeSink {
+    fn nudge(&self, overlay_ip: std::net::Ipv4Addr) -> anyhow::Result<()> {
+        let sock = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
+            .context("binding ephemeral nudge socket")?;
+        let dst = SocketAddr::from((overlay_ip, NUDGE_DST_PORT));
+        sock.send_to(&[0u8; 1], dst).with_context(|| format!("sending nudge to {dst}"))?;
+        Ok(())
+    }
+}
+
+/// Send ONE small datagram from an ephemeral socket toward peer `gid`'s overlay
+/// IP (a routable host in its allowed-ips), routed through `wg0`. This single
+/// primitive serves TWO purposes depending on the peer's session state:
+///
+///  - **Handshake nudge** (sessionless peer, just (re)pointed): boringtun 0.6.0
+///    sees "data to send, no session" → initiates its WG handshake NOW rather
+///    than waiting ~26s for its persistent-keepalive tick (spike finding 1).
+///    Used by the direct punch ([`punch_and_apply`]) and the relay endpoint
+///    install / re-path ([`ensure_relay_transport`]) — after
+///    [`set_peer_endpoint`]'s scoped remove+re-add leaves the peer sessionless,
+///    without this the relay tunnel flows encrypted data but never completes a
+///    handshake (relay_matrix case1: `latest_handshake` stuck at 0).
+///
+///  - **Liveness probe** (live `Direct`/`Relayed` peer, from `run_path_ticks`
+///    every [`LIVENESS_PROBE_INTERVAL`]): the datagram decrypts to a NON-empty
+///    inner packet on the peer, so it bumps the peer's `rx_bytes` — unlike a
+///    bare WG keepalive, which boringtun does NOT count in `rx_bytes` (see
+///    [`LIVENESS_PROBE_INTERVAL`]). Every gateway probes, so each live pair
+///    exchanges a visible datagram and BOTH sides' rx-corroborated liveness
+///    holds through a keepalive-only idle (convergence A4).
+///
+/// Best-effort: a failed send just means boringtun falls back to its slower
+/// keepalive-tick behavior. The blocking socket I/O runs off the async runtime.
+async fn poke_peer_overlay(ctx: &PathCtx, gid: u64) {
+    let allowed_ips: Vec<String> = ctx
+        .desired
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|ds| ds.peers.iter().find(|p| p.gateway_id == gid).map(|p| p.allowed_ips.clone()))
+        .unwrap_or_default();
+    match tokio::task::spawn_blocking(move || punch::nudge_peer(&TunNudgeSink, &allowed_ips)).await {
+        Ok(Ok(_)) => {}
+        Ok(Err(e)) => eprintln!("wiremesh-gateway: overlay poke to peer={gid} failed: {e}"),
+        Err(e) => eprintln!("wiremesh-gateway: overlay poke task for peer={gid} panicked: {e}"),
+    }
+}
+
+/// Sleep until `go_unix_ms` (best-effort, clamped to `MAX_PUNCH_DELAY`), then
+/// run ONE endpoint-driven punch trial toward `candidates` for peer `gid`.
+///
+/// This is the productionized §3 punch (puncher-socket-isolation): there is NO
+/// separate `SO_REUSEPORT` punch socket. A [`punch::CandidateTrial`] sequences
+/// the candidates one at a time; for each, we
+///
+///   1. set the peer's WG endpoint via [`set_peer_endpoint`] — a SCOPED
+///      remove+re-add of ONLY this peer (leaving every other peer's live
+///      session intact), NEVER a boringtun in-place `update_peer` modify (which
+///      panics 0.6.0 — spike finding 2) nor a full `replace_peers` (which would
+///      reset every other established peer — see `apply_peer_endpoint_scoped`);
+///   2. NUDGE boringtun to initiate its handshake NOW via [`punch::nudge_peer`]
+///      with the production [`TunNudgeSink`] (one ephemeral-socket datagram
+///      toward the peer's overlay IP — spike finding 1); and
+///   3. wait up to [`PER_CANDIDATE_PUNCH_TIMEOUT`] for the handshake to land,
+///      detected by the peer's path reaching `Direct` (the T2 rx-corroborated
+///      liveness `run_path_ticks` publishes — the punch IS boringtun's own
+///      authenticated handshake, so its completion is the confirmation).
+///
+/// On liveness the pair's back-off is reset (fix T3) and we return; on trial
+/// exhaustion (every candidate tried, or none dialable) the back-off records a
+/// failure and the path SM drives the existing `Relayed` fallback.
+///
+/// ### Relay-preservation invariant (make-before-break)
+///
+/// The trial NEVER points WireGuard away from an ACTIVE relay endpoint. A WG
+/// peer has one endpoint and, under approach B, the endpoint-set IS the punch —
+/// so while the peer is on a relay path (`relay_pointed`, or `path.state ==
+/// Relayed` during the install window) the loop YIELDS (returns) instead of
+/// setting a direct candidate. Clobbering the relay socket would time out relay
+/// recv and sawtooth the path; a corroborated Relayed → Direct cutover needs a
+/// forced rehandshake with no second socket and is a documented fast-follow, so
+/// a Relayed pair stays relayed until then. See the guard at the loop head.
+///
+/// ### Reconciliation with `path::CONNECT_TIMEOUT` (the `Connecting` budget)
+///
+/// `path.rs` gives a `Connecting` peer `CONNECT_TIMEOUT` (10s) before it falls
+/// back to `Relayed`/`Disconnected`. A punchable pair almost always has ONE or
+/// two candidates (its observed public mapping, plus perhaps a local endpoint),
+/// so its trial completes in ≤5–10s — comfortably inside the budget, and the
+/// nudge makes the handshake land within ~1 RTT of the first punch, far sooner
+/// than the window. A pair with THREE-plus candidates could run a trial longer
+/// than `CONNECT_TIMEOUT`; if a relay becomes available meanwhile the path
+/// enters `Relayed` and the trial then YIELDS (per the invariant above) — the
+/// relay carries traffic and the pair simply stays relayed (the documented
+/// fast-follow), rather than the punch fighting the relay for the endpoint. We
+/// therefore keep `CONNECT_TIMEOUT` at its spec'd 10s rather than stretching it:
+/// the done-bar pairs (nat_matrix, convergence A↔B) each punch a single observed
+/// candidate and reach `Direct` well within it.
 ///
 /// `_guard` is the in-flight-punch slot from [`PathCtx::try_start_punch`] —
-/// unused by name, but its whole purpose is to be HELD for this function's
-/// entire lifetime (including every early `return` below) and released via
-/// `Drop` when it returns, so at most one `punch_and_apply` runs per peer at
-/// a time regardless of whether it was triggered by a controller `Punch`
-/// directive or a tick-driven `StartPunch`.
+/// unused by name, but HELD for this function's entire lifetime (including
+/// every early `return`) and released via `Drop`, so at most one
+/// `punch_and_apply` runs per peer at a time regardless of whether it was
+/// triggered by a controller `Punch` directive or a tick-driven `StartPunch` /
+/// `ProbeDirect`. Every blocking call (`uapi::apply` inside `set_peer_endpoint`,
+/// the nudge socket) runs inside `spawn_blocking`; no mutex guard is ever held
+/// across an `.await`.
 async fn punch_and_apply(
     ctx: PathCtx,
     gid: u64,
@@ -1017,88 +1158,139 @@ async fn punch_and_apply(
         paths.entry(gid).or_insert_with(|| Path::new(Instant::now()));
     }
 
-    let wg_port = ctx.base_wg_port;
-    let cands = candidates.clone();
-    let confirmed = match tokio::task::spawn_blocking(move || {
-        punch::punch_candidates(wg_port, &cands, PUNCH_WINDOW)
-    })
-    .await
-    {
-        Ok(Ok(c)) => c,
-        Ok(Err(e)) => {
-            eprintln!("wiremesh-gateway: punch to peer={gid} failed: {e}");
-            // Fix T3: an attempt that ran and did not confirm feeds the
-            // pair's back-off (finding §3 storm guard).
-            ctx.record_punch_outcome(gid, false);
+    let mut trial = punch::CandidateTrial::new(&candidates, Instant::now());
+    let mut last_addr: Option<SocketAddr> = None;
+    loop {
+        // Make-before-break: NEVER let this endpoint-driven punch clobber an
+        // ACTIVE relay endpoint. Under approach B a WireGuard peer has exactly
+        // ONE endpoint and the endpoint-set IS the punch, so pointing WG at a
+        // direct candidate while the peer is Relayed points it AWAY from the
+        // relay socket (`127.0.0.1:<relay port>` that `ensure_relay_transport`
+        // installed) — relay recv then times out and the path sawtooths
+        // relayed -> disconnected -> connecting -> relayed. A corroborated
+        // Relayed -> Direct cutover needs a forced rehandshake and no second
+        // socket, which is a DOCUMENTED fast-follow (CLAUDE.md / cycle4c note),
+        // so until then a punch trial must YIELD to a live relay path rather
+        // than disrupt it. `relay_pointed` is the precise signal ("WG endpoint
+        // currently points at a relay socket"); `path.state == Relayed` closes
+        // the brief transition window before `ensure_relay_transport` has set
+        // `relay_pointed` (Connecting times out -> Relayed, relay endpoint
+        // still installing). Checking BOTH covers the ProbeDirect probe, a
+        // controller directive that slipped past the back-off, and a mid-trial
+        // Connecting -> Relayed transition, AND the case3 relay-eviction
+        // re-path (Disconnected -> Connecting StartPunch while the endpoint is
+        // already re-pointed at the second relay). We return WITHOUT recording
+        // a punch outcome: no dialability was actually tested (the trial
+        // yielded), so neither success nor failure should feed the pair's
+        // back-off. This is the regression fix for the endpoint-driven punch
+        // clobbering the relay path (relay_matrix 0/2, convergence A4).
+        let on_relay = {
+            let relayed = ctx
+                .paths
+                .lock()
+                .unwrap()
+                .get(&gid)
+                .map(|p| p.state == PathState::Relayed)
+                .unwrap_or(false);
+            let pointed = ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+            relayed || pointed
+        };
+        if on_relay {
+            // Low-noise, and deliberately NOT worded with any of the four
+            // attempt-counting prefixes (`punch to peer=`, `no candidate
+            // confirmed`, `punch confirmed`, `punch task for peer=`) — yielding
+            // to the relay is not a punch attempt.
+            eprintln!(
+                "wiremesh-gateway: peer={gid} on active relay path; deferring direct punch \
+                 (make-before-break, relay kept flowing)"
+            );
             return;
         }
-        Err(e) => {
-            eprintln!("wiremesh-gateway: punch task for peer={gid} panicked: {e}");
-            // A join panic isn't `punch_candidates` returning `Err`, but the
-            // attempt provably ran without confirming — count it (fix T3):
-            // a repeatedly-panicking punch path must decay like any other
-            // persistent failure rather than storm.
-            ctx.record_punch_outcome(gid, false);
+
+        match trial.poll(Instant::now(), PER_CANDIDATE_PUNCH_TIMEOUT) {
+            punch::TrialStep::Punch(addr) => {
+                last_addr = Some(addr);
+                // Set the endpoint via the scoped remove+re-add (make-before-
+                // break: only THIS peer's session resets, spike finding 2 — no
+                // boringtun in-place modify), then nudge it to handshake NOW.
+                match set_peer_endpoint(&ctx, gid, addr, false).await {
+                    // Nudge boringtun to initiate its handshake NOW (spike
+                    // finding 1) — the scoped re-add left the peer sessionless.
+                    Ok(()) => poke_peer_overlay(&ctx, gid).await,
+                    // NB: deliberately NOT worded with a "punch to peer=" /
+                    // "no candidate confirmed" / "punch confirmed" prefix — this
+                    // is a mid-trial, per-candidate error, NOT one of the four
+                    // TERMINAL outcome lines the convergence anti-storm test
+                    // counts as a punch ATTEMPT. Exactly one terminal line is
+                    // emitted per `punch_and_apply` (on Exhausted or Direct).
+                    Err(e) => eprintln!(
+                        "wiremesh-gateway: applying punch endpoint for peer={gid} at {addr} failed: {e}"
+                    ),
+                }
+            }
+            punch::TrialStep::Waiting => {}
+            punch::TrialStep::Exhausted => {
+                // Every candidate tried without a completed handshake (e.g. a
+                // symmetric-NAT peer — the documented relay-needed case), or no
+                // dialable candidate at all. The path SM drives retry/relay,
+                // rate-bounded by the pair's back-off (fix T3).
+                eprintln!("wiremesh-gateway: no candidate confirmed for peer={gid}");
+                ctx.record_punch_outcome(gid, false);
+                return;
+            }
+        }
+
+        // Sleep, then check for the rx-corroborated liveness signal: the punch
+        // IS boringtun's own handshake, so a completed handshake = the peer's
+        // path reaching `Direct` (published by `run_path_ticks` off UAPI). That
+        // is the confirmation — there is no PING/PONG anymore.
+        tokio::time::sleep(PUNCH_POLL_INTERVAL).await;
+        let is_direct = ctx
+            .paths
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .map(|p| p.state == PathState::Direct)
+            .unwrap_or(false);
+        if is_direct {
+            // Fix T3: a landed direct handshake proves the pair dialable, so
+            // the pair's back-off clears immediately.
+            ctx.record_punch_outcome(gid, true);
+            match last_addr {
+                Some(addr) => {
+                    eprintln!("wiremesh-gateway: punch confirmed peer={gid} endpoint={addr}")
+                }
+                None => eprintln!("wiremesh-gateway: punch confirmed peer={gid}"),
+            }
             return;
-        }
-    };
-
-    let Some(addr) = confirmed else {
-        // Nothing confirmed within the window (e.g. symmetric-NAT peer — the
-        // documented relay-needed case). The path SM will drive retry/relay,
-        // rate-bounded by the pair's back-off (fix T3).
-        eprintln!("wiremesh-gateway: no candidate confirmed for peer={gid}");
-        ctx.record_punch_outcome(gid, false);
-        return;
-    };
-
-    // Fix T3: a confirmed candidate resets the pair's back-off immediately
-    // (recorded on confirmation, before the endpoint apply — the punch
-    // itself proved the pair dialable, which is the back-off's question).
-    ctx.record_punch_outcome(gid, true);
-
-    // Re-reconcile the FULL device (replace_peers) with the confirmed endpoint
-    // moved to the front of this peer's candidate list so `primary_endpoint()`
-    // prefers it — this doubles as the make-before-break direct cutover when
-    // `gid` was `Relayed` (the relay transport is torn down separately by
-    // `run_path_ticks` once the ensuing handshake actually lands `Direct`).
-    match set_peer_endpoint(&ctx, gid, addr, false).await {
-        Ok(()) => {
-            eprintln!("wiremesh-gateway: punch confirmed peer={gid} endpoint={addr}");
-            // The path SM transitions to Direct off the ensuing WG handshake,
-            // observed by `run_path_ticks` — not off this punch confirmation.
-        }
-        Err(e) => {
-            eprintln!("wiremesh-gateway: applying punched endpoint for peer={gid} failed: {e}")
         }
     }
 }
 
-/// Point peer `gid`'s WG endpoint at `endpoint` and re-apply the full device
-/// config (guarded: `apply_device_if_changed` makes a re-confirm of an
-/// already-applied endpoint a true no-op, so the controller re-brokering
-/// punches every few seconds never resets a live session).
+/// Point peer `gid`'s WG endpoint at `endpoint` via a SCOPED single-peer
+/// re-point (guarded: the change-guard makes a re-confirm of an already-applied
+/// endpoint a true no-op, so the controller re-brokering punches every few
+/// seconds never resets a live session).
 ///
-/// This uses the FULL `replace_peers` apply (via `apply_device_if_changed`),
-/// NOT a scoped single-peer re-point, because re-pointing is a MODIFY of an
-/// existing peer and boringtun (0.6.0) cannot modify in place. A scoped
-/// remove+re-add of just the target peer WAS prototyped (T8 convergence
-/// work) to spare other peers' sessions from the full apply's `clear_peers()`
-/// — it works for the direct path (nat_matrix green) but deterministically
-/// breaks the RELAY path's session reporting (relay_matrix case1's
-/// real-handshake assertion fails, `latest_handshake=0` on both sides while
-/// data flows), so it was reverted. The full apply's `clear_peers()` reset of
-/// OTHER established peers on a ≥3-gateway fabric (the residual T8
-/// ASSERTION-3 interruption) is a known remaining limitation tracked for a
-/// follow-up (needs either a boringtun fix for remove+re-add relay sessions,
-/// or a redesign that doesn't conflict with fail-static peer bootstrapping).
-/// The T4 live-endpoint pins bound its blast radius: every rebuilt peer keeps
-/// its live endpoint and re-handshakes to the RIGHT place immediately, so the
-/// established pair recovers within a round-trip rather than breaking
-/// permanently like the original incident. Shared by [`punch_and_apply`] (a
-/// hole-punch-confirmed direct candidate, `is_relay=false`) and
-/// [`ensure_relay_transport`] (pointing a peer at its `RelayTransport`'s
-/// local relay socket, Cycle 4c Task 8, `is_relay=true`).
+/// This uses [`apply_peer_endpoint_scoped`] — a `remove=true` + re-add of ONLY
+/// this peer ([`uapi::set_one_peer`]) — NOT the full `replace_peers` apply.
+/// remove+re-add is the only existing-peer mutation boringtun 0.6.0 supports
+/// (its `update_peer` panics on an in-place modify), and scoping it to the
+/// target peer leaves every OTHER peer's live boringtun session and keepalive
+/// timer intact. That is the finding-§5 session-continuity fix: the former
+/// full `replace_peers` apply here was implemented as `clear_peers()`, so a
+/// punch/relay re-point against ONE peer rebuilt EVERY peer's `Tunn` — under
+/// punch contention against a permanently-blocked peer that reset an
+/// established pair's session repeatedly and it degraded (convergence A4). The
+/// earlier scoped attempt was reverted because the re-added peer flowed data
+/// but never reported a current handshake — resolved here by the caller nudging
+/// it to re-handshake promptly (`poke_peer_overlay`, spike finding 1), which
+/// makes the scoped path work for BOTH the direct and relay paths. The T4
+/// live-endpoint pins are still recorded so any later full `apply_state` rebuild
+/// keeps this endpoint. Shared by [`punch_and_apply`] (a hole-punched direct
+/// candidate, `is_relay=false`) and [`ensure_relay_transport`] (pointing a peer
+/// at its `RelayTransport`'s local relay socket, Cycle 4c Task 8,
+/// `is_relay=true`); both nudge after this returns `Ok`.
 ///
 /// `is_relay` records into `ctx.relay_pointed` (Cycle 4c Task 9) whether
 /// `endpoint` is the local relay-transport socket or a real direct
@@ -1136,7 +1328,10 @@ async fn set_peer_endpoint(
     // point; the next apply retries it, and `run_path_ticks` clears the pin
     // if no live path ever materializes.)
     ctx.live_endpoints.lock().unwrap().insert(gid, endpoint.to_string());
-    let dev = {
+    // Build the full pinned desired device (for the change-guard and the
+    // `applied_peers` bookkeeping `apply_state` diffs against) AND resolve the
+    // TARGET peer's pubkey — the one peer whose block the scoped apply pushes.
+    let (dev, target_pubkey) = {
         let desired = ctx.desired.lock().unwrap();
         let ds = desired.as_ref().ok_or_else(|| {
             anyhow::anyhow!("no desired state yet; cannot set endpoint for peer={gid}")
@@ -1150,10 +1345,81 @@ async fn set_peer_endpoint(
         // re-pointing ONE peer can't clobber another's established endpoint.
         let pins = ctx.wg0_pins.lock().unwrap();
         let live = ctx.live_endpoints.lock().unwrap();
-        reconcile::device_config_pinned(ds, &priv_key, wg_port, &pins, &live)
+        let dev = reconcile::device_config_pinned(ds, &priv_key, wg_port, &pins, &live);
+        // The target peer's device pubkey: Role-B pinned if a rotation pin
+        // exists for it, else its advertised active key — the SAME resolution
+        // `device_config_pinned` used to build the target's block, so it always
+        // matches a block in `dev.peers`.
+        let target_pubkey = ds
+            .peers
+            .iter()
+            .find(|p| p.gateway_id == gid)
+            .and_then(|p| pins.get(&gid).cloned().or_else(|| p.active_pubkey_b64.clone()));
+        (dev, target_pubkey)
     };
-    apply_device_if_changed(&ifname, &dev, &ctx.active).await?;
+    // SCOPED apply (session-continuity fix): re-point ONLY this peer via
+    // remove+re-add, leaving every OTHER peer's live boringtun session and
+    // keepalive timer intact. The old full `replace_peers` apply here rebuilt
+    // EVERY peer (`clear_peers()`), so a punch/relay re-point against peer C
+    // reset peer B's established session — under punch contention B then went
+    // silent and degraded (convergence A4). See `apply_peer_endpoint_scoped`.
+    apply_peer_endpoint_scoped(&ifname, &dev, target_pubkey.as_deref(), &ctx.active).await?;
     ctx.relay_pointed.lock().unwrap().insert(gid, is_relay);
+    Ok(())
+}
+
+/// Re-point ONE peer's endpoint on `ifname` via a scoped remove+re-add
+/// ([`uapi::set_one_peer`]), leaving every OTHER peer's live boringtun session
+/// untouched. This replaces [`set_peer_endpoint`]'s former full
+/// [`apply_device_if_changed`] (`replace_peers=true` → `clear_peers()`), which
+/// rebuilt every peer's `Tunn` — so a punch/relay re-point against one peer
+/// reset every OTHER established peer, the finding-§5 session-continuity
+/// contention (convergence A4: peerB degraded whenever a permanently-blocked
+/// peerC was punched/relayed).
+///
+/// `dev` is the full pinned desired device, used ONLY for the change-guard (so
+/// re-confirming an already-applied endpoint stays a true no-op) and to keep
+/// `applied_config`/`applied_peers` consistent with the logical device state
+/// that `apply_state`'s incremental-add diff compares against. `target_pubkey`
+/// selects which single peer block to push. The scoped remove+re-add resets
+/// only the target's session (boringtun can't modify a peer in place); the
+/// caller nudges it to re-handshake promptly (`poke_peer_overlay`).
+async fn apply_peer_endpoint_scoped(
+    ifname: &str,
+    dev: &DeviceConfig,
+    target_pubkey: Option<&str>,
+    active: &Arc<std::sync::Mutex<ActiveTunInfo>>,
+) -> anyhow::Result<()> {
+    let encoded = uapi::encode_set(dev).context("encoding active-tun device config")?;
+    // Change-guard: a re-confirm of an already-applied endpoint is a no-op
+    // (the controller re-brokers punches every few seconds; without this it
+    // would needlessly reset the target's session on every one).
+    if active.lock().unwrap().applied_config.as_deref() == Some(encoded.as_str()) {
+        return Ok(());
+    }
+    // The single peer whose endpoint we're setting. Absent (target not keyed,
+    // or dropped from desired state) → nothing to push to the device; still
+    // sync the change-guard to the logical device state so a later reconcile
+    // doesn't see phantom drift.
+    let peer = target_pubkey
+        .and_then(|pk| dev.peers.iter().find(|p| p.public_key_b64 == pk).cloned());
+    if let Some(peer) = peer {
+        let ifn = ifname.to_string();
+        tokio::task::spawn_blocking(move || uapi::set_one_peer(&ifn, &peer))
+            .await
+            .context("scoped set-one-peer UAPI task panicked")??;
+    }
+    // Keep the change-guard consistent with the logical full-device state:
+    // after the scoped remove+re-add boringtun holds exactly `dev`'s peers
+    // (target re-pointed, others unchanged), so `apply_state`'s
+    // `classify_peer_delta` (which diffs `applied_peers`) correctly sees the
+    // new endpoint and stays on its Unchanged/incremental-add fast paths
+    // rather than forcing a session-destructive full apply.
+    {
+        let mut a = active.lock().unwrap();
+        a.applied_config = Some(encoded);
+        a.applied_peers = dev.peers.clone();
+    }
     Ok(())
 }
 
@@ -1264,6 +1530,15 @@ async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_pro
     if let Err(e) = set_peer_endpoint(&ctx, gid, local_addr, true).await {
         eprintln!("wiremesh-gateway: pointing peer={gid} at relay={relay_id} endpoint failed: {e}");
     } else {
+        // NUDGE boringtun to handshake over the relay NOW (spike finding 1):
+        // `set_peer_endpoint`'s scoped remove+re-add left the peer sessionless,
+        // and boringtun would otherwise not init until its ~26s keepalive tick —
+        // so the relay tunnel would flow encrypted data but never complete a
+        // handshake (relay_matrix case1: `latest_handshake` stuck at 0 on both
+        // sides while data flows). Same tun-nudge the direct punch uses. Fires
+        // on a relay-to-relay re-path too (case3), since this runs on every
+        // (re)establish.
+        poke_peer_overlay(&ctx, gid).await;
         eprintln!("wiremesh-gateway: peer={gid} now relayed via relay={relay_id} ({local_addr})");
     }
 }
@@ -1311,23 +1586,27 @@ async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
 /// guard).
 ///
 /// Stability debug note (Cycle 4c Task 9, `relay_matrix.rs` case 1 flake):
-/// `Path::tick`'s `Relayed` arm now rate-limits `ProbeDirect` to once per
+/// `Path::tick`'s `Relayed` arm rate-limits `ProbeDirect` to once per
 /// `path::PROBE_DIRECT_INTERVAL` (with a full grace interval before the
-/// FIRST probe of a `Relayed` spell), rather than every ~1s tick. Firing
-/// every tick stacked back-to-back `punch_and_apply` attempts (the punch
-/// window outlives a tick, so the next tick's request was rejected by
-/// `try_start_punch` — "punch already in flight; skipping" — and immediately
-/// retried the instant the guard released) and kept the driver's transient
-/// same-port `SO_REUSEPORT` punch socket (`punch::punch_candidates`) open
-/// almost continuously. That socket shares the WG listen port with
-/// `RelayTransport`'s local downlink delivery target (`ensure_relay_transport`
-/// binds its `local_peer_hint` at `127.0.0.1:<wg_listen_port>`, the very
-/// address boringtun's own socket listens on), so the kernel's
-/// `SO_REUSEPORT` load-balancing intermittently steered inbound relayed WG
-/// datagrams to the punch socket instead of boringtun's — silently starving
-/// an otherwise-healthy relay path of traffic, which is what actually broke
-/// case 1, not a bad state-machine transition. See
-/// docs/research/cycle4c-relay-stability-note.md. Note this only makes the
+/// FIRST probe of a `Relayed` spell), rather than every ~1s tick. HISTORICAL
+/// root cause (now removed by the puncher-socket-isolation cycle): firing
+/// every tick stacked back-to-back `punch_and_apply` attempts, which each
+/// opened the driver's transient same-port `SO_REUSEPORT` punch socket
+/// (`punch::punch_candidates`) — kept almost continuously open, it shared the
+/// WG listen port with `RelayTransport`'s local downlink delivery target
+/// (`ensure_relay_transport` binds its `local_peer_hint` at
+/// `127.0.0.1:<wg_listen_port>`, the very address boringtun's own socket
+/// listens on), so the kernel's `SO_REUSEPORT` load-balancing intermittently
+/// steered inbound relayed WG datagrams to the punch socket instead of
+/// boringtun's — silently starving an otherwise-healthy relay path of traffic,
+/// which is what actually broke case 1, not a bad state-machine transition.
+/// See docs/research/cycle4c-relay-stability-note.md. **That punch socket no
+/// longer exists** — `punch_and_apply` now drives boringtun's own handshake
+/// (endpoint-set + tun nudge, no competing socket), so the starvation
+/// mechanism is gone at the source; the `ProbeDirect` rate-limit is retained
+/// because a low background probe rate is still the right posture (a full
+/// `replace_peers` re-point is not free) and it keeps the relay path's
+/// long undisturbed windows. Note this only makes the
 /// RELAY path stable; a genuine `Relayed -> Direct` cutover for a pair whose
 /// NAT kind allows it was already correct (`punch_and_apply` only repoints
 /// the WG endpoint on a CONFIRMED candidate — never blindly) and is
@@ -1379,6 +1658,12 @@ async fn run_path_ticks(ctx: PathCtx) {
     // session, timestamp climbing every tick with rx frozen) refreshes its
     // pending entry forever but never sees rx move, so it is never promoted.
     let mut pending_hs: HashMap<u64, Instant> = HashMap::new();
+    // Last instant we sent a liveness probe (visible overlay datagram) to each
+    // peer, so probes fire at most once per `LIVENESS_PROBE_INTERVAL` rather
+    // than every ~1s tick. See `LIVENESS_PROBE_INTERVAL`: this is what makes a
+    // keepalive-only-idle `Direct`/`Relayed` path's rx-corroborated liveness
+    // hold, since boringtun does not count bare WG keepalives in `rx_bytes`.
+    let mut last_probe: HashMap<u64, Instant> = HashMap::new();
     loop {
         tokio::time::sleep(PATH_TICK_PERIOD).await;
 
@@ -1458,6 +1743,8 @@ async fn run_path_ticks(ctx: PathCtx) {
         let mut to_punch: Vec<(u64, Vec<String>)> = Vec::new();
         let mut to_relay_needed: Vec<u64> = Vec::new();
         let mut to_teardown_relay: Vec<u64> = Vec::new();
+        // Peers due a liveness probe this tick (keepalive-invisibility fix).
+        let mut to_probe: Vec<u64> = Vec::new();
         {
             let mut paths = ctx.paths.lock().unwrap();
             for peer in &ds.peers {
@@ -1598,6 +1885,26 @@ async fn run_path_ticks(ctx: PathCtx) {
                     Some(PathAction::Retry) | None => {}
                 }
 
+                // Liveness probe (keepalive-invisibility fix): a peer in a LIVE
+                // state must keep receiving VISIBLE inbound to hold, because
+                // boringtun does not count bare WG keepalives in `rx_bytes`
+                // (see `LIVENESS_PROBE_INTERVAL`). Send a small overlay datagram
+                // toward each live peer every `LIVENESS_PROBE_INTERVAL`; every
+                // gateway does this, so each live pair exchanges visible rx and
+                // both sides corroborate through a keepalive-only idle
+                // (convergence A4). Only `Direct`/`Relayed` — `Connecting` is
+                // already nudged by the punch, and a `Degraded`/`Disconnected`
+                // peer recovers via the punch/relay path, not a probe.
+                if matches!(path.state, PathState::Direct | PathState::Relayed) {
+                    let due = last_probe
+                        .get(&gid)
+                        .map_or(true, |t| now.saturating_duration_since(*t) >= LIVENESS_PROBE_INTERVAL);
+                    if due {
+                        last_probe.insert(gid, now);
+                        to_probe.push(gid);
+                    }
+                }
+
                 if before != path.state {
                     to_record.push((gid, before, path.state));
                     if path.state == PathState::Direct {
@@ -1614,6 +1921,14 @@ async fn run_path_ticks(ctx: PathCtx) {
         // (fix T5). Whole-map replacement: peers dropped from desired state
         // vanish from the scrape body the same tick.
         *ctx.peer_stats.lock().unwrap() = stats_snapshot;
+
+        // Fire this tick's due liveness probes (keepalive-invisibility fix).
+        // Spawned, not awaited, so a slow send never delays the tick loop; the
+        // per-peer cadence is already bounded by `last_probe`.
+        for gid in to_probe {
+            let ctx = ctx.clone();
+            tokio::spawn(async move { poke_peer_overlay(&ctx, gid).await });
+        }
 
         for (gid, before, after) in to_record {
             // Fix T4: a path leaving the LIVE states (Direct / Relayed) no
@@ -2580,7 +2895,6 @@ mod tests {
                 applied_config: None,
                 applied_peers: Vec::new(),
             })),
-            base_wg_port: 0,
             identity: Arc::new(Identity {
                 cert_pem: String::new(),
                 key_pem: String::new(),
