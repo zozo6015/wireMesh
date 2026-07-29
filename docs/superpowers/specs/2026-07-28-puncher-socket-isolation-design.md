@@ -100,11 +100,11 @@ convention), following `spike/natpunch`'s harness:
   observed candidate — NO `SO_REUSEPORT` socket anywhere — and asserts a real
   WG handshake completes (direct path) reliably (bar: 4/4 runs, matching
   natpunch).
-- Answers: does boringtun emit its init promptly enough on endpoint-set to open
-  the mapping within the crossing window? If yes → productionize as below. If
-  the init timing is too loose, the spike is where we discover whether a nudge
-  (e.g. a UAPI touch that forces an immediate init) is needed — WITHOUT
-  reintroducing a competing socket.
+- Answered (spike RESULT above): boringtun does NOT emit an init promptly on an
+  endpoint-set — it waits for its ~26s persistent-keepalive tick — so a nudge IS
+  required. The productionization uses the tun-based nudge (write a packet toward
+  the peer overlay IP → boringtun inits immediately), WITHOUT reintroducing a
+  competing socket. See "spike RESULT: GO-WITH-NUDGE".
 - Records its result in `docs/research/` (go/no-go + runs), like every spike.
 
 ## Scope
