@@ -217,3 +217,18 @@ auto-rebind-on-orphan remains the fix (tracked in the operator follow-ups).
 A Twingate client on an operator workstation intercepts overlapping resource
 CIDRs ahead of the mesh static routes — mesh-vs-ZTNA-client route shadowing is
 worth a docs paragraph.
+
+## Puncher-socket-isolation productionization (2026-07-29): test-coverage note
+
+The §3 fix (endpoint-driven punch + prompt-init nudge, no `SO_REUSEPORT` punch
+socket) removed `crates/wiremesh-gateway/src/punch.rs`'s `punch_candidates` and
+its `observe::reuseport_udp` use. The old `tests/punch_netns.rs` — which drove
+two `SO_REUSEPORT` sockets through a port-restricted NAT and confirmed a punch
+via a `PING`/`PONG` exchange — tested a mechanism that no longer exists, so it
+was **removed** (not ported): the punch is now boringtun's own handshake, which
+requires a full boringtun device and is exercised end-to-end by
+`tests/nat_matrix.rs` (brokered punch → real WG handshake → `Direct` through a
+port-restricted NAT), `tests/mesh_milestone.rs`, and the un-ignored
+`tests/convergence_matrix.rs` done-bar. The new pure surfaces
+(`nudge_target`/`nudge_peer`/`CandidateTrial`) are unit-pinned by
+`tests/punch_endpoint_driven.rs`. Net coverage is preserved and strengthened.

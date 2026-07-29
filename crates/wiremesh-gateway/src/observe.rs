@@ -67,12 +67,15 @@ pub fn report_once(
 }
 
 /// Bind a UDP socket to `0.0.0.0:port` with `SO_REUSEADDR + SO_REUSEPORT`
-/// (spec §3/§5.4: the transient punch socket and the observation probe both
-/// need to present the *same* source `ip:port` boringtun's own WG socket
-/// uses). `pub(crate)` so `punch.rs` (same crate) can reuse this exact
-/// technique instead of duplicating the raw-socket setup — see `punch.rs`.
-/// (The `netns` integration tests are a separate compilation unit and cannot
-/// reach a `pub(crate)` item, so `tests/punch_netns.rs` keeps its own copy.)
+/// (spec §5.4: the controller address-echo observation probe presents the
+/// *same* source `ip:port` boringtun's own WG socket uses, so the controller
+/// echoes back the public mapping the WG data plane will actually use). This
+/// is the ONLY remaining `SO_REUSEPORT` socket in the gateway: it is transient
+/// (one probe per `OBSERVE_PERIOD`, not the near-continuous §3 punch-socket
+/// culprit) and genuinely needs its own socket to receive a non-WG reply —
+/// explicitly kept out of scope by the puncher-socket-isolation cycle, which
+/// removed the punch's use of it. This helper is `pub(crate)`; its only caller,
+/// `report_once` above, is `pub`.
 pub(crate) fn reuseport_udp(port: u16) -> anyhow::Result<UdpSocket> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);

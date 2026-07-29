@@ -158,6 +158,69 @@ pub fn add_peers(ifname: &str, peers: &[PeerConfig]) -> anyhow::Result<()> {
     send_set(ifname, &encode_add_peers(peers)?)
 }
 
+/// Encode OP 1 of the scoped single-peer re-point: REMOVE only the target
+/// peer. One `set=1` body with NO `replace_peers`/`private_key`/`listen_port`
+/// header, so every OTHER peer's live boringtun `Tunn` session and keepalive
+/// timer stay intact; `remove=true` on an absent peer is a no-op (standard
+/// UAPI). See [`set_one_peer`] for why this is a SEPARATE message from the
+/// re-add.
+pub fn encode_remove_peer(public_key_b64: &str) -> anyhow::Result<String> {
+    let hex = key_b64_to_hex(public_key_b64)?;
+    // Trailing blank line terminates the request.
+    Ok(format!("public_key={hex}\nremove=true\n\n"))
+}
+
+/// Apply a SCOPED single-peer re-point to `ifname` as TWO separate `set=1`
+/// operations — remove, then clean add — leaving every other peer's live
+/// session untouched. This is the make-before-break endpoint re-point that
+/// replaces the full [`apply`] (`replace_peers=true` = `clear_peers()`, which
+/// rebuilt EVERY peer's session — so a punch/relay re-point against one peer
+/// reset every OTHER established peer, the session-continuity contention this
+/// cycle eliminates).
+///
+/// TWO messages, NOT one: boringtun 0.6.0's `set` handler does NOT re-create a
+/// peer from a re-add block that FOLLOWS a `remove=true` of the SAME key in the
+/// SAME `set=1` — the remove wins and the peer VANISHES (observed as `wg show`
+/// listing no peers + `endpoint=None`). So:
+///
+///  1. [`encode_remove_peer`] removes the existing peer (the only way to change
+///     it — boringtun's `update_peer` panics on an in-place modify of a present
+///     peer, see [`apply`]/[`encode_add_peers`]).
+///  2. [`encode_add_peers`] cleanly ADDs the now-absent peer with the new
+///     endpoint/allowed-ips/keepalive, via the same `Tunn::new` CREATE path a
+///     brand-new peer takes — no in-place modify, no panic.
+///
+/// Neither op carries `replace_peers`, so no other peer is touched. The
+/// re-created peer starts with NO noise session, so the CALLER MUST nudge
+/// boringtun to initiate a fresh handshake promptly (spike finding 1); without
+/// that nudge the re-added peer flows data but never reports a current
+/// handshake — the breakage the earlier scoped attempt hit before the nudge.
+pub fn set_one_peer(ifname: &str, peer: &PeerConfig) -> anyhow::Result<()> {
+    // Op 1: remove the existing peer (no replace_peers → others untouched).
+    send_set(ifname, &encode_remove_peer(&peer.public_key_b64)?)?;
+    // Op 2: clean add of the now-absent peer with its new endpoint.
+    //
+    // PARTIAL-FAILURE SAFETY (MAJOR-2): the remove already succeeded, so if the
+    // ADD send fails the peer is now REMOVED from the device. Silently
+    // returning would let the caller's change-guard record the re-point as
+    // applied while the peer is actually GONE (traffic to it black-holes until
+    // some later full apply). So retry the add ONCE, and if it STILL fails
+    // propagate the error (never swallow) — the scoped caller then leaves its
+    // change-guard un-updated, so the next `apply_state` reconciles and re-adds
+    // the peer.
+    let add_body = encode_add_peers(std::slice::from_ref(peer))?;
+    if let Err(first) = send_set(ifname, &add_body) {
+        eprintln!(
+            "wiremesh-gateway: scoped peer re-add failed after remove succeeded ({first}); \
+             retrying the add once (peer is currently REMOVED)"
+        );
+        send_set(ifname, &add_body).with_context(|| {
+            format!("re-adding peer after remove (peer left REMOVED; first attempt: {first})")
+        })?;
+    }
+    Ok(())
+}
+
 /// Derive the base64 WireGuard public key from a base64 private key.
 pub fn base64_pub_from_priv(priv_b64: &str) -> anyhow::Result<String> {
     let raw = base64_decode(priv_b64)?;
@@ -475,6 +538,58 @@ mod tests {
              \n"
         );
         assert_eq!(out, expected);
+    }
+
+    /// The scoped single-peer re-point MUST be TWO separate `set=1` ops —
+    /// remove, then a clean add — NEITHER carrying `replace_peers` (or the
+    /// device header). Regression pin: the earlier one-message
+    /// `remove=true`+re-add of the SAME key made boringtun 0.6 drop the peer
+    /// entirely (`wg show`: no peers, `endpoint=None`), so this pins that the
+    /// two ops are encoded distinctly and the remove/add live in different
+    /// messages. (DeviceHandle-level GET verification — target present with its
+    /// new endpoint AND a second pre-existing peer still present — is the
+    /// test-author's `tests/scoped_peer_apply.rs`.)
+    #[test]
+    fn scoped_set_one_peer_is_two_ops_remove_then_add_no_replace_peers() {
+        let pub_raw = [0x22u8; 32];
+        let peer = PeerConfig {
+            public_key_b64: b64(&pub_raw),
+            endpoint: Some("203.0.113.5:51820".into()),
+            allowed_ips: vec!["10.10.2.0/24".into()],
+            keepalive_secs: 25,
+        };
+        let pub_hex = "22".repeat(32);
+
+        // Op 1: remove ONLY the target peer — no re-add in this message, no
+        // replace_peers/private_key/listen_port (every other peer untouched).
+        let remove = encode_remove_peer(&peer.public_key_b64).unwrap();
+        assert_eq!(remove, format!("public_key={pub_hex}\nremove=true\n\n"));
+
+        // Op 2: a clean ADD of the now-absent peer with its new endpoint — the
+        // exact incremental-add encoder (a CREATE, not an in-place modify, so
+        // no boringtun `update_peer` panic).
+        let add = encode_add_peers(std::slice::from_ref(&peer)).unwrap();
+        let expected_add = format!(
+            "public_key={pub_hex}\n\
+             endpoint=203.0.113.5:51820\n\
+             replace_allowed_ips=true\n\
+             allowed_ip=10.10.2.0/24\n\
+             persistent_keepalive_interval=25\n\
+             \n"
+        );
+        assert_eq!(add, expected_add);
+
+        // The invariant the single-message bug violated: NEITHER op carries
+        // `replace_peers` (which would `clear_peers()` every OTHER session) nor
+        // the device header — remove and add are SEPARATE `set=1` messages.
+        for op in [&remove, &add] {
+            assert!(!op.contains("replace_peers"), "scoped op must not replace_peers: {op:?}");
+            assert!(!op.contains("private_key="), "scoped op must not carry device header: {op:?}");
+            assert!(!op.contains("listen_port="), "scoped op must not carry device header: {op:?}");
+        }
+        // Op 1 removes; op 2 must NOT (it re-adds the peer).
+        assert!(remove.contains("remove=true"), "op 1 removes: {remove:?}");
+        assert!(!add.contains("remove=true"), "op 2 must not remove: {add:?}");
     }
 
     #[test]
