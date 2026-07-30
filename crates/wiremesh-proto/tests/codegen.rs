@@ -3,7 +3,7 @@ use prost::Message;
 use wiremesh_proto::v1::{
     StateSnapshot, Peer, sync_message::Body, SyncMessage, PunchDirective, ReportRequest,
     RelayInfo, RelayHealth, Delta, EnrollRequest, RotateDirective, SubmitEpochKeyRequest,
-    EpochAck,
+    EpochAck, PeerPath,
 };
 
 #[test]
@@ -67,6 +67,8 @@ fn report_request_local_endpoints_roundtrips() {
         local_endpoints: vec!["10.0.0.5:51820".into()],
         relay_health: vec![],
         epoch_acks: vec![],
+        peer_paths: vec![],
+        peer_paths_snapshot: false,
     };
     let bytes = with_endpoints.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
@@ -79,6 +81,8 @@ fn report_request_local_endpoints_roundtrips() {
         local_endpoints: vec![],
         relay_health: vec![],
         epoch_acks: vec![],
+        peer_paths: vec![],
+        peer_paths_snapshot: false,
     };
     let bytes = no_endpoints.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
@@ -182,6 +186,8 @@ fn report_request_relay_health_roundtrips() {
             RelayHealth { relay_id: 2, healthy: false },
         ],
         epoch_acks: vec![],
+        peer_paths: vec![],
+        peer_paths_snapshot: false,
     };
 
     let bytes = report.encode_to_vec();
@@ -275,6 +281,8 @@ fn report_request_epoch_acks_roundtrips() {
             EpochAck { peer_gateway_id: 1, epoch: 6, live: true },
             EpochAck { peer_gateway_id: 2, epoch: 6, live: false },
         ],
+        peer_paths: vec![],
+        peer_paths_snapshot: false,
     };
 
     let bytes = with_acks.encode_to_vec();
@@ -295,8 +303,72 @@ fn report_request_epoch_acks_roundtrips() {
         local_endpoints: vec!["10.0.0.5:51820".into()],
         relay_health: vec![],
         epoch_acks: vec![],
+        peer_paths: vec![],
+        peer_paths_snapshot: false,
     };
     let bytes = no_acks.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
     assert_eq!(decoded, no_acks);
+}
+
+#[test]
+fn report_request_peer_paths_roundtrips() {
+    // Directive-storm fix (FIX A): ReportRequest gains `repeated PeerPath
+    // peer_paths = 5;` with `message PeerPath { uint64 peer_gateway_id = 1;
+    // string state = 2; }` so a gateway can tell the controller its current
+    // per-peer path state (the lowercase `PathState::as_str()` label) and
+    // the broker can stop re-punching pairs that are already settled. Two
+    // distinct states, to prove `state` is a real per-entry string and not
+    // a defaulted value.
+    //
+    // CodeRabbit follow-up: `bool peer_paths_snapshot = 6;` disambiguates a
+    // NEW client's snapshot report (true — `peer_paths` is the reporter's
+    // COMPLETE current path map, empty meaning "no tracked paths, clear my
+    // stored states") from an old client / the rotation-tick epoch-ack
+    // unary report (false — not a path snapshot, must never wipe stored
+    // states). `true` must survive the wire; absent/default must decode
+    // `false` (old-client requests never set it).
+    let with_paths = ReportRequest {
+        applied_version: 9,
+        local_endpoints: vec!["10.0.0.5:51820".into()],
+        relay_health: vec![],
+        epoch_acks: vec![],
+        peer_paths: vec![
+            PeerPath { peer_gateway_id: 2, state: "direct".into() },
+            PeerPath { peer_gateway_id: 3, state: "connecting".into() },
+        ],
+        peer_paths_snapshot: true,
+    };
+
+    let bytes = with_paths.encode_to_vec();
+    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+
+    assert_eq!(decoded.peer_paths.len(), 2);
+    assert_eq!(decoded.peer_paths[0].peer_gateway_id, 2);
+    assert_eq!(decoded.peer_paths[0].state, "direct");
+    assert_eq!(decoded.peer_paths[1].peer_gateway_id, 3);
+    assert_eq!(decoded.peer_paths[1].state, "connecting");
+    assert!(
+        decoded.peer_paths_snapshot,
+        "peer_paths_snapshot=true (a new client's snapshot report) must roundtrip"
+    );
+
+    // Empty peer_paths must still roundtrip cleanly (additive field,
+    // old-client behavior — an empty list must decode as today's request),
+    // and the unset snapshot flag must decode as false.
+    let no_paths = ReportRequest {
+        applied_version: 9,
+        local_endpoints: vec!["10.0.0.5:51820".into()],
+        relay_health: vec![],
+        epoch_acks: vec![],
+        peer_paths: vec![],
+        peer_paths_snapshot: false,
+    };
+    let bytes = no_paths.encode_to_vec();
+    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    assert_eq!(decoded, no_paths);
+    assert!(
+        !decoded.peer_paths_snapshot,
+        "an old-client request (flag never set) must decode peer_paths_snapshot=false"
+    );
 }

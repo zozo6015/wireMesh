@@ -149,7 +149,7 @@ async fn connect_via_hostname_yields_working_mtls_sync() {
         "snapshot over the hostname-dialed channel lists peer B's segment: {:?}",
         ds.peers
     );
-    sync::report(&mut client, ds.policy_version, vec![], vec![], vec![])
+    sync::report(&mut client, ds.policy_version, vec![], vec![], vec![], None)
         .await
         .expect("report over hostname-dialed channel");
 }

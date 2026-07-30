@@ -917,6 +917,8 @@ impl StubGateway {
                 local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
                 relay_health: vec![],
                 epoch_acks: vec![],
+                peer_paths: vec![],
+                peer_paths_snapshot: false,
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report failed: {status}"))?;
@@ -1010,9 +1012,76 @@ impl StubGateway {
                     })
                     .collect(),
                 epoch_acks: vec![],
+                peer_paths: vec![],
+                peer_paths_snapshot: false,
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report (relay health) failed: {status}"))?;
+        Ok(())
+    }
+
+    /// (Directive-storm fix) Additive counterpart to [`Self::report`] that
+    /// also populates `ReportRequest.peer_paths` — what a real gateway's
+    /// steady-state sync loop computes from its own path state machine
+    /// (`wiremesh_gateway::path::PathState::as_str()`'s lowercase labels),
+    /// stood in here by a caller-supplied `(peer_gateway_id, state)` list so
+    /// controller-only tests can exercise the broker's both-settled punch
+    /// skip without any real gateway data plane. Sends
+    /// `peer_paths_snapshot: true` — it models a NEW steady-state client,
+    /// whose report is always its COMPLETE path map, so the broker REPLACES
+    /// the stored states with `peer_paths` (an empty list here therefore
+    /// CLEARS them; the plain [`Self::report`] keeps the old-client shape:
+    /// empty `peer_paths`, snapshot=false, a broker no-op).
+    /// `local_endpoints` is taken alongside (unlike
+    /// [`Self::report_epoch_acks`]) because `local_endpoints` has
+    /// full-REPLACE empty-list-clears semantics — a peer-path report must be
+    /// able to re-assert the candidate set it isn't changing. Mirrors
+    /// [`Self::report_with_relay_health`]'s connection setup exactly.
+    pub async fn report_with_peer_paths(
+        &self,
+        applied_version: u64,
+        local_endpoints: &[&str],
+        peer_paths: &[(u64, &str)],
+    ) -> anyhow::Result<()> {
+        let uri = format!("https://{}", self.sync_addr);
+        let tls = ClientTlsConfig::new()
+            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
+            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
+            .domain_name("127.0.0.1");
+        let channel = Channel::from_shared(uri)
+            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
+            .tls_config(tls)
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "configuring StubGateway mTLS for Sync.Report (peer paths): {e}"
+                )
+            })?
+            .connect()
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "connecting to the controller's Sync (mTLS) TCP port for Sync.Report \
+                     (peer paths): {e}"
+                )
+            })?;
+
+        SyncClient::new(channel)
+            .report(ReportRequest {
+                applied_version,
+                local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
+                relay_health: vec![],
+                epoch_acks: vec![],
+                peer_paths: peer_paths
+                    .iter()
+                    .map(|(peer_gateway_id, state)| wiremesh_proto::v1::PeerPath {
+                        peer_gateway_id: *peer_gateway_id,
+                        state: state.to_string(),
+                    })
+                    .collect(),
+                peer_paths_snapshot: true,
+            })
+            .await
+            .map_err(|status| anyhow::anyhow!("Sync.Report (peer paths) failed: {status}"))?;
         Ok(())
     }
 
@@ -1066,6 +1135,8 @@ impl StubGateway {
                         live: *live,
                     })
                     .collect(),
+                peer_paths: vec![],
+                peer_paths_snapshot: false,
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report (epoch acks) failed: {status}"))?;

@@ -86,3 +86,7 @@ heals too.
   re-resolution as the gateway.
 - Consider also alerting on roster `applied_version` lag (controller side),
   which is what actually exposed this.
+- **Sync session generation**: per-boot nonce in Watch+Report so a delayed
+  pre-restart Report can't restore stale
+  `peer_paths`/`local_endpoints`/`relay_health` after reconnect (see
+  `Broker::on_report`'s known-race note).

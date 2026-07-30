@@ -855,6 +855,22 @@ impl Sync for SyncSvc {
             })?;
 
         let req = request.into_inner();
+
+        // (Directive-storm fix) Record this gateway's per-peer path states
+        // FIRST — before `set_local_candidates` below can publish an
+        // `EndpointObserved` — so a single Report carrying BOTH a candidate
+        // change and settled `peer_paths` has its states already stored by
+        // the time the broker's candidate-change trigger runs, and the
+        // both-settled skip applies to that very trigger (a candidate change
+        // must never bypass the skip). `peer_paths_snapshot` distinguishes a
+        // new client's full-map snapshot (REPLACE, empty clears) from the
+        // legacy upsert-only shape where empty is a no-op (old client /
+        // rotation-tick epoch ack) — see `Broker::on_report`. Synchronous (a
+        // `std::sync::Mutex` map update), so it costs the Report call
+        // nothing.
+        self.broker
+            .on_report(gw.id, &req.peer_paths, req.peer_paths_snapshot);
+
         self.db
             .set_applied_version(gw.id, req.applied_version)
             .await

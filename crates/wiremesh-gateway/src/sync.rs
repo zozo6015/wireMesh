@@ -8,8 +8,8 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity as TlsIdentity};
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{
-    sync_message::Body, EpochAck, PunchDirective, RelayHealth, ReportRequest, RotateDirective,
-    SubmitEpochKeyRequest, SyncMessage, WatchRequest,
+    sync_message::Body, EpochAck, PeerPath, PunchDirective, RelayHealth, ReportRequest,
+    RotateDirective, SubmitEpochKeyRequest, SyncMessage, WatchRequest,
 };
 
 /// One decoded Sync message, surfaced to the gateway boot loop. `Snapshot`/
@@ -153,15 +153,49 @@ pub async fn watch(client: &mut SyncClient<Channel>) -> anyhow::Result<tonic::St
 /// session with rotating gateway A's epoch-N key" — the signal that drives
 /// the controller's promote state machine. The steady-state sync loop sends
 /// an empty vec; only the rotation observation tick (Role B) populates it.
+///
+/// `peer_paths` (directive-storm fix + CodeRabbit snapshot follow-up) is
+/// this gateway's complete current per-peer path-state SNAPSHOT (one entry
+/// per tracked peer in `ctx.paths`, `state` = `PathState::as_str()`'s
+/// lowercase label), which the controller's broker uses to stop re-punching
+/// a pair BOTH sides report settled ("direct"/"relayed" —
+/// make-before-break awareness). The `Option` encodes the wire's
+/// `peer_paths_snapshot` flag so the two shapes can't be mixed up:
+///
+/// - `Some(paths)` — a genuine snapshot (the steady-state sync loop, every
+///   `Report` call): sets `peer_paths_snapshot: true`, so the broker
+///   REPLACES this gateway's stored states with `paths` — INCLUDING
+///   `Some(vec![])`, which clears them (no tracked paths is real
+///   information; without the flag an empty list would be
+///   indistinguishable from an old client and the broker's stored states
+///   would go stale until reconnect — reports are event-driven, sent when
+///   a `SyncEvent::State` applies, not periodic, so "the next report fixes
+///   it soon" holds no water).
+/// - `None` — not a path snapshot (the rotation observation tick's unary
+///   epoch-ack report): sends the legacy shape (empty list,
+///   `peer_paths_snapshot: false`), a broker NO-OP that must never wipe
+///   the states the last real snapshot established mid-rotation.
 pub async fn report(
     client: &mut SyncClient<Channel>,
     applied_version: u64,
     local_endpoints: Vec<String>,
     relay_health: Vec<RelayHealth>,
     epoch_acks: Vec<EpochAck>,
+    peer_paths: Option<Vec<PeerPath>>,
 ) -> anyhow::Result<()> {
+    let (peer_paths, peer_paths_snapshot) = match peer_paths {
+        Some(paths) => (paths, true),
+        None => (Vec::new(), false),
+    };
     client
-        .report(ReportRequest { applied_version, local_endpoints, relay_health, epoch_acks })
+        .report(ReportRequest {
+            applied_version,
+            local_endpoints,
+            relay_health,
+            epoch_acks,
+            peer_paths,
+            peer_paths_snapshot,
+        })
         .await
         .map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
     Ok(())
