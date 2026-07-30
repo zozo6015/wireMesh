@@ -86,6 +86,29 @@ message ReportRequest {
   repeated EpochAck epoch_acks = 4;      // gateway->controller liveness acks
                                           // for peers' pending epochs during
                                           // rotation (key-rotation Task 1).
+  repeated PeerPath peer_paths = 5;       // additive (directive-storm fix); the
+                                          // gateway's current per-peer path state
+                                          // (every tracked peer, each Report call)
+                                          // so the broker can skip re-punching a
+                                          // pair BOTH sides report settled
+                                          // ("direct"/"relayed"). Empty = old
+                                          // client = pre-fix broker behavior.
+  bool peer_paths_snapshot = 6;           // additive; true = `peer_paths` is the
+                                          // reporter's COMPLETE current path map
+                                          // (a snapshot — REPLACES its stored
+                                          // states; empty snapshot clears them).
+                                          // New clients set true on EVERY
+                                          // steady-state report, INCLUDING empty
+                                          // ones. false = legacy upsert-only
+                                          // shape (old clients + the gateway's
+                                          // rotation-tick unary epoch-ack report,
+                                          // which is not a path snapshot and must
+                                          // never wipe stored states).
 }
 message EpochAck { uint64 peer_gateway_id = 1; uint32 epoch = 2; bool live = 3; }
+// One entry of `ReportRequest.peer_paths`: `state` is the reporting gateway's
+// lowercase path-state string for `peer_gateway_id` — exactly
+// `PathState::as_str()` ("connecting"|"direct"|"degraded"|"relayed"|
+// "disconnected"), the same label the gateway's metrics use.
+message PeerPath { uint64 peer_gateway_id = 1; string state = 2; }
 message ReportResponse {}

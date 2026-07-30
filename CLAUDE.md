@@ -114,7 +114,10 @@ Next action: the Cycle-4c fast-follows (make-before-break direct cutover;
 `relay_pair_id` width + per-relay connection multiplexing) and the
 key-rotation fast-follow (carried from 4a). Also pending: Cycle 2b fast-follow
 (OpenBao provider driver); relay/controller Sync-keepalive mirrors (see
-above). Update this section as phases complete.
+above); Sync session generation (per-boot nonce in Watch+Report so a delayed
+pre-restart Report can't restore stale peer_paths/local_endpoints/
+relay_health — see `Broker::on_report`'s known-race note). Update this
+section as phases complete.
 
 ## Agent workflow rules
 

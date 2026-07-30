@@ -32,10 +32,30 @@
 //! [`ChangeEvent`] broadcast every mutation site publishes on — an
 //! `EndpointObserved` is emitted by both the UDP observation endpoint and
 //! `Sync.Report`'s local-endpoint path), and (c) a bounded periodic retry:
-//! the controller does not know a pair's data-plane `Direct` state in 4b, so
 //! the periodic sweep re-punches connected+candidate'd pairs only up to
 //! [`MAX_PERIODIC_ATTEMPTS`] consecutive times, the budget reset on any
 //! candidate change or reconnect.
+//!
+//! # Path-state skip (directive-storm fix; make-before-break awareness)
+//!
+//! In 4b the controller could not observe a pair's data-plane state, so every
+//! trigger above re-punched unconditionally — and because the periodic budget
+//! resets on ANY candidate change or reconnect, an already-settled pair kept
+//! receiving `PunchDirective`s forever (each one burst-firing the gateway's
+//! "deferring direct punch" make-before-break defer line). Gateways now
+//! attach their per-peer path states to `Sync.Report`
+//! (`ReportRequest.peer_paths`, forwarded here via [`Broker::on_report`]),
+//! and EVERY emit path funnels through [`Broker::emit_pair`], which skips a
+//! pair entirely — no directives, no periodic-budget consumption — iff BOTH
+//! members' latest stored reports mark the OTHER member "direct" OR
+//! "relayed": a settled pair must not be fought over (a punch toward a
+//! `Relayed` peer would disturb a flowing relay path; the `Relayed→Direct`
+//! cutover fast-follow will revisit this skip when a deliberate,
+//! rehandshake-driven direct probe exists). Anything one-sided, absent, or in
+//! any other state fails OPEN toward punching (empty `peer_paths` = old
+//! client = the 4b behavior), and a reporter's stored states are cleared when
+//! it reconnects ([`Broker::on_gateway_connected`]) so a restarted gateway's
+//! stale "direct" claim never suppresses the punch it now needs.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -44,7 +64,7 @@ use std::time::{Duration, SystemTime};
 use tokio::sync::{broadcast, mpsc, oneshot};
 
 use wiremesh_proto::v1::sync_message::Body;
-use wiremesh_proto::v1::{PunchDirective, RotateDirective, SyncMessage};
+use wiremesh_proto::v1::{PeerPath, PunchDirective, RotateDirective, SyncMessage};
 
 use crate::db::AWAITING_SUBMISSION_SENTINEL;
 use crate::db_async::DbHandle;
@@ -77,12 +97,31 @@ pub const PUNCH_CHANNEL_CAPACITY: usize = 16;
 
 /// Max consecutive PERIODIC re-punches for a pair before the periodic sweep
 /// backs off (reset to zero on any candidate change or reconnect for that
-/// pair). Bounds the retry the controller would otherwise issue forever, since
-/// it cannot observe whether a pair has already reached `Direct` in 4b.
+/// pair). Bounds the retry for pairs whose data-plane state the controller
+/// does NOT (yet) know is settled — for a pair BOTH sides have reported
+/// settled, `emit_pair_periodic` still consults this ceiling first, but the
+/// path-state skip inside [`Broker::emit_pair`] then emits nothing and
+/// returns `false`, so no attempt is ever CONSUMED from the budget; this
+/// budget remains the only bound for old clients that never report
+/// `peer_paths`.
 const MAX_PERIODIC_ATTEMPTS: u32 = 5;
 
 /// Periodic retry cadence for the background sweep (trigger (c)).
 const RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Memory backstop on how many per-peer path states ONE reporter can have
+/// stored at a time ([`Broker::on_report`] drops a report's excess NEW peer
+/// ids beyond it). The peer ids inside `peer_paths` are client-supplied and
+/// never validated against the roster here (`on_report` is deliberately
+/// synchronous — no DB lookup on the Report hot path), so without a cap a
+/// single authenticated gateway could grow its entry without bound. This is
+/// NOT an authz filter — the fabric is single-tenant and every reporter is
+/// mTLS-authenticated, so severity is low (a misbehaving peer is an operator
+/// problem, not a tenant boundary) — just a bound. Generous: real fabrics
+/// are orders of magnitude below 4096 gateways, and `pair_settled` only ever
+/// reads ids that are genuine roster peers, so capping can never suppress a
+/// legitimate punch.
+const MAX_PEER_PATHS_PER_REPORTER: usize = 4096;
 
 /// Constructs a fresh, empty [`PunchRegistry`] — one per controller instance,
 /// created in `serve()` and shared with the broker and every Watch connection.
@@ -103,6 +142,16 @@ pub struct Broker {
     /// `(min(a,b), max(a,b))`. Reset (removed) on any candidate change or
     /// reconnect for the pair — see [`Broker::reset_pair`].
     periodic_attempts: Mutex<HashMap<(i64, i64), u32>>,
+    /// (Directive-storm fix) Latest gateway-reported path state per
+    /// `reporter -> (peer -> lowercase state string)`, fed by
+    /// [`Broker::on_report`] from `ReportRequest.peer_paths` and read by
+    /// [`Broker::emit_pair`]'s both-settled skip. A reporter's whole entry is
+    /// cleared on its reconnect ([`Broker::on_gateway_connected`]) — a
+    /// restarted gateway may have no tunnel at all, and its stale "direct"
+    /// claim must not suppress the punch it now needs. Same locking style as
+    /// `periodic_attempts`: a `std::sync::Mutex` held only across
+    /// purely-synchronous map work, never an `.await`.
+    peer_path_states: Mutex<HashMap<i64, HashMap<i64, String>>>,
 }
 
 impl Broker {
@@ -113,7 +162,107 @@ impl Broker {
             db,
             registry,
             periodic_attempts: Mutex::new(HashMap::new()),
+            peer_path_states: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// (Directive-storm fix) Records `reporter_gateway_id`'s latest view of
+    /// its peers' path states from a `Sync.Report`'s `peer_paths`, read by
+    /// [`Broker::emit_pair`]'s both-settled skip. Two wire shapes
+    /// (CodeRabbit follow-up — `ReportRequest.peer_paths_snapshot`):
+    ///
+    /// - `snapshot == true` (a NEW client's steady-state report, which
+    ///   always serializes its COMPLETE path map): REPLACE this reporter's
+    ///   stored map with the report's content. An empty snapshot is a
+    ///   genuine "I track no paths" and clears the reporter's entries
+    ///   entirely — without this, a reporter that pruned a peer (or lost
+    ///   all its paths) would keep exporting stale settled states until its
+    ///   next reconnect.
+    /// - `snapshot == false` (an old client, or the gateway's rotation-tick
+    ///   unary epoch-ack report — not a path snapshot): legacy upsert-only,
+    ///   LATEST wins per `(reporter, peer)`, and empty is a NO-OP — it must
+    ///   never wipe stored states (an epoch ack mid-rotation must not make
+    ///   the broker start re-punching a settled pair).
+    ///
+    /// KNOWN RACE (owner-adjudicated: valid but DEFERRED): a Report from a
+    /// gateway's PREVIOUS session — network-delayed past its restart — can
+    /// be processed after [`Broker::on_gateway_connected`]'s clear, and,
+    /// being `snapshot == true`, REPLACE the fresh (empty) state with
+    /// pre-restart claims. Impact is bounded: the settled skip is an
+    /// OPTIMIZATION over 4b's punch-blindly behavior, `pair_settled` needs
+    /// BOTH directions to agree, the gateway's own tick-driven `StartPunch`
+    /// recovery is directive-independent, and any later fresh snapshot (or
+    /// reconnect) corrects the stored states. The same stale-report race
+    /// predates this field for `local_endpoints` and `relay_health`; the
+    /// shared fix is a per-boot session generation carried in Watch+Report
+    /// (the controller rejecting mismatches), tracked as a Sync-hardening
+    /// fast-follow alongside the keepalive mirrors — see
+    /// `docs/research/ops-finding-sync-half-open-stream.md`.
+    ///
+    /// `reporter_gateway_id` is the AUTHENTICATED gateway id `Sync.Report`
+    /// resolved from the mTLS peer certificate — never anything
+    /// client-supplied; the peer ids INSIDE `peer_paths` are client-supplied
+    /// and unvalidated, bounded per reporter by
+    /// [`MAX_PEER_PATHS_PER_REPORTER`] (a memory backstop — see its doc;
+    /// applied to both shapes).
+    pub fn on_report(&self, reporter_gateway_id: i64, peer_paths: &[PeerPath], snapshot: bool) {
+        if !snapshot && peer_paths.is_empty() {
+            return;
+        }
+        let Ok(mut states) = self.peer_path_states.lock() else {
+            return;
+        };
+        if snapshot && peer_paths.is_empty() {
+            // Empty SNAPSHOT: the reporter genuinely tracks no paths — drop
+            // its whole entry (not just its values) so it costs no memory.
+            states.remove(&reporter_gateway_id);
+            return;
+        }
+        let entry = states.entry(reporter_gateway_id).or_default();
+        if snapshot {
+            // Snapshot REPLACE: start from empty so peers absent from this
+            // report (pruned by the gateway) drop out rather than linger.
+            entry.clear();
+        }
+        for pp in peer_paths {
+            let peer = pp.peer_gateway_id as i64;
+            // At the cap, still allow UPDATES for already-tracked peers
+            // (skipping only NEW ids), so a legitimate peer's state can
+            // never be starved out by junk ids earlier in the list.
+            if entry.len() >= MAX_PEER_PATHS_PER_REPORTER && !entry.contains_key(&peer) {
+                continue;
+            }
+            entry.insert(peer, pp.state.clone());
+        }
+    }
+
+    /// (Directive-storm fix) True iff the pair `(a, b)` is SETTLED: BOTH
+    /// members' latest stored reports mark the OTHER member's state as
+    /// "direct" OR "relayed" (a mixed direct/relayed pair is just as settled
+    /// — neither end wants a punch fighting its path). Anything one-sided,
+    /// absent, or in any other state ("connecting", "degraded",
+    /// "disconnected", or an unknown future label) is NOT settled — the
+    /// broker fails open toward punching.
+    fn pair_settled(&self, a: i64, b: i64) -> bool {
+        let Ok(states) = self.peer_path_states.lock() else {
+            return false;
+        };
+        let settled = |reporter: i64, peer: i64| {
+            states
+                .get(&reporter)
+                .and_then(|peers| peers.get(&peer))
+                .is_some_and(|s| s == "direct" || s == "relayed")
+        };
+        settled(a, b) && settled(b, a)
+    }
+
+    /// (Directive-storm fix) Drops every stored path state `gateway_id` has
+    /// reported — see `peer_path_states`'s doc for why this happens on its
+    /// reconnect.
+    fn clear_reported_states(&self, gateway_id: i64) {
+        if let Ok(mut states) = self.peer_path_states.lock() {
+            states.remove(&gateway_id);
+        }
     }
 
     /// Registers `sender` under `gateway_id` and returns a [`RegistrationGuard`]
@@ -184,11 +333,16 @@ impl Broker {
         }
     }
 
-    /// Trigger (a): a gateway's `Watch` stream just opened. Resets the periodic
-    /// budget for every pair this gateway belongs to (a fresh connection is a
-    /// fresh opportunity) and attempts a punch for each — a no-op for any peer
-    /// not also connected or without a candidate yet.
+    /// Trigger (a): a gateway's `Watch` stream just opened. Clears every path
+    /// state this gateway previously reported (a reconnect may be a process
+    /// restart with no tunnels at all — its stale "direct"/"relayed" claims
+    /// must not keep suppressing punches its pairs now need; the natural home
+    /// for the clear, since this is also where pair budgets reset), then
+    /// resets the periodic budget for every pair this gateway belongs to (a
+    /// fresh connection is a fresh opportunity) and attempts a punch for each
+    /// — a no-op for any peer not also connected or without a candidate yet.
     pub async fn on_gateway_connected(&self, gateway_id: i64) {
+        self.clear_reported_states(gateway_id);
         self.punch_peers_of(gateway_id, true).await;
     }
 
@@ -319,8 +473,18 @@ impl Broker {
     }
 
     /// Emits a paired `PunchDirective` to both `a` and `b` iff both are
-    /// connected and each has ≥1 candidate. Returns `true` iff both directives
-    /// were sent.
+    /// connected, each has ≥1 candidate, and the pair is not already SETTLED
+    /// (both members' latest reports mark the other "direct"/"relayed" —
+    /// [`Broker::pair_settled`], the directive-storm fix's make-before-break
+    /// awareness). Returns `true` iff both directives were sent.
+    ///
+    /// The settled skip sits HERE, on the one funnel every trigger flows
+    /// through — reconnect and candidate-change ([`Broker::punch_peers_of`])
+    /// and the periodic sweep ([`Broker::emit_pair_periodic`]) alike — so a
+    /// candidate change can reset a pair's periodic budget but can never
+    /// bypass the skip and re-punch a settled pair (exactly the reset path
+    /// that kept the directive storm alive). Skipping returns `false`, so
+    /// the periodic wrapper consumes no budget either.
     ///
     /// All the fallible/awaiting work (candidate reads) happens BEFORE the
     /// critical section. The critical section itself — locking the registry,
@@ -338,6 +502,18 @@ impl Broker {
             if !reg.contains_key(&a) || !reg.contains_key(&b) {
                 return false;
             }
+        }
+
+        // Path-state skip (directive-storm fix): a pair BOTH sides report
+        // settled ("direct"/"relayed" toward each other) gets NO directive at
+        // all — a punch would only make each gateway's make-before-break
+        // guard defer it (and could disturb a flowing relay path). One-sided,
+        // absent, or any other state falls through and emits as before (fail
+        // open — old clients never report `peer_paths`). The `Relayed→Direct`
+        // cutover fast-follow will revisit this skip once a deliberate,
+        // rehandshake-driven direct probe exists to punch FOR.
+        if self.pair_settled(a, b) {
+            return false;
         }
 
         let a_candidates = match self.db.candidates_for(a).await {
@@ -395,7 +571,10 @@ impl Broker {
     /// [`Broker::emit_pair`] wrapped in the per-pair periodic budget: skips once
     /// the pair has been periodically re-punched [`MAX_PERIODIC_ATTEMPTS`]
     /// consecutive times (with no intervening candidate change/reconnect to
-    /// reset it), and counts a successful emit against that budget.
+    /// reset it), and counts a successful emit against that budget. A SETTLED
+    /// pair is skipped inside `emit_pair` itself (the path-state skip returns
+    /// `false`), so it consumes none of this budget — the periodic sweep goes
+    /// fully quiet for it rather than burning attempts.
     async fn emit_pair_periodic(&self, a: i64, b: i64) {
         let key = pair_key(a, b);
         {

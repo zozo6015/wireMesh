@@ -87,6 +87,35 @@ impl PathState {
     }
 }
 
+/// (Directive-storm fix) The controller-directive arm's spawn precondition:
+/// should a `SyncEvent::Punch` directive for a peer whose path map holds
+/// `state` (`None` = no entry yet) spawn a `punch_and_apply` task at all?
+///
+/// Mirrors `punch_and_apply`'s own make-before-break guard exactly — that
+/// guard accepts a trial only while the path is `Connecting` AND the WG
+/// endpoint is not pointed at a relay socket (`relay_pointed`), and it
+/// creates a fresh `Connecting` entry for an unknown peer — so spawning in
+/// any other situation is a guaranteed once-per-directive "deferring direct
+/// punch" defer-line (the burst the directive storm fired forever):
+///
+/// - `None` (unknown peer) with `relay_pointed == false`: the fresh-directive
+///   case the punch exists for — spawn.
+/// - `Some(Connecting)` with `relay_pointed == false`: the one live-entry
+///   state the guard accepts — spawn.
+/// - `relay_pointed == true` (ANY state, including `None` — owner-settled):
+///   a pointed relay socket must never be fought by a punch even without a
+///   path entry; `punch_and_apply`'s commit guard would refuse anyway.
+/// - `Direct`/`Relayed`/`Degraded`/`Disconnected`: settled or tick-driver-
+///   owned recovery — the guard would defer every one of these.
+///
+/// Consulted by the directive arm in `main.rs` BEFORE `try_start_punch`/
+/// `punch_allowed`, so a filtered directive consumes no back-off window and
+/// churns no concurrency guard. Pure (no sockets, no clocks), like the rest
+/// of this module.
+pub fn directive_should_punch(state: Option<PathState>, relay_pointed: bool) -> bool {
+    matches!(state, None | Some(PathState::Connecting)) && !relay_pointed
+}
+
 /// An action `Path::tick` asks the caller (Task 10's driver) to perform.
 /// Pure data — this module never touches sockets or UAPI itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
