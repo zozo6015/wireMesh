@@ -727,8 +727,9 @@ struct PathCtx {
     /// cutover (`Path::on_handshake`) — it just means the relay path is
     /// alive, so it feeds `Path::on_authenticated_inbound` instead. Only a
     /// handshake completing AFTER the endpoint has been repointed at a real
-    /// direct candidate (`ensure_relay_transport`'s ProbeDirect punch
-    /// succeeding) counts as the actual cutover. Absent/`false` is the safe
+    /// direct candidate (the forced-rehandshake Relayed→Direct cutover — a
+    /// documented fast-follow, not yet wired) counts as the actual cutover.
+    /// Absent/`false` is the safe
     /// default for a peer that has never been relayed at all, preserving
     /// every pre-4c-Task-9 direct-only scenario's behavior unchanged.
     relay_pointed: Arc<std::sync::Mutex<HashMap<u64, bool>>>,
@@ -769,7 +770,7 @@ struct PathCtx {
     /// the near-continuously-open transient `SO_REUSEPORT` punch socket then
     /// starved OTHER pairs' inbound WG traffic). Consulted via
     /// [`PathCtx::punch_allowed`] before BOTH spawn sites (controller
-    /// `Punch` directives and tick-driven `StartPunch`/`ProbeDirect`); fed
+    /// `Punch` directives and tick-driven `StartPunch`); fed
     /// by [`PathCtx::record_punch_outcome`] from `punch_and_apply`. Note
     /// `try_start_punch` bounds concurrency; this bounds RATE.
     punch_backoff: Arc<std::sync::Mutex<HashMap<u64, PunchBackoff>>>,
@@ -1162,8 +1163,8 @@ async fn poke_peer_overlay(ctx: &PathCtx, gid: u64) {
 /// unused by name, but HELD for this function's entire lifetime (including
 /// every early `return`) and released via `Drop`, so at most one
 /// `punch_and_apply` runs per peer at a time regardless of whether it was
-/// triggered by a controller `Punch` directive or a tick-driven `StartPunch` /
-/// `ProbeDirect`. Every blocking call (`uapi::apply` inside `set_peer_endpoint`,
+/// triggered by a controller `Punch` directive or a tick-driven `StartPunch`.
+/// Every blocking call (`uapi::apply` inside `set_peer_endpoint`,
 /// the nudge socket) runs inside `spawn_blocking`; no mutex guard is ever held
 /// across an `.await`.
 async fn punch_and_apply(
@@ -1208,8 +1209,10 @@ async fn punch_and_apply(
         // currently points at a relay socket"); `path.state == Relayed` closes
         // the brief transition window before `ensure_relay_transport` has set
         // `relay_pointed` (Connecting times out -> Relayed, relay endpoint
-        // still installing). Checking BOTH covers the ProbeDirect probe, a
-        // controller directive that slipped past the back-off, and a mid-trial
+        // still installing). Checking BOTH covers a controller directive that
+        // slipped past the back-off (the only spawn path left that can arrive
+        // while Relayed — tick-driven ProbeDirect is a deliberate driver
+        // no-op, see the tick match arm), a mid-trial
         // Connecting -> Relayed transition, AND the case3 relay-eviction
         // re-path (Disconnected -> Connecting StartPunch while the endpoint is
         // already re-pointed at the second relay). We return WITHOUT recording
@@ -1228,8 +1231,10 @@ async fn punch_and_apply(
         // clobbering a freshly installed relay socket (WG left pointed at a dead
         // direct candidate with a healthy relay transport that
         // `ensure_relay_transport` then refuses to re-point → silent dead relay
-        // path). This subsumes the old `Relayed || relay_pointed` guard: the
-        // `Relayed` `ProbeDirect` case still yields (state != Connecting), and
+        // path). This subsumes the old `Relayed || relay_pointed` guard: any
+        // trial arriving while `Relayed` (a controller directive — no
+        // tick-driven trial can any longer) still yields (state !=
+        // Connecting), and
         // the `Disconnected` window this bug drove through is now covered too. A
         // completed direct handshake returns via the `is_direct` check below, so
         // reaching this point in any non-`Connecting` state means yield.
@@ -1700,9 +1705,9 @@ async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
 /// `on_authenticated_inbound`, so 25s keepalives count as
 /// inbound even between ~120s handshake rekeys; time-driven degrade/
 /// disconnect via `tick`), record transitions, and act on the returned
-/// `PathAction`: `StartPunch`/`Retry`/`ProbeDirect` all re-run a bounded
-/// punch (`ProbeDirect`'s make-before-break background probe reuses the same
-/// `punching` dedup guard as a fresh `StartPunch`); `MarkRelayNeeded` spawns
+/// `PathAction`: `StartPunch` re-runs a bounded punch; `ProbeDirect` is a
+/// deliberate driver no-op — any spawned probe would yield instantly to the
+/// make-before-break guard (see the tick match arm); `MarkRelayNeeded` spawns
 /// [`ensure_relay_transport`] (Cycle 4c Task 8 — a no-op if the controller
 /// hasn't advertised any relay). `relay_available` is computed per peer as
 /// "the controller has advertised ≥1 relay AND this peer already has a live,
@@ -1735,14 +1740,16 @@ async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
 /// See docs/research/cycle4c-relay-stability-note.md. **That punch socket no
 /// longer exists** — `punch_and_apply` now drives boringtun's own handshake
 /// (endpoint-set + tun nudge, no competing socket), so the starvation
-/// mechanism is gone at the source; the `ProbeDirect` rate-limit is retained
-/// because a low background probe rate is still the right posture (a full
-/// `replace_peers` re-point is not free) and it keeps the relay path's
-/// long undisturbed windows. Note this only makes the
-/// RELAY path stable; a genuine `Relayed -> Direct` cutover for a pair whose
-/// NAT kind allows it was already correct (`punch_and_apply` only repoints
-/// the WG endpoint on a CONFIRMED candidate — never blindly) and is
-/// unaffected. For a symmetric<->symmetric pair specifically (this test's
+/// mechanism is gone at the source; the SM's `ProbeDirect` rate-limit is
+/// retained even though the driver no longer acts on the action (see the
+/// tick match arm) — a low bounded probe rate stays the right posture (a
+/// full `replace_peers` re-point is not free) for when the forced-rehandshake
+/// cutover fast-follow re-wires this seam. Note this only makes the
+/// RELAY path stable; with no probe running while `Relayed`, a genuine
+/// `Relayed -> Direct` cutover is currently inert for EVERY NAT kind —
+/// pending that same forced-rehandshake fast-follow — not just the
+/// symmetric pairs that could never punch. For a symmetric<->symmetric pair
+/// specifically (this test's
 /// scenario), the punch can never confirm at all (`nat_matrix.rs`'s
 /// `case2_symmetric_relay_needed` already proves that for this NAT kind), so
 /// a real Direct cutover from `Relayed` for that pairing is out of scope here
@@ -2020,9 +2027,20 @@ async fn run_path_ticks(ctx: PathCtx) {
                 let relay_available =
                     relays_advertised && *healthy_relay.get(&gid).unwrap_or(&false);
                 match path.tick(now, relay_available) {
-                    Some(PathAction::StartPunch) | Some(PathAction::ProbeDirect) => {
+                    Some(PathAction::StartPunch) => {
                         to_punch.push((gid, peer.candidates.clone()))
                     }
+                    // Deliberate no-op: `ProbeDirect` only fires while
+                    // `Relayed`, and `punch_and_apply`'s MAJOR-1 make-before-
+                    // break guard yields the moment the path isn't
+                    // `Connecting` — so a spawned probe could never test a
+                    // candidate, only burn a `punching` slot and print the
+                    // "deferring direct punch" line once per relayed peer per
+                    // `PROBE_DIRECT_INTERVAL`, forever. A real Relayed→Direct
+                    // cutover needs a forced rehandshake (documented Cycle-4c
+                    // fast-follow); the SM's emission and its rate-limit are
+                    // the seam that fast-follow re-wires.
+                    Some(PathAction::ProbeDirect) => {}
                     Some(PathAction::MarkRelayNeeded) => to_relay_needed.push(gid),
                     Some(PathAction::Retry) | None => {}
                 }
@@ -2105,9 +2123,8 @@ async fn run_path_ticks(ctx: PathCtx) {
             // when an attempt will actually start; if a punch is already in
             // flight, skip without touching the back-off. The path SM's own
             // backoff bounds how often StartPunch fires per DISCONNECT cycle,
-            // but an undialable pair re-enters that cycle forever (and
-            // ProbeDirect re-fires per `PROBE_DIRECT_INTERVAL` while
-            // Relayed) — the indefinite storm this back-off exists to bound.
+            // but an undialable pair re-enters that cycle forever — the
+            // indefinite storm this back-off exists to bound.
             // Skips are silent: the state change was logged when the window
             // opened.
             match ctx.try_start_punch(gid) {
@@ -2118,7 +2135,7 @@ async fn run_path_ticks(ctx: PathCtx) {
                     // else: backed off — drop the guard without spawning.
                 }
                 None => eprintln!(
-                    "wiremesh-gateway: punch already in flight for peer={gid}; skipping tick-driven StartPunch/ProbeDirect"
+                    "wiremesh-gateway: punch already in flight for peer={gid}; skipping tick-driven StartPunch"
                 ),
             }
         }

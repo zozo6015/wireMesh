@@ -109,7 +109,11 @@ pub enum PathAction {
     /// Make-before-break: while `Relayed` and the relay stays available, ask
     /// the driver to run a low-rate background direct hole-punch probe. The
     /// relay keeps carrying traffic in the meantime; only a completed WG
-    /// handshake (`on_handshake`) actually cuts over to `Direct`.
+    /// handshake (`on_handshake`) actually cuts over to `Direct`. NOTE: the
+    /// driver currently deliberately no-ops this action (see
+    /// `run_path_ticks`'s tick match arm in main.rs) pending the
+    /// forced-rehandshake cutover fast-follow — the emission and its
+    /// rate-limit are the seam that fast-follow re-wires.
     ProbeDirect,
 }
 

@@ -40,8 +40,8 @@
 //! Normative semantics (plan T3):
 //!
 //!  - `decide` is consulted before EVERY punch attempt — both a controller
-//!    `PunchDirective` and a tick-driven `StartPunch`/`ProbeDirect` — with
-//!    that attempt's candidate list.
+//!    `PunchDirective` and a tick-driven `StartPunch` — with that attempt's
+//!    candidate list.
 //!  - Candidate lists compare as UNORDERED SETS (order and duplicates are
 //!    irrelevant — `set_peer_endpoint` reorders candidates, and a reorder is
 //!    not new information). A decide whose candidate SET differs from the
