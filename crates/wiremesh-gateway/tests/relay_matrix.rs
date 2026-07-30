@@ -102,6 +102,7 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use wiremesh_gateway::identity::Identity;
+use wiremesh_gateway::path::PROBE_DIRECT_INTERVAL;
 use wiremesh_gateway::uapi::base64_pub_from_priv;
 use wiremesh_proto::v1::{EnrollRequest, MintTokenRequest};
 use wiremesh_testkit::netns::{apply_netem, assert_netem_present, Lab, NatKind, Ns};
@@ -127,6 +128,15 @@ const RELAY_ADDR: &str = "198.51.100.4:5555";
 const RELAY_ADDR_2: &str = "198.51.100.5:5556";
 const METRICS_PORT: u16 = 9099;
 const WG_PORT: u16 = 51820;
+
+/// The make-before-break yield line `punch_and_apply` (src/main.rs) prints
+/// when a spawned punch trial finds the path no longer `Connecting` and
+/// defers to the live relay path. Counted by case 1's defer-spam guard (see
+/// that phase's comment). A substring of the full line (not the whole
+/// message) so peer-id formatting changes don't silently blind the guard —
+/// but distinctive enough that nothing else in the gateway's stderr can
+/// match it.
+const DEFER_NEEDLE: &str = "deferring direct punch";
 
 /// Fabric: seg-a -> seg-b, allow icmp only (default-deny otherwise). A ping
 /// crossing proves both that the tunnel actually carries data AND that the
@@ -449,6 +459,23 @@ impl GwProc {
             start += 1;
         }
         s[start..].to_string()
+    }
+    /// Current byte length of the captured stderr log — a position marker so
+    /// a later [`Self::stderr_from`] read can be scoped to output the
+    /// gateway emitted AFTER this instant (the drain thread appends to the
+    /// log file continuously, so the file's length at time T is a stable
+    /// "everything before T" boundary, modulo pipe latency — which is why
+    /// counts taken against such a marker need a ±1 tolerance around
+    /// transitions).
+    fn stderr_len(&self) -> u64 {
+        std::fs::metadata(&self.err_log).map(|m| m.len()).unwrap_or(0)
+    }
+    /// Everything the gateway wrote to stderr from byte `offset` onward
+    /// (lossy UTF-8; `offset` clamped to the file's current length).
+    fn stderr_from(&self, offset: u64) -> String {
+        let bytes = std::fs::read(&self.err_log).unwrap_or_default();
+        let start = (offset as usize).min(bytes.len());
+        String::from_utf8_lossy(&bytes[start..]).into_owned()
     }
 }
 
@@ -778,6 +805,13 @@ async fn build_scenario(prefix: &str, relay_specs: Vec<RelaySpec<'_>>) -> Scenar
 /// seg-a -> seg-b) over the tunnel, with the WG handshake's own endpoint
 /// proving the data actually crossed the relay rather than some accidental
 /// direct path.
+///
+/// Also here (defer-spam guard, final phase): the same stably-relayed pair
+/// is then HELD relayed for >=2.5 x `path::PROBE_DIRECT_INTERVAL` and each
+/// gateway's post-steady-state stderr is counted for the make-before-break
+/// "deferring direct punch" yield line — see the phase-4 comment below for
+/// the bug this pins down (one doomed punch spawn + stderr line per relayed
+/// peer per interval, forever).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn case1_symmetric_pair_flows_over_relay() {
     let sc = build_scenario(
@@ -818,6 +852,16 @@ async fn case1_symmetric_pair_flows_over_relay() {
         );
     }
     eprintln!("case1: PASS both sides reached path_state=relayed in {:?}", start.elapsed());
+
+    // Marker for the defer-spam guard (phase 4 below): everything either
+    // gateway writes to stderr AFTER this instant is post-steady-state
+    // output. Taken HERE — the moment both sides' relayed state is
+    // confirmed — not later, so the guard's window covers the earliest
+    // `ProbeDirect` the Relayed arm can emit (one full
+    // `PROBE_DIRECT_INTERVAL` grace after entering Relayed).
+    let steady_at = Instant::now();
+    let defer_off_a = sc.pa.stderr_len();
+    let defer_off_b = sc.pb.stderr_len();
 
     // Concrete "not a direct candidate" proof: the WG peer endpoint on BOTH
     // sides must be the LOCAL relay-transport socket (127.0.0.1:<port>) —
@@ -870,6 +914,101 @@ async fn case1_symmetric_pair_flows_over_relay() {
              (gwA={final_a:?}, gwB={final_b:?}) — investigate before changing the assertion"
         );
     }
+
+    // Phase 4 (defer-spam guard): a STABLY-relayed pair must not burn a
+    // doomed punch trial per `PROBE_DIRECT_INTERVAL`, forever. On the buggy
+    // driver, `Path::tick`'s Relayed arm emits `PathAction::ProbeDirect`
+    // every interval (src/path.rs, Relayed arm), `run_path_ticks` treats it
+    // exactly like `StartPunch` and spawns `punch_and_apply` (src/main.rs),
+    // and that trial's make-before-break guard then yields IMMEDIATELY for
+    // any non-`Connecting` path — printing the `DEFER_NEEDLE` stderr line.
+    // Net effect in production: one such line per relayed peer every 20s,
+    // indefinitely (and the deferred trial deliberately records no punch
+    // outcome, so the pair back-off never opens a window to dampen it). The
+    // Relayed->Direct cutover is a DOCUMENTED fast-follow (CLAUDE.md /
+    // docs/research/cycle4c-relay-notes.md) — until it lands, the driver
+    // must not spawn a punch trial it KNOWS will yield, so a stably-relayed
+    // pair should emit this line rarely or never.
+    //
+    // Mechanics: hold the (already fully proven, still-running) pair for
+    // >=2.5 x PROBE_DIRECT_INTERVAL past the steady-state marker taken in
+    // phase 1, then count `DEFER_NEEDLE` occurrences in each gateway's
+    // stderr AFTER that marker. Tolerance <=1 per gateway: a punch trial
+    // legitimately spawned while the path was still `Connecting` can land
+    // its one yield line just after the transition (and the phase-1 marker
+    // itself races the stderr pipe drain by a line at most) — but the
+    // per-interval spam produces ~2-3 lines in this window, so the buggy
+    // driver fails loud here.
+    let window = PROBE_DIRECT_INTERVAL * 5 / 2 + Duration::from_secs(5);
+    let mut last_log3 = Instant::now() - Duration::from_secs(10);
+    // Per-iteration stability sampling (review finding): checking stability
+    // only at the window's END would miss a mid-window flap off `relayed`
+    // that self-heals before then — and a flap passes back through
+    // `Connecting`, whose LEGITIMATE punch trials can land defer lines of
+    // their own, making the count below meaningless. Sample both sides on
+    // every wakeup (~500ms, same cadence `wait_until` already scrapes at)
+    // and record the FIRST instability with its offset-into-window and both
+    // states; fail loud on it after the loop.
+    let mut unstable_at: Option<(Duration, Option<String>, Option<String>)> = None;
+    while steady_at.elapsed() < window {
+        let st_a = path_state(&sc.gwa);
+        let st_b = path_state(&sc.gwb);
+        if st_a.as_deref() != Some("relayed") || st_b.as_deref() != Some("relayed") {
+            unstable_at = Some((steady_at.elapsed(), st_a, st_b));
+            break;
+        }
+        if last_log3.elapsed() >= Duration::from_secs(10) {
+            eprintln!(
+                "case1: t+{:?} defer-spam hold {:?}/{window:?} (gwA={st_a:?} gwB={st_b:?})",
+                start.elapsed(),
+                steady_at.elapsed(),
+            );
+            last_log3 = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if let Some((at, ua, ub)) = unstable_at {
+        dump_diag("case1 defer-spam mid-window flap", &sc);
+        panic!(
+            "case1: pair flapped off path_state=relayed {at:?} into the {window:?} \
+             defer-spam observation window (gwA={ua:?}, gwB={ub:?}) — a flap re-enters \
+             Connecting, whose legitimate punch trials can add {DEFER_NEEDLE:?} lines, so \
+             the defer-line count would be meaningless; investigate the instability first"
+        );
+    }
+
+    // The guard's premise is a STABLY-relayed pair — the per-iteration
+    // sampling above covers the window's interior; this closes the final
+    // <=500ms gap after the loop's last sample.
+    let held_a = path_state(&sc.gwa);
+    let held_b = path_state(&sc.gwb);
+    if held_a.as_deref() != Some("relayed") || held_b.as_deref() != Some("relayed") {
+        dump_diag("case1 defer-spam hold-stability", &sc);
+        panic!(
+            "case1: pair did not STAY path_state=relayed across the {window:?} defer-spam \
+             observation window (gwA={held_a:?}, gwB={held_b:?}) — investigate the \
+             instability before reading anything into the defer-line count"
+        );
+    }
+
+    let defers_a = sc.pa.stderr_from(defer_off_a).matches(DEFER_NEEDLE).count();
+    let defers_b = sc.pb.stderr_from(defer_off_b).matches(DEFER_NEEDLE).count();
+    if defers_a > 1 || defers_b > 1 {
+        dump_diag("case1 defer-spam", &sc);
+        panic!(
+            "case1: stably-relayed pair kept spawning doomed direct-punch trials — counted \
+             {DEFER_NEEDLE:?} {defers_a}x on gwA and {defers_b}x on gwB in the {window:?} \
+             after relayed steady state (tolerance: <=1 each, from the Connecting \
+             transition window). More than one means `run_path_ticks` is still turning the \
+             Relayed arm's `ProbeDirect` into a `punch_and_apply` spawn whose \
+             make-before-break guard instantly yields: per-peer stderr spam every \
+             PROBE_DIRECT_INTERVAL, forever, in production"
+        );
+    }
+    eprintln!(
+        "case1: PASS defer-spam guard — {defers_a} (gwA) / {defers_b} (gwB) deferred-punch \
+         lines across {window:?} of relayed steady state"
+    );
 
     eprintln!(
         "CASE 1 PASS: symmetric<->symmetric pair flowed real ping traffic over the relay \

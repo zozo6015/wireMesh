@@ -22,8 +22,8 @@
 //! per peer at a time); this type bounds RATE (how often a pair may punch
 //! at all). One instance per peer pair; `main.rs` keeps them keyed by peer
 //! `gateway_id` and consults [`PunchBackoff::decide`] before EVERY punch
-//! attempt — controller `PunchDirective`s and tick-driven
-//! `StartPunch`/`ProbeDirect` alike.
+//! attempt — controller `PunchDirective`s and tick-driven `StartPunch`
+//! alike.
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
