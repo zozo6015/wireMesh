@@ -128,6 +128,67 @@ pub fn token_secret_body(gateway_name: &str, token: &str, bound_cidrs: &[String]
     sec
 }
 
+/// What the mint step must do this reconcile — see [`mint_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintAction {
+    /// Roster unreadable while a rebind is pending: mint NOTHING and do not
+    /// touch the token Secret (the pending rebind must stay derivable).
+    Defer,
+    /// Mint an ordinary gateway token bound to the segment CIDRs and (re)write
+    /// the Secret's bound-CIDR record.
+    MintOrdinary,
+    /// Mint a `kind = "rebind"` token scoped to the segment id and refresh the
+    /// Secret.
+    MintRebind,
+    /// Steady state: nothing to do.
+    None,
+}
+
+/// The whole mint decision, pure — the reconciler matches on the result and
+/// owns only the I/O (the mint calls, the Secret apply, the deferral warning).
+///
+/// `identity_persisted` is [`identity_persisted`]'s output
+/// (`pvc_exists && gateway_active`); `gateway_active` is passed separately
+/// because the rebind arm keys off it directly, and because a roster FAILURE
+/// forces it false while `pvc_exists` may well be true.
+///
+/// # Why the order is load-bearing
+///
+/// `Defer` MUST come first. A failed `list_gateways` yields an empty roster,
+/// which makes `gateway_active` false → `identity_persisted` false →
+/// `should_mint_token` true, so the ordinary-mint arm is REACHABLE on a mere
+/// controller hiccup. Taking it while a rebind is pending is doubly wrong:
+///   * it mints a PLAIN token, which a still-occupied segment rejects with
+///     `SegmentAlreadyBound`; and
+///   * it rewrites the Secret's bound-CIDR record (via [`token_secret_body`]),
+///     so [`needs_rebind`] reads false from then on and the required rebind is
+///     PERMANENTLY LOST — nothing re-derives it. The gateway then sits on an
+///     unusable plain token and wedges at the next re-enroll.
+/// Deferring costs nothing: the not-enrolled requeue is 15s and the pending
+/// rebind stays derivable from the untouched Secret.
+///
+/// The ordinary-mint arm also deliberately precedes the rebind arm: an
+/// unpersisted identity (e.g. a replaced PVC) has nothing to keep, so it needs
+/// an unspent ORDINARY token — the rebind arm is for an ENROLLED gateway whose
+/// CIDRs moved underneath it.
+pub fn mint_action(
+    roster_ok: bool,
+    gateway_active: bool,
+    identity_persisted: bool,
+    rebind_pending: bool,
+    token_secret: Option<&Secret>,
+) -> MintAction {
+    if rebind_pending && !roster_ok {
+        MintAction::Defer
+    } else if should_mint_token(identity_persisted, token_secret) {
+        MintAction::MintOrdinary
+    } else if gateway_active && rebind_pending {
+        MintAction::MintRebind
+    } else {
+        MintAction::None
+    }
+}
+
 /// Reader half of the [`token_secret_body`] roundtrip: the exact CIDR set the
 /// Secret's token was minted against, or `None` for a legacy Secret with no
 /// record (an UNKNOWN binding — distinct from a recorded-empty one).
@@ -442,38 +503,42 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     let rebind_pending =
         needs_rebind(existing_secret.as_ref().and_then(bound_cidrs_of).as_deref(), &cidrs);
 
-    if rebind_pending && !roster_ok {
-        // PENDING-REBIND GUARD. With the roster unreadable we cannot tell
-        // whether this gateway is still the segment's ACTIVE one, so both
-        // branches below would be wrong:
-        //   * the ordinary-mint arm is reachable here (a failed roster read
-        //     makes `gateway_active` false → `identity_persisted` false →
-        //     `should_mint_token` true), and it would mint a PLAIN token — which
-        //     a still-occupied segment rejects with `SegmentAlreadyBound`;
-        //   * worse, it would write the NEW CIDRs into the Secret's binding
-        //     record, so `needs_rebind` reads false from then on and the
-        //     required rebind is silently LOST — permanently, since nothing
-        //     re-derives it. The gateway would sit on an unusable plain token
-        //     and wedge at the next re-enroll.
-        // Deferring costs nothing: the requeue below is 15s while not-enrolled,
-        // and the pending rebind stays derivable from the untouched Secret.
-        tracing::warn!(
-            "gateway {name}: segment {segment} CIDRs changed but the controller roster is \
-             unreadable — DEFERRING the mint to a later reconcile. Minting now would issue a \
-             plain token the occupied segment rejects AND overwrite the Secret's bound-CIDR \
-             record, losing the pending rebind.",
-            segment = seg.spec.segment_name,
-        );
-    } else if should_mint_token(identity_persisted, existing_secret.as_ref()) {
-        let token = ctx.admin.mint_gateway_token(&cidrs).await.map_err(Error::Admin)?;
-        // `token_secret_body` also RECORDS the CIDRs the token was minted
-        // against, so later reconciles can detect a segment-CIDR change and
-        // issue a rebind (see the rebind arm below).
-        let mut sec = token_secret_body(&name, &token, &cidrs);
-        sec.metadata.namespace = Some(ns.clone());
-        sec.metadata.owner_references = Some(vec![owner_ref(gw)?]);
-        apply(&secrets, &sec).await?;
-    } else if gateway_active && rebind_pending {
+    // The decision itself is pure and lives in ONE place (`mint_action`), so a
+    // future edit cannot silently reorder the arms — in particular it cannot
+    // let the ordinary-mint arm run ahead of the pending-rebind guard and
+    // destroy the Secret's bound-CIDR record. Everything below is just the I/O
+    // for whichever action was chosen.
+    match mint_action(
+        roster_ok,
+        gateway_active,
+        identity_persisted,
+        rebind_pending,
+        existing_secret.as_ref(),
+    ) {
+        MintAction::Defer => {
+            // PENDING-REBIND GUARD (see `mint_action`'s doc for why this must
+            // win over every other arm). Deferring costs nothing: the requeue
+            // below is 15s while not-enrolled, and the pending rebind stays
+            // derivable from the untouched Secret.
+            tracing::warn!(
+                "gateway {name}: segment {segment} CIDRs changed but the controller roster is \
+                 unreadable — DEFERRING the mint to a later reconcile. Minting now would issue a \
+                 plain token the occupied segment rejects AND overwrite the Secret's bound-CIDR \
+                 record, losing the pending rebind.",
+                segment = seg.spec.segment_name,
+            );
+        }
+        MintAction::MintOrdinary => {
+            let token = ctx.admin.mint_gateway_token(&cidrs).await.map_err(Error::Admin)?;
+            // `token_secret_body` also RECORDS the CIDRs the token was minted
+            // against, so later reconciles can detect a segment-CIDR change and
+            // issue a rebind (see the rebind arm below).
+            let mut sec = token_secret_body(&name, &token, &cidrs);
+            sec.metadata.namespace = Some(ns.clone());
+            sec.metadata.owner_references = Some(vec![owner_ref(gw)?]);
+            apply(&secrets, &sec).await?;
+        }
+        MintAction::MintRebind => {
         // REBIND (segment-CIDR change on an enrolled gateway): the stored token
         // was minted against the OLD CIDR set, so any future re-enroll (fresh
         // PVC, adoption, node loss) would be rejected — on the CIDR set
@@ -498,34 +563,37 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
         // is absent, and skips otherwise (the live identity stays valid; the
         // fabric apply already routes the new CIDRs, and the refreshed token
         // covers every future re-enroll).
-        match ctx.admin.segment_id_by_name(&seg.spec.segment_name).await {
-            Ok(Some(segment_id)) => {
-                let token = ctx
-                    .admin
-                    .mint_gateway_rebind_token(segment_id)
-                    .await
-                    .map_err(Error::Admin)?;
-                let mut sec = token_secret_body(&name, &token, &cidrs);
-                sec.metadata.namespace = Some(ns.clone());
-                sec.metadata.owner_references = Some(vec![owner_ref(gw)?]);
-                apply(&secrets, &sec).await?;
-                tracing::info!(
-                    "gateway {name}: segment {segment} CIDRs changed — minted a rebind token \
-                     and refreshed the token Secret (new bound CIDRs: {cidrs:?})",
-                    segment = seg.spec.segment_name,
-                );
+            match ctx.admin.segment_id_by_name(&seg.spec.segment_name).await {
+                Ok(Some(segment_id)) => {
+                    let token = ctx
+                        .admin
+                        .mint_gateway_rebind_token(segment_id)
+                        .await
+                        .map_err(Error::Admin)?;
+                    let mut sec = token_secret_body(&name, &token, &cidrs);
+                    sec.metadata.namespace = Some(ns.clone());
+                    sec.metadata.owner_references = Some(vec![owner_ref(gw)?]);
+                    apply(&secrets, &sec).await?;
+                    tracing::info!(
+                        "gateway {name}: segment {segment} CIDRs changed — minted a rebind token \
+                         and refreshed the token Secret (new bound CIDRs: {cidrs:?})",
+                        segment = seg.spec.segment_name,
+                    );
+                }
+                Ok(None) => {
+                    // The fabric apply that introduces/renames the segment hasn't
+                    // landed controller-side yet; the requeue will retry the rebind.
+                    tracing::warn!(
+                        "gateway {name}: rebind needed but segment {segment} is not registered \
+                         in the controller yet; deferring to the next reconcile",
+                        segment = seg.spec.segment_name,
+                    );
+                }
+                Err(e) => return Err(Error::Admin(e)),
             }
-            Ok(None) => {
-                // The fabric apply that introduces/renames the segment hasn't
-                // landed controller-side yet; the requeue will retry the rebind.
-                tracing::warn!(
-                    "gateway {name}: rebind needed but segment {segment} is not registered \
-                     in the controller yet; deferring to the next reconcile",
-                    segment = seg.spec.segment_name,
-                );
-            }
-            Err(e) => return Err(Error::Admin(e)),
         }
+        // Steady state: single-use tokens must not be re-minted every reconcile.
+        MintAction::None => {}
     }
 
     // Persist the gateway identity on a per-gateway PVC (owner-referenced → GC'd

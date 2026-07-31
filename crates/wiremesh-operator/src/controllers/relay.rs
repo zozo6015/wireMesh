@@ -14,6 +14,7 @@
 
 use super::{apply, apply_deployment, owner_ref, Context, Error};
 
+use crate::admin_exec::RelayRow;
 use crate::crd::{WiremeshRelay, WiremeshResourceStatus};
 use crate::workloads;
 use futures::StreamExt;
@@ -51,6 +52,37 @@ pub fn should_mint_token(identity_persisted: bool, token_secret: Option<&Secret>
     !identity_persisted || needs_token(token_secret)
 }
 
+/// Whether the relay's identity is durably PERSISTED: the PVC exists AND the
+/// controller's relay roster holds a row for this CR's `endpoint`. Parity with
+/// `gateway::identity_persisted` (PVC + roster corroboration), with two
+/// relay-specific properties that are each easy to break by accident:
+///
+/// **Matched by ENDPOINT, never by name.** The controller names an enrolled
+/// relay `relay-<token-hash>` (`services/enrollment.rs`), which shares nothing
+/// with the CR's name; the endpoint is the CR's `spec.endpoint` verbatim. A
+/// name match would never hit → the identity would read as never-persisted →
+/// a spare token minted on EVERY reconcile forever. The comparison is exact:
+/// a neighbouring port or a host that merely contains this one is a DIFFERENT
+/// relay.
+///
+/// **Deliberately NOT status-filtered.** The health pipeline evicts by flipping
+/// `status` (`Db::set_relay_status`, documented there as "a HEALTH-eviction
+/// state ... not a revocation/de-enrollment"); it never deletes the row. So
+/// presence at ANY status is exactly the historical fact being asked — "this
+/// relay completed an enrollment" — and an evicted-but-enrolled relay does not
+/// re-mint a spare token for the whole outage. (Contrast the gateway's
+/// `active_in_segment`, whose status filter guards the one-gateway-per-segment
+/// occupancy invariant — a different question.)
+///
+/// The PVC is still required: a roster row from a previous incarnation must not
+/// suppress the mint for a pod whose PVC was replaced or does not exist yet —
+/// that identity has nowhere to live, and suppressing there is the `Init:Error`
+/// wedge. An EMPTY roster yields false, which is also what the reconciler's
+/// conservative failed-probe arm substitutes.
+pub fn relay_identity_persisted(pvc_exists: bool, roster: &[RelayRow], endpoint: &str) -> bool {
+    pvc_exists && roster.iter().any(|r| r.endpoint == endpoint)
+}
+
 async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = ctx.namespace.clone();
     let name = relay.name_any();
@@ -71,7 +103,10 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
 
     // `identity_persisted` corroboration: the PVC exists AND the controller's
     // relay roster holds a row for this CR's endpoint — exact parity with the
-    // gateway (`gateway::identity_persisted`: PVC + roster row).
+    // gateway (`gateway::identity_persisted`: PVC + roster row). The decision
+    // itself is pure and lives in `relay_identity_persisted` (which documents
+    // the endpoint-match and no-status-filter properties); this arm owns only
+    // the I/O and the conservative failure rule.
     //
     // WHY NOT Deployment availability (the earlier basis): availability is a
     // LIVENESS signal, and the question here is "was an identity ever written
@@ -102,17 +137,20 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
     // CONSERVATIVE on a probe failure (unchanged rule): treat as NOT enrolled →
     // mint a spare token, which lapses unused because `wiremesh-relay-enroll`
     // skips when a complete identity is present (`enroll::probe_identity`).
-    let relay_enrolled = match ctx.admin.list_relays().await {
-        Ok(rows) => rows.iter().any(|r| r.endpoint == relay.spec.endpoint),
+    let roster = match ctx.admin.list_relays().await {
+        Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(
                 "relay {name}: controller relay-roster query failed ({e}); treating the \
                  identity as NOT persisted (conservative: mint a spare enrollment token)"
             );
-            false
+            // An empty roster flows through `relay_identity_persisted` to false
+            // — the conservative "not enrolled" verdict.
+            Vec::new()
         }
     };
-    let identity_persisted = pvc_exists && relay_enrolled;
+    let identity_persisted =
+        relay_identity_persisted(pvc_exists, &roster, &relay.spec.endpoint);
 
     // Mint whenever the identity is not durably persisted OR no populated token
     // Secret exists (`should_mint_token`, the gateway contract). The force-
