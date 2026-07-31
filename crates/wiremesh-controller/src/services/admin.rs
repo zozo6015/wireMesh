@@ -185,6 +185,22 @@ impl Admin for AdminSvc {
             return Err(Status::invalid_argument("token kind must not be empty"));
         }
 
+        // A `rebind` token's ENTIRE authorization scope is its segment id: at
+        // redemption the enroll path requires the resolved segment to equal the
+        // token's `rebind_segment_id` (`Db::enroll_gateway`). But `0` is the
+        // wire encoding for "no rebind" and is stored as NULL below, so a
+        // `kind = "rebind"` mint with a zero/absent id produces a token that is
+        // unscoped-and-therefore-unusable — every redemption fails
+        // `BoundCidrMismatch`, long after the mint, with nothing pointing back
+        // at the real mistake. Reject it at mint time instead (mirrors the
+        // bound_cidr validation right below: catch it here, not at enrollment).
+        if req.kind == "rebind" && req.rebind_segment_id == 0 {
+            return Err(Status::invalid_argument(
+                "rebind_segment_id must be non-zero for a rebind token (it is the token's \
+                 authorization scope; 0 encodes 'no rebind')",
+            ));
+        }
+
         // Validate each bound CIDR as IPv4 up front (mirrors CreateSegment) so
         // a malformed CIDR is rejected at mint time rather than surfacing much
         // later at enrollment.

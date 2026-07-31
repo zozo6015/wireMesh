@@ -100,8 +100,10 @@ pub async fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         }
         "mint-token" => {
             // Fail closed on the two rebind mis-encodings that would otherwise
-            // mint a token which can only be rejected at redemption.
-            if kind == "rebind" {
+            // mint a token which can only be rejected at redemption. Keyed off
+            // the SHARED `REBIND_TOKEN_KIND` (not a local literal) so the kind
+            // can never drift from what the transports encode.
+            if kind == crate::admin::REBIND_TOKEN_KIND {
                 if rebind_segment_id == 0 {
                     return Err(anyhow!(
                         "mint-token --kind rebind requires a non-zero --rebind-segment-id \

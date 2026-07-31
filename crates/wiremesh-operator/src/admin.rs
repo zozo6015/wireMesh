@@ -25,8 +25,17 @@ use wiremesh_proto::v1::{
 /// degrades the mint.
 pub const REBIND_TOKEN_KIND: &str = "rebind";
 
-/// The exact `MintTokenRequest` an operator rebind mint must send — the single
-/// definition both transports encode.
+/// The exact `MintTokenRequest` an operator rebind mint must send — the
+/// gRPC transport's encoding of a rebind mint.
+///
+/// NOTE on sharing: what all three call sites genuinely share is
+/// [`REBIND_TOKEN_KIND`] — this function is only the gRPC transport's
+/// encoding. The exec transport builds the equivalent argv separately in
+/// [`crate::admin_exec::rebind_mint_args`], and `operator_admin.rs` (the CLI on
+/// the far side of that exec, which turns the argv back into a
+/// `MintTokenRequest`) validates its own flag combinations. All three reference
+/// the constant, so the kind cannot drift between them; the two encodings are
+/// pinned together by `tests/rebind_token_encoding.rs`.
 ///
 /// Byte-for-byte the encoding `crates/wiremesh-controller/tests/rebind.rs`
 /// proves end-to-end: [`REBIND_TOKEN_KIND`], **empty** `bound_cidrs`, and the
@@ -35,7 +44,22 @@ pub const REBIND_TOKEN_KIND: &str = "rebind";
 /// alone, so CIDRs there would be dead, misleading data. (The operator records
 /// the segment's new CIDRs in its own token Secret instead — see
 /// `controllers::gateway::token_secret_body`.)
+///
+/// # Invariant
+///
+/// `rebind_segment_id` MUST be non-zero — `0` is the wire encoding for "no
+/// rebind", so a zero here mints an unscoped token that can only ever fail
+/// redemption. Callers enforce it ([`FabricAdmin::mint_gateway_rebind_token`]
+/// and [`crate::admin_exec::AdminExec::mint_gateway_rebind_token`]), and the
+/// controller now rejects it at mint time too
+/// (`services/admin.rs`); the `debug_assert!` documents it here so a future
+/// caller that skips the guard trips in dev/test builds.
 pub fn rebind_mint_request(rebind_segment_id: u64) -> MintTokenRequest {
+    debug_assert!(
+        rebind_segment_id != 0,
+        "rebind_mint_request(0): 0 encodes 'no rebind' — a rebind token's scope IS the \
+         segment id, so this would mint a token that can only fail redemption"
+    );
     MintTokenRequest {
         kind: REBIND_TOKEN_KIND.to_string(),
         bound_cidrs: Vec::new(),
