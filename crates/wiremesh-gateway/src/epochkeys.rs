@@ -2,6 +2,25 @@
 //! `state.rs`'s fail-static persistence idiom (0600, atomic tmp+rename,
 //! fsync file and directory) but for the gateway's own rotating keypairs
 //! rather than controller-sourced desired state.
+//!
+//! Lifecycle wiring (Backlog 3 Task 1 — durable promote/retire): `promote`
+//! is driven by the Role-A FlipRoutes cutover in `main.rs`'s rotation tick
+//! (the moment the data plane flips onto the new epoch's tun) and `retire`
+//! by `service_retire` (the old Device's teardown) — each followed by a
+//! `persist`, so a reboot at any point of a rotation sees the store the data
+//! plane actually reached. `retire` REMOVES the epoch's entry outright
+//! (`Vec::retain`), so the retired PRIVATE key is scrubbed from the
+//! serialized `epoch_keys.json` bytes on the next `persist` — retirement is
+//! key destruction in THIS file, not a state flag next to a still-readable
+//! key. Boot selects its key via [`EpochKeys::select_boot_key`].
+//!
+//! SCOPE OF THE SCRUB (known residual): retirement destroys key material in
+//! `epoch_keys.json` ONLY. The epoch-0 key remains on disk in
+//! `identity.json`/`wg_private.key` (the enrollment identity is never
+//! rewritten — follow-up, Tasks 2-4 territory), and `select_boot_key`'s
+//! legacy fallback will happily boot it again if `epoch_keys.json` is
+//! DELETED (an absent file is the fallback branch by design; a present but
+//! corrupt file fails loudly at `load` instead).
 use anyhow::{anyhow, Context};
 use rand::{rngs::OsRng, RngCore};
 use std::fs;
@@ -119,6 +138,54 @@ impl EpochKeys {
         }
     }
 
+    /// Select the keypair the gateway must boot its base tun with:
+    /// the persisted store's ACTIVE epoch entry when one exists, else an
+    /// epoch-0 "active" entry synthesized from the legacy identity key
+    /// (`Identity::wg_private_key_b64`). Pure — no I/O; the caller loads
+    /// the store ([`EpochKeys::load`]) and passes it in.
+    ///
+    /// Fallback ladder:
+    ///  1. `store` has an entry in state `"active"` → that entry, verbatim.
+    ///     A `"retiring"` entry never shadows it — a crash between the
+    ///     LOCAL cutover's persisted promote and the local retire must
+    ///     reboot onto the PROMOTED epoch, since that is the only key peers
+    ///     advertise once the controller has promoted it.
+    ///  2. No store, or a store with NO `"active"` entry → synthesized
+    ///     epoch-0 active entry from the legacy key. NB the no-active-entry
+    ///     branch has no natural producer in today's lifecycle: a crash
+    ///     between `generate_next`+persist and the cutover's promote leaves
+    ///     epoch 0 STILL `"active"` alongside the `"pending"` mint (branch 1
+    ///     correctly selects epoch 0 — no cutover happened). It is
+    ///     defensive hardening for a hand-edited/foreign store, pinned by
+    ///     `tests/epoch_boot_key.rs`: a pending key must never boot, since
+    ///     the local data plane never ran it; the legacy key is the last
+    ///     state this gateway's data plane actually used.
+    ///
+    /// KNOWN RESIDUAL (follow-up, T2 territory): the store only records
+    /// LOCAL cutovers. The controller's Rule-4 ack-less grace-promote is NOT
+    /// reconciled down into it — a rotation whose new-epoch session never
+    /// established locally but that the controller grace-promoted anyway
+    /// leaves this store pending-only, so a reboot takes branch 2 and boots
+    /// the OLD key, which post-grace-promote no peer advertises. Closing
+    /// that corner needs the boot path (or Sync) to reconcile the
+    /// controller's promoted epoch into the store.
+    pub fn select_boot_key(
+        store: Option<&EpochKeys>,
+        legacy_priv_b64: &str,
+    ) -> anyhow::Result<EpochKey> {
+        if let Some(active) = store.and_then(|s| s.active()) {
+            return Ok(active.clone());
+        }
+        let pubkey_b64 = crate::uapi::base64_pub_from_priv(legacy_priv_b64)
+            .context("deriving pubkey for legacy boot-key fallback")?;
+        Ok(EpochKey {
+            epoch: 0,
+            private_key_b64: legacy_priv_b64.to_string(),
+            pubkey_b64,
+            state: "active".to_string(),
+        })
+    }
+
     /// The current active epoch, if any.
     pub fn active(&self) -> Option<&EpochKey> {
         self.epochs.iter().find(|k| k.state == "active")
@@ -157,7 +224,9 @@ impl EpochKeys {
     }
 
     /// Remove `epoch` iff it is currently "retiring". Errors otherwise
-    /// (not found, or found but not "retiring").
+    /// (not found, or found but not "retiring"). Removal (not a state flip)
+    /// is the scrub mechanism: once the caller `persist`s, the retired
+    /// PRIVATE key is gone from `epoch_keys.json`'s bytes entirely.
     pub fn retire(&mut self, epoch: u32) -> anyhow::Result<()> {
         let is_retiring = self
             .epochs
