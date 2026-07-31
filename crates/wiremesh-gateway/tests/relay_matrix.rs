@@ -18,6 +18,17 @@
 //! end-to-end, for the first time, under netns. See that test fn's own doc
 //! comment for the eviction mechanism and why.
 //!
+//! Also here (aether-prod-fi-01 relay-wedge regression):
+//! `case4_relay_leg_death_unwedges_direct_punch`, which varies the shared
+//! topology — **port-restricted** NAT on both sides plus a temporary
+//! direct-lane blackhole (`build_scenario`'s `nat`/`block_direct` params) —
+//! to prove a relayed pair whose relay legs die OF SILENCE (an in-transit
+//! severance detected only by QUIC's idle timeout — the `TimedOut`
+//! death-reason branch; case 3 remains the graceful-close/eviction
+//! fast-path pin) recovers a real DIRECT path instead of sawtoothing
+//! forever on a stale `relay_pointed` pin. See that test fn's doc comment
+//! for the incident and the repro-design rationale.
+//!
 //! ./dev.sh run "cargo test -p wiremesh-gateway --test relay_matrix \
 //!   --features netns-tests -- --test-threads=1 --nocapture"
 //!
@@ -200,6 +211,13 @@ const RELAY_ADDR_CIDR: &str = "198.51.100.4/24";
 /// `RELAY_ADDR_2`'s host, reformatted as a `/24` — see `RELAY_ADDR_2`'s doc
 /// comment.
 const RELAY_ADDR_2_CIDR: &str = "198.51.100.5/24";
+/// The two NAT routers' external (bridge-facing) addresses — the source/
+/// destination every masqueraded gateway<->gateway datagram carries on the
+/// bridge. Case 4 blackholes each one inside the OPPOSITE router (see
+/// `build_scenario`'s `block_direct`) to force the pair onto the relay
+/// during establishment even though its NAT pairing could punch direct.
+const RA_EXT: &str = "198.51.100.2";
+const RB_EXT: &str = "198.51.100.3";
 
 /// Best-effort teardown of the root-netns bridge + host-side veth ends (the
 /// child-netns ends go away with the `Lab`'s netns). Runs even on panic.
@@ -652,6 +670,12 @@ struct Scenario {
     gwb: Ns,
     wla: Ns,
     wlb: Ns,
+    /// The two NAT router namespaces, kept so a case can mutate in-transit
+    /// reachability mid-test (case 4 lifts the `block_direct` blackholes via
+    /// [`unblock_direct`]). `Ns` is a non-owning handle — the `Lab` still
+    /// owns netns teardown — so holding these adds no Drop-order hazard.
+    ra: Ns,
+    rb: Ns,
     _lab: Lab,
     _h: TestController,
     relays: Vec<RelayHandle>,
@@ -661,15 +685,75 @@ struct Scenario {
     _root_guard: RootNetGuard,
 }
 
-/// Builds the full topology: both gateways behind SYMMETRIC NAT (so the
-/// brokered punch genuinely fails — Cycle 4b `nat_matrix.rs`'s
-/// `case2_symmetric_relay_needed` already establishes that fact for this
-/// exact NAT kind), one real controller-enrolled+advertised relay per entry
+/// Lifts the `block_direct` blackhole routes installed by [`build_scenario`]
+/// (case 4's phase 2): from this instant the two gateways' masqueraded
+/// datagrams can genuinely reach each other's router again, so a direct
+/// punch — for a NAT pairing that allows one — becomes possible.
+fn unblock_direct(sc: &Scenario) {
+    sc.ra
+        .exec(&["ip", "route", "del", "blackhole", &format!("{RB_EXT}/32")])
+        .expect("lift ra blackhole");
+    sc.rb
+        .exec(&["ip", "route", "del", "blackhole", &format!("{RA_EXT}/32")])
+        .expect("lift rb blackhole");
+}
+
+/// Case 4's relay-leg severance: blackholes the relay's address in BOTH NAT
+/// routers, so from this instant every gateway<->relay datagram silently
+/// dies in transit — in BOTH directions, because with the gateways' outbound
+/// dropped the relay stops receiving, and (having no keep-alives and no data
+/// of its own) therefore stops sending; any stray packet it did emit could
+/// not matter, since no CONNECTION_CLOSE is ever generated (see below).
+///
+/// The point of this mechanism — versus case 3's `RelayHandle::evict`
+/// (`quinn::Endpoint::close`) — is that NO close frame can possibly reach
+/// either gateway, so both legs die the way the PRODUCTION wedge's did: of
+/// pure silence, detected only by QUIC's idle timer and classified
+/// `TimedOut`, which is the punch-window driver branch this case pins. A
+/// graceful `Endpoint::close` would instead classify `Closed` and take the
+/// eviction fast-path (immediate reconnect — case 3's branch, already
+/// pinned there). Guarantees: the blackhole route type drops without ICMP;
+/// QUIC idle timeout is a silent discard on both ends (RFC 9000 §10.1 — no
+/// close frame is sent at expiry, and quinn follows this); and the relay
+/// process itself is left alive and unclosed the whole time, so no
+/// close-at-shutdown can leak either.
+fn sever_relay(sc: &Scenario) {
+    let relay_host = RELAY_ADDR.split(':').next().expect("RELAY_ADDR has a host");
+    sc.ra
+        .exec(&["ip", "route", "add", "blackhole", &format!("{relay_host}/32")])
+        .expect("install ra relay blackhole");
+    sc.rb
+        .exec(&["ip", "route", "add", "blackhole", &format!("{relay_host}/32")])
+        .expect("install rb relay blackhole");
+}
+
+/// Builds the full topology: both gateways behind `nat`-kind NAT (cases 1
+/// and 3 pass `NatKind::Symmetric` so the brokered punch genuinely fails —
+/// Cycle 4b `nat_matrix.rs`'s `case2_symmetric_relay_needed` already
+/// establishes that fact for that NAT kind; case 4 passes
+/// `NatKind::PortRestricted`, the pairing `nat_matrix.rs` case 1 proves CAN
+/// punch direct), one real controller-enrolled+advertised relay per entry
 /// in `relay_specs` (advertisement order == `relay_specs` order, which is
 /// what `ensure_relay_transport`'s round-robin cursor picks in), and both
 /// REAL gateway binaries. Does NOT wait for convergence — the caller (the
 /// test fn) asserts the expected relayed outcome.
-async fn build_scenario(prefix: &str, relay_specs: Vec<RelaySpec<'_>>) -> Scenario {
+///
+/// `block_direct` (case 4): installs a `/32` blackhole route in EACH router
+/// toward the OTHER router's external address BEFORE the gateways spawn, so
+/// every masqueraded gateway<->gateway datagram (punch probes and WG alike)
+/// is silently dropped in transit while the controller (`CTRL_IP`) and the
+/// relay addresses on the same bridge stay fully reachable — forcing even a
+/// punch-capable NAT pairing onto the relay during establishment, exactly
+/// like a transiently unpunchable real-world path would. Lifted later via
+/// [`unblock_direct`]. Installed router-side (not in the gateway netns) so
+/// gateway-side sends still succeed and die in transit — no local send
+/// errors that the real incident never had.
+async fn build_scenario(
+    prefix: &str,
+    relay_specs: Vec<RelaySpec<'_>>,
+    nat: NatKind,
+    block_direct: bool,
+) -> Scenario {
     setup_bridge();
     let root_guard = RootNetGuard;
 
@@ -709,8 +793,8 @@ async fn build_scenario(prefix: &str, relay_specs: Vec<RelaySpec<'_>>) -> Scenar
     let gwb = lab.ns("gb").expect("gwB netns");
     let wla = lab.ns("wa").expect("wlA netns");
     let wlb = lab.ns("wb").expect("wlB netns");
-    let ra = lab.nat_router("ra", NatKind::Symmetric).expect("ra");
-    let rb = lab.nat_router("rb", NatKind::Symmetric).expect("rb");
+    let ra = lab.nat_router("ra", nat).expect("ra");
+    let rb = lab.nat_router("rb", nat).expect("rb");
 
     // Inside (gateway <-> router) links.
     lab.veth((&gwa, "nat0", "192.168.80.2/24"), (&ra, "in0", "192.168.80.1/24"))
@@ -729,6 +813,19 @@ async fn build_scenario(prefix: &str, relay_specs: Vec<RelaySpec<'_>>) -> Scenar
     apply_netem(&rb, "out0", 20).expect("netem rb/out0");
     assert_netem_present(&ra, "out0");
     assert_netem_present(&rb, "out0");
+
+    // Case 4's direct-lane block (see this fn's doc comment): installed
+    // BEFORE the gateways spawn, so the very first punch cycles are already
+    // deterministically doomed and the pair's initial convergence can only
+    // be the relay. A `/32` blackhole overrides the routers' connected-/24
+    // route for exactly the opposite router's external address and silently
+    // drops (no ICMP), leaving controller+relay reachability untouched.
+    if block_direct {
+        ra.exec(&["ip", "route", "add", "blackhole", &format!("{RB_EXT}/32")])
+            .expect("install ra blackhole");
+        rb.exec(&["ip", "route", "add", "blackhole", &format!("{RA_EXT}/32")])
+            .expect("install rb blackhole");
+    }
 
     // Segment (workload) links + default routes.
     lab.veth((&gwa, "seg0", "10.10.11.1/24"), (&wla, "eth0", "10.10.11.2/24"))
@@ -787,6 +884,8 @@ async fn build_scenario(prefix: &str, relay_specs: Vec<RelaySpec<'_>>) -> Scenar
         gwb,
         wla,
         wlb,
+        ra,
+        rb,
         _lab: lab,
         _h: h,
         relays,
@@ -817,6 +916,8 @@ async fn case1_symmetric_pair_flows_over_relay() {
     let sc = build_scenario(
         "rm1",
         vec![RelaySpec::InProcess { addr: RELAY_ADDR, csr_tag: "relay-case1" }],
+        NatKind::Symmetric,
+        false,
     )
     .await;
     let start = Instant::now();
@@ -1068,6 +1169,8 @@ async fn case3_relay_eviction_repaths_to_second_relay() {
             RelaySpec::Killable { addr: RELAY_ADDR, csr_tag: "relay-case3-r1" },
             RelaySpec::InProcess { addr: RELAY_ADDR_2, csr_tag: "relay-case3-r2" },
         ],
+        NatKind::Symmetric,
+        false,
     )
     .await;
     let start = Instant::now();
@@ -1215,6 +1318,390 @@ async fn case3_relay_eviction_repaths_to_second_relay() {
         "CASE 3 PASS: symmetric<->symmetric pair survived R1's eviction and re-flowed real \
          ping traffic over R2 within {:?} of the eviction (total test time {:?}).",
         evict_at.elapsed(),
+        start.elapsed()
+    );
+}
+
+/// Case 4's DEATH-DETECTION budget: how long after the in-transit severance
+/// ([`sever_relay`]) each gateway's transport takes to actually notice its
+/// leg is dead. A close-frame-less severance is detected ONLY by QUIC's idle
+/// timer: `wiremesh_relay::transport_config` fixes `max_idle_timeout = 30s`
+/// on both sides with no keep-alives, `Client::is_alive` (=
+/// `RelayTransport::is_healthy`) flips exactly when quinn's idle timer
+/// expires and records the `TimedOut` close reason — nothing flips it
+/// earlier (a blackholed route emits no ICMP, and the relay never sends a
+/// close: RFC 9000 idle timeout is a SILENT discard on both ends). Until
+/// that instant the path legitimately stays `Relayed` (the SM's
+/// relay-death branch is `relay_available`-driven, i.e. health-driven).
+/// Budget = the 30s constant + margin for the last pre-severance received
+/// packet (idle timers restart on receipt; keepalive/probe traffic means
+/// the last receipt is ≤ a few seconds before the severance instant), the
+/// ~1s path-tick cadence, and container CPU jitter.
+const CASE4_DEATH_DETECTION_BUDGET: Duration = Duration::from_secs(35);
+
+/// Case 4's RECOVERY budget AFTER the death is detectable: with the fix the
+/// recovery is one or two `Disconnected -> Connecting -> StartPunch` cycles
+/// (backoff 4-16s + `CONNECT_TIMEOUT` 10s each) plus the handshake itself,
+/// so ~10-15s nominal after detection (~40-45s total from severance,
+/// ~55-60s expected worst with one failed cycle); on PRE-FIX code the wedge
+/// sawtooth runs forever, so no budget would ever be enough — the bound
+/// only exists to fail loud in bounded time. The recovery wait below is
+/// bounded by `CASE4_DEATH_DETECTION_BUDGET + CASE4_RECOVERY_BUDGET` from
+/// the severance instant, so this component stays a pure
+/// recovery-after-detection allowance.
+const CASE4_RECOVERY_BUDGET: Duration = Duration::from_secs(90);
+
+/// Post-severance `DEFER_NEEDLE` tolerance per gateway (case 4). During the
+/// ~30s silent detection phase NO defer lines can accrue at all: the path
+/// stays `Relayed` (see [`CASE4_DEATH_DETECTION_BUDGET`] — health flips
+/// only at the idle-timer expiry), so there are no `Connecting` cycles, no
+/// tick-driven punch spawns, and directives stay filtered. On PRE-FIX code,
+/// once detection lands every `Disconnected -> Connecting` cycle spawns a
+/// punch trial that instantly defers against the stale `relay_pointed` pin
+/// — one defer line per sawtooth cycle (backoff 4s doubling toward 30s +
+/// 10s `CONNECT_TIMEOUT`), i.e. 3+ lines inside the recovery window,
+/// repeating forever. With the fix the pin is cleared on relay death, so a
+/// defer can only come from the benign race the make-before-break guard
+/// exists for: a punch trial still in flight when `Connecting` times out
+/// mid-recovery (at most one line per failed recovery cycle, and recovery
+/// completes within a cycle or two). ≤2 separates the two worlds.
+///
+/// Known UN-MODELED flake margins (for diagnosing a future red without
+/// assuming the wedge regressed):
+/// (a) each failed recovery cycle whose punch trial straddles the 10s
+///     `CONNECT_TIMEOUT` prints one defer line, so ≥3 failed cycles before
+///     an ultimately-successful recovery would breach this bound even
+///     though recovery was legitimately in progress;
+/// (b) `punch_backoff` (`FAILURE_THRESHOLD` = 3 consecutive failures opens
+///     a ~30s window) can silently swallow phase 4's FIRST `StartPunch`
+///     spawn (+~18s to recovery) if phase 1's blocked-direct punches
+///     already accrued 3 recorded failures.
+const CASE4_MAX_POST_DEATH_DEFERS: usize = 2;
+
+/// Case 4 (aether-prod-fi-01 relay-wedge regression, v0.3.0 incident): a
+/// RELAYED pair whose relay legs die OF SILENCE (close-frame-less, QUIC
+/// idle timeout — the `RelayDeathReason::TimedOut` classification, i.e. the
+/// production wedge's death mode) — with no reachable relay to re-path onto
+/// and a NAT pairing that genuinely allows a direct punch — must UNWEDGE:
+/// clear the dead relay's `relay_pointed` pin, get a clean direct punch
+/// window, and re-establish real WG flow direct. RED on pre-fix code.
+///
+/// ## The production wedge being reproduced
+///
+/// Gateway A was `Relayed` toward peer B; B restarted fresh and punched A
+/// direct, tearing down B's relay leg. A's own relay leg then died (downlink
+/// recv error -> `is_healthy()` false), and A sawtoothed forever (~40s
+/// period): `Relayed -> Disconnected` (+`MarkRelayNeeded` -> immediate relay
+/// reconnect on a fresh socket), `Disconnected -> Connecting` + `StartPunch`
+/// whose trial instantly printed `DEFER_NEEDLE` and yielded — because
+/// `relay_pointed` is only cleared by a successful DIRECT endpoint commit or
+/// roster pruning, and `teardown_relay_transport` runs only on reaching
+/// `Direct`, a DEAD transport never cleared the pin — then `Connecting`
+/// timed out, re-relayed toward a relay the peer had left, timed out again,
+/// repeat. The peer never got one clean direct-punch window.
+///
+/// ## Repro design (the cheapest DETERMINISTIC one this harness supports)
+///
+/// Production's exact shape — a one-sided leg death with the relay still
+/// serving and the peer punching in unilaterally — is not deterministically
+/// reproducible here: `RelayHandle::Killable`'s `quinn::Endpoint::close`
+/// severs EVERY connection on the relay (the per-connection registry isn't
+/// addressable from the test), and a one-sided network severance (e.g.
+/// blackholing one router's route to the relay) would strand the OTHER side
+/// `Relayed`-on-a-healthy-leg with no traffic — a distinct, out-of-scope
+/// stall (`Relayed` has no silence-based exit), under which not even the fix
+/// could recover the pair, so nothing would discriminate. The wedge's ROOT
+/// CAUSE, however, is per-side and mechanism-identical under a both-sides
+/// leg death: dead transport -> `Relayed -> Disconnected` -> pin never
+/// cleared -> every punch defers -> sawtooth. So:
+///
+/// 1. Both gateways behind **port-restricted** NAT (`nat_matrix.rs` case 1
+///    proves this pairing punches to a real `Direct` WG handshake), ONE
+///    `Killable` relay, and `build_scenario`'s `block_direct` blackholes so
+///    the initial punches deterministically fail in transit and the pair's
+///    only possible first convergence is `Relayed` — proven flowing exactly
+///    like case 1.
+/// 2. Lift the blackholes (direct becomes genuinely possible) and confirm
+///    the pair deliberately STAYS relayed — the driver no-ops `ProbeDirect`
+///    and filters punch directives against `relay_pointed`, so nothing may
+///    move a healthy relayed pair (that cutover is the documented
+///    fast-follow, not this case's subject; this also pins that the later
+///    recovery is attributable to the leg-death handling, not the unblock).
+/// 3. Sever both relay legs IN TRANSIT ([`sever_relay`]: the relay's `/32`
+///    blackholed in both routers) — deliberately NOT case 3's
+///    `RelayHandle::evict`/`quinn::Endpoint::close`, whose graceful
+///    CONNECTION_CLOSE classifies as `RelayDeathReason::Closed` and takes
+///    the eviction fast-path (immediate reconnect), a DIFFERENT driver
+///    branch from the one that wedged in production. Pure silence means
+///    both transports die only when QUIC's 30s idle timer expires
+///    (`TimedOut` — see [`CASE4_DEATH_DETECTION_BUDGET`] for the exact
+///    detection semantics), and with no reachable relay and a
+///    punch-capable pairing, DIRECT is the only possible recovery —
+///    exactly the window the wedge permanently blocks.
+///
+/// ## Why this cannot conflate with case 3's eviction re-path
+///
+/// Case 3's `RelaysChanged`-driven re-path kills R1 GRACEFULLY (a real
+/// CONNECTION_CLOSE ⇒ `Closed` ⇒ the immediate-reconnect fast-path) with a
+/// SECOND advertised relay standing by: the death is immediately followed
+/// by a successful re-relay that the PEER also lands on, so traffic
+/// recovers over R2 and the (re-pinned) `relay_pointed` is correct — no
+/// wedge, and that behavior must keep working (case 3 stays green and
+/// untouched as the `Closed`-branch pin). This case severs by SILENCE
+/// (`TimedOut`), removes the second relay, and makes the NAT pairing
+/// punch-capable, so the ONLY way to recover flow is the direct punch
+/// window that clearing the pin grants — the two cases pin the two driver
+/// branches of `RelayDied` respectively.
+///
+/// ## RED/GREEN discrimination
+///
+/// Pre-fix: `relay_pointed` stays pinned on both sides; every punch trial
+/// defers (`DEFER_NEEDLE` once per sawtooth cycle, forever); and even if a
+/// post-eviction `apply_state` rebuild happens to re-point WG at real
+/// candidates and traffic leaks through, the stale pin routes every
+/// corroborated handshake to `on_authenticated_inbound` instead of
+/// `on_handshake(_, true)`, so `path_state` can NEVER reach `direct` — the
+/// recovery assertion (direct + flowing ping) fails, and the defer count
+/// shows the sawtooth. Post-fix: the relay-death action tears down the dead
+/// transport, clears the pin, skips the immediate re-relay; the next punch
+/// window commits real candidates on both sides, the handshake corroborates
+/// -> `direct` on both, the ping crosses, defers stay ≤
+/// `CASE4_MAX_POST_DEATH_DEFERS`. Expected timeline from the severance:
+/// ~30s silent detection ([`CASE4_DEATH_DETECTION_BUDGET`]) + one or two
+/// punch cycles (~10-30s) ≈ 40-60s total; the wait below is bounded by
+/// detection budget + [`CASE4_RECOVERY_BUDGET`] so the recovery allowance
+/// itself stays 90s-after-detection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn case4_relay_leg_death_unwedges_direct_punch() {
+    // `InProcess` deliberately (NOT `Killable`): case 4 never closes the
+    // relay — the severance is in-transit silence (`sever_relay`), and the
+    // relay endpoint must stay alive and unclosed for the whole test so no
+    // CONNECTION_CLOSE frame can possibly originate anywhere (a close would
+    // classify `Closed` and take the eviction fast-path instead of the
+    // `TimedOut` punch-window branch this case pins).
+    let sc = build_scenario(
+        "rm4",
+        vec![RelaySpec::InProcess { addr: RELAY_ADDR, csr_tag: "relay-case4" }],
+        NatKind::PortRestricted,
+        true,
+    )
+    .await;
+    let start = Instant::now();
+
+    // Phase 1: with the direct lane blackholed, the pair's only possible
+    // convergence is the relay — same reach-relayed bound and proof shape as
+    // case 1 (state on both sides, flowing ping, local-relay-socket
+    // endpoints).
+    let mut last_log = Instant::now() - Duration::from_secs(5);
+    let relayed = wait_until(Duration::from_secs(45), || {
+        if last_log.elapsed() >= Duration::from_secs(5) {
+            eprintln!(
+                "case4: t+{:?} pre-death gwA={:?} gwB={:?}",
+                start.elapsed(),
+                path_state(&sc.gwa),
+                path_state(&sc.gwb),
+            );
+            last_log = Instant::now();
+        }
+        path_state(&sc.gwa).as_deref() == Some("relayed")
+            && path_state(&sc.gwb).as_deref() == Some("relayed")
+    });
+    if !relayed {
+        dump_diag("case4 reach-relayed", &sc);
+        panic!(
+            "case4: blocked-direct port-restricted pair never reached path_state=relayed on \
+             both sides (gwA={:?}, gwB={:?}) within 45s — the wedge scenario needs a \
+             genuinely relayed starting point",
+            path_state(&sc.gwa),
+            path_state(&sc.gwb)
+        );
+    }
+    let crossed = wait_until(Duration::from_secs(25), || ping_ok(&sc.wla, "10.10.12.2"));
+    if !crossed {
+        dump_diag("case4 ping-cross (relayed)", &sc);
+        panic!("case4: wlA -> wlB ping never crossed the relayed tunnel before the leg death");
+    }
+    let ep_a_relayed = wg_endpoint(&sc.gwa);
+    let ep_b_relayed = wg_endpoint(&sc.gwb);
+    if !ep_a_relayed.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
+        || !ep_b_relayed.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
+    {
+        dump_diag("case4 endpoint-check (relayed)", &sc);
+        panic!(
+            "case4: expected BOTH peers' WG endpoint on the local relay socket while \
+             relayed, got gwA={ep_a_relayed:?} gwB={ep_b_relayed:?}"
+        );
+    }
+    eprintln!(
+        "case4: PASS pair is genuinely relayed and flowing in {:?} \
+         (endpoints gwA={ep_a_relayed:?} gwB={ep_b_relayed:?})",
+        start.elapsed()
+    );
+
+    // Phase 2: lift the blackholes — direct is now genuinely possible — and
+    // confirm the healthy relayed pair deliberately stays put (see the doc
+    // comment: nothing may disturb a live relay path until its leg actually
+    // dies, so the later recovery is attributable to the death handling).
+    unblock_direct(&sc);
+    let settle_until = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < settle_until {
+        let st_a = path_state(&sc.gwa);
+        let st_b = path_state(&sc.gwb);
+        if st_a.as_deref() != Some("relayed") || st_b.as_deref() != Some("relayed") {
+            dump_diag("case4 post-unblock flap", &sc);
+            panic!(
+                "case4: pair left path_state=relayed after merely unblocking the direct \
+                 lane (gwA={st_a:?}, gwB={st_b:?}) — a healthy relay path must not be \
+                 disturbed before its leg dies; investigate before reading the recovery \
+                 phase"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    eprintln!("case4: PASS pair stayed relayed across the unblock settle window");
+
+    // Phase 3: sever both relay legs IN TRANSIT (silence, no close frame —
+    // see `sever_relay`'s doc for the guarantees). Stderr offsets taken at
+    // the severance instant scope the defer-spam count below to post-death
+    // output only; the legs stay nominally healthy (path `Relayed`) for the
+    // ~30s silent detection phase that follows, during which no defer line
+    // can accrue (see `CASE4_MAX_POST_DEATH_DEFERS`).
+    let defer_off_a = sc.pa.stderr_len();
+    let defer_off_b = sc.pb.stderr_len();
+    let severed_at = Instant::now();
+    sever_relay(&sc);
+    eprintln!("case4: severed both relay legs (silence, no close frame) at t+{:?}", start.elapsed());
+
+    // Phase 4: THE regression assertion. Within detection budget + recovery
+    // budget both sides must reach a REAL direct path — path_state=direct on
+    // both AND a flowing workload ping. Requiring the state label (not just
+    // the ping) is load-bearing: on pre-fix code the stale relay_pointed pin
+    // routes every corroborated handshake away from the Direct cutover, so
+    // even accidentally-flowing traffic can never produce `direct` — the
+    // wedge is caught regardless of any data-plane luck. The ping attempts
+    // double as the tunnel demand that drives boringtun's handshakes (same
+    // pattern as case 1 / nat_matrix's establish_direct). Expect the first
+    // ~30s of progress logs to show both sides still "relayed" — that is
+    // the silent idle-timeout detection phase, not a failure.
+    let recovery_bound = CASE4_DEATH_DETECTION_BUDGET + CASE4_RECOVERY_BUDGET;
+    let mut last_log2 = Instant::now() - Duration::from_secs(5);
+    let recovered = wait_until(recovery_bound, || {
+        if last_log2.elapsed() >= Duration::from_secs(5) {
+            eprintln!(
+                "case4: t+{:?} post-severance gwA={:?} gwB={:?}",
+                severed_at.elapsed(),
+                path_state(&sc.gwa),
+                path_state(&sc.gwb),
+            );
+            last_log2 = Instant::now();
+        }
+        path_state(&sc.gwa).as_deref() == Some("direct")
+            && path_state(&sc.gwb).as_deref() == Some("direct")
+            && ping_ok(&sc.wla, "10.10.12.2")
+    });
+    if !recovered {
+        let defers_a = sc.pa.stderr_from(defer_off_a).matches(DEFER_NEEDLE).count();
+        let defers_b = sc.pb.stderr_from(defer_off_b).matches(DEFER_NEEDLE).count();
+        dump_diag("case4 wedge", &sc);
+        panic!(
+            "case4: pair never re-established a REAL direct path within {recovery_bound:?} of \
+             the silent relay-leg severance (= {CASE4_DEATH_DETECTION_BUDGET:?} idle-timeout \
+             detection + {CASE4_RECOVERY_BUDGET:?} recovery-after-detection; gwA={:?}, \
+             gwB={:?}; {DEFER_NEEDLE:?} counted {defers_a}x on gwA / {defers_b}x on gwB since \
+             the severance) — this is the aether-prod-fi-01 relay wedge: a relay leg dead of \
+             silence (TimedOut) never clears relay_pointed, so every StartPunch cycle defers \
+             its punch trial and the pair sawtooths Disconnected/Connecting (re-relaying at \
+             each Connecting timeout) forever instead of getting one clean direct-punch \
+             window",
+            path_state(&sc.gwa),
+            path_state(&sc.gwb)
+        );
+    }
+    eprintln!(
+        "case4: PASS pair recovered a direct flowing path {:?} after the severance \
+         (~30s of that is the idle-timeout detection phase)",
+        severed_at.elapsed()
+    );
+
+    // Concrete "really direct now" proof: both WG endpoints must be the
+    // peer's ROUTABLE masqueraded address on the bridge (198.51.100.x) — a
+    // 127.0.0.1 endpoint would mean still pointed at a (dead) relay socket.
+    let ep_a_direct = wg_endpoint(&sc.gwa);
+    let ep_b_direct = wg_endpoint(&sc.gwb);
+    if !ep_a_direct.as_deref().is_some_and(|e| e.starts_with("198.51.100."))
+        || !ep_b_direct.as_deref().is_some_and(|e| e.starts_with("198.51.100."))
+    {
+        dump_diag("case4 endpoint-check (direct)", &sc);
+        panic!(
+            "case4: expected BOTH recovered WG endpoints on routable bridge addresses \
+             (198.51.100.x), got gwA={ep_a_direct:?} gwB={ep_b_direct:?}"
+        );
+    }
+    eprintln!(
+        "case4: PASS recovered endpoints are routable direct candidates \
+         (gwA={ep_a_direct:?} gwB={ep_b_direct:?})"
+    );
+
+    // Defer-spam bound (the second RED signal): after the severance the
+    // "deferring direct punch" line must not repeat unboundedly. See
+    // `CASE4_MAX_POST_DEATH_DEFERS` for the pre-fix (~1 per sawtooth cycle,
+    // forever) vs post-fix (at most a benign in-flight-trial race per failed
+    // recovery cycle) separation, and for the two known un-modeled flake
+    // margins to check before reading a red here as the wedge regressing.
+    let defers_a = sc.pa.stderr_from(defer_off_a).matches(DEFER_NEEDLE).count();
+    let defers_b = sc.pb.stderr_from(defer_off_b).matches(DEFER_NEEDLE).count();
+    if defers_a > CASE4_MAX_POST_DEATH_DEFERS || defers_b > CASE4_MAX_POST_DEATH_DEFERS {
+        dump_diag("case4 defer-spam", &sc);
+        panic!(
+            "case4: counted {DEFER_NEEDLE:?} {defers_a}x on gwA and {defers_b}x on gwB after \
+             the relay leg severance (tolerance: <={CASE4_MAX_POST_DEATH_DEFERS} each) — punch \
+             trials are still being deferred against a relay path that is DEAD, i.e. the \
+             relay_pointed pin outlived its transport (see CASE4_MAX_POST_DEATH_DEFERS's doc \
+             for the two benign margins to rule out first)"
+        );
+    }
+    eprintln!(
+        "case4: PASS defer-spam bound — {defers_a} (gwA) / {defers_b} (gwB) deferred-punch \
+         lines since the severance"
+    );
+
+    // Stability hold: the recovered direct path must be a real steady state,
+    // not a transient reading — and no late sawtooth may resume (final defer
+    // recount covers the whole post-death window including this hold).
+    let hold_until = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < hold_until {
+        let st_a = path_state(&sc.gwa);
+        let st_b = path_state(&sc.gwb);
+        if st_a.as_deref() != Some("direct") || st_b.as_deref() != Some("direct") {
+            dump_diag("case4 direct-hold flap", &sc);
+            panic!(
+                "case4: recovered pair did not STAY path_state=direct \
+                 (gwA={st_a:?}, gwB={st_b:?} during the 20s stability hold)"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    if !ping_ok(&sc.wla, "10.10.12.2") {
+        dump_diag("case4 direct-hold ping", &sc);
+        panic!("case4: wlA -> wlB ping stopped crossing during the post-recovery hold");
+    }
+    let defers_a = sc.pa.stderr_from(defer_off_a).matches(DEFER_NEEDLE).count();
+    let defers_b = sc.pb.stderr_from(defer_off_b).matches(DEFER_NEEDLE).count();
+    if defers_a > CASE4_MAX_POST_DEATH_DEFERS || defers_b > CASE4_MAX_POST_DEATH_DEFERS {
+        dump_diag("case4 defer-spam (post-hold)", &sc);
+        panic!(
+            "case4: defer lines kept accruing after recovery — {defers_a}x gwA / {defers_b}x \
+             gwB across the whole post-death window (tolerance \
+             <={CASE4_MAX_POST_DEATH_DEFERS} each)"
+        );
+    }
+
+    eprintln!(
+        "CASE 4 PASS: relayed pair whose relay legs died of silence recovered a REAL direct \
+         path in {:?} from the severance (~30s of that is idle-timeout detection; endpoints \
+         gwA={ep_a_direct:?} gwB={ep_b_direct:?}, defers gwA={defers_a} gwB={defers_b}; \
+         total test time {:?}).",
+        severed_at.elapsed(),
         start.elapsed()
     );
 }
