@@ -67,9 +67,13 @@ pub enum PathState {
     /// `RelayTransport` while the driver periodically probes for a direct
     /// path in the background (`PathAction::ProbeDirect`); a completed WG
     /// handshake (`on_handshake`) cuts over straight to `Direct` and the
-    /// relay is torn down. If the relay itself goes unhealthy with nothing
-    /// else available, `tick` re-paths to `Disconnected` so the driver finds
-    /// another one.
+    /// relay is torn down. If the relay leg itself goes unhealthy, `tick`
+    /// re-paths to `Disconnected` and emits [`PathAction::RelayDied`] so the
+    /// driver tears down the dead transport, clears the peer's relay pin,
+    /// and branches on the death's classification — immediate re-relay for
+    /// a graceful relay-side close (eviction), or a clean direct-punch
+    /// window for silence/other (a relay-needing pair then re-relays via
+    /// the `Connecting`-timeout ladder). See [`PathAction::RelayDied`].
     Relayed,
     Disconnected,
 }
@@ -116,6 +120,33 @@ pub fn directive_should_punch(state: Option<PathState>, relay_pointed: bool) -> 
     matches!(state, None | Some(PathState::Connecting)) && !relay_pointed
 }
 
+/// True iff the `before -> after` transition crosses the SETTLED boundary:
+/// membership in the settled set `{Direct, Relayed}` differs between the two
+/// states (relay-wedge fix round 4; the pinned truth table lives in
+/// `tests/path_settled_boundary.rs`).
+///
+/// Why the boundary matters: the controller broker's pathstate-aware skip
+/// treats a pair as settled — no re-punching, no periodic-budget burn — iff
+/// BOTH members' latest `peer_paths` reports mark the other `direct` OR
+/// `relayed`, and its freshness depends entirely on the gateways reporting
+/// boundary crossings PROMPTLY. Entering settled tells the broker it may
+/// stop re-punching; LEAVING settled (`relayed -> disconnected`, the case-4
+/// relay-death edge; `direct -> degraded`) is the unsettle edge the broker
+/// must see quickly to un-skip the pair, re-arm its punch budget, and emit a
+/// SYNCHRONIZED punch pair — the authoritative case-4 run showed both sides
+/// otherwise punching on unsynchronized self-timers (idle-timeout detection
+/// + backoff drift), which a port-restricted pair can never land. Movement
+/// entirely within one side of the boundary (`connecting -> disconnected`,
+/// `direct -> relayed`) changes nothing the broker acts on and returns
+/// `false` — reporting those eagerly would just re-create report chatter.
+/// The driver (`run_path_ticks`' `to_record` loop) consults this on every
+/// recorded transition to decide whether to trigger the prompt snapshot
+/// report.
+pub fn transition_crosses_settled_boundary(before: PathState, after: PathState) -> bool {
+    let settled = |s: PathState| matches!(s, PathState::Direct | PathState::Relayed);
+    settled(before) != settled(after)
+}
+
 /// An action `Path::tick` asks the caller (Task 10's driver) to perform.
 /// Pure data — this module never touches sockets or UAPI itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,7 +161,31 @@ pub enum PathAction {
     /// endpoint points at it; and parking in `Disconnected` with NO relay
     /// available — the driver should keep trying to find/health-check a
     /// relay for next time, since there's nothing else to do meanwhile.
+    /// EXCEPTION: the `Relayed` arm's own relay-death branch also parks in
+    /// `Disconnected` but deliberately emits [`RelayDied`](Self::RelayDied)
+    /// instead — see that variant for why an immediate relay reconnect there
+    /// was the aether-prod-fi-01 wedge.
     MarkRelayNeeded,
+    /// The relay leg this `Relayed` peer was riding DIED (`tick`'s
+    /// `relay_available == false` while `Relayed`) — the driver must tear
+    /// down the dead transport and clear the peer's `relay_pointed` pin so
+    /// the next `Connecting` spell can actually punch. Deliberately does NOT
+    /// unconditionally request an immediate relay reconnect (unlike
+    /// `MarkRelayNeeded`): the peer may have LEFT the relay entirely — e.g.
+    /// restarted and punched direct, the aether-prod-fi-01 production wedge,
+    /// where the immediate re-relay re-pinned `relay_pointed` and blocked
+    /// every subsequent direct-punch window forever. Instead the driver
+    /// CLASSIFIES the death (`relay::RelayTransport::death_reason`): a
+    /// graceful relay-side close (`Closed` — a controller eviction, which
+    /// severed the peer's leg too) takes an immediate-reconnect fast-path
+    /// restoring the eviction re-path timing; silence (`TimedOut`, the wedge
+    /// shape) and everything else keep the punch-window semantics, where a
+    /// genuinely relay-needing pair (symmetric NAT) re-relays one punch
+    /// cycle later via the existing `Connecting`-timeout → `MarkRelayNeeded`
+    /// ladder. The SM itself is agnostic to that branch: this variant is
+    /// emitted ONLY from the `Relayed` arm's relay-death branch, and the
+    /// state transition (`Relayed -> Disconnected`) is unchanged.
+    RelayDied,
     /// Still waiting (degraded, not yet dead): retry whatever low-rate
     /// recovery probe is already appropriate — no fresh punch session, no
     /// relay escalation yet.
@@ -309,14 +364,21 @@ impl Path {
                         None
                     }
                 } else {
-                    // The relay path itself died with nothing else
-                    // available: re-path to `Disconnected` so the normal
-                    // backoff/StartPunch cycle (and a fresh relay search)
-                    // takes over.
+                    // The relay leg itself died: re-path to `Disconnected`
+                    // so the normal backoff/StartPunch cycle takes over, and
+                    // tell the driver via the dedicated `RelayDied` action —
+                    // NOT `MarkRelayNeeded` — so it tears down the dead
+                    // transport, clears the `relay_pointed` pin, and
+                    // branches on the death's classification (see the
+                    // variant doc: eviction reconnects immediately; the
+                    // wedge's silent death gets a clean punch window — the
+                    // blind immediate reconnect + stale pin was the
+                    // aether-prod-fi-01 wedge, deferring every subsequent
+                    // direct punch forever).
                     self.state = PathState::Disconnected;
                     self.disconnected_since = Some(now);
                     self.relayed_probe_last = None;
-                    Some(PathAction::MarkRelayNeeded)
+                    Some(PathAction::RelayDied)
                 }
             }
             PathState::Disconnected => {
@@ -556,12 +618,15 @@ mod tests {
         assert_eq!(p.state, PathState::Relayed);
         assert_eq!(action, Some(PathAction::MarkRelayNeeded));
 
-        // The relay path itself is now gone: re-path to Disconnected and
-        // ask the driver to re-establish a path.
+        // The relay leg itself is now gone: re-path to Disconnected with the
+        // dedicated RelayDied action (aether-prod-fi-01 wedge fix — NOT
+        // MarkRelayNeeded, whose driver arm would immediately re-relay
+        // without clearing the relay_pointed pin; see
+        // tests/path_relay_death.rs for the full pinned semantics).
         let lost_at = t0 + CONNECT_TIMEOUT + Duration::from_secs(2);
         let action = p.tick(lost_at, false);
         assert_eq!(p.state, PathState::Disconnected);
-        assert_eq!(action, Some(PathAction::MarkRelayNeeded));
+        assert_eq!(action, Some(PathAction::RelayDied));
     }
 
     /// Review fix (4c Task 8, IMPORTANT): `backoff` only ever grew across a

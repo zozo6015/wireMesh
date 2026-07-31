@@ -332,6 +332,16 @@ fn insert_cidrs_tx(tx: &Transaction<'_>, segment_id: i64, name: &str, cidrs: &[I
 }
 
 fn insert_segment_tx(tx: &Transaction<'_>, name: &str, cidrs: &[Ipv4Net]) -> Result<i64> {
+    // (Backlog 10 PR-A Item 2b, db-layer belt) Every RPC boundary that can
+    // reach here (`CreateSegment`, `Apply`, enrollment) already rejects an
+    // empty cidrs list with `invalid_argument`, but this is the single
+    // structural choke point every segment INSERT passes through — guarding
+    // here closes the gap for any future direct-DB writer, so a zero-CIDR
+    // segment (which no policy can compile against and no enrollment can
+    // bind) can never be stored at all.
+    if cidrs.is_empty() {
+        anyhow::bail!("segment {name:?}: cidrs must not be empty");
+    }
     tx.execute("INSERT INTO segment (name) VALUES (?1)", params![name])?;
     let segment_id = tx.last_insert_rowid();
     insert_cidrs_tx(tx, segment_id, name, cidrs)?;

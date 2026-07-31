@@ -14,7 +14,7 @@
 //! [`crate::flatten::flatten`]'s output into a FRESH generation's per-CPU
 //! map-in-map tables via a single atomic `ACTIVE` flip.
 
-use crate::flatten::{flatten, FlatRule};
+use crate::flatten::{flatten, DistinctSideCidrs, FlatRule};
 use crate::{BackendKind, Counters, DenyEvent, Enforcer, EnforcerConfig};
 use anyhow::{bail, Context, Result};
 use aya::{
@@ -315,6 +315,9 @@ impl Enforcer for EbpfEnforcer {
 
     fn apply(&mut self, ir: &PolicyIR) -> Result<()> {
         let flat = flatten(ir)?;
+        // Pre-flight, BEFORE apply_generation does any kernel work (trie
+        // building, reap-grace waiting): see `check_lpm_capacity`'s doc.
+        check_lpm_capacity(&flat)?;
         apply_generation(&mut self.ebpf, &flat, &mut self.gen, self.cfg.reap_grace)
     }
 
@@ -523,6 +526,58 @@ fn side_cidrs<'a>(f: &'a FlatRule, side: Side) -> &'a [Ipv4Net] {
     }
 }
 
+/// The DISTINCT CIDRs appearing across every [`FlatRule`]'s CIDR list on
+/// `side`, in first-appearance order — exactly the set of LPM-trie entries
+/// [`build_lpm_entries`] produces (which delegates its dedup here) and
+/// therefore exactly what [`check_lpm_capacity`] must count: the two are
+/// factored onto this ONE helper so the pre-check and the trie build can
+/// never drift apart (Backlog 10 PR-A Item 1).
+fn distinct_side_cidrs(flat: &[FlatRule], side: Side) -> Vec<Ipv4Net> {
+    accumulate_side(flat, side).into_vec()
+}
+
+/// Folds `flat`'s `side` lists into the shared [`DistinctSideCidrs`]
+/// accumulator — the single place this crate decides what "distinct" means,
+/// so [`distinct_side_cidrs`] (which produces the real trie keys) and
+/// [`check_lpm_capacity`] (which vets them) are the same computation, and
+/// `flatten`'s incremental guard is that same computation again.
+fn accumulate_side(flat: &[FlatRule], side: Side) -> DistinctSideCidrs {
+    let mut acc = DistinctSideCidrs::default();
+    for f in flat {
+        acc.observe(side_cidrs(f, side));
+    }
+    acc
+}
+
+// The compile-time (wiremesh-policy) and load-time (this crate) halves of
+// the LPM-capacity guard must fix the SAME number — the duplicated-constant
+// contract `MAX_RULES` already follows (see `wiremesh-policy`'s
+// `compile.rs`: that crate cannot depend on the enforcer crates, so the
+// constant is duplicated, and parity is asserted where the dependency
+// direction allows: here, and in `tests/lpm_capacity.rs`).
+const _: () = assert!(
+    wiremesh_policy::MAX_LPM_CIDRS_PER_SIDE == LPM_MAX_ENTRIES,
+    "wiremesh_policy::MAX_LPM_CIDRS_PER_SIDE must equal wiremesh_enforcer_common::LPM_MAX_ENTRIES"
+);
+
+/// Pre-insert LPM-capacity check (Backlog 10 PR-A Item 1, the enforcer's
+/// load-time half of `wiremesh_policy::MAX_LPM_CIDRS_PER_SIDE`'s
+/// compile-time guard): `Ok(())` iff BOTH sides' distinct-CIDR counts — the
+/// exact per-side entry counts [`build_lpm_entries`] would produce, via the
+/// shared [`distinct_side_cidrs`] helper — fit in the eBPF trie's
+/// `LPM_MAX_ENTRIES` (1024). Consulted by the eBPF `apply()` path BEFORE
+/// any trie is built, so an oversized policy fails with a clear, named
+/// error instead of the opaque `trie.insert` failure entry #1025 used to
+/// hit deep inside `apply_generation`. Pure and unprivileged (like
+/// [`crate::flatten`]) — the enforcer consumes IR off the wire and must not
+/// trust that whatever compiled it upstream enforced any limit.
+pub fn check_lpm_capacity(flat: &[FlatRule]) -> anyhow::Result<()> {
+    for (side, name) in [(Side::Src, "src"), (Side::Dst, "dst")] {
+        accumulate_side(flat, side).check(name)?;
+    }
+    Ok(())
+}
+
 /// Builds this side's LPM entries per the Task 8 brief's cumulative-bitset
 /// contract: one entry per DISTINCT CIDR appearing across every
 /// [`FlatRule`]'s CIDR list on this side; each entry's stored bitset is the
@@ -537,19 +592,13 @@ fn side_cidrs<'a>(f: &'a FlatRule, side: Side) -> &'a [Ipv4Net] {
 /// is the canary: a naive non-cumulative implementation would pass the
 /// brief's literal (c) test but fail this one.)
 ///
-/// O(distinct * n), both bounded by `MAX_RULES` (256) — fine at this scale
-/// per the brief.
+/// O(distinct * n) for the bitset pass below, with n (flat rules) bounded
+/// by `MAX_RULES` (256) and distinct (per-side CIDRs) by `LPM_MAX_ENTRIES`
+/// (1024) — `apply()` runs [`check_lpm_capacity`] before this is reached,
+/// so an over-capacity wire policy fails the cheap pre-check and never
+/// pays (or overflows) this pass. Fine at this scale.
 fn build_lpm_entries(flat: &[FlatRule], side: Side) -> Vec<(Ipv4Net, RuleBits)> {
-    let mut distinct: Vec<Ipv4Net> = Vec::new();
-    for f in flat {
-        for c in side_cidrs(f, side) {
-            if !distinct.contains(c) {
-                distinct.push(*c);
-            }
-        }
-    }
-
-    distinct
+    distinct_side_cidrs(flat, side)
         .into_iter()
         .map(|p| {
             let mut bits: RuleBits = [0u64; BITSET_WORDS];
