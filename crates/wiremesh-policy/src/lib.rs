@@ -20,7 +20,7 @@ mod dsl;
 mod ir;
 mod validate;
 
-pub use compile::{compile, rule_id};
+pub use compile::{compile, rule_id, MAX_LPM_CIDRS_PER_SIDE};
 pub use ir::{IrAction, IrBlock, IrProto, IrRule, PolicyIR};
 
 use std::fmt;
@@ -42,7 +42,9 @@ pub struct PolicySource(#[allow(dead_code)] dsl::PolicyDoc);
 /// Parses `yaml` as a WireMesh policy DSL document (design §4) and
 /// validates it against `segments` — the controller's current segment
 /// table. Enforces, as compile errors that name their location: unknown
-/// segment names in `from`/`to`; more than one block per ordered
+/// segment names in `from`/`to`; a referenced segment whose `cidrs` list is
+/// empty (Backlog 10 PR-A Item 2a — such a block's side would match
+/// nothing); more than one block per ordered
 /// `(from, to)` pair; `src` not a subset of the `from`-segment's CIDRs (and
 /// likewise `dst`/`to`); `ports` without an explicit `proto: tcp|udp`;
 /// malformed CIDRs/ports/ranges (`lo > hi`, port 0, port > 65535); non-IPv4

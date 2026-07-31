@@ -445,3 +445,82 @@ its commit's revision (single-tenant controller pattern shared with Cycle 2's
 RotateKey/Drain/RevokeCert), and per-CPU BPF counters replacing the non-atomic
 `*c += 1` (the Phase 0 spike-grade carry — enforcement is unaffected; only the
 observability counter can under-report under cross-CPU contention).
+
+## Backlog 10 hardening carry-list (audited 2026-07-30; PR-A closes items 1-3)
+
+The Backlog-10 audit of the Cycle-3 pipeline surfaced four carries. Items
+1-3 are **FIXED by PR-A** (the "Cycle-3 hardening trio"); item 4 remains
+open for a separate PR.
+
+1. **LPM capacity had no compile-time (or pre-insert load-time) guard —
+   FIXED (PR-A).** Nothing bounded the distinct CIDRs a policy could put on
+   one side, but the eBPF per-side LPM tries cap at
+   `wiremesh_enforcer_common::LPM_MAX_ENTRIES = 1024` — entry #1025 failed
+   deep inside gateway `apply()` as an opaque trie-insert error. Now:
+   `wiremesh_policy::MAX_LPM_CIDRS_PER_SIDE` (= 1024, duplicated-constant
+   pattern like `MAX_RULES`) is enforced in `compile()` as the per-side
+   distinct UNION (rule side, or block segment fallback when empty), and
+   `wiremesh_enforcer::check_lpm_capacity` is the load-time belt, run by the
+   eBPF `apply()` path before any trie is built and factored onto the same
+   `distinct_side_cidrs` helper `build_lpm_entries` uses so the counts
+   cannot drift; a `const _` parity assert in `ebpf.rs` pins the constants
+   equal. Evidence: `crates/wiremesh-policy/tests/hardening.rs` (1024
+   boundary, 1025 src/dst, segment-fallback, union-not-sum),
+   `crates/wiremesh-enforcer/tests/lpm_capacity.rs` (constant parity +
+   check semantics).
+
+2. **Empty-CIDR segments sailed through every boundary — FIXED (PR-A), at
+   three layers.** (a) The policy pipeline: a referenced zero-CIDR segment
+   is now a `CompileError` naming the segment (`validate.rs`'s resolution
+   point). (b) The controller: `CreateSegment` and the `Apply` fabric path
+   both reject empty `cidrs` with `invalid_argument` ("cidrs must not be
+   empty", mirroring `enrollment.rs`'s existing guard); `Apply`'s policy
+   half was already covered by (a) since `Db::apply_fabric` runs
+   `parse_policy`+`compile`, and its segments half now rejects unreferenced
+   zero-CIDR declarations too. (c) The enforcer belt: `flatten()` errors on
+   any rule whose effective side has zero CIDRs — one choke point both
+   backends pass through first, so eBPF's silent dead rule and nftables'
+   malformed `{ }` set rendering are both unreachable for wire-supplied IR.
+   Evidence: `crates/wiremesh-policy/tests/hardening.rs`
+   (`referenced_segment_with_no_cidrs_is_a_compile_error`),
+   `crates/wiremesh-enforcer/tests/hardening.rs`,
+   `crates/wiremesh-controller/tests/admin.rs`
+   (`create_segment_with_empty_cidrs_is_invalid_argument`).
+
+3. **Interface names were never validated — FIXED (PR-A).** `iface` flowed
+   verbatim into nft-script codegen (`iifname "<iface>"` — quote/brace/
+   comment injection), bpffs pin paths (`/`, `..` traversal), shelled-out
+   CLIs (leading `-` reads as a flag), and tc attach (>15-byte names only
+   died as late opaque attach errors). Now `validate_iface()`
+   (`wiremesh-enforcer/src/lib.rs`: non-empty, ≤15 bytes, `[A-Za-z0-9_.-]`,
+   no leading `-`/`.`, message contains "invalid interface name") guards
+   every external iface entry point — `probe`/`probe_with` (the only routes
+   to either backend constructor) and the pub `ruleset()` codegen —
+   before any kernel/fs work. Evidence:
+   `crates/wiremesh-enforcer/tests/iface_validation.rs`.
+
+4. **Reap-grace — STILL OPEN (deliberately untouched by PR-A; separate
+   PR).** The eBPF backend's `apply()` blocks synchronously (a
+   `std::thread::sleep` in `apply_generation`) for up to `reap_grace`
+   (default 10s) when a previous generation is pending reap — a
+   back-to-back policy update stalls the caller's thread instead of
+   deferring the reap asynchronously.
+
+**RELEASE NOTE (item 1/2 fallout — behavior change for pre-upgrade stored
+policies).** A fleet upgrading to a build containing PR-A whose controller
+has a PRE-upgrade stored policy that references a zero-CIDR segment (or one
+exceeding the 1024 per-side LPM capacity — previously only failing deep in
+eBPF `apply()`) will now fail policy apply LOUDLY on the gateway: `flatten`
+(both backends) and `check_lpm_capacity` (eBPF) reject the IR, so instead
+of the old silent behavior (eBPF: dead rules that match nothing; nftables:
+an opaque `nft -f` syntax error for `{ }`), the gateway logs a clear error
+and stays on its last-good applied state — which can present as a
+crash-loop/retry-loop against the same bad stored policy until it is fixed
+on the controller. **Operators should check for zero-CIDR segments (and
+>1024-distinct-CIDR sides) before rolling the upgrade**; the forward path
+cannot mint such IR anymore (`parse_policy`/`compile`, `CreateSegment`,
+`Apply`, and the db insert layer all reject it now), so this only concerns
+policies stored before the upgrade. The apply-error posture itself (fatal
+vs. log+retry-with-backoff) is deliberately unchanged here — that is the
+separate PR-B (reap-grace/apply-worker) item, where apply errors become
+log+retry.

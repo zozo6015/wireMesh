@@ -18,6 +18,7 @@ mod ebpf;
 mod flatten;
 mod nft;
 
+pub use ebpf::check_lpm_capacity;
 pub use flatten::{flatten, FlatRule, MAX_RULES};
 pub use nft::ruleset;
 
@@ -139,6 +140,11 @@ pub struct DenyEvent {
 /// returned — the caller only cares about the last, most-relevant failure
 /// once every backend has been tried.
 pub fn probe(iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforcer>> {
+    // Validated here as well as in `probe_with` so an invalid name fails
+    // once, cleanly, instead of also emitting the misleading "eBPF failed,
+    // falling back to nftables" log line below for a name NO backend could
+    // ever accept.
+    validate_iface(iface)?;
     match probe_with(BackendKind::Ebpf, iface, cfg) {
         Ok(enforcer) => Ok(enforcer),
         Err(e) => {
@@ -164,6 +170,11 @@ pub fn probe(iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforce
 /// `.superpowers/sdd/task-12-brief.md`'s Interfaces section: "an env/knob-
 /// free forced choice for tests: `probe_with(BackendKind, ...)`".
 pub fn probe_with(kind: BackendKind, iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforcer>> {
+    // Boundary validation (Backlog 10 PR-A Item 3): both backends'
+    // constructors are only ever reached through this function, so this one
+    // call guards every constructor path before ANY kernel/filesystem work
+    // (eBPF load/attach, bpffs pin paths) is attempted.
+    validate_iface(iface)?;
     match kind {
         BackendKind::Ebpf => {
             let enforcer = ebpf::EbpfEnforcer::new(iface, cfg)?;
@@ -174,4 +185,37 @@ pub fn probe_with(kind: BackendKind, iface: &str, cfg: EnforcerConfig) -> anyhow
             Ok(Box::new(enforcer))
         }
     }
+}
+
+/// Validates a Linux interface name at this crate's external boundaries
+/// (Backlog 10 PR-A Item 3): [`probe`]/[`probe_with`] (the only routes to
+/// either backend's constructor) and the pure [`ruleset`] codegen entry
+/// point (the other public function that interpolates `iface` — into nft
+/// script text). An unvalidated name would otherwise flow verbatim into
+/// nft-script codegen (`iifname "<iface>"` — `"`/`}`/`#` are injection
+/// vectors), shelled-out `nft`/`conntrack` invocations, and bpffs pin
+/// paths (`/`/`..` traverse), and a >15-byte name only surfaces as a late,
+/// opaque tc-attach failure (the kernel's IFNAMSIZ is 15 bytes + NUL).
+///
+/// Accepts: non-empty, at most 15 BYTES, charset `[A-Za-z0-9_.-]`, not
+/// starting with `-` (reads as an option flag to every CLI the name
+/// reaches) or `.` (hidden/relative path components in pin paths).
+/// Rejection messages always contain `"invalid interface name"` — pinned
+/// by `tests/iface_validation.rs`.
+pub(crate) fn validate_iface(iface: &str) -> anyhow::Result<()> {
+    let charset_ok = iface
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
+    if iface.is_empty()
+        || iface.len() > 15
+        || !charset_ok
+        || iface.starts_with('-')
+        || iface.starts_with('.')
+    {
+        anyhow::bail!(
+            "invalid interface name {iface:?}: must be 1-15 bytes of [A-Za-z0-9_.-] \
+             and must not start with '-' or '.'"
+        );
+    }
+    Ok(())
 }
