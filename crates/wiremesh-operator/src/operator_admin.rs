@@ -8,8 +8,8 @@
 //! Ops: `apply` (fabric YAML on stdin), `mint-token --kind gateway|relay|rebind
 //! [--cidr …] [--rebind-segment-id <n>]`, `register-relay --name --endpoint`,
 //! `delete-segment --name`, `segment-id --name` (name → controller segment id,
-//! `null` if absent), `list-gateways`, `drain --id`. `--socket` overrides the
-//! UDS path.
+//! `null` if absent), `list-gateways`, `list-relays`, `drain --id`. `--socket`
+//! overrides the UDS path.
 //!
 //! `--kind` is passed to `Admin.MintToken` verbatim — the controller's three
 //! kinds are `gateway`, `relay`, and `rebind`. A **rebind** token (the one that
@@ -30,8 +30,8 @@ use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use wiremesh_proto::v1::admin_client::AdminClient;
 use wiremesh_proto::v1::{
-    ApplyRequest, DeleteSegmentRequest, DrainRequest, ListGatewaysRequest, ListSegmentsRequest,
-    MintTokenRequest, RegisterRelayRequest,
+    ApplyRequest, DeleteSegmentRequest, DrainRequest, ListGatewaysRequest, ListRelaysRequest,
+    ListSegmentsRequest, MintTokenRequest, RegisterRelayRequest,
 };
 
 /// Default UDS path (matches the controller's `WIREMESH_SOCKET_PATH` default).
@@ -149,6 +149,22 @@ pub async fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
             let segs = client.list_segments(ListSegmentsRequest {}).await?.into_inner().segments;
             let id = segs.into_iter().find(|s| s.name == name).map(|s| s.id);
             serde_json::json!({ "id": id })
+        }
+        "list-relays" => {
+            let relays = client.list_relays(ListRelaysRequest {}).await?.into_inner().relays;
+            serde_json::Value::Array(
+                relays
+                    .into_iter()
+                    .map(|r| {
+                        // snake_case keys — must match `admin_exec::RelayRow`'s
+                        // deserialized field names (the exec consumer).
+                        serde_json::json!({
+                            "id": r.id, "name": r.name,
+                            "endpoint": r.endpoint, "status": r.status,
+                        })
+                    })
+                    .collect(),
+            )
         }
         "list-gateways" => {
             let gws = client.list_gateways(ListGatewaysRequest {}).await?.into_inner().gateways;

@@ -70,7 +70,7 @@ USAGE:
 
 operator-admin OPS:
     apply | mint-token | register-relay | delete-segment | segment-id |
-    list-gateways | drain
+    list-gateways | list-relays | drain
     Flags (per op): --socket <path>, --kind gateway|relay|rebind,
     --cidr <cidr>, --name <s>, --endpoint <ip:port>, --id <n>,
     --rebind-segment-id <n> (required by, and only valid with, --kind rebind;

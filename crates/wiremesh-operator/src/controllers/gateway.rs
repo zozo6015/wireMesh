@@ -274,14 +274,17 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // fresh token. That is harmless — a spare token simply goes unused once the
     // persisted identity makes the enroll init skip — and it avoids wedging the
     // reconcile on a transient controller hiccup.
-    let roster = match ctx.admin.list_gateways().await {
-        Ok(rows) => rows,
+    // `roster_ok` distinguishes "the controller says there is no active gateway"
+    // from "we could not ask". Both yield an empty roster, but they must NOT be
+    // treated alike by the rebind arm below — see the pending-rebind guard.
+    let (roster, roster_ok) = match ctx.admin.list_gateways().await {
+        Ok(rows) => (rows, true),
         Err(e) => {
             tracing::warn!(
                 "gateway {name}: controller roster query failed ({e}); treating gateway as \
                  not-active (conservative: mint a spare enrollment token)"
             );
-            Vec::new()
+            (Vec::new(), false)
         }
     };
     // Find THIS CR's segment's ACTIVE row in the roster ONCE and reuse it for
@@ -433,7 +436,35 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // controller-side idempotency key on MintToken (a possible follow-up).
     let identity_persisted = identity_persisted(pvc_exists, gateway_active);
     let existing_secret = secrets.get_opt(&token_secret).await?;
-    if should_mint_token(identity_persisted, existing_secret.as_ref()) {
+    // Evaluated INDEPENDENTLY of the roster: whether the segment's CIDRs moved
+    // since this Secret's token was minted is a fact about the Secret, not about
+    // the controller's view of the gateway.
+    let rebind_pending =
+        needs_rebind(existing_secret.as_ref().and_then(bound_cidrs_of).as_deref(), &cidrs);
+
+    if rebind_pending && !roster_ok {
+        // PENDING-REBIND GUARD. With the roster unreadable we cannot tell
+        // whether this gateway is still the segment's ACTIVE one, so both
+        // branches below would be wrong:
+        //   * the ordinary-mint arm is reachable here (a failed roster read
+        //     makes `gateway_active` false → `identity_persisted` false →
+        //     `should_mint_token` true), and it would mint a PLAIN token — which
+        //     a still-occupied segment rejects with `SegmentAlreadyBound`;
+        //   * worse, it would write the NEW CIDRs into the Secret's binding
+        //     record, so `needs_rebind` reads false from then on and the
+        //     required rebind is silently LOST — permanently, since nothing
+        //     re-derives it. The gateway would sit on an unusable plain token
+        //     and wedge at the next re-enroll.
+        // Deferring costs nothing: the requeue below is 15s while not-enrolled,
+        // and the pending rebind stays derivable from the untouched Secret.
+        tracing::warn!(
+            "gateway {name}: segment {segment} CIDRs changed but the controller roster is \
+             unreadable — DEFERRING the mint to a later reconcile. Minting now would issue a \
+             plain token the occupied segment rejects AND overwrite the Secret's bound-CIDR \
+             record, losing the pending rebind.",
+            segment = seg.spec.segment_name,
+        );
+    } else if should_mint_token(identity_persisted, existing_secret.as_ref()) {
         let token = ctx.admin.mint_gateway_token(&cidrs).await.map_err(Error::Admin)?;
         // `token_secret_body` also RECORDS the CIDRs the token was minted
         // against, so later reconciles can detect a segment-CIDR change and
@@ -442,9 +473,7 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
         sec.metadata.namespace = Some(ns.clone());
         sec.metadata.owner_references = Some(vec![owner_ref(gw)?]);
         apply(&secrets, &sec).await?;
-    } else if gateway_active
-        && needs_rebind(existing_secret.as_ref().and_then(bound_cidrs_of).as_deref(), &cidrs)
-    {
+    } else if gateway_active && rebind_pending {
         // REBIND (segment-CIDR change on an enrolled gateway): the stored token
         // was minted against the OLD CIDR set, so any future re-enroll (fresh
         // PVC, adoption, node loss) would be rejected — on the CIDR set

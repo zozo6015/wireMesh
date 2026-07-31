@@ -104,6 +104,11 @@ pub async fn run(ctx: Arc<Context>) {
     Controller::new(Api::<WiremeshController>::all(client.clone()), watcher::Config::default())
         .owns(Api::<Deployment>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
         .owns(Api::<Service>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
+        // Watch the data PVC too (parity with the gateway/relay reconcilers):
+        // a deleted or externally-edited PVC enqueues its owning CR at once
+        // rather than waiting out the 300s requeue. The apply itself stays
+        // CREATE-ONLY (`pvc_needs_create`) — this only affects when we look.
+        .owns(Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
             match res {

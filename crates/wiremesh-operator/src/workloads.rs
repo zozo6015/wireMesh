@@ -173,7 +173,17 @@ pub fn validate_dial_target(s: &str) -> anyhow::Result<()> {
         .parse()
         .with_context(|| format!("invalid port in {s:?}"))?;
     anyhow::ensure!(port != 0, "port 0 in {s:?} is not a reachable dial target");
-    if host.starts_with('[') || matches!(host.parse(), Ok(std::net::IpAddr::V6(_))) {
+    // `host.contains(':')` is load-bearing, not redundant with the parse below:
+    // `rsplit_once` splits on the LAST colon, so a bare IPv6 literal like
+    // `fe80::1` yields host `"fe80:"` + port `"1"` — the port parses, the host
+    // is neither bracketed nor a parseable `IpAddr`, and it isn't
+    // digits-and-dots, so every other check waves it through. Any leftover
+    // colon in the host means the input was an IPv6-ish or otherwise malformed
+    // shape; fail closed.
+    if host.starts_with('[')
+        || host.contains(':')
+        || matches!(host.parse(), Ok(std::net::IpAddr::V6(_)))
+    {
         anyhow::bail!("IPv6 dial target {s:?} is unsupported (v1 is IPv4-only)");
     }
     if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
@@ -455,11 +465,19 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
 /// explicit CR `nodeSelector` is preserved, and an explicit `kubernetes.io/hostname`
 /// key in it WINS over the folded-in `nodeName` (`or_insert`). Cross-node failover
 /// remains out of scope (a node-local RWO PVC still binds on one node).
-fn scheduler_aware_node_selector(spec: &WiremeshGatewaySpec) -> Option<BTreeMap<String, String>> {
-    let mut sel = spec.node_selector.clone().unwrap_or_default();
-    if let Some(n) = &spec.node_name {
+///
+/// Takes the two pin inputs rather than a whole spec so the RELAY — which now
+/// owns an identity PVC too, but whose CRD has only `nodeName` (no
+/// `nodeSelector`) — routes through the same helper instead of re-introducing
+/// the direct-`nodeName` bug on its own workload.
+fn scheduler_aware_node_selector(
+    node_name: Option<&str>,
+    node_selector: Option<&BTreeMap<String, String>>,
+) -> Option<BTreeMap<String, String>> {
+    let mut sel = node_selector.cloned().unwrap_or_default();
+    if let Some(n) = node_name {
         // `or_insert`: an explicit hostname key in the CR's nodeSelector wins.
-        sel.entry("kubernetes.io/hostname".to_string()).or_insert_with(|| n.clone());
+        sel.entry("kubernetes.io/hostname".to_string()).or_insert_with(|| n.to_string());
     }
     if sel.is_empty() {
         None
@@ -601,7 +619,10 @@ pub fn gateway_deployment(
         // `kubernetes.io/hostname` nodeSelector instead (see
         // `scheduler_aware_node_selector`).
         node_name: None,
-        node_selector: scheduler_aware_node_selector(&gw.spec),
+        node_selector: scheduler_aware_node_selector(
+            gw.spec.node_name.as_deref(),
+            gw.spec.node_selector.as_ref(),
+        ),
         init_containers: Some(vec![enroll]),
         containers: vec![main],
         volumes: Some(vec![
@@ -787,7 +808,16 @@ pub fn relay_deployment(
     };
 
     let pod = PodSpec {
-        node_name: r.spec.node_name.clone(),
+        // Never set `nodeName` directly: it BYPASSES the scheduler, so the
+        // relay's new RWO identity PVC (`relay_pvc`) would never get its
+        // "first consumer" scheduling event under the common
+        // `volumeBindingMode: WaitForFirstConsumer` storage classes (k3s
+        // local-path, most CSI) → PVC Pending → pod Pending forever. This is
+        // the exact bug already fixed for the gateway; the relay inherits it
+        // the moment it gains a PVC. Pin via a `kubernetes.io/hostname`
+        // nodeSelector instead (see `scheduler_aware_node_selector`).
+        node_name: None,
+        node_selector: scheduler_aware_node_selector(r.spec.node_name.as_deref(), None),
         init_containers: Some(vec![enroll]),
         containers: vec![main],
         volumes: Some(vec![

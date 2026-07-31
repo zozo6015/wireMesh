@@ -5,7 +5,8 @@
 //! `--endpoint` — which both issues the relay's cert and creates the
 //! advertised relay record (matching the testkit relay-enroll flow), so no
 //! separate `RegisterRelay` call is needed. The mint decision mirrors the
-//! gateway's: keyed off "is the identity durably persisted", not off the token
+//! gateway's: keyed off "is the identity durably persisted" (PVC + a
+//! controller relay-roster row for this CR's endpoint), not off the token
 //! Secret alone (a populated-but-SPENT token must not suppress the re-mint a
 //! certs-less relay needs — the Init:Error wedge). On CR delete the relay pod
 //! is GC'd (owner ref) and the controller's health pipeline evicts the stale
@@ -68,30 +69,50 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
     let existing_pvc = pvc_api.get_opt(&pvc_name).await?;
     let pvc_exists = existing_pvc.is_some();
 
-    // `identity_persisted` corroboration: the PVC exists AND the relay
-    // Deployment reports an available replica. Availability means the enroll
-    // init-container COMPLETED (init containers gate pod readiness — either by
-    // enrolling or, in steady state, by SKIPPING because the identity is
-    // already on the PVC) and the QUIC bridge is serving off those certs —
-    // proof the identity was actually written. There is no `list_relays` on
-    // `AdminExec` (no relay roster probe), so Deployment availability is the
-    // cheapest pod-exec-free corroboration available. CONSERVATIVE on any
-    // probe gap/failure (per the documented rule): not persisted → mint a
-    // spare token, which simply lapses unused because `wiremesh-relay-enroll`
+    // `identity_persisted` corroboration: the PVC exists AND the controller's
+    // relay roster holds a row for this CR's endpoint — exact parity with the
+    // gateway (`gateway::identity_persisted`: PVC + roster row).
+    //
+    // WHY NOT Deployment availability (the earlier basis): availability is a
+    // LIVENESS signal, and the question here is "was an identity ever written
+    // to this PVC", which is a HISTORICAL fact. Any restart, rollout, eviction
+    // or node outage drops availability to 0 while the identity sits intact on
+    // the PVC, re-classifying it as unpersisted and re-minting a spare token on
+    // EVERY 15s reconcile for the whole outage — thousands of dead
+    // `enrollment_token` rows + audit entries for an overnight node failure.
+    // (`Admin.ListRelays` did exist all along; only the operator's `AdminExec`
+    // wrapper lacked it, which is what made availability look like the only
+    // option.)
+    //
+    // WHY NOT PVC-existence alone: a PVC can exist holding NO identity — the
+    // first enroll can crash AFTER spending its single-use token but BEFORE
+    // writing the certs. That relay still needs a fresh token, and PVC-only
+    // would suppress the mint forever (`Init:Error` wedge) — the very bug the
+    // gateway's roster corroboration exists to prevent.
+    //
+    // The roster row is durable across outages BY DESIGN: the health pipeline
+    // EVICTS by flipping `status` (`Db::set_relay_status`, documented there as
+    // "a HEALTH-eviction state ... not a revocation/de-enrollment"), it never
+    // deletes the row. So presence — at ANY status — is exactly "this relay
+    // completed an enrollment", and is deliberately NOT status-filtered (unlike
+    // the gateway's `active_in_segment`, where the filter guards the
+    // one-gateway-per-segment occupancy invariant). A genuinely replaced PVC is
+    // still caught: `pvc_exists` is false on the pass that recreates it.
+    //
+    // CONSERVATIVE on a probe failure (unchanged rule): treat as NOT enrolled →
+    // mint a spare token, which lapses unused because `wiremesh-relay-enroll`
     // skips when a complete identity is present (`enroll::probe_identity`).
-    let relay_available = match deployments.get_opt(&name).await {
-        Ok(dep) => {
-            dep.and_then(|d| d.status).and_then(|s| s.available_replicas).unwrap_or(0) >= 1
-        }
+    let relay_enrolled = match ctx.admin.list_relays().await {
+        Ok(rows) => rows.iter().any(|r| r.endpoint == relay.spec.endpoint),
         Err(e) => {
             tracing::warn!(
-                "relay {name}: Deployment availability probe failed ({e}); treating the \
+                "relay {name}: controller relay-roster query failed ({e}); treating the \
                  identity as NOT persisted (conservative: mint a spare enrollment token)"
             );
             false
         }
     };
-    let identity_persisted = pvc_exists && relay_available;
+    let identity_persisted = pvc_exists && relay_enrolled;
 
     // Mint whenever the identity is not durably persisted OR no populated token
     // Secret exists (`should_mint_token`, the gateway contract). The force-

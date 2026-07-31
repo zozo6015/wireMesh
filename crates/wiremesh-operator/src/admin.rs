@@ -12,7 +12,7 @@ use tonic::{Request, Status};
 use wiremesh_proto::v1::admin_client::AdminClient;
 use wiremesh_proto::v1::{
     ApplyDiff, ApplyRequest, DeleteSegmentRequest, DrainRequest, GatewayInfo, ListGatewaysRequest,
-    ListSegmentsRequest, MintTokenRequest, RegisterRelayRequest,
+    ListRelaysRequest, ListSegmentsRequest, MintTokenRequest, RegisterRelayRequest, Relay,
 };
 
 /// The token `kind` the controller keys the REBIND path off
@@ -199,6 +199,19 @@ impl FabricAdmin {
                 .context("Admin.DeleteSegment")?;
         }
         Ok(())
+    }
+
+    /// Every registered relay row (id, name, endpoint, status) — the relay
+    /// counterpart of [`Self::list_gateways`], and the operator's only proof
+    /// that a relay's enrollment actually completed.
+    pub async fn list_relays(&mut self) -> anyhow::Result<Vec<Relay>> {
+        Ok(self
+            .client
+            .list_relays(ListRelaysRequest {})
+            .await
+            .context("Admin.ListRelays")?
+            .into_inner()
+            .relays)
     }
 
     /// Current gateway rows (id, name, segment, status, applied_version).

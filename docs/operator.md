@@ -104,6 +104,7 @@ All five CRDs are **cluster-scoped**, group `wiremesh.io/v1alpha1`. The
 controller is single-tenant — one `WiremeshController` per cluster.
 
 ### WiremeshController (`wmctrl`)
+
 | field | default | purpose |
 |-------|---------|---------|
 | `image` | `ghcr.io/zozo6015/wiremesh-controller:latest` | controller image |
@@ -116,12 +117,14 @@ controller is single-tenant — one `WiremeshController` per cluster.
 Status: `ready`, `adminEndpoint` (the sync-tcp Service DNS), `conditions`.
 
 ### WiremeshSegment (`wmseg`)
+
 | field | purpose |
 |-------|---------|
 | `segmentName` | fabric segment name |
 | `cidrs` | list of IPv4 CIDRs in the segment |
 
 ### WiremeshPolicy (`wmpol`)
+
 | field | purpose |
 |-------|---------|
 | `from` / `to` | source / destination segment names |
@@ -131,6 +134,7 @@ Status: `ready`, `adminEndpoint` (the sync-tcp Service DNS), `conditions`.
 Default-deny: only what a policy allows passes.
 
 ### WiremeshGateway (`wmgw`)
+
 | field | default | purpose |
 |-------|---------|---------|
 | `segmentRef` | — | the `WiremeshSegment` (by `.metadata.name`) this gateway fronts |
@@ -170,6 +174,7 @@ and absent otherwise — it does **not** surface the data-plane
 `Direct`/`Relayed`/`Degraded` path state.
 
 ### WiremeshRelay (`wmrelay`)
+
 | field | default | purpose |
 |-------|---------|---------|
 | `endpoint` | — | the relay's public IPv4 `ip:port` (advertised to gateways) |

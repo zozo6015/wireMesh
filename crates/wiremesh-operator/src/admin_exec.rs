@@ -54,6 +54,23 @@ pub fn rebind_mint_args(rebind_segment_id: u64) -> Vec<String> {
     ]
 }
 
+/// A relay roster row — the shape both transports return (the gRPC path maps
+/// the proto `Relay`; the exec path parses the sidecar's JSON).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayRow {
+    #[allow(dead_code)]
+    pub id: u64,
+    #[allow(dead_code)]
+    pub name: String,
+    /// The relay's advertised `ip:port` — the ONLY field the operator can match
+    /// a `WiremeshRelay` CR against: the controller names an enrolled relay
+    /// `relay-<token-hash>` (`services/enrollment.rs`), never the CR's name,
+    /// whereas the endpoint is the CR's `spec.endpoint` verbatim.
+    pub endpoint: String,
+    #[allow(dead_code)]
+    pub status: String,
+}
+
 pub enum AdminExec {
     /// Direct gRPC to `addr` (host:port) with a bearer `token`.
     Grpc { addr: String, token: String },
@@ -288,6 +305,24 @@ impl AdminExec {
         }
         let v = self.exec_json(&["list-gateways"], None).await?;
         Ok(serde_json::from_value(v).context("parsing gateway roster")?)
+    }
+
+    /// The controller's relay roster.
+    pub async fn list_relays(&self) -> anyhow::Result<Vec<RelayRow>> {
+        if self.is_grpc() {
+            let rows = self.grpc().await?.list_relays().await?;
+            return Ok(rows
+                .into_iter()
+                .map(|r| RelayRow {
+                    id: r.id,
+                    name: r.name,
+                    endpoint: r.endpoint,
+                    status: r.status,
+                })
+                .collect());
+        }
+        let v = self.exec_json(&["list-relays"], None).await?;
+        Ok(serde_json::from_value(v).context("parsing relay roster")?)
     }
 
     /// Drain a gateway by id (driven by the Gateway finalizer).
