@@ -1020,6 +1020,53 @@ pub fn server_config_with_denylist(certdir: &Path, denylist: Denylist) -> Result
     Ok(server_config)
 }
 
+/// The shared `host:port` dial-target pieces (`wiremesh-enroll`) behind
+/// [`run_sync`]'s dial — re-exported here so the relay's DDNS dial contract
+/// (first-IPv4-wins, no cross-family fallback, bounded lookup; pinned by
+/// `tests/sync_hostname.rs`) is addressable from this crate's root, exactly
+/// mirroring `wiremesh_gateway::sync::{resolve_host_port, prefer_ipv4}`.
+/// `validate_host_port` is the gateway's boot-time syntax check
+/// (`wiremesh_gateway::config`'s original), applied by the `relay` bin's
+/// `--controller` value parser so a misconfigured target exits non-zero at
+/// boot instead of the sync task logging resolution failures forever.
+pub use wiremesh_enroll::{prefer_ipv4, resolve_host_port, validate_host_port};
+
+/// HTTP/2 PING cadence on the relay's Sync channel, sent even while the
+/// channel is otherwise idle (`keep_alive_while_idle`) — and the relay's
+/// `Sync.Watch` stream IS the idle case: it receives nothing between
+/// revocations, so without a keepalive it is completely silent on the wire.
+/// A NAT/conntrack entry that times out on that silence leaves the stream
+/// half-open — the FIN/RST never reaches the relay, whose blocked stream
+/// read waits forever. For the relay that silence is a SECURITY failure, not
+/// just staleness: the Watch stream carries `revoked_serials`, so a half-open
+/// relay keeps ACCEPTING certificates revoked after the stream died, until
+/// restart (the offline-persisted denylist only covers what arrived before
+/// the stream went dead). Same live-found failure class — and the same
+/// landed values — as the gateway's Sync channel (PR #28,
+/// `docs/research/ops-finding-sync-half-open-stream.md`); with
+/// [`SYNC_KEEPALIVE_TIMEOUT`] a dead link surfaces as a stream error within
+/// ~25s worst case, which the `relay` bin's reconnect loop already handles
+/// (re-resolving DNS via [`resolve_host_port`], so a rotated DDNS address
+/// heals too). The VALUE is the canonical
+/// `wiremesh_enroll::SYNC_KEEPALIVE_INTERVAL`, shared with the gateway
+/// client and the controller's server-side mirror so the figures can't
+/// drift apart; `pub` here because `tests/sync_keepalive.rs` pins the
+/// channel construction through this crate's root.
+pub const SYNC_KEEPALIVE_INTERVAL: Duration = wiremesh_enroll::SYNC_KEEPALIVE_INTERVAL;
+
+/// How long an unanswered keepalive PING may go unacknowledged before the
+/// channel is declared dead and the error is surfaced to the reconnect loop.
+/// See [`SYNC_KEEPALIVE_INTERVAL`] for the half-open-stream rationale (and
+/// for why the value comes from `wiremesh-enroll`).
+pub const SYNC_KEEPALIVE_TIMEOUT: Duration = wiremesh_enroll::SYNC_KEEPALIVE_TIMEOUT;
+
+/// Bound on the TCP/TLS dial itself. Without one, a dial toward a stale DDNS
+/// address that blackholes (no RST) can hang the reconnect loop far longer
+/// than the DNS record's own churn; a bounded dial keeps the
+/// resolve-dial-retry cycle turning so the next attempt picks up the fresh
+/// A record. Value shared via `wiremesh-enroll`, as above.
+pub const SYNC_CONNECT_TIMEOUT: Duration = wiremesh_enroll::SYNC_CONNECT_TIMEOUT;
+
 /// Relay Sync client (mirrors `wiremesh-gateway::sync::connect`+`watch`):
 /// mTLS-dials the controller with the relay's own cert (`<certdir>/relay.pem`
 /// / `.key`, root `<certdir>/ca.pem`), then folds every `revoked_serials`
@@ -1027,13 +1074,20 @@ pub fn server_config_with_denylist(certdir: &Path, denylist: Denylist) -> Result
 /// atomic) after each update so a subsequent restart — even fully offline —
 /// still enforces the last-known revocation set.
 ///
+/// `sync_addr` is a `host:port` dial target — a DNS hostname (DDNS
+/// controllers) or an IPv4 literal — resolved via [`resolve_host_port`]
+/// INSIDE every call, so the `relay` bin's reconnect loop re-resolves DNS on
+/// each retry and a rotated DDNS A record heals without a relay restart
+/// (the gateway's per-reconnect semantics). An IPv6 literal is rejected at
+/// resolution, before any dial: v1 is IPv4-only end to end.
+///
 /// Snapshot is a full replace (the controller's complete current set);
 /// Delta is additive-only, matching
 /// `wiremesh-gateway::state::DesiredState::apply_delta`'s treatment of the
 /// same field. Returns (with an error) when the Watch stream ends or errors;
 /// the caller (the `relay` bin) decides whether/how to retry.
 pub async fn run_sync(
-    sync_addr: SocketAddr,
+    sync_addr: &str,
     certdir: &Path,
     relay_id: &str,
     denylist: Denylist,
@@ -1044,24 +1098,39 @@ pub async fn run_sync(
     use wiremesh_proto::v1::sync_client::SyncClient;
     use wiremesh_proto::v1::{sync_message::Body, WatchRequest};
 
+    // Resolution happens FIRST, inside every call — the per-dial
+    // re-resolution seam (see the doc comment above), and the point where an
+    // IPv6-only target fails fast instead of ever being dialed.
+    let resolved = resolve_host_port(sync_addr).await?;
+
     let cert_pem = std::fs::read_to_string(certdir.join("relay.pem")).context("reading relay.pem")?;
     let key_pem = std::fs::read_to_string(certdir.join("relay.key")).context("reading relay.key")?;
     let ca_pem = std::fs::read_to_string(certdir.join("ca.pem")).context("reading ca.pem")?;
 
-    let uri = format!("https://{sync_addr}");
+    let uri = format!("https://{resolved}");
     let tls = ClientTlsConfig::new()
         .identity(TlsIdentity::from_pem(&cert_pem, &key_pem))
         .ca_certificate(Certificate::from_pem(&ca_pem))
         .domain_name("127.0.0.1");
+    // Keepalive/timeout mirror of `wiremesh-gateway::sync::connect`'s channel
+    // (same builder order): `keep_alive_while_idle(true)` is load-bearing —
+    // the Watch stream receives nothing between revocations, and without an
+    // idle-time PING a silently dead link would keep this relay enforcing a
+    // stale denylist (accepting revoked certs) until restart. See
+    // [`SYNC_KEEPALIVE_INTERVAL`].
     let channel = Channel::from_shared(uri)
         .context("controller Sync addr must form a valid URI")?
         .tls_config(tls)
         .context("configuring relay mTLS")?
+        .connect_timeout(SYNC_CONNECT_TIMEOUT)
+        .http2_keep_alive_interval(SYNC_KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(SYNC_KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
         .connect()
         .await
         .context("connecting to controller Sync (mTLS)")?;
     let mut client = SyncClient::new(channel);
-    eprintln!("relay: sync[{relay_id}] connected to controller at {sync_addr}");
+    eprintln!("relay: sync[{relay_id}] connected to controller at {sync_addr} ({resolved})");
 
     let mut stream = client
         .watch(WatchRequest {})
