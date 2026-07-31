@@ -45,7 +45,35 @@ direct path. Rotation × NAT-repunch is untested and unhandled; relay is the fal
 Acceptable edge case for now; fix alongside A (the active-port punch needs the same
 active-tun awareness).
 
-## C. Retirement is process-local; a reboot resurrects the retired epoch
+## C. Retirement is process-local; a reboot resurrects the retired epoch — FIXED for locally-cut-over rotations (Backlog 3 Task 1)
+**STATUS: fixed by Backlog 3 Task 1 for rotations whose LOCAL cutover ran** (the store
+records local promote/retire transitions only). **Known residuals, still open:**
+(i) the controller's Rule-4 ack-less grace-promote is NOT reconciled down into the
+store — a rotation whose new-epoch session never established locally but was
+grace-promoted controller-side leaves the store pending-only, so a reboot falls back
+to the legacy key, which post-promote no peer advertises (the original black hole,
+surviving in that corner; T2 territory — see `select_boot_key`'s KNOWN RESIDUAL doc).
+(ii) The retire scrub destroys key material in `epoch_keys.json` ONLY: the epoch-0
+private key remains on disk in `identity.json`/`wg_private.key` (enrollment identity is
+never rewritten), and deleting `epoch_keys.json` re-arms the legacy fallback to boot it
+(absent file → fallback by design; corrupt file → fail-loud at load). Test-author note:
+`tests/epoch_boot_key.rs`'s header (lines ~20-29) frames the selector as fixing the
+Rule-4 grace-promote reboot — stale per (i); the selector only fixes the
+locally-cut-over case. The lifecycle is now
+wired and durable: the Role-A FlipRoutes cutover arm (`run_rotation_ticks`, main.rs)
+drives `EpochKeys::promote(new)` + `persist` the moment the data plane flips, and
+`service_retire` drives `EpochKeys::retire(old)` + `persist` alongside the Device
+teardown — `retire` REMOVES the entry, so the retired private key is scrubbed from
+`epoch_keys.json`'s bytes, not left dormant. Boot now selects its key via
+`EpochKeys::select_boot_key` (store's ACTIVE epoch wins; legacy `Identity` key only as
+fallback when no active entry exists), always on the base tun/port per OD-1. Evidence:
+`crates/wiremesh-gateway/src/epochkeys.rs` (`select_boot_key` + module doc),
+`crates/wiremesh-gateway/tests/epoch_boot_key.rs` (selector contract),
+`crates/wiremesh-gateway/tests/epoch_persistence.rs` (promote/retire persistence +
+raw-bytes scrub), and `crates/wiremesh-gateway/tests/key_rotation.rs`
+`rotation_survives_gateway_restart_on_new_epoch` (SIGKILL + restart boots the promoted
+key, retired priv absent from disk, traffic reconverges, OD-1 re-normalization).
+Original finding kept below for the record:
 `EpochKeys::promote()`/`retire()` are never called in `main.rs` (only `generate_next()`),
 and boot ALWAYS brings up epoch 0 from `id.wg_private_key_b64` (hardcoded epoch 0),
 independent of the persisted store. So after a rotation the store still reads
@@ -59,13 +87,57 @@ retirement is NOT durable: it is process-local until rotation PERSISTENCE lands
 active epoch's key + the controller-side promote reconciled with the boot key). Track as
 a fast-follow; qualify the security claim as "process-local until rotation persistence."
 
-## D. (Minor) Role-B post-cutover CIDR churn routes via wg0
+## D. (Minor) Role-B post-cutover CIDR churn routes via wg0 — PARTIALLY FIXED (Backlog 3 Task 1 slice)
 Role B deliberately never flips `active` (it isn't rotating its own key; flipping would
 mis-apply its `wg0` pin) — correct. Consequence: a NEW CIDR added to an already-rotated
 peer on the Role-B side, post-cutover, routes via `wg0` (active) rather than the overlap
 tun; a removed CIDR's `del_route(cidr, wg0)` no-ops and can leak the route on the overlap
 tun. Existing peer CIDRs ARE explicitly flipped onto the overlap tun at cutover, so this
 is a narrow untested churn scenario. Low impact; fold into the multi-peer overlap work.
+
+**Backlog 3 Task 1 shipped the minimal Role-B COLLAPSE (reverse make-before-break),
+the core slice of the ratified plan's Task 3.** The un-collapsed overlap was the fatal
+half of this finding: after the peer's rotation completed, the surviving gateway kept
+routes + a frozen offset-port endpoint on `wg0e<N>` forever while stale `wg0` held the
+peer's retired key — so a peer that later rebooted onto the base port (item C's fix, OD-1)
+could never re-reach it (base-port punch confirms on the unrouted device). Now:
+`maybe_collapse_role_b` (main.rs, State arm, BEFORE `apply_state`) detects the peer's
+retire delta (roster collapses to active-only on the very key the overlap targeted),
+unpins `wg0_pins[gid]` so that same apply rekeys `wg0` to the peer's new key, and arms
+the collapse; the rotation tick then waits for a live rx-corroborated `wg0` session
+toward the new key, flips routes back `wg0e<N>` -> `wg0`, and signals
+`service_role_b_collapse` (run task) to tear the overlap Device down + evict its
+enforcer + drop the `role_b` entry. The overlap is never torn down before `wg0` is
+proven live. Runtime arbiter: `rotation_survives_gateway_restart_on_new_epoch`
+(key_rotation.rs) — post-reboot traffic reconvergence requires the collapse.
+
+**Remaining — named follow-ups:**
+- **(F2)** [T2 territory] `promote(epoch)` promotes by EPOCH NUMBER, so after a
+  crash + re-directive an orphaned stale `"pending"` entry at that number can be the one
+  promoted instead of the freshly minted key. Mechanics: promote by minted key identity
+  (or purge stale pendings at mint time).
+- **(F3)** [T3 per-peer keying — PRIORITIZED] boot-epoch tunnel keying: a rebooted-once
+  gateway's BASE tun sits in `TunnelSet`/`enforcers` under key 1, so a peer rotating to
+  pending epoch 1 collides — `maybe_start_role_b`'s `bring_up` bails on EVERY State
+  event and the overlap never forms. Same root as our-own-rotation epoch-N collisions.
+- **(F4)** [small dedicated task] a crash inside the local retire grace orphans the old
+  epoch's `"retiring"` entry — with its private key — in `epoch_keys.json` forever
+  (nothing retires it post-reboot). Mechanics: mirror the controller's boot-time orphan
+  cleanup — scrub non-active leftovers at load/boot.
+- **(F8)** [T3] the collapse pass hardcodes `rot.base_tun` as the watch/flip target — if
+  our OWN rotation cut over concurrently (active tun now `wg0e<N>`), the collapse
+  watches/routes the wrong device and wedges. Needs active-tun awareness.
+
+**Remaining — unnamed (full Task 3):** (1) re-rotation of the same peer while an overlap
+exists is skipped by `maybe_start_role_b`'s `contains_key` guard (and a collapse-armed
+entry blocks a fresh overlap until it completes); (2) multi-peer overlap (one
+single-purpose Device per rotating peer; concurrent rotations untested); (3) the collapse
+cannot COMPLETE while the rotated peer stays on its offset port (its base port has no WG
+listener post-retire — pairs with findings A/B; the overlap keeps carrying traffic until
+the peer re-normalizes, e.g. reboots, so nothing breaks — it just defers); (4) a peer
+REMOVED from the roster mid-overlap leaks its overlap Device/routes (no collapse trigger
+fires); (5) the original post-cutover CIDR-churn note above still stands for the
+overlap's lifetime.
 
 ---
 ## Concrete implementation plan for Fast-follow A (worked out 2026-07-22, ready for a fresh session)

@@ -2,7 +2,6 @@
 use crate::identity::Identity;
 use crate::state::DesiredState;
 use anyhow::{anyhow, Context};
-use std::net::SocketAddr;
 use std::time::Duration;
 use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Identity as TlsIdentity};
@@ -43,62 +42,33 @@ pub enum SyncEvent {
 /// handles correctly (and re-resolves DNS via [`connect`], so a rotated DDNS
 /// address heals too). 15s stays comfortably inside common home-router idle
 /// timeouts (minutes for TCP) without meaningful load on the controller.
-const SYNC_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+/// The VALUE is the canonical `wiremesh_enroll::SYNC_KEEPALIVE_INTERVAL`
+/// (shared with the relay client and the controller's server-side mirror so
+/// the figures can't drift apart); this alias just keeps it private here.
+const SYNC_KEEPALIVE_INTERVAL: Duration = wiremesh_enroll::SYNC_KEEPALIVE_INTERVAL;
 
 /// How long an unanswered keepalive PING may go unacknowledged before the
 /// channel is declared dead and the error is surfaced to the reconnect loop.
-/// See [`SYNC_KEEPALIVE_INTERVAL`] for the half-open-stream rationale.
-const SYNC_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// See [`SYNC_KEEPALIVE_INTERVAL`] for the half-open-stream rationale (and
+/// for why the value comes from `wiremesh-enroll`).
+const SYNC_KEEPALIVE_TIMEOUT: Duration = wiremesh_enroll::SYNC_KEEPALIVE_TIMEOUT;
 
 /// Bound on the TCP/TLS dial itself. Without one, a dial toward a stale DDNS
 /// address that blackholes (no RST) can hang the reconnect loop far longer
 /// than the DNS record's own churn; a bounded dial keeps the
 /// resolve-dial-retry cycle turning so the next attempt picks up the fresh
-/// A record.
-const SYNC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// A record. Value shared via `wiremesh-enroll`, as above.
+const SYNC_CONNECT_TIMEOUT: Duration = wiremesh_enroll::SYNC_CONNECT_TIMEOUT;
 
-/// Bound on the DNS lookup in [`resolve_host_port`]. `getaddrinfo` has no
-/// application-level timeout of its own, and [`SYNC_CONNECT_TIMEOUT`] cannot
-/// cover the resolve phase because resolution happens BEFORE the dial — so
-/// without this bound a hung OS resolver (e.g. the DDNS host's configured
-/// nameserver blackholing) would stall the Sync reconnect loop and the
-/// observe tick indefinitely: the same silent-hang class the Sync keepalive
-/// exists to kill (`docs/research/ops-finding-sync-half-open-stream.md`). On
-/// expiry the caller gets an error and retries on its own cadence, each
-/// attempt resolving fresh.
-const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Resolve a `host:port` dial target — a DNS hostname or an IPv4 literal —
-/// to one `SocketAddr`: the first IPv4 result ([`prefer_ipv4`]). A name that
-/// resolves to only IPv6 is an ERROR, not a fallback — v1 is IPv4-only end
-/// to end (spec §1; the controller itself binds an `Ipv4Addr`), so an IPv6
-/// address can never reach a v1 controller. Callers resolve fresh at every
-/// dial/tick ON PURPOSE: a DDNS name's A record changes when the ISP rotates
-/// the controller's public IP, and per-reconnect (Sync) / per-tick (observe)
-/// re-resolution is what picks the new address up without a gateway restart
-/// (`docs/research/operator-remote-deployment-notes.md` Finding 3). IP
-/// literals pass through `lookup_host` without touching DNS, so netns tests
-/// and IP-configured deployments never depend on a resolver.
-pub async fn resolve_host_port(s: &str) -> anyhow::Result<SocketAddr> {
-    let addrs: Vec<SocketAddr> = tokio::time::timeout(RESOLVE_TIMEOUT, tokio::net::lookup_host(s))
-        .await
-        .map_err(|_| anyhow!("DNS resolution of {s:?} timed out after {RESOLVE_TIMEOUT:?}"))?
-        .with_context(|| format!("resolving {s:?}"))?
-        .collect();
-    prefer_ipv4(&addrs)
-        .ok_or_else(|| anyhow!("{s:?} resolved to no IPv4 addresses (v1 is IPv4-only)"))
-}
-
-/// The pure address-selection policy behind [`resolve_host_port`]: the first
-/// IPv4 result, `None` when the list has none. Deliberately NO cross-family
-/// fallback: v1 is IPv4-only end to end (spec §1 — the controller binds an
-/// `Ipv4Addr`), so an IPv6 candidate is a dead end and "falling back" to one
-/// would only trade a clear resolution error for an unreachable-dial loop.
-/// Factored out of the resolver so the selection is checkable against a
-/// synthetic candidate list, without a resolver in the loop.
-pub fn prefer_ipv4(addrs: &[SocketAddr]) -> Option<SocketAddr> {
-    addrs.iter().find(|a| a.is_ipv4()).copied()
-}
+// The bounded `host:port` resolver behind [`connect`] (and `main.rs`'s
+// observe tick) moved to `wiremesh-enroll` when the relay's Sync client
+// gained the same DDNS dial semantics (Backlog 2, mirroring this crate's
+// PR-#28 fix — see `docs/research/ops-finding-sync-half-open-stream.md`).
+// Re-exported under the original paths so every caller — and the pinned
+// contract in `tests/hostname_resolve.rs` — is unchanged. Semantics
+// (first-IPv4-wins, no cross-family fallback, 10s-bounded lookup, resolved
+// fresh at every dial) are documented at the definition.
+pub use wiremesh_enroll::{prefer_ipv4, resolve_host_port};
 
 /// Dial the controller Sync endpoint (`host:port`, hostname or IP literal)
 /// over mTLS. DNS resolution happens HERE, inside every call, so the

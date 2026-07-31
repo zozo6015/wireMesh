@@ -32,47 +32,15 @@ pub struct GatewayConfig {
     pub metrics_addr: SocketAddr,
 }
 
-/// Syntax-only validation of a `host:port` dial target: split on the LAST
-/// `:`, require a non-empty host part and a valid `u16` port. Deliberately
-/// does NO DNS lookup — a hostname that doesn't resolve right now must still
-/// parse, because the gateway boots fail-static with the controller (and
-/// possibly the resolver) unreachable; actual resolution is deferred to dial
-/// time (`sync::resolve_host_port`).
-///
-/// Two deliberate exceptions to "syntax only", both so a misconfigured unit
-/// fails at boot instead of at every dial:
-/// - An IPv6 dial-target literal — bracketed (`[…]:port`) or a host that
-///   parses as an IPv6 [`std::net::IpAddr`] — is rejected outright: v1 is
-///   IPv4-only end to end (the controller binds an `Ipv4Addr`), so an IPv6
-///   target can never be reached and would otherwise just fail at every
-///   dial forever.
-/// - An IPv4-shaped host (digits and dots only; an all-numeric TLD is not a
-///   legal DNS name, so such a string can never be a resolvable hostname)
-///   must make the WHOLE input parse as a [`SocketAddr`]. Without this, a
-///   typo'd literal like `10.0.0.300:9500` would be waved through as a
-///   "hostname" and the process would run forever logging resolution
-///   failures, where the old `SocketAddr`-typed flag exited non-zero at
-///   boot. This costs no DNS and doesn't touch the genuine-hostname path.
-pub fn validate_host_port(s: &str) -> anyhow::Result<()> {
-    let (host, port) = s
-        .rsplit_once(':')
-        .ok_or_else(|| anyhow!("expected host:port, got {s:?}"))?;
-    if host.is_empty() {
-        return Err(anyhow!("empty host in {s:?}"));
-    }
-    port.parse::<u16>()
-        .map(|_| ())
-        .with_context(|| format!("invalid port in {s:?}"))?;
-    if host.starts_with('[') || matches!(host.parse(), Ok(std::net::IpAddr::V6(_))) {
-        return Err(anyhow!("IPv6 dial target {s:?} is unsupported (v1 is IPv4-only)"));
-    }
-    if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        s.parse::<SocketAddr>()
-            .map(|_| ())
-            .with_context(|| format!("invalid IP literal in {s:?}"))?;
-    }
-    Ok(())
-}
+// The syntax-only boot-time `host:port` validation behind
+// `--controller-sync`/`--observe` moved to `wiremesh-enroll` (byte-identical
+// semantics) when the relay bin's `--controller` gained the same boot
+// posture (Backlog 2) — a misconfigured unit must exit non-zero at boot on
+// either binary, not run forever logging resolution failures. Re-exported
+// under the original path so `parse` below and the pinned unit tests are
+// unchanged. Full semantics (no DNS; the two IPv6/typo'd-IP-literal
+// fail-at-boot exceptions) are documented at the definition.
+pub use wiremesh_enroll::validate_host_port;
 
 impl GatewayConfig {
     pub fn from_env() -> anyhow::Result<Self> {

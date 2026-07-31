@@ -31,10 +31,16 @@
 //! a candidate changes for either member (the broker subscribes to the same
 //! [`ChangeEvent`] broadcast every mutation site publishes on — an
 //! `EndpointObserved` is emitted by both the UDP observation endpoint and
-//! `Sync.Report`'s local-endpoint path), and (c) a bounded periodic retry:
+//! `Sync.Report`'s local-endpoint path), (c) a bounded periodic retry:
 //! the periodic sweep re-punches connected+candidate'd pairs only up to
 //! [`MAX_PERIODIC_ATTEMPTS`] consecutive times, the budget reset on any
-//! candidate change or reconnect.
+//! candidate change or reconnect — and (d) the settled→UNSETTLED edge
+//! (round 4, relay-wedge follow-up): a member's `peer_paths` report flips a
+//! previously both-settled pair out of settled ([`Broker::on_report`]),
+//! which resets the pair's budget and fires an immediate synchronized emit —
+//! a fallen pair's budget is typically exhausted and its candidates
+//! unchanged, so without this edge nothing would ever re-punch it and the
+//! two gateways would punch on unsynchronized self-timers.
 //!
 //! # Path-state skip (directive-storm fix; make-before-break awareness)
 //!
@@ -205,34 +211,112 @@ impl Broker {
     /// and unvalidated, bounded per reporter by
     /// [`MAX_PEER_PATHS_PER_REPORTER`] (a memory backstop — see its doc;
     /// applied to both shapes).
-    pub fn on_report(&self, reporter_gateway_id: i64, peer_paths: &[PeerPath], snapshot: bool) {
+    ///
+    /// # The settled → UNSETTLED edge (round 4, relay-wedge follow-up)
+    ///
+    /// Besides storing states, this detects the pair-level unsettle EDGE:
+    /// for every pair `(reporter, peer)` this report can affect, the settled
+    /// predicate is evaluated against the stored map BEFORE and AFTER the
+    /// update (both inside one lock scope — [`settled_in`]); a `true →
+    /// false` flip means the pair just fell off settled (the case-4 shape: a
+    /// relayed pair's legs died and the reporter's snapshot flipped its
+    /// stored peer state out of `{direct, relayed}` — or dropped the peer
+    /// entirely). On that edge — and ONLY that edge — the pair's periodic
+    /// budget is reset and an immediate synchronized [`Broker::emit_pair`]
+    /// fires (both streams, one `go_unix_ms`): by the time a settled pair
+    /// falls, its budget was typically exhausted during establishment and
+    /// its candidates are unchanged, so no existing trigger would ever
+    /// re-punch it — the two gateways were left punching on unsynchronized
+    /// self-timers, which a port-restricted pair can never land. A report
+    /// that merely KEEPS a pair unsettled (`connecting → disconnected`)
+    /// grants nothing — else every steady-state snapshot from a struggling
+    /// pair would re-arm the punch storm the settled-skip ended. Async since
+    /// the edge emits after the lock is released (the store update itself
+    /// stays a synchronous `std::sync::Mutex` scope; the awaits happen
+    /// strictly after — the established collect-then-emit pattern).
+    pub async fn on_report(
+        &self,
+        reporter_gateway_id: i64,
+        peer_paths: &[PeerPath],
+        snapshot: bool,
+    ) {
         if !snapshot && peer_paths.is_empty() {
             return;
         }
-        let Ok(mut states) = self.peer_path_states.lock() else {
-            return;
-        };
-        if snapshot && peer_paths.is_empty() {
-            // Empty SNAPSHOT: the reporter genuinely tracks no paths — drop
-            // its whole entry (not just its values) so it costs no memory.
-            states.remove(&reporter_gateway_id);
-            return;
-        }
-        let entry = states.entry(reporter_gateway_id).or_default();
-        if snapshot {
-            // Snapshot REPLACE: start from empty so peers absent from this
-            // report (pruned by the gateway) drop out rather than linger.
-            entry.clear();
-        }
-        for pp in peer_paths {
-            let peer = pp.peer_gateway_id as i64;
-            // At the cap, still allow UPDATES for already-tracked peers
-            // (skipping only NEW ids), so a legitimate peer's state can
-            // never be starved out by junk ids earlier in the list.
-            if entry.len() >= MAX_PEER_PATHS_PER_REPORTER && !entry.contains_key(&peer) {
-                continue;
+        // Store update + edge detection under ONE lock scope (guard dropped
+        // before the emits below — never held across an await).
+        let unsettled_edges: Vec<i64> = {
+            let Ok(mut states) = self.peer_path_states.lock() else {
+                return;
+            };
+
+            // The pairs this report can affect: every peer id it carries,
+            // plus — for a snapshot, whose REPLACE semantics can unsettle by
+            // OMISSION (the reporter pruned the peer) — every peer currently
+            // stored for this reporter.
+            let mut affected: Vec<i64> =
+                peer_paths.iter().map(|pp| pp.peer_gateway_id as i64).collect();
+            if snapshot {
+                if let Some(old) = states.get(&reporter_gateway_id) {
+                    affected.extend(old.keys().copied());
+                }
             }
-            entry.insert(peer, pp.state.clone());
+            affected.sort_unstable();
+            affected.dedup();
+            let settled_before: Vec<bool> = affected
+                .iter()
+                .map(|&peer| settled_in(&states, reporter_gateway_id, peer))
+                .collect();
+
+            if snapshot && peer_paths.is_empty() {
+                // Empty SNAPSHOT: the reporter genuinely tracks no paths —
+                // drop its whole entry (not just its values) so it costs no
+                // memory.
+                states.remove(&reporter_gateway_id);
+            } else {
+                let entry = states.entry(reporter_gateway_id).or_default();
+                if snapshot {
+                    // Snapshot REPLACE: start from empty so peers absent from
+                    // this report (pruned by the gateway) drop out rather
+                    // than linger.
+                    entry.clear();
+                }
+                for pp in peer_paths {
+                    let peer = pp.peer_gateway_id as i64;
+                    // At the cap, still allow UPDATES for already-tracked
+                    // peers (skipping only NEW ids), so a legitimate peer's
+                    // state can never be starved out by junk ids earlier in
+                    // the list.
+                    if entry.len() >= MAX_PEER_PATHS_PER_REPORTER && !entry.contains_key(&peer) {
+                        continue;
+                    }
+                    entry.insert(peer, pp.state.clone());
+                }
+            }
+
+            affected
+                .into_iter()
+                .zip(settled_before)
+                .filter(|&(peer, was_settled)| {
+                    was_settled && !settled_in(&states, reporter_gateway_id, peer)
+                })
+                .map(|(peer, _)| peer)
+                .collect()
+        };
+
+        // The unsettle edges: reset each pair's periodic budget and emit an
+        // immediate synchronized punch pair through the one funnel every
+        // trigger uses (`emit_pair`'s no-await critical section keeps the
+        // go-skew guarantee). Rare by construction — only a genuine
+        // settled→unsettled flip lands here — so the Report RPC picking up
+        // these awaits costs the steady-state path nothing.
+        for peer in unsettled_edges {
+            eprintln!(
+                "wiremesh-controller: pair ({reporter_gateway_id}, {peer}) fell off settled \
+                 (reporter's snapshot unsettled it); resetting budget + re-brokering"
+            );
+            self.reset_pair(reporter_gateway_id, peer);
+            self.emit_pair(reporter_gateway_id, peer).await;
         }
     }
 
@@ -247,13 +331,7 @@ impl Broker {
         let Ok(states) = self.peer_path_states.lock() else {
             return false;
         };
-        let settled = |reporter: i64, peer: i64| {
-            states
-                .get(&reporter)
-                .and_then(|peers| peers.get(&peer))
-                .is_some_and(|s| s == "direct" || s == "relayed")
-        };
-        settled(a, b) && settled(b, a)
+        settled_in(&states, a, b)
     }
 
     /// (Directive-storm fix) Drops every stored path state `gateway_id` has
@@ -601,6 +679,23 @@ impl Broker {
             attempts.remove(&pair_key(a, b));
         }
     }
+}
+
+/// The settled predicate over a `peer_path_states` map (see
+/// [`Broker::pair_settled`] for the semantics): BOTH members' latest stored
+/// reports mark the OTHER "direct" OR "relayed". A free function over a
+/// borrowed map — rather than a `&self` method taking the lock — so
+/// [`Broker::on_report`]'s unsettle-edge detection can evaluate it twice
+/// (before/after its store update) inside ONE lock scope without
+/// re-acquiring (or deadlocking on) the `peer_path_states` mutex.
+fn settled_in(states: &HashMap<i64, HashMap<i64, String>>, a: i64, b: i64) -> bool {
+    let settled_dir = |reporter: i64, peer: i64| {
+        states
+            .get(&reporter)
+            .and_then(|peers| peers.get(&peer))
+            .is_some_and(|s| s == "direct" || s == "relayed")
+    };
+    settled_dir(a, b) && settled_dir(b, a)
 }
 
 /// Normalizes an unordered gateway pair to a canonical `(low, high)` key so

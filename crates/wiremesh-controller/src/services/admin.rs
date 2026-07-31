@@ -124,6 +124,17 @@ impl Admin for AdminSvc {
             return Err(Status::invalid_argument("segment name must not be empty"));
         }
 
+        // (Backlog 10 PR-A Item 2b) A zero-length cidrs list vacuously
+        // passed the per-entry parse below and stored a segment no policy
+        // can meaningfully reference (compiling against it is now itself a
+        // CompileError — wiremesh-policy's Item 2a guard — and enrollment
+        // against it has no CIDRs to bind). Rejected here with the exact
+        // wording the enrollment path already uses at its own boundary
+        // (`enrollment.rs`).
+        if req.cidrs.is_empty() {
+            return Err(Status::invalid_argument("cidrs must not be empty"));
+        }
+
         // (Task 5 review finding) `.trunc()` normalizes each declared CIDR to
         // its network address (host bits zeroed) at THIS parse boundary — so
         // a caller declaring `172.16.5.9/12` (a host address within, but not
@@ -817,6 +828,17 @@ impl Admin for AdminSvc {
                         })
                 })
                 .collect::<Result<_, _>>()?;
+            // (Backlog 10 PR-A Item 2b) Same empty-cidrs boundary guard as
+            // `CreateSegment`/`enrollment.rs`. The policy compiler inside
+            // `Db::apply_fabric` already rejects a zero-CIDR segment any
+            // policy block REFERENCES (wiremesh-policy's Item 2a check),
+            // but an unreferenced one would otherwise still be stored.
+            if cidrs.is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "segment {:?}: cidrs must not be empty",
+                    s.name
+                )));
+            }
             segments.push((s.name.clone(), cidrs));
         }
 

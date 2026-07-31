@@ -52,6 +52,11 @@ use crate::{BackendKind, Counters, DenyEvent, Enforcer, EnforcerConfig};
 /// `tests/nft_codegen.rs` and `tests/fixtures/*.nft` for the exact,
 /// golden-tested shape this must produce.
 pub fn ruleset(ir: &PolicyIR, iface: &str) -> anyhow::Result<String> {
+    // `iface` is interpolated into nft script text below (`table ip
+    // wiremesh_<iface>`, `iifname "<iface>"`) — and this is a `pub` entry
+    // point callable without going through `probe_with`'s identical guard,
+    // so it validates at its own boundary too (Backlog 10 PR-A Item 3).
+    crate::validate_iface(iface)?;
     let flat = flatten(ir)?;
 
     // Distinct rule_ids, first-appearance order over the flattened list
@@ -110,6 +115,13 @@ pub fn ruleset(ir: &PolicyIR, iface: &str) -> anyhow::Result<String> {
 /// `{ a, b, c }` — nft anonymous-set syntax, always bracketed regardless of
 /// element count (uniform codegen, no cardinality branch; also the form the
 /// Task 11 brief's own worked example uses even for a single CIDR).
+///
+/// `cidrs` is guaranteed non-empty (Backlog 10 PR-A Item 2c): every caller
+/// works from `flatten`'s output, and `flatten` now rejects any rule whose
+/// effective side has zero CIDRs — so the malformed `{  }` empty-set
+/// rendering this function used to be capable of (which `nft -f` rejects
+/// only later, at apply time, as an opaque syntax error on the gateway) is
+/// unreachable, and needs no cardinality special-case here.
 fn cidr_set(cidrs: &[Ipv4Net]) -> String {
     let parts: Vec<String> = cidrs.iter().map(|c| c.to_string()).collect();
     format!("{{ {} }}", parts.join(", "))

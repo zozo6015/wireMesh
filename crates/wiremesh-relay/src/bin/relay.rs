@@ -31,14 +31,33 @@ struct Args {
     /// by fabric-CA enrollment in production — see module doc comment).
     #[arg(default_value = "/var/lib/wiremesh")]
     certdir: PathBuf,
-    /// Controller Sync address (mTLS), e.g. 127.0.0.1:7000. When given, the
-    /// relay runs a background Sync client (`wiremesh_relay::run_sync`) that
-    /// folds the controller's `revoked_serials` into the live denylist and
-    /// persists it to `<certdir>/denylist.json`. When absent (as in the
-    /// offline denylist test), the relay serves using only whatever denylist
-    /// was already on disk at startup — no controller involved at all.
-    #[arg(long)]
-    controller: Option<SocketAddr>,
+    /// Controller Sync dial target (mTLS) as host:port — a DNS hostname
+    /// (DDNS controllers) or an IPv4 literal, e.g. ctrl.example.com:9500 or
+    /// 127.0.0.1:7000; IPv6 and malformed IPv4-shaped literals are rejected
+    /// at boot (v1 is IPv4-only — see `validated_host_port`). When given,
+    /// the relay runs a background Sync client (`wiremesh_relay::run_sync`)
+    /// that folds the controller's `revoked_serials` into the live denylist
+    /// and persists it to `<certdir>/denylist.json`. Resolution happens
+    /// inside every `run_sync` call, so the retry loop below re-resolves DNS
+    /// on each reconnect. When absent (as in the offline denylist test), the
+    /// relay serves using only whatever denylist was already on disk at
+    /// startup — no controller involved at all.
+    #[arg(long, value_parser = validated_host_port)]
+    controller: Option<String>,
+}
+
+/// clap value parser for `--controller`: the shared boot-time syntax check
+/// (`wiremesh_relay::validate_host_port`, the same one behind the gateway's
+/// `--controller-sync`/`--observe`). No DNS — a currently-unresolvable
+/// hostname must still boot (fail-static; resolution is per-dial inside
+/// `run_sync`) — but an IPv6 literal or a typo'd IPv4-shaped literal like
+/// `10.0.0.300:9500` can never dial successfully, so it exits non-zero HERE
+/// instead of the sync task logging resolution failures forever, exactly as
+/// the old `SocketAddr`-typed flag (and the gateway) behaved.
+fn validated_host_port(s: &str) -> Result<String, String> {
+    wiremesh_relay::validate_host_port(s)
+        .map(|()| s.to_string())
+        .map_err(|e| format!("{e:#}"))
 }
 
 #[tokio::main]
@@ -62,10 +81,13 @@ async fn main() -> Result<()> {
             // never take the relay's datagram-forwarding path down with it
             // (fail-static — see module doc comment). Each disconnect just
             // means the relay keeps enforcing whatever denylist it last
-            // persisted until the controller comes back.
+            // persisted until the controller comes back. run_sync resolves
+            // the host:port target inside every call, so each retry here
+            // also re-resolves DNS — a rotated DDNS A record heals without
+            // a relay restart.
             loop {
                 let result = wiremesh_relay::run_sync(
-                    sync_addr,
+                    &sync_addr,
                     &certdir,
                     "relay",
                     denylist.clone(),

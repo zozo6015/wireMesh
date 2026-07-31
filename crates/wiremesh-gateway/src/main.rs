@@ -3,7 +3,7 @@ use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -15,9 +15,11 @@ use wiremesh_gateway::enforce::GatewayEnforcer;
 use wiremesh_gateway::epochkeys::EpochKeys;
 use wiremesh_gateway::identity::Identity;
 use wiremesh_gateway::metrics;
-use wiremesh_gateway::path::{directive_should_punch, Path, PathAction, PathState};
+use wiremesh_gateway::path::{
+    directive_should_punch, transition_crosses_settled_boundary, Path, PathAction, PathState,
+};
 use wiremesh_gateway::punch_backoff::{PunchBackoff, PunchDecision};
-use wiremesh_gateway::relay::RelayTransport;
+use wiremesh_gateway::relay::{RelayDeathReason, RelayTransport};
 use wiremesh_gateway::rotation::{Rotation, RotationAction, RotationPhase};
 use wiremesh_gateway::state::DesiredState;
 use wiremesh_gateway::tunnelset::TunnelSet;
@@ -154,8 +156,10 @@ const RETIRE_POLL_PERIOD: Duration = Duration::from_millis(500);
 struct ActiveTunInfo {
     /// The active tun's interface name (`wg0` or `wg0e<N>`).
     ifname: String,
-    /// The active tun's WireGuard private key (epoch 0's identity key, or the
-    /// rotated epoch's key after a Role-A cutover).
+    /// The active tun's WireGuard private key (the boot key selected by
+    /// `EpochKeys::select_boot_key` — the store's active epoch, else the
+    /// legacy identity key — or the rotated epoch's key after a Role-A
+    /// cutover).
     priv_key: String,
     /// The active tun's WireGuard listen port (base port, or the rotation
     /// epoch's offset port after a cutover).
@@ -227,17 +231,46 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     if let Err(e) = routes::set_rp_filter_loose() {
         eprintln!("wiremesh-gateway: could not set loose rp_filter (continuing): {e}");
     }
-    // Bring the boot epoch (0) up INTO the `TunnelSet` rather than as a
+    // Boot-key selection (Backlog 3 Task 1 — durable promote/retire): the
+    // persisted epoch store's ACTIVE entry wins over the legacy identity key,
+    // so a rebooted post-rotation gateway comes up on the PROMOTED epoch's
+    // key rather than resurrecting the retired epoch-0 key (which no peer
+    // advertises once the controller has promoted — the black-hole bug, see
+    // docs/research/key-rotation-teardown-notes.md item C). With no store or
+    // no active entry this falls back to `Identity::wg_private_key_b64`,
+    // byte-identical to the pre-fix boot. Per OD-1 the selection changes the
+    // KEY only, never the tun/port: boot is ALWAYS the base tun (`wg0`) at
+    // the base listen port regardless of the selected epoch — a reboot tears
+    // every WG session anyway, and peers hold base-port candidates for us,
+    // so re-normalizing is what lets the punch/re-establish ladder converge.
+    let epoch_store = EpochKeys::load(&cfg.state_dir).context("loading epoch key store")?;
+    let boot_key = EpochKeys::select_boot_key(epoch_store.as_ref(), &id.wg_private_key_b64)
+        .context("selecting boot key")?;
+    if boot_key.epoch != 0 {
+        eprintln!(
+            "wiremesh-gateway: booting on promoted epoch {} key (base tun/port per OD-1)",
+            boot_key.epoch
+        );
+    }
+    // Bring the boot epoch up INTO the `TunnelSet` rather than as a
     // standalone `Tunnel`, so that once a rotation retires it the old epoch's
     // Device can actually be torn down (its boringtun Device dropped +
     // `ip link del`). `bring_up` creates the boringtun Device, brings the tun
-    // link up at `TUN_MTU`, and applies epoch 0's private key + listen port
-    // with an EMPTY peer set; `apply_state` (boot fail-static below, and every
-    // Sync snapshot) fills in the peers.
+    // link up at `TUN_MTU`, and applies the boot epoch's private key + listen
+    // port with an EMPTY peer set; `apply_state` (boot fail-static below, and
+    // every Sync snapshot) fills in the peers. Keyed by the boot key's EPOCH
+    // number so a later rotation's retire (`old_epoch` = the store's active
+    // epoch at mint time) tears down THIS entry.
     let mut tunnels = TunnelSet::new();
-    tunnels.bring_up(0, &cfg.tun_ifname, &id.wg_private_key_b64, cfg.wg_listen_port, TUN_MTU)?;
+    tunnels.bring_up(
+        boot_key.epoch,
+        &cfg.tun_ifname,
+        &boot_key.private_key_b64,
+        cfg.wg_listen_port,
+        TUN_MTU,
+    )?;
     routes::install_mss_clamp(&cfg.tun_ifname, MSS)?;
-    // All live L4 enforcers, keyed by epoch (0 = boot tun `wg0`; `wg0e<N>` per
+    // All live L4 enforcers, keyed by epoch (boot epoch = boot tun `wg0`; `wg0e<N>` per
     // rotation). `apply_state` applies the current policy to EVERY entry so a
     // policy update reaches every tun that may be carrying traffic during a
     // rotation overlap (not just `wg0`). A `tokio::sync::Mutex` (same as the
@@ -246,7 +279,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // entries are torn down in a later step.
     let enforcers: Arc<Mutex<HashMap<u32, GatewayEnforcer>>> = Arc::new(Mutex::new({
         let mut m = HashMap::new();
-        m.insert(0u32, GatewayEnforcer::attach(&cfg.tun_ifname)?);
+        m.insert(boot_key.epoch, GatewayEnforcer::attach(&cfg.tun_ifname)?);
         m
     }));
 
@@ -267,7 +300,10 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // a continuous flow zero-drop across the make-before-break rotation window.
     let active = Arc::new(std::sync::Mutex::new(ActiveTunInfo {
         ifname: cfg.tun_ifname.clone(),
-        priv_key: id.wg_private_key_b64.clone(),
+        // The SELECTED boot key (store-active epoch, or the legacy identity
+        // key fallback) — must match what `bring_up` just applied, or the
+        // first `apply_state` would silently rekey the base tun.
+        priv_key: boot_key.private_key_b64.clone(),
         wg_port: cfg.wg_listen_port,
         applied_config: None,
         applied_peers: Vec::new(),
@@ -347,13 +383,14 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         desired: Arc::new(std::sync::Mutex::new(applied.clone())),
         paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
         transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        punching: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        punching: Arc::new(std::sync::Mutex::new(HashMap::new())),
         relay_transports: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
         relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
         endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
         wg0_pins: wg0_pins.clone(),
+        path_report_notify: Arc::new(tokio::sync::Notify::new()),
         peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
         live_endpoints: live_endpoints.clone(),
         punch_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -388,7 +425,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     let kind = match map.values().next().map(|e| e.kind()) {
                         Some(BackendKind::Nftables) => "nftables",
                         // eBPF is also the safe default for the (unreachable)
-                        // empty map — epoch 0 is always present.
+                        // empty map — the boot epoch is always present.
                         Some(BackendKind::Ebpf) | None => "ebpf",
                     };
                     let mut per_tun = Vec::with_capacity(map.len());
@@ -457,17 +494,25 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // Migrate the pre-rotation single identity key into a one-epoch store
     // (epoch 0, "active") the first time a rotation-aware gateway boots, so
     // `generate_next` has a base to mint from. Steady-state (no rotation)
-    // behavior is completely unchanged: epoch 0 already runs on `wg0` at the
-    // base port from the boot above; the epoch store is only consulted when a
-    // rotation actually starts.
-    let mut epoch_keys = match EpochKeys::load(&cfg.state_dir)? {
-        Some(k) => k,
-        None => {
-            let k = EpochKeys::from_legacy(&id.wg_private_key_b64)?;
-            k.persist(&cfg.state_dir)?;
-            k
-        }
-    };
+    // behavior is completely unchanged: the boot epoch already runs on `wg0`
+    // at the base port from the boot above; the epoch store is only consulted
+    // when a rotation actually starts. Uses the store loaded at boot-key
+    // selection above; an EXISTING store is kept verbatim even when
+    // `select_boot_key` fell back to the legacy key (a pending-only store
+    // from a crash-mid-mint) — overwriting it with `from_legacy` here would
+    // destroy the persisted mint. Shared (`Arc<Mutex<_>>`) because the
+    // lifecycle now has three writers: `handle_rotate` (sync loop) mints,
+    // the rotation tick's Role-A cutover promotes, and `service_retire`
+    // (run task) retires — each persisting its transition (Backlog 3 Task 1).
+    let epoch_keys: Arc<std::sync::Mutex<EpochKeys>> =
+        Arc::new(std::sync::Mutex::new(match epoch_store {
+            Some(k) => k,
+            None => {
+                let k = EpochKeys::from_legacy(&id.wg_private_key_b64)?;
+                k.persist(&cfg.state_dir)?;
+                k
+            }
+        }));
     // `tunnels` (created at boot — it owns the boot epoch-0 Device now, and the
     // per-rotation Devices below) stays owned by THIS (`block_on`'d) task,
     // never moved into a spawned task, since boringtun's `DeviceHandle` is not
@@ -497,6 +542,8 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         desired: ctx.desired.clone(),
         live_endpoints: live_endpoints.clone(),
         retire_ready: Arc::new(std::sync::Mutex::new(None)),
+        epoch_keys: epoch_keys.clone(),
+        collapse_ready: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     tokio::spawn(run_rotation_ticks(rot.clone()));
 
@@ -513,28 +560,90 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     }
                 };
                 let mut current = applied.clone();
+                // Prompt-report debounce state (relay-wedge fix round 4),
+                // per connection: `pending` is set when the path-tick driver
+                // signals a settled-boundary crossing, and flushed at the
+                // top of the loop once the debounce window opens — kept as a
+                // flag (rather than sleeping on the notify arm) so the Watch
+                // stream stays serviced while the window closes; the
+                // `RETIRE_POLL_PERIOD` bounded wait guarantees a wakeup
+                // within ~500ms of the window opening.
+                let mut prompt_report_pending = false;
+                let mut last_prompt_report: Option<Instant> = None;
                 loop {
                     // Service any pending old-epoch retire the rotation tick has
                     // signalled (every peer cut over to the new tun and the
                     // grace elapsed). Done HERE in the run task because it owns
                     // the non-`Send` `tunnels`/`enforcers`.
                     service_retire(&mut tunnels, &enforcers, &rot).await;
+                    // Likewise any completed Role-B collapse (a rotated PEER's
+                    // overlap Device whose reverse make-before-break finished).
+                    service_role_b_collapse(&mut tunnels, &enforcers, &rot).await;
+
+                    // Flush a pending prompt path-snapshot report once its
+                    // debounce window opens (≥ PROMPT_REPORT_DEBOUNCE since
+                    // the last prompt report — the WHY lives on
+                    // `PathCtx::path_report_notify`: the broker needs the
+                    // unsettle edge promptly to re-arm + re-synchronize the
+                    // pair's punches, the case-4 finding). Failures are
+                    // logged and dropped — the next State apply sends the
+                    // same snapshot anyway.
+                    if prompt_report_pending
+                        && last_prompt_report
+                            .map_or(true, |t| t.elapsed() >= PROMPT_REPORT_DEBOUNCE)
+                    {
+                        prompt_report_pending = false;
+                        last_prompt_report = Some(Instant::now());
+                        let version = applied.as_ref().map(|d| d.policy_version).unwrap_or(0);
+                        if let Err(e) = send_paths_snapshot_report(
+                            &mut client,
+                            &ctx,
+                            cfg.wg_listen_port,
+                            version,
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "wiremesh-gateway: prompt path-snapshot report failed: {e}"
+                            );
+                        }
+                    }
 
                     // Bounded wait so the loop still wakes to service a retire
                     // even while the controller is quiet. `next_event` is
                     // cancel-safe (tonic's `Streaming` keeps its own buffered
-                    // state), so dropping it on timeout never loses a message.
-                    let ev = match tokio::time::timeout(
-                        RETIRE_POLL_PERIOD,
-                        sync::next_event(&mut stream, &mut current),
-                    )
-                    .await
-                    {
-                        Ok(res) => res,
-                        Err(_elapsed) => continue,
+                    // state), so dropping it on timeout never loses a message —
+                    // and `Notify::notified` is likewise cancel-safe here (a
+                    // permit delivered while the other branch wins stays
+                    // stored, so the signal is picked up on a later wait).
+                    let ev = tokio::select! {
+                        res = tokio::time::timeout(
+                            RETIRE_POLL_PERIOD,
+                            sync::next_event(&mut stream, &mut current),
+                        ) => match res {
+                            Ok(res) => res,
+                            Err(_elapsed) => continue,
+                        },
+                        // Prompt-report signal (round 4): a peer's path
+                        // crossed the settled boundary. Just mark pending —
+                        // the flush above sends it once the debounce allows,
+                        // keeping this wait free to keep draining the stream.
+                        _ = ctx.path_report_notify.notified() => {
+                            prompt_report_pending = true;
+                            continue;
+                        }
                     };
                     match ev {
                         Ok(Some(sync::SyncEvent::State(ds))) => {
+                            // (Backlog 3 Task 1 slice of T3 — Role-B collapse
+                            // trigger) BEFORE apply_state, so that when a
+                            // rotating peer's retire delta collapses its key
+                            // set back to active-only, the unpin below takes
+                            // effect in THIS very apply: `wg0` gets rebuilt
+                            // with the peer's NEW active key immediately, and
+                            // the tick's reverse make-before-break can start
+                            // waiting for that session to go live.
+                            maybe_collapse_role_b(&rot, &ds);
                             apply_state(
                                 &enforcers,
                                 applied.as_ref(),
@@ -565,40 +674,26 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // path-tick tasks (guard dropped before the await
                             // below — never held across it).
                             *ctx.desired.lock().unwrap() = Some(ds.clone());
-                            let local_endpoints = netif::local_wg_endpoints(cfg.wg_listen_port);
-                            let relay_health = ctx.relay_health_snapshot().await;
-                            // (Directive-storm fix) Attach the complete
-                            // current per-peer path-state snapshot (every
-                            // tracked peer, `PathState::as_str()`'s lowercase
-                            // label — the same one the metrics use) so the
-                            // controller's broker can skip re-punching pairs
-                            // both sides report settled. `Some(..)` = a real
-                            // snapshot (sets `peer_paths_snapshot` on the
-                            // wire), so an EMPTY map is meaningful too — it
-                            // clears this gateway's stored states rather
-                            // than reading as an old client. Guard taken in
-                            // a tight scope and dropped before the await,
-                            // per `PathCtx`'s no-lock-across-await
-                            // discipline.
-                            let peer_paths: Vec<PeerPath> = ctx
-                                .paths
-                                .lock()
-                                .unwrap()
-                                .iter()
-                                .map(|(gid, p)| PeerPath {
-                                    peer_gateway_id: *gid,
-                                    state: p.state.as_str().to_string(),
-                                })
-                                .collect();
-                            let _ = sync::report(
+                            // (Directive-storm fix) The full steady-state
+                            // report, including the complete per-peer
+                            // path-state snapshot (every tracked peer,
+                            // `PathState::as_str()`'s lowercase label) so
+                            // the controller's broker can skip re-punching
+                            // pairs both sides report settled — see
+                            // `send_paths_snapshot_report` (round 4: shared
+                            // with the prompt-report path, which is why it
+                            // also feeds the prompt debounce below — a State
+                            // apply IS a fresh snapshot, so any pending
+                            // prompt is satisfied by it).
+                            let _ = send_paths_snapshot_report(
                                 &mut client,
+                                &ctx,
+                                cfg.wg_listen_port,
                                 ds.policy_version,
-                                local_endpoints,
-                                relay_health,
-                                vec![],
-                                Some(peer_paths),
                             )
                             .await;
+                            prompt_report_pending = false;
+                            last_prompt_report = Some(Instant::now());
                             applied_version.store(ds.policy_version, Ordering::Relaxed);
                             applied = Some(ds);
                         }
@@ -633,7 +728,10 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // returns Allow (consuming the window) — so it
                             // must not run when no attempt will actually
                             // start. If the guard is already held (a punch in
-                            // flight), we skip WITHOUT touching the back-off.
+                            // flight), we don't touch the back-off: a
+                            // DIRECTIVE-origin holder is skipped outright,
+                            // while a TICK-origin holder is PREEMPTED (round
+                            // 5 — see the None arm below).
                             // While backed off — and equally when the
                             // path-state precondition fails — directives are
                             // skipped SILENTLY (the state change was logged
@@ -653,7 +751,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 directive_should_punch(state, pointed)
                             };
                             if should_punch {
-                                match ctx.try_start_punch(gid) {
+                                match ctx.try_start_punch(gid, PunchOrigin::Directive) {
                                     Some(guard) => {
                                         if ctx.punch_allowed(gid, &d.candidates) {
                                             tokio::spawn(punch_and_apply(
@@ -667,10 +765,43 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                         // else: backed off — drop the guard (it
                                         // releases on scope exit) without spawning.
                                     }
-                                    None => eprintln!(
-                                        "wiremesh-gateway: punch already in flight for peer={gid}; \
-                                         skipping controller directive"
-                                    ),
+                                    // Round 5 (directive preemption — case-4
+                                    // rerun finding): the slot is occupied. A
+                                    // TICK-origin holder is a stale self-timer
+                                    // trial — by the time it yields on its own
+                                    // (deferring when the SM recycles
+                                    // Connecting→Disconnected at
+                                    // CONNECT_TIMEOUT), this directive's
+                                    // synchronized go-time has long passed, so
+                                    // every broker-synchronized window was
+                                    // being eaten by "punch already in
+                                    // flight" skips. Cancel it and hand the
+                                    // directive to a small bounded-wait task
+                                    // that claims the slot the moment it
+                                    // frees (the cancelled trial polls its
+                                    // flag every PUNCH_POLL_INTERVAL=500ms).
+                                    // A DIRECTIVE-origin holder keeps today's
+                                    // skip: two synchronized directives carry
+                                    // the same go — racing them buys nothing.
+                                    None => {
+                                        if ctx.preempt_tick_punch(gid) {
+                                            eprintln!(
+                                                "wiremesh-gateway: peer={gid} controller directive \
+                                                 preempting stale tick-origin punch trial; handing off"
+                                            );
+                                            tokio::spawn(directive_punch_handoff(
+                                                ctx.clone(),
+                                                gid,
+                                                d.candidates,
+                                                d.go_unix_ms,
+                                            ));
+                                        } else {
+                                            eprintln!(
+                                                "wiremesh-gateway: punch already in flight for peer={gid}; \
+                                                 skipping controller directive"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -680,7 +811,6 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 d.epoch
                             );
                             if let Err(e) = handle_rotate(
-                                &mut epoch_keys,
                                 &mut tunnels,
                                 &enforcers,
                                 &rot,
@@ -746,13 +876,20 @@ struct PathCtx {
     /// Cumulative `{(from,to) -> count}` path-state transition tally — the
     /// bookkeeping behind `metrics::render_path_transitions`.
     transitions: Arc<std::sync::Mutex<HashMap<(PathState, PathState), u64>>>,
-    /// Gateway IDs with a `punch_and_apply` task currently in flight (review
-    /// finding: a controller `Punch` directive and a tick-driven
-    /// `StartPunch` for the SAME peer could otherwise spawn two concurrent
-    /// tasks that each `replace_peers`-apply the full device). Claimed via
+    /// Per-peer in-flight `punch_and_apply` slot (review finding: a
+    /// controller `Punch` directive and a tick-driven `StartPunch` for the
+    /// SAME peer could otherwise spawn two concurrent tasks that each
+    /// `replace_peers`-apply the full device). Claimed via
     /// [`PathCtx::try_start_punch`], released by dropping the returned
-    /// [`PunchGuard`].
-    punching: Arc<std::sync::Mutex<HashSet<u64>>>,
+    /// [`PunchGuard`]. Each slot records its [`PunchOrigin`] and carries a
+    /// cancellation flag (round 5, directive preemption): a
+    /// controller-directive arrival may preempt a stale TICK-origin trial —
+    /// the case-4 rerun showed the broker's synchronized directives being
+    /// dropped at "punch already in flight" against self-timer tick trials,
+    /// eating every synchronized window — whereas a DIRECTIVE-origin
+    /// in-flight trial is left alone (two synchronized directives share one
+    /// go; racing them buys nothing).
+    punching: Arc<std::sync::Mutex<HashMap<u64, PunchSlot>>>,
     /// Live relay transport per peer `gateway_id` currently relying on relay
     /// help — present only while that peer is (or very recently was)
     /// `Relayed`. A `tokio::sync::Mutex` (unlike every other `PathCtx` map)
@@ -829,6 +966,26 @@ struct PathCtx {
     /// by [`PathCtx::record_punch_outcome`] from `punch_and_apply`. Note
     /// `try_start_punch` bounds concurrency; this bounds RATE.
     punch_backoff: Arc<std::sync::Mutex<HashMap<u64, PunchBackoff>>>,
+    /// Prompt-report signal (relay-wedge fix round 4): `run_path_ticks`
+    /// fires `notify_one` whenever any peer's recorded transition CROSSES
+    /// the settled boundary (`path::transition_crosses_settled_boundary` —
+    /// membership in `{Direct, Relayed}` changed), and the sync loop
+    /// `select!`s on `notified()` alongside its Watch stream to send a full
+    /// `peer_paths` snapshot Report promptly (debounced there, ≥2s between
+    /// prompt reports across ALL peers). WHY (the authoritative case-4
+    /// finding): reports used to ride only `SyncEvent::State` applies, so
+    /// when a relayed pair's legs died the controller's stored states said
+    /// `relayed`/`relayed` (settled — possibly settled-SKIPPING the pair)
+    /// long after the fall, its periodic punch budget stayed exhausted from
+    /// establishment, and the two gateways punched on unsynchronized
+    /// self-timers (idle-timeout detection + backoff drift) that a
+    /// port-restricted pair can never land — the broker needs the unsettle
+    /// edge promptly, not at the next roster change. `Notify`'s stored
+    /// permit means an edge fired while the sync loop was busy (or
+    /// disconnected) is picked up at its next wait, and multiple edges
+    /// coalesce — correct, since every prompt report is a complete
+    /// snapshot.
+    path_report_notify: Arc<tokio::sync::Notify>,
     /// Latest per-peer UAPI liveness snapshot (rx/tx bytes + latest
     /// handshake), keyed by peer `gateway_id` — published by `run_path_ticks`
     /// from the SAME `uapi::get_peer_liveness` fetch that drives the path
@@ -915,20 +1072,50 @@ impl PathCtx {
         }
     }
 
-    /// Try to claim the in-flight-punch slot for peer `gid`. Returns `None`
-    /// if a punch for this peer is already running — the caller should skip
-    /// spawning another `punch_and_apply` and just log it. Returns
+    /// Try to claim the in-flight-punch slot for peer `gid`, recording the
+    /// attempt's `origin` (round 5: tick-driven vs controller-directive —
+    /// see `punching`'s doc for why the distinction matters). Returns `None`
+    /// if a punch for this peer is already running — a tick-driven caller
+    /// should skip and log; the DIRECTIVE arm instead consults
+    /// [`PathCtx::preempt_tick_punch`] to evict a stale tick trial. Returns
     /// `Some(guard)` otherwise, having marked `gid` as in-flight; the caller
     /// must move the guard into the spawned task (e.g. as an extra
     /// parameter to `punch_and_apply`) so it's held for the task's whole
     /// lifetime and released — fail-static, on success OR error OR panic —
-    /// when the guard drops.
-    fn try_start_punch(&self, gid: u64) -> Option<PunchGuard> {
-        let mut set = self.punching.lock().unwrap();
-        if !set.insert(gid) {
+    /// when the guard drops. `punch_and_apply` polls the guard's `cancel`
+    /// flag each trial iteration and yields promptly once preempted.
+    fn try_start_punch(&self, gid: u64, origin: PunchOrigin) -> Option<PunchGuard> {
+        let mut slots = self.punching.lock().unwrap();
+        if slots.contains_key(&gid) {
             return None;
         }
-        Some(PunchGuard { punching: self.punching.clone(), gid })
+        let cancel = Arc::new(AtomicBool::new(false));
+        slots.insert(gid, PunchSlot { origin, cancel: cancel.clone() });
+        Some(PunchGuard { punching: self.punching.clone(), gid, cancel })
+    }
+
+    /// (Round 5, directive preemption) If peer `gid`'s in-flight punch slot
+    /// is held by a TICK-origin trial, set its cancellation flag and return
+    /// `true` — the caller (the controller-directive arm) then spawns
+    /// [`directive_punch_handoff`] to claim the slot the moment the
+    /// cancelled trial yields it. Returns `false` when the slot is held by a
+    /// DIRECTIVE-origin trial (two synchronized directives share one go —
+    /// racing them buys nothing; keep today's skip) or is already free (the
+    /// caller should simply retry [`PathCtx::try_start_punch`]; the handoff
+    /// task's first poll does exactly that, so callers may treat free as
+    /// preemptable — this method returns `true` for that case to keep the
+    /// arm's logic single-branch). Idempotent: re-flagging an
+    /// already-cancelled trial is harmless.
+    fn preempt_tick_punch(&self, gid: u64) -> bool {
+        let slots = self.punching.lock().unwrap();
+        match slots.get(&gid) {
+            Some(slot) if slot.origin == PunchOrigin::Tick => {
+                slot.cancel.store(true, Ordering::Relaxed);
+                true
+            }
+            Some(_) => false, // directive-origin in flight: leave it be
+            None => true,     // freed in the meantime: hand off immediately
+        }
     }
 
     /// Try to claim the in-flight-relay-connect slot for peer `gid`. Same
@@ -961,19 +1148,59 @@ impl PathCtx {
     }
 }
 
+/// Who started an in-flight punch attempt (round 5, directive preemption):
+/// the path SM's self-timer (`StartPunch`, unsynchronized with the peer) or
+/// a controller `PunchDirective` (broker-synchronized go on both sides —
+/// the only kind that can land a port-restricted pair). A directive arrival
+/// preempts a `Tick` holder but never a `Directive` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PunchOrigin {
+    Tick,
+    Directive,
+}
+
+/// One peer's occupied in-flight-punch slot: its origin plus the
+/// cancellation flag `punch_and_apply` polls each trial iteration
+/// (dependency-free `Arc<AtomicBool>` — the trial loop already wakes every
+/// [`PUNCH_POLL_INTERVAL`] = 500ms, so a set flag is honored well inside
+/// the handoff wait budget).
+struct PunchSlot {
+    origin: PunchOrigin,
+    cancel: Arc<AtomicBool>,
+}
+
 /// RAII release for [`PathCtx::try_start_punch`]'s in-flight-punch slot.
 /// Removing `gid` on `Drop` (rather than requiring an explicit call at every
 /// `punch_and_apply` return site) means an early `return` on error, or even
 /// a task panic unwinding through it, still releases the slot — a punch
-/// failure must never permanently wedge future punches for that peer.
+/// failure must never permanently wedge future punches for that peer. Drop
+/// removes the entry only if it is still THIS guard's own slot (`Arc::ptr_eq`
+/// on the cancel flag — same defensive shape as `RegistrationGuard`'s
+/// `same_channel`), so a late drop can never evict a successor's slot.
 struct PunchGuard {
-    punching: Arc<std::sync::Mutex<HashSet<u64>>>,
+    punching: Arc<std::sync::Mutex<HashMap<u64, PunchSlot>>>,
     gid: u64,
+    /// This attempt's own cancellation flag — set via
+    /// [`PathCtx::preempt_tick_punch`]; polled by `punch_and_apply`.
+    cancel: Arc<AtomicBool>,
+}
+
+impl PunchGuard {
+    /// Whether this attempt has been preempted (round 5) — checked by
+    /// `punch_and_apply` at the top of every trial iteration.
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for PunchGuard {
     fn drop(&mut self) {
-        self.punching.lock().unwrap().remove(&self.gid);
+        let mut slots = self.punching.lock().unwrap();
+        let still_ours =
+            slots.get(&self.gid).is_some_and(|s| Arc::ptr_eq(&s.cancel, &self.cancel));
+        if still_ours {
+            slots.remove(&self.gid);
+        }
     }
 }
 
@@ -1214,11 +1441,20 @@ async fn poke_peer_overlay(ctx: &PathCtx, gid: u64) {
 /// the done-bar pairs (nat_matrix, convergence A↔B) each punch a single observed
 /// candidate and reach `Direct` well within it.
 ///
-/// `_guard` is the in-flight-punch slot from [`PathCtx::try_start_punch`] —
-/// unused by name, but HELD for this function's entire lifetime (including
-/// every early `return`) and released via `Drop`, so at most one
-/// `punch_and_apply` runs per peer at a time regardless of whether it was
-/// triggered by a controller `Punch` directive or a tick-driven `StartPunch`.
+/// `guard` is the in-flight-punch slot from [`PathCtx::try_start_punch`] —
+/// HELD for this function's entire lifetime (including every early `return`)
+/// and released via `Drop`, so at most one `punch_and_apply` runs per peer
+/// at a time regardless of whether it was triggered by a controller `Punch`
+/// directive or a tick-driven `StartPunch`. The guard also carries this
+/// attempt's CANCELLATION flag (round 5, directive preemption): the trial
+/// polls it at the top of every loop iteration AND again immediately before
+/// each endpoint commit (B1 follow-up — the cheap common-case exit) and,
+/// once preempted (a controller directive evicting a stale tick-origin trial
+/// — [`PathCtx::preempt_tick_punch`]), returns promptly WITHOUT recording a
+/// punch outcome (mirroring the make-before-break yield semantics: no
+/// dialability was conclusively tested), freeing the slot for the waiting
+/// [`directive_punch_handoff`] — whose [`HANDOFF_WAIT_MAX`] is derived from
+/// this loop's worst-case latency to observe the flag.
 /// Every blocking call (`uapi::apply` inside `set_peer_endpoint`,
 /// the nudge socket) runs inside `spawn_blocking`; no mutex guard is ever held
 /// across an `.await`.
@@ -1227,7 +1463,7 @@ async fn punch_and_apply(
     gid: u64,
     candidates: Vec<String>,
     go_unix_ms: Option<u64>,
-    _guard: PunchGuard,
+    guard: PunchGuard,
 ) {
     if let Some(go) = go_unix_ms {
         let now_ms = SystemTime::now()
@@ -1250,6 +1486,19 @@ async fn punch_and_apply(
     let mut trial = punch::CandidateTrial::new(&candidates, Instant::now());
     let mut last_addr: Option<SocketAddr> = None;
     loop {
+        // Preemption check (round 5): a controller directive has evicted
+        // this stale tick-origin trial — yield the slot NOW so the waiting
+        // handoff can run the broker-synchronized punch before its go-time
+        // rots. Return WITHOUT recording an outcome (no dialability was
+        // conclusively tested), exactly like the make-before-break yield.
+        if guard.cancelled() {
+            eprintln!(
+                "wiremesh-gateway: peer={gid} punch trial preempted by controller directive; \
+                 yielding slot"
+            );
+            return;
+        }
+
         // Make-before-break: NEVER let this endpoint-driven punch clobber an
         // ACTIVE relay endpoint. Under approach B a WireGuard peer has exactly
         // ONE endpoint and the endpoint-set IS the punch, so pointing WG at a
@@ -1308,10 +1557,10 @@ async fn punch_and_apply(
         // very task created at the top has since been PRUNED (the tick
         // loop's desired-peer `retain` — the peer left the roster
         // mid-trial), and punching a de-rostered peer must yield.
-        let connecting = {
+        let (connecting, relay_pointed_now) = {
             let state = ctx.paths.lock().unwrap().get(&gid).map(|p| p.state);
             let pointed = ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
-            state.is_some() && directive_should_punch(state, pointed)
+            (state.is_some() && directive_should_punch(state, pointed), pointed)
         };
         if !connecting {
             // Low-noise, and deliberately NOT worded with any of the four
@@ -1319,15 +1568,45 @@ async fn punch_and_apply(
             // confirmed`, `punch confirmed`, `punch task for peer=`) — yielding
             // is not a punch attempt, so it must not feed the anti-storm tally.
             // Return WITHOUT recording an outcome: no dialability was tested.
+            // The "deferring direct punch" substring is the counting tests'
+            // DEFER_NEEDLE and must stay byte-identical; only the
+            // parenthetical varies — the relay clause is only claimed when
+            // the WG endpoint really is pointed at a relay socket (round-5
+            // wording fix: a post-relay-death yield has no relay flowing).
+            let why = if relay_pointed_now {
+                "(make-before-break, relay path kept flowing)"
+            } else {
+                "(make-before-break)"
+            };
             eprintln!(
-                "wiremesh-gateway: peer={gid} path no longer connecting; deferring direct punch \
-                 (make-before-break, relay path kept flowing)"
+                "wiremesh-gateway: peer={gid} path no longer connecting; deferring direct punch {why}"
             );
             return;
         }
 
         match trial.poll(Instant::now(), PER_CANDIDATE_PUNCH_TIMEOUT) {
             punch::TrialStep::Punch(addr) => {
+                // Second preemption check (B1 review follow-up), immediately
+                // BEFORE the iteration's expensive part — the endpoint
+                // commit + nudge. Safe by construction: nothing has been
+                // written yet (`set_peer_endpoint` performs the whole
+                // guard+write atomically under `endpoint_commit`, and this
+                // returns before entering it), so there is no half-applied
+                // endpoint state — identical to the make-before-break yield,
+                // which already returns from this same point. This does not
+                // LOWER the worst-case bound (a flag set just after this
+                // check still costs apply+nudge+sleep — see
+                // `HANDOFF_WAIT_MAX`'s arithmetic, which budgets for exactly
+                // that), but it collapses the common case: a directive
+                // arriving while the trial is between candidates now yields
+                // the slot in ~one poll instead of a full apply cycle.
+                if guard.cancelled() {
+                    eprintln!(
+                        "wiremesh-gateway: peer={gid} punch trial preempted by controller \
+                         directive before endpoint commit; yielding slot"
+                    );
+                    return;
+                }
                 last_addr = Some(addr);
                 // Set the endpoint via the scoped remove+re-add (make-before-
                 // break: only THIS peer's session resets, spike finding 2 — no
@@ -1396,6 +1675,89 @@ async fn punch_and_apply(
             }
             return;
         }
+    }
+}
+
+/// How often [`directive_punch_handoff`] re-polls the per-peer punch slot
+/// while waiting for a preempted tick trial to yield it (round 5).
+const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Bounded allowance for ONE endpoint-apply + nudge inside a punch trial
+/// iteration — `set_peer_endpoint`'s [`PathCtx::endpoint_commit`] acquisition
+/// plus its `spawn_blocking` UAPI write, plus `poke_peer_overlay`'s own
+/// `spawn_blocking` socket send. All are local (UAPI socket / loopback
+/// datagram) and typically complete in single-digit ms; 1s is deliberately
+/// generous for container CPU contention and for the commit lock briefly
+/// being held by a concurrent relay install.
+const HANDOFF_ENDPOINT_APPLY_ALLOWANCE: Duration = Duration::from_millis(1000);
+
+/// Upper bound on [`directive_punch_handoff`]'s wait for the slot, DERIVED
+/// from the preempted trial's actual worst-case latency to observe its
+/// cancel flag rather than guessed (B1 review finding: a flat 1.5s could be
+/// shorter than that worst case, dropping the directive after a successful
+/// preemption — wasting the very window preemption exists to capture).
+///
+/// Arithmetic — worst case is the flag being set immediately AFTER the
+/// trial's last cancel check in an iteration, so the whole remainder of that
+/// iteration runs before the next check:
+///
+/// * [`HANDOFF_ENDPOINT_APPLY_ALLOWANCE`] (1000ms) — the endpoint write +
+///   nudge that iteration may still perform;
+/// * [`PUNCH_POLL_INTERVAL`] (500ms) — the trial's per-iteration sleep,
+///   always completed before it loops back to the check;
+/// * [`HANDOFF_POLL_INTERVAL`] (100ms) — this task observes the freed slot
+///   up to one poll late.
+///
+/// That sums to 1600ms; doubled for headroom = 3200ms. Comfortably under the
+/// broker's ~5s periodic re-emit cadence, so a genuinely stuck slot (e.g. a
+/// fresh trial re-claimed it first) still falls back to the sweep rather
+/// than parking this task indefinitely.
+const HANDOFF_WAIT_MAX: Duration = Duration::from_millis(
+    2 * (HANDOFF_ENDPOINT_APPLY_ALLOWANCE.as_millis() as u64
+        + PUNCH_POLL_INTERVAL.as_millis() as u64
+        + HANDOFF_POLL_INTERVAL.as_millis() as u64),
+);
+
+/// (Round 5, directive preemption) Bounded wait for a preempted TICK-origin
+/// punch trial to release peer `gid`'s slot, then run the controller
+/// directive's synchronized punch (`candidates` + shared `go_unix_ms`) in
+/// its place. Spawned by the directive arm when `try_start_punch` found the
+/// slot held by a tick trial (which it flagged for cancellation via
+/// [`PathCtx::preempt_tick_punch`]). Mirrors the arm's own ordering
+/// discipline on claim: concurrency guard FIRST, then the
+/// `directive_should_punch` precondition re-check (the path may have left
+/// `Connecting` during the wait — spawning anyway would only buy a
+/// "deferring direct punch" line, silently skip instead, exactly like the
+/// arm), then `punch_allowed` (fix T3: never consume a back-off window
+/// unless an attempt actually starts). `punch_and_apply`'s go-delay handles
+/// an already-past `go_unix_ms` as "start now", so a handoff landing after
+/// the go instant still punches immediately — late by ≤~1 trial-poll, still
+/// inside the punch probes' overlap window.
+async fn directive_punch_handoff(ctx: PathCtx, gid: u64, candidates: Vec<String>, go_unix_ms: u64) {
+    let deadline = Instant::now() + HANDOFF_WAIT_MAX;
+    loop {
+        if let Some(guard) = ctx.try_start_punch(gid, PunchOrigin::Directive) {
+            let should_punch = {
+                let state = ctx.paths.lock().unwrap().get(&gid).map(|p| p.state);
+                let pointed =
+                    ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+                directive_should_punch(state, pointed)
+            };
+            if should_punch && ctx.punch_allowed(gid, &candidates) {
+                punch_and_apply(ctx.clone(), gid, candidates, Some(go_unix_ms), guard).await;
+            }
+            // else: precondition lapsed or backed off — drop the guard
+            // silently without spawning (same as the directive arm).
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "wiremesh-gateway: peer={gid} directive handoff timed out waiting for the \
+                 punch slot; dropping directive (broker re-emits on its sweep)"
+            );
+            return;
+        }
+        tokio::time::sleep(HANDOFF_POLL_INTERVAL).await;
     }
 }
 
@@ -1631,8 +1993,15 @@ async fn apply_peer_endpoint_scoped(
 
 /// Ensure peer `gid` has a live, healthy [`RelayTransport`] and that its WG
 /// endpoint points at it (Cycle 4c Task 8 — the `MarkRelayNeeded` action,
-/// both for freshly entering `Relayed` and for a relay-to-relay re-path once
-/// the peer's current transport dies). No-op if a healthy transport already
+/// both for freshly entering `Relayed` and for a relay-to-relay re-path
+/// after the peer's current transport dies; since the aether-prod-fi-01
+/// wedge fix a dead transport first goes through `PathAction::RelayDied` —
+/// teardown + pin clear — whose driver branch then either spawns this
+/// IMMEDIATELY (a graceful relay-side close, i.e. an eviction: the
+/// fast-path preserving the ≤30s re-path budget) or grants one clean
+/// direct-punch window first (silence/other), with the re-relay landing
+/// here one punch cycle later via the `Connecting`-timeout
+/// `MarkRelayNeeded` ladder). No-op if a healthy transport already
 /// exists. `relays` is the controller's currently-advertised relay list
 /// (`DesiredState.relays`); a peer's round-robin cursor
 /// (`PathCtx::relay_next_idx`) picks which one to (re)connect to, advancing
@@ -1750,22 +2119,64 @@ async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_pro
     }
 }
 
-/// Tear down peer `gid`'s relay transport, if any (Cycle 4c Task 8's
-/// make-before-break cutover: called once a peer reaches `Direct`, whether
-/// it arrived there from `Relayed` or never needed relay help at all — a
-/// no-op in the latter case). Explicitly [`RelayTransport::close`]s the QUIC
-/// connection before dropping (see that method's doc: `Client` clones don't
-/// close on drop by themselves).
-async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
+/// Tear down peer `gid`'s relay transport, if any. Serves BOTH teardown
+/// paths: Cycle 4c Task 8's make-before-break cutover (called once a peer
+/// reaches `Direct`, whether it arrived there from `Relayed` or never needed
+/// relay help at all — a no-op in the latter case), and the relay-death
+/// cleanup (`PathAction::RelayDied` — the peer's relay leg died, so the dead
+/// transport must go before the next direct-punch window opens). `reason` is
+/// interpolated into the teardown log line so the Direct-cutover wording
+/// isn't emitted for the death path. Explicitly [`RelayTransport::close`]s
+/// the QUIC connection before dropping (see that method's doc: `Client`
+/// clones don't close on drop by themselves).
+async fn teardown_relay_transport(ctx: &PathCtx, gid: u64, reason: &str) {
     let removed = ctx.relay_transports.lock().await.remove(&gid);
     if let Some(peer_relay) = removed {
         peer_relay.transport.close();
         eprintln!(
-            "wiremesh-gateway: peer={gid} reached Direct; tore down relay={} transport",
+            "wiremesh-gateway: peer={gid} {reason}; tore down relay={} transport",
             peer_relay.relay_id
         );
     }
 }
+
+/// Builds and sends the gateway's COMPLETE steady-state `Sync.Report`: the
+/// full local-endpoint set, the relay-health snapshot, and the per-peer
+/// path-state SNAPSHOT (`Some(..)` → `peer_paths_snapshot=true` on the
+/// wire). Factored so BOTH report sites emit the identical shape (relay-wedge
+/// fix round 4): the `SyncEvent::State` apply path, and the prompt-report
+/// path (a settled-boundary transition signalled via
+/// `PathCtx::path_report_notify` — the broker needs the unsettle edge
+/// promptly, not at the next roster change). The `paths` guard is taken in a
+/// tight scope and dropped before any await, per `PathCtx`'s discipline.
+async fn send_paths_snapshot_report(
+    client: &mut SyncClient<Channel>,
+    ctx: &PathCtx,
+    wg_listen_port: u16,
+    applied_version: u64,
+) -> anyhow::Result<()> {
+    let local_endpoints = netif::local_wg_endpoints(wg_listen_port);
+    let relay_health = ctx.relay_health_snapshot().await;
+    let peer_paths: Vec<PeerPath> = ctx
+        .paths
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(gid, p)| PeerPath {
+            peer_gateway_id: *gid,
+            state: p.state.as_str().to_string(),
+        })
+        .collect();
+    sync::report(client, applied_version, local_endpoints, relay_health, vec![], Some(peer_paths))
+        .await
+}
+
+/// Minimum spacing between PROMPT (notify-triggered) path-snapshot reports —
+/// a simple across-all-peers debounce so a burst of boundary crossings (e.g.
+/// several peers' relay legs dying at once) coalesces into one snapshot
+/// rather than one RPC per transition. Each report is a complete snapshot,
+/// so coalescing loses nothing.
+const PROMPT_REPORT_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Periodic path-state driver (spec §6.1). Every `PATH_TICK_PERIOD`: read the
 /// device's per-peer latest-handshake times AND `rx_bytes`
@@ -1779,7 +2190,28 @@ async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
 /// deliberate driver no-op — any spawned probe would yield instantly to the
 /// make-before-break guard (see the tick match arm); `MarkRelayNeeded` spawns
 /// [`ensure_relay_transport`] (Cycle 4c Task 8 — a no-op if the controller
-/// hasn't advertised any relay). `relay_available` is computed per peer as
+/// hasn't advertised any relay); `RelayDied` (the `Relayed` arm's relay-death
+/// branch, aether-prod-fi-01 wedge fix) tears down the peer's DEAD relay
+/// transport, clears its `relay_pointed` pin, and then branches on the
+/// death's classification (`RelayTransport::death_reason`): a graceful
+/// relay-side close (`Closed` — a controller eviction, which severed the
+/// peer's leg too) reconnects a relay IMMEDIATELY, restoring the eviction
+/// re-path timing; `TimedOut` (silence — the wedge shape: the peer left the
+/// relay entirely) and `Other` do NOT immediately re-relay, so the next
+/// `Connecting` spell's punch guard actually opens (a genuinely
+/// relay-needing pair re-relays one punch cycle later via the
+/// `Connecting`-timeout `MarkRelayNeeded` ladder). A per-tick stale-pin
+/// invariant sweep backs all of this up: any `relay_pointed` pin with no
+/// healthy transport while the peer is not `Relayed` is a leak (e.g. a
+/// late `ensure_relay_transport` re-pinning after a `RelayDied` cleanup,
+/// whose transport then dies outside `Relayed` — `RelayDied` can't re-fire
+/// there) and is cleared, with the dead map entry torn down — see the sweep
+/// collect/act phases in the loop body. Recorded transitions that CROSS the
+/// settled boundary (`path::transition_crosses_settled_boundary`) fire
+/// `PathCtx::path_report_notify` so the sync loop sends a prompt `peer_paths`
+/// snapshot report (round 4 — the broker needs the unsettle edge promptly to
+/// re-synchronize a fallen pair's punches; see that field's doc).
+/// `relay_available` is computed per peer as
 /// "the controller has advertised ≥1 relay AND this peer already has a live,
 /// healthy `RelayTransport`" — so the FIRST time a peer's direct budget is
 /// exhausted it still parks `Disconnected` (no transport exists yet) while
@@ -1971,6 +2403,14 @@ async fn run_path_ticks(ctx: PathCtx) {
         let mut to_punch: Vec<(u64, Vec<String>)> = Vec::new();
         let mut to_relay_needed: Vec<u64> = Vec::new();
         let mut to_teardown_relay: Vec<u64> = Vec::new();
+        // Peers whose relay leg DIED this tick (`PathAction::RelayDied`):
+        // dead-transport teardown + relay_pointed clear, NO relay reconnect.
+        let mut to_relay_died: Vec<u64> = Vec::new();
+        // Stale-pin sweep candidates (round-3 reviewer MAJOR): peers whose
+        // `relay_pointed` pin is set with NO healthy transport while not
+        // `Relayed` — a leaked pin nothing else would ever clear. See the
+        // sweep loop below for the leak path and the race trace.
+        let mut to_sweep_pin: Vec<u64> = Vec::new();
         // Peers due a liveness probe this tick (keepalive-invisibility fix).
         let mut to_probe: Vec<u64> = Vec::new();
         {
@@ -2105,7 +2545,8 @@ async fn run_path_ticks(ctx: PathCtx) {
 
                 let relay_available =
                     relays_advertised && *healthy_relay.get(&gid).unwrap_or(&false);
-                match path.tick(now, relay_available) {
+                let action = path.tick(now, relay_available);
+                match action {
                     Some(PathAction::StartPunch) => {
                         to_punch.push((gid, peer.candidates.clone()))
                     }
@@ -2121,7 +2562,45 @@ async fn run_path_ticks(ctx: PathCtx) {
                     // the seam that fast-follow re-wires.
                     Some(PathAction::ProbeDirect) => {}
                     Some(PathAction::MarkRelayNeeded) => to_relay_needed.push(gid),
+                    // Relay-death (aether-prod-fi-01 wedge fix): the peer's
+                    // relay leg died while `Relayed`. Handled after the
+                    // `paths` guard drops — tear down the dead transport,
+                    // clear the `relay_pointed` pin, then branch on the
+                    // death's classification: immediate relay reconnect for
+                    // a graceful close (eviction), or a clean direct-punch
+                    // window (no reconnect) for silence/other — see the
+                    // to_relay_died loop below.
+                    Some(PathAction::RelayDied) => to_relay_died.push(gid),
                     Some(PathAction::Retry) | None => {}
+                }
+
+                // Stale-pin invariant sweep — COLLECT phase (round-3
+                // reviewer MAJOR). Leak path being closed: a late-completing
+                // `ensure_relay_transport` (spawned before a `RelayDied`
+                // cleanup ran) can re-point + re-pin AFTER that cleanup —
+                // its commit has no staleness guard ("the relay path never
+                // yields"). If that transport then dies BEFORE the path
+                // re-enters `Relayed`, `RelayDied` can never fire again (it
+                // is emitted only from the `Relayed` arm), nothing else
+                // clears the pin, and every StartPunch defers — the
+                // production wedge surviving through a window that was
+                // benign pre-fix only because every death immediately
+                // re-spawned `ensure`. The invariant enforced here: a pin
+                // may only outlive its tick if a healthy transport backs it
+                // or the peer is `Relayed` (the legitimate install window —
+                // ensure just committed, path about to go Relayed — always
+                // HAS a healthy transport in the map, so it is excluded by
+                // construction). The same-tick `RelayDied` peer is excluded
+                // too: its own cleanup below already tears down + clears.
+                // `healthy_relay` here is this tick's earlier snapshot; the
+                // ACT phase below re-checks the live map before acting (see
+                // its race trace).
+                if !matches!(action, Some(PathAction::RelayDied))
+                    && path.state != PathState::Relayed
+                    && !*healthy_relay.get(&gid).unwrap_or(&false)
+                    && ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false)
+                {
+                    to_sweep_pin.push(gid);
                 }
 
                 // Liveness probe (keepalive-invisibility fix): a peer in a LIVE
@@ -2169,6 +2648,22 @@ async fn run_path_ticks(ctx: PathCtx) {
             tokio::spawn(async move { poke_peer_overlay(&ctx, gid).await });
         }
 
+        // Prompt-report trigger (relay-wedge fix round 4): any recorded
+        // transition that crosses the settled boundary must reach the
+        // controller broker PROMPTLY — the case-4 finding: after a relay-leg
+        // death the broker's stored states stayed `relayed`/`relayed`
+        // (settled-skipping the pair) until the next `SyncEvent::State`,
+        // its punch budget stayed exhausted, and the two sides punched on
+        // unsynchronized self-timers a port-restricted pair can never land.
+        // One `notify_one` per tick at most; the sync loop coalesces +
+        // debounces and sends the full snapshot (see
+        // `PathCtx::path_report_notify`).
+        if to_record
+            .iter()
+            .any(|(_, before, after)| transition_crosses_settled_boundary(*before, *after))
+        {
+            ctx.path_report_notify.notify_one();
+        }
         for (gid, before, after) in to_record {
             // Fix T4: a path leaving the LIVE states (Direct / Relayed) no
             // longer shows liveness, so its endpoint pin must go — that is
@@ -2184,7 +2679,91 @@ async fn run_path_ticks(ctx: PathCtx) {
             ctx.record_transition(gid, before, after);
         }
         for gid in to_teardown_relay {
-            teardown_relay_transport(&ctx, gid).await;
+            teardown_relay_transport(&ctx, gid, "reached Direct").await;
+        }
+        for gid in to_relay_died {
+            // Relay-death cleanup (aether-prod-fi-01 wedge fix): drop the
+            // DEAD transport, then clear the peer's relay_pointed pin so the
+            // upcoming Disconnected -> Connecting StartPunch cycle's guard
+            // chain (`directive_should_punch` / `punch_and_apply`'s
+            // make-before-break yield) actually opens. Lock ordering: the
+            // reason read and the teardown each take the tokio
+            // `relay_transports` mutex alone; the std `relay_pointed` lock
+            // is only taken after both guards are dropped.
+            //
+            // Read the death classification BEFORE the teardown removes the
+            // transport from the map — it is the branch input below.
+            let reason = {
+                let map = ctx.relay_transports.lock().await;
+                map.get(&gid).and_then(|pr| pr.transport.death_reason())
+            };
+            teardown_relay_transport(&ctx, gid, "relay leg died").await;
+            ctx.relay_pointed.lock().unwrap().remove(&gid);
+            // Branch on WHY the leg died (runner-verified against the netns
+            // done-bars; classification pinned by tests/relay_death_reason.rs):
+            match reason {
+                // EVICTION fast-path (relay_matrix case 3): the relay
+                // gracefully CLOSED the connection under us — a controller-
+                // driven eviction severs every client with a real
+                // CONNECTION_CLOSE. Our peer was evicted right alongside us
+                // and is re-pathing to the surviving relay too, so burning a
+                // direct punch window first (~12s, for a pairing that may
+                // not even punch — case 3 is symmetric<->symmetric) would
+                // blow the ≤30s re-path budget. Reconnect a relay
+                // IMMEDIATELY, restoring the pre-RelayDied eviction timing;
+                // the round-robin cursor already points past the dead relay.
+                Some(RelayDeathReason::Closed) => {
+                    eprintln!(
+                        "wiremesh-gateway: peer={gid} relay leg gracefully closed (eviction); \
+                         reconnecting a relay immediately"
+                    );
+                    tokio::spawn(ensure_relay_transport(ctx.clone(), gid, ds.relays.clone()));
+                }
+                // WEDGE semantics (relay_matrix case 4): the leg died of
+                // SILENCE (QUIC idle timeout — the production shape: the
+                // peer restarted, punched direct, and LEFT the relay; our
+                // leg starved). NO immediate re-relay — the next Connecting
+                // spell gets one clean direct-punch window; a genuinely
+                // relay-needing pair re-relays one punch cycle later via the
+                // Connecting-timeout MarkRelayNeeded ladder. `Other`
+                // (exotic quinn errors) and `None` (no transport found —
+                // e.g. already pruned) map here too, conservatively: only a
+                // positively-identified eviction earns the fast-path.
+                Some(RelayDeathReason::TimedOut) | Some(RelayDeathReason::Other) | None => {}
+            }
+        }
+        // Stale-pin invariant sweep — ACT phase (round-3 reviewer MAJOR; see
+        // the collect phase above for the leak path). Race trace for why
+        // this cannot clear a HEALTHY install's pin:
+        // `ensure_relay_transport` commits in a fixed order — it inserts the
+        // (healthy, just-connected) transport into `relay_transports` FIRST,
+        // and only then runs `set_peer_endpoint(.., is_relay=true)`, which
+        // sets the pin. So any pin the collect phase observed implies its
+        // transport was ALREADY in the map at that moment; if the collect's
+        // `healthy_relay` snapshot said "no healthy transport", either the
+        // transport is genuinely dead (the leak this sweep exists for) or
+        // the install committed AFTER the snapshot was taken — and the
+        // re-check below, against the LIVE map, sees that install's healthy
+        // transport and skips. The one residual interleaving (an install's
+        // insert lands after this re-check but its pin-set after our clear)
+        // leaves a pin with a closed transport for at most one tick — the
+        // sweep is a standing per-tick invariant enforcer, so the next tick
+        // clears it. Lock ordering: the tokio `relay_transports` guard (the
+        // re-check, then the teardown's own) is never held while the std
+        // `relay_pointed` lock is taken.
+        for gid in to_sweep_pin {
+            {
+                let map = ctx.relay_transports.lock().await;
+                if map.get(&gid).is_some_and(|pr| pr.transport.is_healthy()) {
+                    continue; // legitimate install raced the snapshot — leave it
+                }
+            }
+            teardown_relay_transport(&ctx, gid, "stale relay pin swept").await;
+            ctx.relay_pointed.lock().unwrap().remove(&gid);
+            eprintln!(
+                "wiremesh-gateway: peer={gid} relay pin swept (pinned, no healthy transport, \
+                 not relayed) — punch guard re-opened"
+            );
         }
         for gid in to_relay_needed {
             // Spawned rather than awaited inline: a `RelayTransport::start`
@@ -2206,7 +2785,7 @@ async fn run_path_ticks(ctx: PathCtx) {
             // indefinite storm this back-off exists to bound.
             // Skips are silent: the state change was logged when the window
             // opened.
-            match ctx.try_start_punch(gid) {
+            match ctx.try_start_punch(gid, PunchOrigin::Tick) {
                 Some(guard) => {
                     if ctx.punch_allowed(gid, &candidates) {
                         tokio::spawn(punch_and_apply(ctx.clone(), gid, candidates, None, guard));
@@ -2494,9 +3073,69 @@ async fn service_retire(
         eprintln!("wiremesh-gateway: tearing down retired epoch {epoch} Device failed: {e}");
     }
     enforcers.lock().await.remove(&epoch);
+    // Durable retire (Backlog 3 Task 1 — the SECURITY half): tearing the
+    // Device down only destroys the live in-process copy of the old private
+    // key; `retire` REMOVES the epoch's store entry and `persist` rewrites
+    // `epoch_keys.json` without it — the retired key is scrubbed from
+    // epoch_keys.json (ONLY: the epoch-0 key also lives on in
+    // identity.json/wg_private.key — see epochkeys.rs's scope-of-the-scrub
+    // note), not left dormant next to an "inactive" flag. This persist also
+    // re-writes the cutover's promote, so it is the durable backstop if the
+    // promote-time persist failed. Failure is logged loudly but doesn't
+    // unwind the teardown (the data-plane retire already happened).
+    {
+        let mut ek = rot.epoch_keys.lock().unwrap();
+        match ek.retire(epoch) {
+            Ok(()) => {
+                if let Err(e) = ek.persist(&rot.state_dir) {
+                    eprintln!(
+                        "wiremesh-gateway: CRITICAL: persisting retire of epoch {epoch} failed: \
+                         {e:#} — the retired PRIVATE key is still on disk in epoch_keys.json"
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "wiremesh-gateway: CRITICAL: retiring epoch {epoch} in the key store failed: \
+                 {e:#} — its private key remains in epoch_keys.json"
+            ),
+        }
+    }
     eprintln!(
-        "wiremesh-gateway: retired epoch {epoch} — old Device torn down (key gone), enforcer evicted"
+        "wiremesh-gateway: retired epoch {epoch} — old Device torn down (key gone), enforcer \
+         evicted, store entry scrubbed"
     );
+}
+
+/// Service completed Role-B collapses the rotation tick has signalled via
+/// [`RotationShared::collapse_ready`]: tear each overlap Device down and
+/// evict its enforcer. Runs in the run task (owner of the non-`Send`
+/// `tunnels`), like [`service_retire`], but deliberately does NOT drive the
+/// Role-A [`Rotation`] SM — a Role-B overlap belongs to a PEER's rotation,
+/// not ours. By the time an entry lands here the tick has already proven the
+/// base tun live toward the peer's new key and flipped the routes back
+/// (reverse make-before-break), so tearing the overlap down cannot cut a
+/// still-needed path. `tear_down` on an absent epoch is a no-op, so a stale
+/// signal is harmless. No epoch-key store involvement: the overlap Device
+/// ran this gateway's OWN active key, which stays active.
+async fn service_role_b_collapse(
+    tunnels: &mut TunnelSet,
+    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
+    rot: &RotationShared,
+) {
+    let ready: Vec<(u64, u32)> = std::mem::take(&mut *rot.collapse_ready.lock().unwrap());
+    for (aid, epoch) in ready {
+        if let Err(e) = tunnels.tear_down(epoch) {
+            eprintln!(
+                "wiremesh-gateway: tearing down collapsed Role-B overlap epoch {epoch} (peer \
+                 {aid}) failed: {e}"
+            );
+        }
+        enforcers.lock().await.remove(&epoch);
+        eprintln!(
+            "wiremesh-gateway: Role B overlap for peer {aid} collapsed — epoch-{epoch} Device \
+             torn down, enforcer evicted; wg0 is the routed device on the peer's new key"
+        );
+    }
 }
 
 /// Fold each live enforcer's [`Counters`] into one aggregate for the metrics
@@ -2577,6 +3216,24 @@ struct RotationShared {
     /// flag and [`service_retire`] (in the run task) consumes it. `None` when
     /// nothing is pending.
     retire_ready: Arc<std::sync::Mutex<Option<u32>>>,
+    /// The durable epoch-key store (Backlog 3 Task 1) — the SAME handle the
+    /// sync loop's `handle_rotate` mints through. The tick's Role-A cutover
+    /// drives `promote(new)` + `persist` and `service_retire` drives
+    /// `retire(old)` + `persist`, so the on-disk `epoch_keys.json` tracks the
+    /// data plane's lifecycle transitions and a reboot at any point selects
+    /// the right key (`EpochKeys::select_boot_key`). `persist` (sync file I/O
+    /// + fsync) runs under the guard — brief, and serializing writers through
+    /// the lock is exactly what keeps two transitions from interleaving their
+    /// tmp+rename writes.
+    epoch_keys: Arc<std::sync::Mutex<EpochKeys>>,
+    /// Signal from the rotation tick to the run task: Role-B overlap Devices
+    /// whose COLLAPSE completed its reverse make-before-break (base-tun
+    /// session live toward the peer's new key, routes flipped back to `wg0`)
+    /// and now need their `(peer gateway_id, overlap epoch)` Device torn down
+    /// + enforcer evicted. Same owns-the-non-`Send`-`tunnels` split as
+    /// `retire_ready`, but a separate channel: consuming it must NOT drive
+    /// the Role-A `Rotation` SM (this gateway isn't the one rotating).
+    collapse_ready: Arc<std::sync::Mutex<Vec<(u64, u32)>>>,
 }
 
 /// Role A (this gateway is rotating its own key): the observation the tick
@@ -2616,6 +3273,15 @@ struct RoleB {
     /// Set once we've flipped routes AND reported the live epoch ack — a
     /// completed Role-B cutover for this peer, not re-driven.
     done: bool,
+    /// Set by `maybe_collapse_role_b` when the rotating peer's advertised key
+    /// set collapses back to active-only (its rotation completed — the new
+    /// key IS `peer_pending_hex`'s key, now active). Arms the reverse
+    /// make-before-break in the rotation tick: wait for the peer's session on
+    /// the BASE tun (rekeyed to the new key by the unpinned apply) to become
+    /// rx-corroborated live, THEN flip routes back `wg0e<N>` -> `wg0` and
+    /// tear the overlap Device down. While armed, the normal cutover arm
+    /// skips this entry.
+    collapse_armed: bool,
 }
 
 /// Role A: handle a `RotateDirective`. Mint+persist the new epoch key, bring
@@ -2624,7 +3290,6 @@ struct RoleB {
 /// and arm the observation tick to watch for the peer's live session. Idempotent
 /// against a re-entrant directive (the SM only honors one from `Idle`).
 async fn handle_rotate(
-    epoch_keys: &mut EpochKeys,
     tunnels: &mut TunnelSet,
     enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
     rot: &RotationShared,
@@ -2644,8 +3309,18 @@ async fn handle_rotate(
         anyhow::anyhow!("RotateDirective arrived before any desired state; no peer set to mint against")
     })?;
 
-    let new_key = epoch_keys.generate_next()?.clone();
-    epoch_keys.persist(&rot.state_dir)?;
+    // Mint + persist under one guard (no `.await` in scope) so the persisted
+    // store always contains the mint, and compute the CURRENT active epoch
+    // from the same snapshot — post-reboot-on-a-promoted-epoch this is the
+    // promoted epoch (not 0), which anchors the port offset and, later, which
+    // epoch the retire tears down.
+    let (new_key, active_epoch) = {
+        let mut ek = rot.epoch_keys.lock().unwrap();
+        let new_key = ek.generate_next()?.clone();
+        ek.persist(&rot.state_dir)?;
+        let active_epoch = ek.active().map(|k| k.epoch).unwrap_or(0);
+        (new_key, active_epoch)
+    };
     if new_key.epoch != n {
         eprintln!(
             "wiremesh-gateway: WARNING minted epoch {} != directive epoch {n}; proceeding on the \
@@ -2654,7 +3329,6 @@ async fn handle_rotate(
         );
     }
 
-    let active_epoch = epoch_keys.active().map(|k| k.epoch).unwrap_or(0);
     let offset = u16::try_from(n.saturating_sub(active_epoch)).unwrap_or(0);
     let new_port = rot.base_wg_port.saturating_add(offset);
     let new_tun = format!("{}e{}", rot.base_tun, n);
@@ -2753,7 +3427,14 @@ async fn maybe_start_role_b(
             continue; // couldn't build the peer's offset endpoint — skip this round
         }
 
-        let own_priv = rot.identity.wg_private_key_b64.clone();
+        // This gateway's OWN key for the overlap Device: the CURRENT ACTIVE
+        // key (what the rotating peer's roster advertises for us), not
+        // `identity.wg_private_key_b64` — after our own rotation (and
+        // especially after a post-rotation reboot, Backlog 3 Task 1) the
+        // identity key is the RETIRED epoch-0 key, and an overlap built on it
+        // could never complete the peer's handshake. Pre-rotation the two are
+        // identical, so steady-state behavior is unchanged.
+        let own_priv = rot.active.lock().unwrap().priv_key.clone();
         tunnels.bring_up(pending_epoch, &new_tun, &own_priv, listen_port, TUN_MTU)?;
 
         // SECURITY (fail-closed): attach the L4 enforcer to this overlap
@@ -2805,6 +3486,7 @@ async fn maybe_start_role_b(
                 peer_pending_hex,
                 peer_cidrs: peer.allowed_ips.clone(),
                 done: false,
+                collapse_armed: false,
             },
         );
         eprintln!(
@@ -2813,6 +3495,69 @@ async fn maybe_start_role_b(
         );
     }
     Ok(())
+}
+
+/// Role-B collapse trigger (the minimal reverse-make-before-break slice of
+/// the ratified plan's Task 3 — see key-rotation-teardown-notes finding D):
+/// when a rotating peer's ROSTER key set no longer advertises a real-keyed
+/// pending epoch AND its active key is the very key this gateway overlapped
+/// toward, start collapsing our overlap state. NB the timing: this fires at
+/// the controller's PROMOTE of the peer's new epoch (pending -> active; the
+/// roster may still carry the old key as a `"retiring"` row at that point —
+/// `pending_key()` is what goes `None`), not at the controller's retire.
+/// Rule-4 laggard consequence: on an ack-less grace-promote where the
+/// rotating peer never actually established its new key, this still unpins
+/// and rekeys `wg0` toward that new key at promote time — dropping any
+/// still-working old-key `wg0` session with the peer; the peer is doomed on
+/// the old key anyway once promoted roster-wide, but recovery then waits
+/// until it genuinely runs the new key (e.g. re-normalizes after a reboot).
+/// Sequence:
+///
+///  (a) HERE (sync, before the caller's `apply_state` for the same delta):
+///      unpin `wg0_pins[gid]`, so the apply rebuilds `wg0`'s entry for this
+///      peer with its NEW active key (`device_config_pinned` falls back to
+///      `active_pubkey_b64` once no pin exists; the key change defeats both
+///      the change-guard and the pure-addition incremental path, so a full
+///      rebuild is guaranteed by that very apply);
+///  (b) arm `collapse_armed` — the rotation tick then waits for the peer's
+///      session on the BASE tun to become rx-corroborated live;
+///  (c) the tick flips routes back `wg0e<N>` -> `wg0` and signals the run
+///      task to tear the overlap Device down (`service_role_b_collapse`).
+///
+/// Deliberately does NOT require `b.done`: the controller's ack-less Rule-4
+/// grace-promote can collapse the roster while our cutover never completed —
+/// in that case routes are still on `wg0` (the reverse flip's `ip route
+/// replace` is an idempotent no-op) and the collapse is exactly the recovery
+/// needed. While armed, the tick's normal cutover arm skips the entry.
+fn maybe_collapse_role_b(rot: &RotationShared, ds: &DesiredState) {
+    let mut role_b = rot.role_b.lock().unwrap();
+    for (aid, b) in role_b.iter_mut() {
+        if b.collapse_armed {
+            continue;
+        }
+        let Some(peer) = ds.peers.iter().find(|p| p.gateway_id == *aid) else {
+            // Peer vanished from the roster entirely (removed, not rotated):
+            // out of scope for this slice — see finding D remainders.
+            continue;
+        };
+        if peer.pending_key().is_some() {
+            continue; // still mid-rotation
+        }
+        let new_active_hex = peer
+            .active_key()
+            .and_then(|k| pubkey_b64_to_hex(&k.pubkey_b64));
+        if new_active_hex.as_deref() != Some(b.peer_pending_hex.as_str()) {
+            continue; // active key isn't the one we overlapped toward
+        }
+        rot.wg0_pins.lock().unwrap().remove(aid);
+        b.collapse_armed = true;
+        eprintln!(
+            "wiremesh-gateway: Role B collapse armed for peer {aid} (rotation complete; roster \
+             active-only on the new key) — wg0 unpinned, awaiting live base-tun session before \
+             tearing {} down",
+            b.new_tun
+        );
+    }
 }
 
 /// First host address of an `ip/prefix` CIDR (network address + 1), e.g.
@@ -3013,6 +3758,48 @@ async fn run_rotation_ticks(rot: RotationShared) {
                                 applied_config,
                                 applied_peers,
                             };
+                            // Durable promote (Backlog 3 Task 1): the data
+                            // plane just cut over to epoch `epoch`, so record
+                            // it in the store (new epoch "active", old epoch
+                            // "retiring") and persist — a reboot from here on
+                            // must select the NEW key (`select_boot_key`), not
+                            // resurrect the old one. Failure posture: the
+                            // cutover has ALREADY happened on the data plane,
+                            // so never unwind it — log loudly and continue.
+                            // A failed persist here still gets a durable
+                            // second chance: `service_retire`'s retire+persist
+                            // (>= RETIRE_GRACE later) re-writes the whole
+                            // store, in-memory promote included. A crash
+                            // inside that window reboots on the old key;
+                            // whether peers still honor it then depends on
+                            // the CONTROLLER's roster clock (peers drop their
+                            // old-key pins when the controller's promote SM
+                            // retires the old epoch roster-side), NOT on our
+                            // local RETIRE_GRACE — the two clocks are
+                            // unrelated, so this degraded window is best-
+                            // effort, not guaranteed reachable. And the
+                            // backstop shares the failure domain: a
+                            // persistent disk fault fails the retire persist
+                            // identically, leaving no durable promote at all.
+                            {
+                                let mut ek = rot.epoch_keys.lock().unwrap();
+                                match ek.promote(epoch) {
+                                    Ok(()) => {
+                                        if let Err(e) = ek.persist(&rot.state_dir) {
+                                            eprintln!(
+                                                "wiremesh-gateway: CRITICAL: persisting promoted \
+                                                 epoch {epoch} failed: {e:#} — a reboot before the \
+                                                 retire persist would resurrect the old key"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => eprintln!(
+                                        "wiremesh-gateway: CRITICAL: promoting epoch {epoch} in \
+                                         the key store failed: {e:#} — store diverges from the \
+                                         live data plane"
+                                    ),
+                                }
+                            }
                             eprintln!(
                                 "wiremesh-gateway: Role A cutover — routes flipped onto {} (epoch {epoch})",
                                 a.new_tun
@@ -3058,13 +3845,22 @@ async fn run_rotation_ticks(rot: RotationShared) {
             }
         }
 
-        // Role B: transient overlap Device(s) toward rotating peer(s).
+        // Role B: transient overlap Device(s) toward rotating peer(s). A
+        // collapse-armed entry is excluded — its rotation already completed
+        // roster-side, so driving the (now-moot) cutover/ack arm against it
+        // would fight the collapse below. One-tick race (benign): this
+        // snapshot is taken before the loop's awaits, while arming happens
+        // concurrently in the sync loop — so a single tick can still drive
+        // the cutover arm for an entry armed just after the snapshot
+        // (re-flipping its routes onto the overlap tun / sending a moot
+        // ack). Harmless: the collapse arm flips the routes back once `wg0`
+        // is proven live, and the ack is idempotent controller-side.
         let pending_b: Vec<(u64, RoleB)> = rot
             .role_b
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, b)| !b.done)
+            .filter(|(_, b)| !b.done && !b.collapse_armed)
             .map(|(k, v)| (*k, v.clone()))
             .collect();
         for (aid, b) in pending_b {
@@ -3106,6 +3902,61 @@ async fn run_rotation_ticks(rot: RotationShared) {
                     "wiremesh-gateway: Role B epoch ack for peer {aid} failed (will retry): {e}"
                 ),
             }
+        }
+
+        // Role B COLLAPSE (reverse make-before-break — Backlog 3 Task 1 slice
+        // of T3): for each collapse-armed entry, watch the BASE tun for a
+        // live, rx-corroborated session toward the peer's NEW active key
+        // (== `peer_pending_hex` — the pending key we overlapped toward is
+        // the one the roster promoted). Ordering guarantee: the overlap
+        // Device `wg0e<N>` is NEVER torn down — and its routes never moved —
+        // before `wg0` is proven live, mirroring (in reverse) the Role-A
+        // cutover's make-before-break. Until `wg0` goes live the overlap
+        // keeps carrying whatever traffic still flows (steady-state
+        // completion), or simply idles (the peer rebooted onto the base
+        // port). No handshake kick here: routes still point at the overlap
+        // tun, so a segment-IP ping can't egress `wg0`; the base tun's
+        // persistent keepalive + the punch/path machinery drive its
+        // handshake instead.
+        let armed_b: Vec<(u64, RoleB)> = rot
+            .role_b
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, b)| b.collapse_armed)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for (aid, b) in armed_b {
+            let live =
+                read_live_peers(&rot.base_tun, std::iter::once(b.peer_pending_hex.clone())).await;
+            if !live.map_or(false, |l| l.contains(&b.peer_pending_hex)) {
+                continue; // wg0 not live yet — keep the overlap intact
+            }
+            // wg0 is live on the new key: flip the peer's routes back onto the
+            // base tun (reverse of the Role-B cutover flip; `add_route` is
+            // `ip route replace`, so this atomically moves each CIDR off
+            // `wg0e<N>`)...
+            for cidr in &b.peer_cidrs {
+                if let Err(e) = routes::add_route(cidr, &rot.base_tun) {
+                    eprintln!(
+                        "wiremesh-gateway: Role B collapse route flip {cidr} -> {} failed: {e}",
+                        rot.base_tun
+                    );
+                }
+            }
+            // ...then — and only then — retire the overlap: drop the role_b
+            // entry (so a future rotation of this peer can start fresh) and
+            // signal the run task to tear the Device down + evict its
+            // enforcer (`service_role_b_collapse`; the tick can't touch the
+            // non-`Send` `tunnels`). `wg0_pins` was already unpinned at the
+            // trigger; the live-endpoint pin is left to the path SM.
+            rot.role_b.lock().unwrap().remove(&aid);
+            rot.collapse_ready.lock().unwrap().push((aid, b.pending_epoch));
+            eprintln!(
+                "wiremesh-gateway: Role B collapse — peer {aid} live on {} with its new key; \
+                 routes flipped back, overlap {} teardown signalled",
+                rot.base_tun, b.new_tun
+            );
         }
     }
 }
@@ -3149,13 +4000,14 @@ mod tests {
             desired: Arc::new(std::sync::Mutex::new(None)),
             paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            punching: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            punching: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_transports: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
             relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
             wg0_pins: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            path_report_notify: Arc::new(tokio::sync::Notify::new()),
             peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
             live_endpoints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             punch_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3170,13 +4022,21 @@ mod tests {
     #[test]
     fn try_start_punch_dedups_per_peer_and_releases_on_drop() {
         let ctx = test_ctx();
-        let guard = ctx.try_start_punch(7).expect("first claim for peer 7 succeeds");
+        let guard = ctx
+            .try_start_punch(7, PunchOrigin::Tick)
+            .expect("first claim for peer 7 succeeds");
         assert!(
-            ctx.try_start_punch(7).is_none(),
+            ctx.try_start_punch(7, PunchOrigin::Directive).is_none(),
             "second concurrent claim for the same peer must be rejected"
         );
-        assert!(ctx.try_start_punch(8).is_some(), "a different peer is unaffected by peer 7's guard");
+        assert!(
+            ctx.try_start_punch(8, PunchOrigin::Tick).is_some(),
+            "a different peer is unaffected by peer 7's guard"
+        );
         drop(guard);
-        assert!(ctx.try_start_punch(7).is_some(), "slot released once the guard drops");
+        assert!(
+            ctx.try_start_punch(7, PunchOrigin::Directive).is_some(),
+            "slot released once the guard drops"
+        );
     }
 }

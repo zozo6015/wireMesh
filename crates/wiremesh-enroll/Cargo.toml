@@ -7,12 +7,25 @@ edition = "2021"
 # leaf identity by driving the controller's `Enrollment.Enroll` RPC. Consumed
 # by the gateway/relay `enroll` subcommands (which write the on-disk layout
 # each binary loads at boot). See docs/research/operator-enrollment-client-gap.md.
+# Also hosts the shared `host:port` dial-target pieces every Sync client
+# uses — the bounded resolver (`resolve_host_port`/`prefer_ipv4`), boot-time
+# `validate_host_port`, and the canonical Sync keepalive constants — this
+# crate is the one client-side crate the gateway and relay both already
+# depend on (the controller depends on it for the constants only).
 [dependencies]
 tonic = { workspace = true }
 rcgen = { workspace = true }
 anyhow = { workspace = true }
+# Deliberately NOT `workspace = true` (which is `features = ["full"]`): the
+# lib only needs `tokio::net::lookup_host` + `tokio::time::timeout`, so a
+# standalone consumer of this crate pulls just `net` + `time`. Inside this
+# workspace feature unification builds full tokio anyway (every binary crate
+# asks for it), so this costs nothing here and helps only external users.
+tokio = { version = "1", default-features = false, features = ["net", "time"] }
 wiremesh-proto = { path = "../wiremesh-proto" }
 
 [dev-dependencies]
+# Full-featured tokio for the test harness (`#[tokio::test]` needs `macros`
+# + an rt); the narrow normal-dep feature set above is unaffected.
 tokio = { workspace = true }
 wiremesh-testkit = { path = "../wiremesh-testkit" }

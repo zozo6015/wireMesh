@@ -13,6 +13,13 @@ tonic = { workspace = true }
 prost = { workspace = true }
 wiremesh-proto = { path = "../wiremesh-proto" }
 wiremesh-trust = { path = "../wiremesh-trust" }
+# The canonical Sync keepalive constants (`SYNC_KEEPALIVE_INTERVAL/TIMEOUT`)
+# the Sync listener's server-side keepalive mirrors — defined once there so
+# the client (gateway/relay) and server figures can't silently drift apart.
+# (The dev-dep chain wiremesh-enroll → wiremesh-testkit → wiremesh-controller
+# is a cargo-legal dev-dependency cycle, same pattern as
+# wiremesh-testkit/wiremesh-enforcer — see that Cargo.toml's comment.)
+wiremesh-enroll = { path = "../wiremesh-enroll" }
 # UnixListenerStream — feeds a UnixListener's accept loop into tonic's
 # serve_with_incoming_shutdown as a Stream (tonic's Server has no built-in
 # UDS incoming type). "sync" additionally pulls in BroadcastStream (Task 8's

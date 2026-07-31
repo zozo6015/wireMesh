@@ -865,11 +865,15 @@ impl Sync for SyncSvc {
         // must never bypass the skip). `peer_paths_snapshot` distinguishes a
         // new client's full-map snapshot (REPLACE, empty clears) from the
         // legacy upsert-only shape where empty is a no-op (old client /
-        // rotation-tick epoch ack) — see `Broker::on_report`. Synchronous (a
-        // `std::sync::Mutex` map update), so it costs the Report call
-        // nothing.
+        // rotation-tick epoch ack) — see `Broker::on_report`. Async since
+        // round 4: on the rare settled→unsettled EDGE the broker also resets
+        // the pair's budget and emits an immediate synchronized punch pair
+        // from here (see `Broker::on_report`'s edge doc); the store update
+        // itself remains a cheap synchronous map write, so the steady-state
+        // Report path still costs nothing.
         self.broker
-            .on_report(gw.id, &req.peer_paths, req.peer_paths_snapshot);
+            .on_report(gw.id, &req.peer_paths, req.peer_paths_snapshot)
+            .await;
 
         self.db
             .set_applied_version(gw.id, req.applied_version)
