@@ -398,6 +398,19 @@ impl Client {
         self.conn.close_reason().is_none()
     }
 
+    /// Why the underlying QUIC connection closed, if it has ([`is_alive`]
+    /// is exactly `close_reason().is_none()`, so this is `Some` iff the
+    /// client is dead). Exposes quinn's own `Connection::close_reason` so a
+    /// caller — the gateway's `RelayTransport` death-reason classification
+    /// (aether-prod-fi-01 relay-wedge fix) — can tell a graceful relay-side
+    /// close (eviction) from an idle timeout (peer left the relay) without
+    /// racing its own pump tasks' error observation: the value is derived
+    /// from the same connection state `is_alive` reads, so it is present
+    /// the instant liveness flips false.
+    pub fn close_reason(&self) -> Option<quinn::ConnectionError> {
+        self.conn.close_reason()
+    }
+
     /// Explicitly close the underlying QUIC connection (error code 0, no
     /// reason text). `Client` is `Clone` (a refcounted handle onto the same
     /// `quinn::Connection`), so simply dropping one clone does NOT close the

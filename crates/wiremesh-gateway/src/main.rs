@@ -3,7 +3,7 @@ use anyhow::Context;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -15,9 +15,11 @@ use wiremesh_gateway::enforce::GatewayEnforcer;
 use wiremesh_gateway::epochkeys::EpochKeys;
 use wiremesh_gateway::identity::Identity;
 use wiremesh_gateway::metrics;
-use wiremesh_gateway::path::{directive_should_punch, Path, PathAction, PathState};
+use wiremesh_gateway::path::{
+    directive_should_punch, transition_crosses_settled_boundary, Path, PathAction, PathState,
+};
 use wiremesh_gateway::punch_backoff::{PunchBackoff, PunchDecision};
-use wiremesh_gateway::relay::RelayTransport;
+use wiremesh_gateway::relay::{RelayDeathReason, RelayTransport};
 use wiremesh_gateway::rotation::{Rotation, RotationAction, RotationPhase};
 use wiremesh_gateway::state::DesiredState;
 use wiremesh_gateway::tunnelset::TunnelSet;
@@ -347,13 +349,14 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         desired: Arc::new(std::sync::Mutex::new(applied.clone())),
         paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
         transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-        punching: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        punching: Arc::new(std::sync::Mutex::new(HashMap::new())),
         relay_transports: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
         relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
         endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
         wg0_pins: wg0_pins.clone(),
+        path_report_notify: Arc::new(tokio::sync::Notify::new()),
         peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
         live_endpoints: live_endpoints.clone(),
         punch_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -513,6 +516,16 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     }
                 };
                 let mut current = applied.clone();
+                // Prompt-report debounce state (relay-wedge fix round 4),
+                // per connection: `pending` is set when the path-tick driver
+                // signals a settled-boundary crossing, and flushed at the
+                // top of the loop once the debounce window opens — kept as a
+                // flag (rather than sleeping on the notify arm) so the Watch
+                // stream stays serviced while the window closes; the
+                // `RETIRE_POLL_PERIOD` bounded wait guarantees a wakeup
+                // within ~500ms of the window opening.
+                let mut prompt_report_pending = false;
+                let mut last_prompt_report: Option<Instant> = None;
                 loop {
                     // Service any pending old-epoch retire the rotation tick has
                     // signalled (every peer cut over to the new tun and the
@@ -520,18 +533,58 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     // the non-`Send` `tunnels`/`enforcers`.
                     service_retire(&mut tunnels, &enforcers, &rot).await;
 
+                    // Flush a pending prompt path-snapshot report once its
+                    // debounce window opens (≥ PROMPT_REPORT_DEBOUNCE since
+                    // the last prompt report — the WHY lives on
+                    // `PathCtx::path_report_notify`: the broker needs the
+                    // unsettle edge promptly to re-arm + re-synchronize the
+                    // pair's punches, the case-4 finding). Failures are
+                    // logged and dropped — the next State apply sends the
+                    // same snapshot anyway.
+                    if prompt_report_pending
+                        && last_prompt_report
+                            .map_or(true, |t| t.elapsed() >= PROMPT_REPORT_DEBOUNCE)
+                    {
+                        prompt_report_pending = false;
+                        last_prompt_report = Some(Instant::now());
+                        let version = applied.as_ref().map(|d| d.policy_version).unwrap_or(0);
+                        if let Err(e) = send_paths_snapshot_report(
+                            &mut client,
+                            &ctx,
+                            cfg.wg_listen_port,
+                            version,
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "wiremesh-gateway: prompt path-snapshot report failed: {e}"
+                            );
+                        }
+                    }
+
                     // Bounded wait so the loop still wakes to service a retire
                     // even while the controller is quiet. `next_event` is
                     // cancel-safe (tonic's `Streaming` keeps its own buffered
-                    // state), so dropping it on timeout never loses a message.
-                    let ev = match tokio::time::timeout(
-                        RETIRE_POLL_PERIOD,
-                        sync::next_event(&mut stream, &mut current),
-                    )
-                    .await
-                    {
-                        Ok(res) => res,
-                        Err(_elapsed) => continue,
+                    // state), so dropping it on timeout never loses a message —
+                    // and `Notify::notified` is likewise cancel-safe here (a
+                    // permit delivered while the other branch wins stays
+                    // stored, so the signal is picked up on a later wait).
+                    let ev = tokio::select! {
+                        res = tokio::time::timeout(
+                            RETIRE_POLL_PERIOD,
+                            sync::next_event(&mut stream, &mut current),
+                        ) => match res {
+                            Ok(res) => res,
+                            Err(_elapsed) => continue,
+                        },
+                        // Prompt-report signal (round 4): a peer's path
+                        // crossed the settled boundary. Just mark pending —
+                        // the flush above sends it once the debounce allows,
+                        // keeping this wait free to keep draining the stream.
+                        _ = ctx.path_report_notify.notified() => {
+                            prompt_report_pending = true;
+                            continue;
+                        }
                     };
                     match ev {
                         Ok(Some(sync::SyncEvent::State(ds))) => {
@@ -565,40 +618,26 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // path-tick tasks (guard dropped before the await
                             // below — never held across it).
                             *ctx.desired.lock().unwrap() = Some(ds.clone());
-                            let local_endpoints = netif::local_wg_endpoints(cfg.wg_listen_port);
-                            let relay_health = ctx.relay_health_snapshot().await;
-                            // (Directive-storm fix) Attach the complete
-                            // current per-peer path-state snapshot (every
-                            // tracked peer, `PathState::as_str()`'s lowercase
-                            // label — the same one the metrics use) so the
-                            // controller's broker can skip re-punching pairs
-                            // both sides report settled. `Some(..)` = a real
-                            // snapshot (sets `peer_paths_snapshot` on the
-                            // wire), so an EMPTY map is meaningful too — it
-                            // clears this gateway's stored states rather
-                            // than reading as an old client. Guard taken in
-                            // a tight scope and dropped before the await,
-                            // per `PathCtx`'s no-lock-across-await
-                            // discipline.
-                            let peer_paths: Vec<PeerPath> = ctx
-                                .paths
-                                .lock()
-                                .unwrap()
-                                .iter()
-                                .map(|(gid, p)| PeerPath {
-                                    peer_gateway_id: *gid,
-                                    state: p.state.as_str().to_string(),
-                                })
-                                .collect();
-                            let _ = sync::report(
+                            // (Directive-storm fix) The full steady-state
+                            // report, including the complete per-peer
+                            // path-state snapshot (every tracked peer,
+                            // `PathState::as_str()`'s lowercase label) so
+                            // the controller's broker can skip re-punching
+                            // pairs both sides report settled — see
+                            // `send_paths_snapshot_report` (round 4: shared
+                            // with the prompt-report path, which is why it
+                            // also feeds the prompt debounce below — a State
+                            // apply IS a fresh snapshot, so any pending
+                            // prompt is satisfied by it).
+                            let _ = send_paths_snapshot_report(
                                 &mut client,
+                                &ctx,
+                                cfg.wg_listen_port,
                                 ds.policy_version,
-                                local_endpoints,
-                                relay_health,
-                                vec![],
-                                Some(peer_paths),
                             )
                             .await;
+                            prompt_report_pending = false;
+                            last_prompt_report = Some(Instant::now());
                             applied_version.store(ds.policy_version, Ordering::Relaxed);
                             applied = Some(ds);
                         }
@@ -633,7 +672,10 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // returns Allow (consuming the window) — so it
                             // must not run when no attempt will actually
                             // start. If the guard is already held (a punch in
-                            // flight), we skip WITHOUT touching the back-off.
+                            // flight), we don't touch the back-off: a
+                            // DIRECTIVE-origin holder is skipped outright,
+                            // while a TICK-origin holder is PREEMPTED (round
+                            // 5 — see the None arm below).
                             // While backed off — and equally when the
                             // path-state precondition fails — directives are
                             // skipped SILENTLY (the state change was logged
@@ -653,7 +695,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 directive_should_punch(state, pointed)
                             };
                             if should_punch {
-                                match ctx.try_start_punch(gid) {
+                                match ctx.try_start_punch(gid, PunchOrigin::Directive) {
                                     Some(guard) => {
                                         if ctx.punch_allowed(gid, &d.candidates) {
                                             tokio::spawn(punch_and_apply(
@@ -667,10 +709,43 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                         // else: backed off — drop the guard (it
                                         // releases on scope exit) without spawning.
                                     }
-                                    None => eprintln!(
-                                        "wiremesh-gateway: punch already in flight for peer={gid}; \
-                                         skipping controller directive"
-                                    ),
+                                    // Round 5 (directive preemption — case-4
+                                    // rerun finding): the slot is occupied. A
+                                    // TICK-origin holder is a stale self-timer
+                                    // trial — by the time it yields on its own
+                                    // (deferring when the SM recycles
+                                    // Connecting→Disconnected at
+                                    // CONNECT_TIMEOUT), this directive's
+                                    // synchronized go-time has long passed, so
+                                    // every broker-synchronized window was
+                                    // being eaten by "punch already in
+                                    // flight" skips. Cancel it and hand the
+                                    // directive to a small bounded-wait task
+                                    // that claims the slot the moment it
+                                    // frees (the cancelled trial polls its
+                                    // flag every PUNCH_POLL_INTERVAL=500ms).
+                                    // A DIRECTIVE-origin holder keeps today's
+                                    // skip: two synchronized directives carry
+                                    // the same go — racing them buys nothing.
+                                    None => {
+                                        if ctx.preempt_tick_punch(gid) {
+                                            eprintln!(
+                                                "wiremesh-gateway: peer={gid} controller directive \
+                                                 preempting stale tick-origin punch trial; handing off"
+                                            );
+                                            tokio::spawn(directive_punch_handoff(
+                                                ctx.clone(),
+                                                gid,
+                                                d.candidates,
+                                                d.go_unix_ms,
+                                            ));
+                                        } else {
+                                            eprintln!(
+                                                "wiremesh-gateway: punch already in flight for peer={gid}; \
+                                                 skipping controller directive"
+                                            );
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -746,13 +821,20 @@ struct PathCtx {
     /// Cumulative `{(from,to) -> count}` path-state transition tally — the
     /// bookkeeping behind `metrics::render_path_transitions`.
     transitions: Arc<std::sync::Mutex<HashMap<(PathState, PathState), u64>>>,
-    /// Gateway IDs with a `punch_and_apply` task currently in flight (review
-    /// finding: a controller `Punch` directive and a tick-driven
-    /// `StartPunch` for the SAME peer could otherwise spawn two concurrent
-    /// tasks that each `replace_peers`-apply the full device). Claimed via
+    /// Per-peer in-flight `punch_and_apply` slot (review finding: a
+    /// controller `Punch` directive and a tick-driven `StartPunch` for the
+    /// SAME peer could otherwise spawn two concurrent tasks that each
+    /// `replace_peers`-apply the full device). Claimed via
     /// [`PathCtx::try_start_punch`], released by dropping the returned
-    /// [`PunchGuard`].
-    punching: Arc<std::sync::Mutex<HashSet<u64>>>,
+    /// [`PunchGuard`]. Each slot records its [`PunchOrigin`] and carries a
+    /// cancellation flag (round 5, directive preemption): a
+    /// controller-directive arrival may preempt a stale TICK-origin trial —
+    /// the case-4 rerun showed the broker's synchronized directives being
+    /// dropped at "punch already in flight" against self-timer tick trials,
+    /// eating every synchronized window — whereas a DIRECTIVE-origin
+    /// in-flight trial is left alone (two synchronized directives share one
+    /// go; racing them buys nothing).
+    punching: Arc<std::sync::Mutex<HashMap<u64, PunchSlot>>>,
     /// Live relay transport per peer `gateway_id` currently relying on relay
     /// help — present only while that peer is (or very recently was)
     /// `Relayed`. A `tokio::sync::Mutex` (unlike every other `PathCtx` map)
@@ -829,6 +911,26 @@ struct PathCtx {
     /// by [`PathCtx::record_punch_outcome`] from `punch_and_apply`. Note
     /// `try_start_punch` bounds concurrency; this bounds RATE.
     punch_backoff: Arc<std::sync::Mutex<HashMap<u64, PunchBackoff>>>,
+    /// Prompt-report signal (relay-wedge fix round 4): `run_path_ticks`
+    /// fires `notify_one` whenever any peer's recorded transition CROSSES
+    /// the settled boundary (`path::transition_crosses_settled_boundary` —
+    /// membership in `{Direct, Relayed}` changed), and the sync loop
+    /// `select!`s on `notified()` alongside its Watch stream to send a full
+    /// `peer_paths` snapshot Report promptly (debounced there, ≥2s between
+    /// prompt reports across ALL peers). WHY (the authoritative case-4
+    /// finding): reports used to ride only `SyncEvent::State` applies, so
+    /// when a relayed pair's legs died the controller's stored states said
+    /// `relayed`/`relayed` (settled — possibly settled-SKIPPING the pair)
+    /// long after the fall, its periodic punch budget stayed exhausted from
+    /// establishment, and the two gateways punched on unsynchronized
+    /// self-timers (idle-timeout detection + backoff drift) that a
+    /// port-restricted pair can never land — the broker needs the unsettle
+    /// edge promptly, not at the next roster change. `Notify`'s stored
+    /// permit means an edge fired while the sync loop was busy (or
+    /// disconnected) is picked up at its next wait, and multiple edges
+    /// coalesce — correct, since every prompt report is a complete
+    /// snapshot.
+    path_report_notify: Arc<tokio::sync::Notify>,
     /// Latest per-peer UAPI liveness snapshot (rx/tx bytes + latest
     /// handshake), keyed by peer `gateway_id` — published by `run_path_ticks`
     /// from the SAME `uapi::get_peer_liveness` fetch that drives the path
@@ -915,20 +1017,50 @@ impl PathCtx {
         }
     }
 
-    /// Try to claim the in-flight-punch slot for peer `gid`. Returns `None`
-    /// if a punch for this peer is already running — the caller should skip
-    /// spawning another `punch_and_apply` and just log it. Returns
+    /// Try to claim the in-flight-punch slot for peer `gid`, recording the
+    /// attempt's `origin` (round 5: tick-driven vs controller-directive —
+    /// see `punching`'s doc for why the distinction matters). Returns `None`
+    /// if a punch for this peer is already running — a tick-driven caller
+    /// should skip and log; the DIRECTIVE arm instead consults
+    /// [`PathCtx::preempt_tick_punch`] to evict a stale tick trial. Returns
     /// `Some(guard)` otherwise, having marked `gid` as in-flight; the caller
     /// must move the guard into the spawned task (e.g. as an extra
     /// parameter to `punch_and_apply`) so it's held for the task's whole
     /// lifetime and released — fail-static, on success OR error OR panic —
-    /// when the guard drops.
-    fn try_start_punch(&self, gid: u64) -> Option<PunchGuard> {
-        let mut set = self.punching.lock().unwrap();
-        if !set.insert(gid) {
+    /// when the guard drops. `punch_and_apply` polls the guard's `cancel`
+    /// flag each trial iteration and yields promptly once preempted.
+    fn try_start_punch(&self, gid: u64, origin: PunchOrigin) -> Option<PunchGuard> {
+        let mut slots = self.punching.lock().unwrap();
+        if slots.contains_key(&gid) {
             return None;
         }
-        Some(PunchGuard { punching: self.punching.clone(), gid })
+        let cancel = Arc::new(AtomicBool::new(false));
+        slots.insert(gid, PunchSlot { origin, cancel: cancel.clone() });
+        Some(PunchGuard { punching: self.punching.clone(), gid, cancel })
+    }
+
+    /// (Round 5, directive preemption) If peer `gid`'s in-flight punch slot
+    /// is held by a TICK-origin trial, set its cancellation flag and return
+    /// `true` — the caller (the controller-directive arm) then spawns
+    /// [`directive_punch_handoff`] to claim the slot the moment the
+    /// cancelled trial yields it. Returns `false` when the slot is held by a
+    /// DIRECTIVE-origin trial (two synchronized directives share one go —
+    /// racing them buys nothing; keep today's skip) or is already free (the
+    /// caller should simply retry [`PathCtx::try_start_punch`]; the handoff
+    /// task's first poll does exactly that, so callers may treat free as
+    /// preemptable — this method returns `true` for that case to keep the
+    /// arm's logic single-branch). Idempotent: re-flagging an
+    /// already-cancelled trial is harmless.
+    fn preempt_tick_punch(&self, gid: u64) -> bool {
+        let slots = self.punching.lock().unwrap();
+        match slots.get(&gid) {
+            Some(slot) if slot.origin == PunchOrigin::Tick => {
+                slot.cancel.store(true, Ordering::Relaxed);
+                true
+            }
+            Some(_) => false, // directive-origin in flight: leave it be
+            None => true,     // freed in the meantime: hand off immediately
+        }
     }
 
     /// Try to claim the in-flight-relay-connect slot for peer `gid`. Same
@@ -961,19 +1093,59 @@ impl PathCtx {
     }
 }
 
+/// Who started an in-flight punch attempt (round 5, directive preemption):
+/// the path SM's self-timer (`StartPunch`, unsynchronized with the peer) or
+/// a controller `PunchDirective` (broker-synchronized go on both sides —
+/// the only kind that can land a port-restricted pair). A directive arrival
+/// preempts a `Tick` holder but never a `Directive` one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PunchOrigin {
+    Tick,
+    Directive,
+}
+
+/// One peer's occupied in-flight-punch slot: its origin plus the
+/// cancellation flag `punch_and_apply` polls each trial iteration
+/// (dependency-free `Arc<AtomicBool>` — the trial loop already wakes every
+/// [`PUNCH_POLL_INTERVAL`] = 500ms, so a set flag is honored well inside
+/// the handoff wait budget).
+struct PunchSlot {
+    origin: PunchOrigin,
+    cancel: Arc<AtomicBool>,
+}
+
 /// RAII release for [`PathCtx::try_start_punch`]'s in-flight-punch slot.
 /// Removing `gid` on `Drop` (rather than requiring an explicit call at every
 /// `punch_and_apply` return site) means an early `return` on error, or even
 /// a task panic unwinding through it, still releases the slot — a punch
-/// failure must never permanently wedge future punches for that peer.
+/// failure must never permanently wedge future punches for that peer. Drop
+/// removes the entry only if it is still THIS guard's own slot (`Arc::ptr_eq`
+/// on the cancel flag — same defensive shape as `RegistrationGuard`'s
+/// `same_channel`), so a late drop can never evict a successor's slot.
 struct PunchGuard {
-    punching: Arc<std::sync::Mutex<HashSet<u64>>>,
+    punching: Arc<std::sync::Mutex<HashMap<u64, PunchSlot>>>,
     gid: u64,
+    /// This attempt's own cancellation flag — set via
+    /// [`PathCtx::preempt_tick_punch`]; polled by `punch_and_apply`.
+    cancel: Arc<AtomicBool>,
+}
+
+impl PunchGuard {
+    /// Whether this attempt has been preempted (round 5) — checked by
+    /// `punch_and_apply` at the top of every trial iteration.
+    fn cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+    }
 }
 
 impl Drop for PunchGuard {
     fn drop(&mut self) {
-        self.punching.lock().unwrap().remove(&self.gid);
+        let mut slots = self.punching.lock().unwrap();
+        let still_ours =
+            slots.get(&self.gid).is_some_and(|s| Arc::ptr_eq(&s.cancel, &self.cancel));
+        if still_ours {
+            slots.remove(&self.gid);
+        }
     }
 }
 
@@ -1214,11 +1386,20 @@ async fn poke_peer_overlay(ctx: &PathCtx, gid: u64) {
 /// the done-bar pairs (nat_matrix, convergence A↔B) each punch a single observed
 /// candidate and reach `Direct` well within it.
 ///
-/// `_guard` is the in-flight-punch slot from [`PathCtx::try_start_punch`] —
-/// unused by name, but HELD for this function's entire lifetime (including
-/// every early `return`) and released via `Drop`, so at most one
-/// `punch_and_apply` runs per peer at a time regardless of whether it was
-/// triggered by a controller `Punch` directive or a tick-driven `StartPunch`.
+/// `guard` is the in-flight-punch slot from [`PathCtx::try_start_punch`] —
+/// HELD for this function's entire lifetime (including every early `return`)
+/// and released via `Drop`, so at most one `punch_and_apply` runs per peer
+/// at a time regardless of whether it was triggered by a controller `Punch`
+/// directive or a tick-driven `StartPunch`. The guard also carries this
+/// attempt's CANCELLATION flag (round 5, directive preemption): the trial
+/// polls it at the top of every loop iteration AND again immediately before
+/// each endpoint commit (B1 follow-up — the cheap common-case exit) and,
+/// once preempted (a controller directive evicting a stale tick-origin trial
+/// — [`PathCtx::preempt_tick_punch`]), returns promptly WITHOUT recording a
+/// punch outcome (mirroring the make-before-break yield semantics: no
+/// dialability was conclusively tested), freeing the slot for the waiting
+/// [`directive_punch_handoff`] — whose [`HANDOFF_WAIT_MAX`] is derived from
+/// this loop's worst-case latency to observe the flag.
 /// Every blocking call (`uapi::apply` inside `set_peer_endpoint`,
 /// the nudge socket) runs inside `spawn_blocking`; no mutex guard is ever held
 /// across an `.await`.
@@ -1227,7 +1408,7 @@ async fn punch_and_apply(
     gid: u64,
     candidates: Vec<String>,
     go_unix_ms: Option<u64>,
-    _guard: PunchGuard,
+    guard: PunchGuard,
 ) {
     if let Some(go) = go_unix_ms {
         let now_ms = SystemTime::now()
@@ -1250,6 +1431,19 @@ async fn punch_and_apply(
     let mut trial = punch::CandidateTrial::new(&candidates, Instant::now());
     let mut last_addr: Option<SocketAddr> = None;
     loop {
+        // Preemption check (round 5): a controller directive has evicted
+        // this stale tick-origin trial — yield the slot NOW so the waiting
+        // handoff can run the broker-synchronized punch before its go-time
+        // rots. Return WITHOUT recording an outcome (no dialability was
+        // conclusively tested), exactly like the make-before-break yield.
+        if guard.cancelled() {
+            eprintln!(
+                "wiremesh-gateway: peer={gid} punch trial preempted by controller directive; \
+                 yielding slot"
+            );
+            return;
+        }
+
         // Make-before-break: NEVER let this endpoint-driven punch clobber an
         // ACTIVE relay endpoint. Under approach B a WireGuard peer has exactly
         // ONE endpoint and the endpoint-set IS the punch, so pointing WG at a
@@ -1308,10 +1502,10 @@ async fn punch_and_apply(
         // very task created at the top has since been PRUNED (the tick
         // loop's desired-peer `retain` — the peer left the roster
         // mid-trial), and punching a de-rostered peer must yield.
-        let connecting = {
+        let (connecting, relay_pointed_now) = {
             let state = ctx.paths.lock().unwrap().get(&gid).map(|p| p.state);
             let pointed = ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
-            state.is_some() && directive_should_punch(state, pointed)
+            (state.is_some() && directive_should_punch(state, pointed), pointed)
         };
         if !connecting {
             // Low-noise, and deliberately NOT worded with any of the four
@@ -1319,15 +1513,45 @@ async fn punch_and_apply(
             // confirmed`, `punch confirmed`, `punch task for peer=`) — yielding
             // is not a punch attempt, so it must not feed the anti-storm tally.
             // Return WITHOUT recording an outcome: no dialability was tested.
+            // The "deferring direct punch" substring is the counting tests'
+            // DEFER_NEEDLE and must stay byte-identical; only the
+            // parenthetical varies — the relay clause is only claimed when
+            // the WG endpoint really is pointed at a relay socket (round-5
+            // wording fix: a post-relay-death yield has no relay flowing).
+            let why = if relay_pointed_now {
+                "(make-before-break, relay path kept flowing)"
+            } else {
+                "(make-before-break)"
+            };
             eprintln!(
-                "wiremesh-gateway: peer={gid} path no longer connecting; deferring direct punch \
-                 (make-before-break, relay path kept flowing)"
+                "wiremesh-gateway: peer={gid} path no longer connecting; deferring direct punch {why}"
             );
             return;
         }
 
         match trial.poll(Instant::now(), PER_CANDIDATE_PUNCH_TIMEOUT) {
             punch::TrialStep::Punch(addr) => {
+                // Second preemption check (B1 review follow-up), immediately
+                // BEFORE the iteration's expensive part — the endpoint
+                // commit + nudge. Safe by construction: nothing has been
+                // written yet (`set_peer_endpoint` performs the whole
+                // guard+write atomically under `endpoint_commit`, and this
+                // returns before entering it), so there is no half-applied
+                // endpoint state — identical to the make-before-break yield,
+                // which already returns from this same point. This does not
+                // LOWER the worst-case bound (a flag set just after this
+                // check still costs apply+nudge+sleep — see
+                // `HANDOFF_WAIT_MAX`'s arithmetic, which budgets for exactly
+                // that), but it collapses the common case: a directive
+                // arriving while the trial is between candidates now yields
+                // the slot in ~one poll instead of a full apply cycle.
+                if guard.cancelled() {
+                    eprintln!(
+                        "wiremesh-gateway: peer={gid} punch trial preempted by controller \
+                         directive before endpoint commit; yielding slot"
+                    );
+                    return;
+                }
                 last_addr = Some(addr);
                 // Set the endpoint via the scoped remove+re-add (make-before-
                 // break: only THIS peer's session resets, spike finding 2 — no
@@ -1396,6 +1620,89 @@ async fn punch_and_apply(
             }
             return;
         }
+    }
+}
+
+/// How often [`directive_punch_handoff`] re-polls the per-peer punch slot
+/// while waiting for a preempted tick trial to yield it (round 5).
+const HANDOFF_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Bounded allowance for ONE endpoint-apply + nudge inside a punch trial
+/// iteration — `set_peer_endpoint`'s [`PathCtx::endpoint_commit`] acquisition
+/// plus its `spawn_blocking` UAPI write, plus `poke_peer_overlay`'s own
+/// `spawn_blocking` socket send. All are local (UAPI socket / loopback
+/// datagram) and typically complete in single-digit ms; 1s is deliberately
+/// generous for container CPU contention and for the commit lock briefly
+/// being held by a concurrent relay install.
+const HANDOFF_ENDPOINT_APPLY_ALLOWANCE: Duration = Duration::from_millis(1000);
+
+/// Upper bound on [`directive_punch_handoff`]'s wait for the slot, DERIVED
+/// from the preempted trial's actual worst-case latency to observe its
+/// cancel flag rather than guessed (B1 review finding: a flat 1.5s could be
+/// shorter than that worst case, dropping the directive after a successful
+/// preemption — wasting the very window preemption exists to capture).
+///
+/// Arithmetic — worst case is the flag being set immediately AFTER the
+/// trial's last cancel check in an iteration, so the whole remainder of that
+/// iteration runs before the next check:
+///
+/// * [`HANDOFF_ENDPOINT_APPLY_ALLOWANCE`] (1000ms) — the endpoint write +
+///   nudge that iteration may still perform;
+/// * [`PUNCH_POLL_INTERVAL`] (500ms) — the trial's per-iteration sleep,
+///   always completed before it loops back to the check;
+/// * [`HANDOFF_POLL_INTERVAL`] (100ms) — this task observes the freed slot
+///   up to one poll late.
+///
+/// That sums to 1600ms; doubled for headroom = 3200ms. Comfortably under the
+/// broker's ~5s periodic re-emit cadence, so a genuinely stuck slot (e.g. a
+/// fresh trial re-claimed it first) still falls back to the sweep rather
+/// than parking this task indefinitely.
+const HANDOFF_WAIT_MAX: Duration = Duration::from_millis(
+    2 * (HANDOFF_ENDPOINT_APPLY_ALLOWANCE.as_millis() as u64
+        + PUNCH_POLL_INTERVAL.as_millis() as u64
+        + HANDOFF_POLL_INTERVAL.as_millis() as u64),
+);
+
+/// (Round 5, directive preemption) Bounded wait for a preempted TICK-origin
+/// punch trial to release peer `gid`'s slot, then run the controller
+/// directive's synchronized punch (`candidates` + shared `go_unix_ms`) in
+/// its place. Spawned by the directive arm when `try_start_punch` found the
+/// slot held by a tick trial (which it flagged for cancellation via
+/// [`PathCtx::preempt_tick_punch`]). Mirrors the arm's own ordering
+/// discipline on claim: concurrency guard FIRST, then the
+/// `directive_should_punch` precondition re-check (the path may have left
+/// `Connecting` during the wait — spawning anyway would only buy a
+/// "deferring direct punch" line, silently skip instead, exactly like the
+/// arm), then `punch_allowed` (fix T3: never consume a back-off window
+/// unless an attempt actually starts). `punch_and_apply`'s go-delay handles
+/// an already-past `go_unix_ms` as "start now", so a handoff landing after
+/// the go instant still punches immediately — late by ≤~1 trial-poll, still
+/// inside the punch probes' overlap window.
+async fn directive_punch_handoff(ctx: PathCtx, gid: u64, candidates: Vec<String>, go_unix_ms: u64) {
+    let deadline = Instant::now() + HANDOFF_WAIT_MAX;
+    loop {
+        if let Some(guard) = ctx.try_start_punch(gid, PunchOrigin::Directive) {
+            let should_punch = {
+                let state = ctx.paths.lock().unwrap().get(&gid).map(|p| p.state);
+                let pointed =
+                    ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+                directive_should_punch(state, pointed)
+            };
+            if should_punch && ctx.punch_allowed(gid, &candidates) {
+                punch_and_apply(ctx.clone(), gid, candidates, Some(go_unix_ms), guard).await;
+            }
+            // else: precondition lapsed or backed off — drop the guard
+            // silently without spawning (same as the directive arm).
+            return;
+        }
+        if Instant::now() >= deadline {
+            eprintln!(
+                "wiremesh-gateway: peer={gid} directive handoff timed out waiting for the \
+                 punch slot; dropping directive (broker re-emits on its sweep)"
+            );
+            return;
+        }
+        tokio::time::sleep(HANDOFF_POLL_INTERVAL).await;
     }
 }
 
@@ -1631,8 +1938,15 @@ async fn apply_peer_endpoint_scoped(
 
 /// Ensure peer `gid` has a live, healthy [`RelayTransport`] and that its WG
 /// endpoint points at it (Cycle 4c Task 8 — the `MarkRelayNeeded` action,
-/// both for freshly entering `Relayed` and for a relay-to-relay re-path once
-/// the peer's current transport dies). No-op if a healthy transport already
+/// both for freshly entering `Relayed` and for a relay-to-relay re-path
+/// after the peer's current transport dies; since the aether-prod-fi-01
+/// wedge fix a dead transport first goes through `PathAction::RelayDied` —
+/// teardown + pin clear — whose driver branch then either spawns this
+/// IMMEDIATELY (a graceful relay-side close, i.e. an eviction: the
+/// fast-path preserving the ≤30s re-path budget) or grants one clean
+/// direct-punch window first (silence/other), with the re-relay landing
+/// here one punch cycle later via the `Connecting`-timeout
+/// `MarkRelayNeeded` ladder). No-op if a healthy transport already
 /// exists. `relays` is the controller's currently-advertised relay list
 /// (`DesiredState.relays`); a peer's round-robin cursor
 /// (`PathCtx::relay_next_idx`) picks which one to (re)connect to, advancing
@@ -1750,22 +2064,64 @@ async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_pro
     }
 }
 
-/// Tear down peer `gid`'s relay transport, if any (Cycle 4c Task 8's
-/// make-before-break cutover: called once a peer reaches `Direct`, whether
-/// it arrived there from `Relayed` or never needed relay help at all — a
-/// no-op in the latter case). Explicitly [`RelayTransport::close`]s the QUIC
-/// connection before dropping (see that method's doc: `Client` clones don't
-/// close on drop by themselves).
-async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
+/// Tear down peer `gid`'s relay transport, if any. Serves BOTH teardown
+/// paths: Cycle 4c Task 8's make-before-break cutover (called once a peer
+/// reaches `Direct`, whether it arrived there from `Relayed` or never needed
+/// relay help at all — a no-op in the latter case), and the relay-death
+/// cleanup (`PathAction::RelayDied` — the peer's relay leg died, so the dead
+/// transport must go before the next direct-punch window opens). `reason` is
+/// interpolated into the teardown log line so the Direct-cutover wording
+/// isn't emitted for the death path. Explicitly [`RelayTransport::close`]s
+/// the QUIC connection before dropping (see that method's doc: `Client`
+/// clones don't close on drop by themselves).
+async fn teardown_relay_transport(ctx: &PathCtx, gid: u64, reason: &str) {
     let removed = ctx.relay_transports.lock().await.remove(&gid);
     if let Some(peer_relay) = removed {
         peer_relay.transport.close();
         eprintln!(
-            "wiremesh-gateway: peer={gid} reached Direct; tore down relay={} transport",
+            "wiremesh-gateway: peer={gid} {reason}; tore down relay={} transport",
             peer_relay.relay_id
         );
     }
 }
+
+/// Builds and sends the gateway's COMPLETE steady-state `Sync.Report`: the
+/// full local-endpoint set, the relay-health snapshot, and the per-peer
+/// path-state SNAPSHOT (`Some(..)` → `peer_paths_snapshot=true` on the
+/// wire). Factored so BOTH report sites emit the identical shape (relay-wedge
+/// fix round 4): the `SyncEvent::State` apply path, and the prompt-report
+/// path (a settled-boundary transition signalled via
+/// `PathCtx::path_report_notify` — the broker needs the unsettle edge
+/// promptly, not at the next roster change). The `paths` guard is taken in a
+/// tight scope and dropped before any await, per `PathCtx`'s discipline.
+async fn send_paths_snapshot_report(
+    client: &mut SyncClient<Channel>,
+    ctx: &PathCtx,
+    wg_listen_port: u16,
+    applied_version: u64,
+) -> anyhow::Result<()> {
+    let local_endpoints = netif::local_wg_endpoints(wg_listen_port);
+    let relay_health = ctx.relay_health_snapshot().await;
+    let peer_paths: Vec<PeerPath> = ctx
+        .paths
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(gid, p)| PeerPath {
+            peer_gateway_id: *gid,
+            state: p.state.as_str().to_string(),
+        })
+        .collect();
+    sync::report(client, applied_version, local_endpoints, relay_health, vec![], Some(peer_paths))
+        .await
+}
+
+/// Minimum spacing between PROMPT (notify-triggered) path-snapshot reports —
+/// a simple across-all-peers debounce so a burst of boundary crossings (e.g.
+/// several peers' relay legs dying at once) coalesces into one snapshot
+/// rather than one RPC per transition. Each report is a complete snapshot,
+/// so coalescing loses nothing.
+const PROMPT_REPORT_DEBOUNCE: Duration = Duration::from_secs(2);
 
 /// Periodic path-state driver (spec §6.1). Every `PATH_TICK_PERIOD`: read the
 /// device's per-peer latest-handshake times AND `rx_bytes`
@@ -1779,7 +2135,28 @@ async fn teardown_relay_transport(ctx: &PathCtx, gid: u64) {
 /// deliberate driver no-op — any spawned probe would yield instantly to the
 /// make-before-break guard (see the tick match arm); `MarkRelayNeeded` spawns
 /// [`ensure_relay_transport`] (Cycle 4c Task 8 — a no-op if the controller
-/// hasn't advertised any relay). `relay_available` is computed per peer as
+/// hasn't advertised any relay); `RelayDied` (the `Relayed` arm's relay-death
+/// branch, aether-prod-fi-01 wedge fix) tears down the peer's DEAD relay
+/// transport, clears its `relay_pointed` pin, and then branches on the
+/// death's classification (`RelayTransport::death_reason`): a graceful
+/// relay-side close (`Closed` — a controller eviction, which severed the
+/// peer's leg too) reconnects a relay IMMEDIATELY, restoring the eviction
+/// re-path timing; `TimedOut` (silence — the wedge shape: the peer left the
+/// relay entirely) and `Other` do NOT immediately re-relay, so the next
+/// `Connecting` spell's punch guard actually opens (a genuinely
+/// relay-needing pair re-relays one punch cycle later via the
+/// `Connecting`-timeout `MarkRelayNeeded` ladder). A per-tick stale-pin
+/// invariant sweep backs all of this up: any `relay_pointed` pin with no
+/// healthy transport while the peer is not `Relayed` is a leak (e.g. a
+/// late `ensure_relay_transport` re-pinning after a `RelayDied` cleanup,
+/// whose transport then dies outside `Relayed` — `RelayDied` can't re-fire
+/// there) and is cleared, with the dead map entry torn down — see the sweep
+/// collect/act phases in the loop body. Recorded transitions that CROSS the
+/// settled boundary (`path::transition_crosses_settled_boundary`) fire
+/// `PathCtx::path_report_notify` so the sync loop sends a prompt `peer_paths`
+/// snapshot report (round 4 — the broker needs the unsettle edge promptly to
+/// re-synchronize a fallen pair's punches; see that field's doc).
+/// `relay_available` is computed per peer as
 /// "the controller has advertised ≥1 relay AND this peer already has a live,
 /// healthy `RelayTransport`" — so the FIRST time a peer's direct budget is
 /// exhausted it still parks `Disconnected` (no transport exists yet) while
@@ -1971,6 +2348,14 @@ async fn run_path_ticks(ctx: PathCtx) {
         let mut to_punch: Vec<(u64, Vec<String>)> = Vec::new();
         let mut to_relay_needed: Vec<u64> = Vec::new();
         let mut to_teardown_relay: Vec<u64> = Vec::new();
+        // Peers whose relay leg DIED this tick (`PathAction::RelayDied`):
+        // dead-transport teardown + relay_pointed clear, NO relay reconnect.
+        let mut to_relay_died: Vec<u64> = Vec::new();
+        // Stale-pin sweep candidates (round-3 reviewer MAJOR): peers whose
+        // `relay_pointed` pin is set with NO healthy transport while not
+        // `Relayed` — a leaked pin nothing else would ever clear. See the
+        // sweep loop below for the leak path and the race trace.
+        let mut to_sweep_pin: Vec<u64> = Vec::new();
         // Peers due a liveness probe this tick (keepalive-invisibility fix).
         let mut to_probe: Vec<u64> = Vec::new();
         {
@@ -2105,7 +2490,8 @@ async fn run_path_ticks(ctx: PathCtx) {
 
                 let relay_available =
                     relays_advertised && *healthy_relay.get(&gid).unwrap_or(&false);
-                match path.tick(now, relay_available) {
+                let action = path.tick(now, relay_available);
+                match action {
                     Some(PathAction::StartPunch) => {
                         to_punch.push((gid, peer.candidates.clone()))
                     }
@@ -2121,7 +2507,45 @@ async fn run_path_ticks(ctx: PathCtx) {
                     // the seam that fast-follow re-wires.
                     Some(PathAction::ProbeDirect) => {}
                     Some(PathAction::MarkRelayNeeded) => to_relay_needed.push(gid),
+                    // Relay-death (aether-prod-fi-01 wedge fix): the peer's
+                    // relay leg died while `Relayed`. Handled after the
+                    // `paths` guard drops — tear down the dead transport,
+                    // clear the `relay_pointed` pin, then branch on the
+                    // death's classification: immediate relay reconnect for
+                    // a graceful close (eviction), or a clean direct-punch
+                    // window (no reconnect) for silence/other — see the
+                    // to_relay_died loop below.
+                    Some(PathAction::RelayDied) => to_relay_died.push(gid),
                     Some(PathAction::Retry) | None => {}
+                }
+
+                // Stale-pin invariant sweep — COLLECT phase (round-3
+                // reviewer MAJOR). Leak path being closed: a late-completing
+                // `ensure_relay_transport` (spawned before a `RelayDied`
+                // cleanup ran) can re-point + re-pin AFTER that cleanup —
+                // its commit has no staleness guard ("the relay path never
+                // yields"). If that transport then dies BEFORE the path
+                // re-enters `Relayed`, `RelayDied` can never fire again (it
+                // is emitted only from the `Relayed` arm), nothing else
+                // clears the pin, and every StartPunch defers — the
+                // production wedge surviving through a window that was
+                // benign pre-fix only because every death immediately
+                // re-spawned `ensure`. The invariant enforced here: a pin
+                // may only outlive its tick if a healthy transport backs it
+                // or the peer is `Relayed` (the legitimate install window —
+                // ensure just committed, path about to go Relayed — always
+                // HAS a healthy transport in the map, so it is excluded by
+                // construction). The same-tick `RelayDied` peer is excluded
+                // too: its own cleanup below already tears down + clears.
+                // `healthy_relay` here is this tick's earlier snapshot; the
+                // ACT phase below re-checks the live map before acting (see
+                // its race trace).
+                if !matches!(action, Some(PathAction::RelayDied))
+                    && path.state != PathState::Relayed
+                    && !*healthy_relay.get(&gid).unwrap_or(&false)
+                    && ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false)
+                {
+                    to_sweep_pin.push(gid);
                 }
 
                 // Liveness probe (keepalive-invisibility fix): a peer in a LIVE
@@ -2169,6 +2593,22 @@ async fn run_path_ticks(ctx: PathCtx) {
             tokio::spawn(async move { poke_peer_overlay(&ctx, gid).await });
         }
 
+        // Prompt-report trigger (relay-wedge fix round 4): any recorded
+        // transition that crosses the settled boundary must reach the
+        // controller broker PROMPTLY — the case-4 finding: after a relay-leg
+        // death the broker's stored states stayed `relayed`/`relayed`
+        // (settled-skipping the pair) until the next `SyncEvent::State`,
+        // its punch budget stayed exhausted, and the two sides punched on
+        // unsynchronized self-timers a port-restricted pair can never land.
+        // One `notify_one` per tick at most; the sync loop coalesces +
+        // debounces and sends the full snapshot (see
+        // `PathCtx::path_report_notify`).
+        if to_record
+            .iter()
+            .any(|(_, before, after)| transition_crosses_settled_boundary(*before, *after))
+        {
+            ctx.path_report_notify.notify_one();
+        }
         for (gid, before, after) in to_record {
             // Fix T4: a path leaving the LIVE states (Direct / Relayed) no
             // longer shows liveness, so its endpoint pin must go — that is
@@ -2184,7 +2624,91 @@ async fn run_path_ticks(ctx: PathCtx) {
             ctx.record_transition(gid, before, after);
         }
         for gid in to_teardown_relay {
-            teardown_relay_transport(&ctx, gid).await;
+            teardown_relay_transport(&ctx, gid, "reached Direct").await;
+        }
+        for gid in to_relay_died {
+            // Relay-death cleanup (aether-prod-fi-01 wedge fix): drop the
+            // DEAD transport, then clear the peer's relay_pointed pin so the
+            // upcoming Disconnected -> Connecting StartPunch cycle's guard
+            // chain (`directive_should_punch` / `punch_and_apply`'s
+            // make-before-break yield) actually opens. Lock ordering: the
+            // reason read and the teardown each take the tokio
+            // `relay_transports` mutex alone; the std `relay_pointed` lock
+            // is only taken after both guards are dropped.
+            //
+            // Read the death classification BEFORE the teardown removes the
+            // transport from the map — it is the branch input below.
+            let reason = {
+                let map = ctx.relay_transports.lock().await;
+                map.get(&gid).and_then(|pr| pr.transport.death_reason())
+            };
+            teardown_relay_transport(&ctx, gid, "relay leg died").await;
+            ctx.relay_pointed.lock().unwrap().remove(&gid);
+            // Branch on WHY the leg died (runner-verified against the netns
+            // done-bars; classification pinned by tests/relay_death_reason.rs):
+            match reason {
+                // EVICTION fast-path (relay_matrix case 3): the relay
+                // gracefully CLOSED the connection under us — a controller-
+                // driven eviction severs every client with a real
+                // CONNECTION_CLOSE. Our peer was evicted right alongside us
+                // and is re-pathing to the surviving relay too, so burning a
+                // direct punch window first (~12s, for a pairing that may
+                // not even punch — case 3 is symmetric<->symmetric) would
+                // blow the ≤30s re-path budget. Reconnect a relay
+                // IMMEDIATELY, restoring the pre-RelayDied eviction timing;
+                // the round-robin cursor already points past the dead relay.
+                Some(RelayDeathReason::Closed) => {
+                    eprintln!(
+                        "wiremesh-gateway: peer={gid} relay leg gracefully closed (eviction); \
+                         reconnecting a relay immediately"
+                    );
+                    tokio::spawn(ensure_relay_transport(ctx.clone(), gid, ds.relays.clone()));
+                }
+                // WEDGE semantics (relay_matrix case 4): the leg died of
+                // SILENCE (QUIC idle timeout — the production shape: the
+                // peer restarted, punched direct, and LEFT the relay; our
+                // leg starved). NO immediate re-relay — the next Connecting
+                // spell gets one clean direct-punch window; a genuinely
+                // relay-needing pair re-relays one punch cycle later via the
+                // Connecting-timeout MarkRelayNeeded ladder. `Other`
+                // (exotic quinn errors) and `None` (no transport found —
+                // e.g. already pruned) map here too, conservatively: only a
+                // positively-identified eviction earns the fast-path.
+                Some(RelayDeathReason::TimedOut) | Some(RelayDeathReason::Other) | None => {}
+            }
+        }
+        // Stale-pin invariant sweep — ACT phase (round-3 reviewer MAJOR; see
+        // the collect phase above for the leak path). Race trace for why
+        // this cannot clear a HEALTHY install's pin:
+        // `ensure_relay_transport` commits in a fixed order — it inserts the
+        // (healthy, just-connected) transport into `relay_transports` FIRST,
+        // and only then runs `set_peer_endpoint(.., is_relay=true)`, which
+        // sets the pin. So any pin the collect phase observed implies its
+        // transport was ALREADY in the map at that moment; if the collect's
+        // `healthy_relay` snapshot said "no healthy transport", either the
+        // transport is genuinely dead (the leak this sweep exists for) or
+        // the install committed AFTER the snapshot was taken — and the
+        // re-check below, against the LIVE map, sees that install's healthy
+        // transport and skips. The one residual interleaving (an install's
+        // insert lands after this re-check but its pin-set after our clear)
+        // leaves a pin with a closed transport for at most one tick — the
+        // sweep is a standing per-tick invariant enforcer, so the next tick
+        // clears it. Lock ordering: the tokio `relay_transports` guard (the
+        // re-check, then the teardown's own) is never held while the std
+        // `relay_pointed` lock is taken.
+        for gid in to_sweep_pin {
+            {
+                let map = ctx.relay_transports.lock().await;
+                if map.get(&gid).is_some_and(|pr| pr.transport.is_healthy()) {
+                    continue; // legitimate install raced the snapshot — leave it
+                }
+            }
+            teardown_relay_transport(&ctx, gid, "stale relay pin swept").await;
+            ctx.relay_pointed.lock().unwrap().remove(&gid);
+            eprintln!(
+                "wiremesh-gateway: peer={gid} relay pin swept (pinned, no healthy transport, \
+                 not relayed) — punch guard re-opened"
+            );
         }
         for gid in to_relay_needed {
             // Spawned rather than awaited inline: a `RelayTransport::start`
@@ -2206,7 +2730,7 @@ async fn run_path_ticks(ctx: PathCtx) {
             // indefinite storm this back-off exists to bound.
             // Skips are silent: the state change was logged when the window
             // opened.
-            match ctx.try_start_punch(gid) {
+            match ctx.try_start_punch(gid, PunchOrigin::Tick) {
                 Some(guard) => {
                     if ctx.punch_allowed(gid, &candidates) {
                         tokio::spawn(punch_and_apply(ctx.clone(), gid, candidates, None, guard));
@@ -3149,13 +3673,14 @@ mod tests {
             desired: Arc::new(std::sync::Mutex::new(None)),
             paths: Arc::new(std::sync::Mutex::new(HashMap::new())),
             transitions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            punching: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            punching: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_transports: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             relay_connecting: Arc::new(std::sync::Mutex::new(HashSet::new())),
             relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
             wg0_pins: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            path_report_notify: Arc::new(tokio::sync::Notify::new()),
             peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
             live_endpoints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             punch_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -3170,13 +3695,21 @@ mod tests {
     #[test]
     fn try_start_punch_dedups_per_peer_and_releases_on_drop() {
         let ctx = test_ctx();
-        let guard = ctx.try_start_punch(7).expect("first claim for peer 7 succeeds");
+        let guard = ctx
+            .try_start_punch(7, PunchOrigin::Tick)
+            .expect("first claim for peer 7 succeeds");
         assert!(
-            ctx.try_start_punch(7).is_none(),
+            ctx.try_start_punch(7, PunchOrigin::Directive).is_none(),
             "second concurrent claim for the same peer must be rejected"
         );
-        assert!(ctx.try_start_punch(8).is_some(), "a different peer is unaffected by peer 7's guard");
+        assert!(
+            ctx.try_start_punch(8, PunchOrigin::Tick).is_some(),
+            "a different peer is unaffected by peer 7's guard"
+        );
         drop(guard);
-        assert!(ctx.try_start_punch(7).is_some(), "slot released once the guard drops");
+        assert!(
+            ctx.try_start_punch(7, PunchOrigin::Directive).is_some(),
+            "slot released once the guard drops"
+        );
     }
 }

@@ -54,6 +54,16 @@
 //!   sets `peer_paths_snapshot: true` (it models a new steady-state
 //!   client); the plain `report` helper keeps the old-client shape (empty
 //!   `peer_paths`, snapshot=false).
+//!
+//! Round 4 (relay-wedge follow-up — see the "Round 4" test block at the
+//! bottom): `Broker::on_report` must additionally detect the pair-level
+//! settled -> UNSETTLED edge (its stored states said both members settled;
+//! this report's content makes that no longer true) and, on that edge
+//! only, reset the pair's periodic budget AND trigger an immediate
+//! synchronized emit for the pair. No new wire surface — the two RED tests
+//! compile against today's proto/testkit and fail at runtime until the
+//! broker change lands; the third (no-storm guard) must be green before
+//! and after.
 
 use std::time::Duration;
 
@@ -79,6 +89,19 @@ const SETTLED_SILENCE: Duration = Duration::from_secs(8);
 /// windows) before asserting the both-settled silence.
 async fn drain_punches(stream: &mut tonic::Streaming<SyncMessage>) {
     while next_punch(stream, NO_PUNCH_TIMEOUT).await.is_ok() {}
+}
+
+/// Drains `stream` until it has been quiet for a FULL periodic sweep
+/// interval plus margin ([`SETTLED_SILENCE`] > the broker's 5s
+/// `RETRY_INTERVAL`). For an UNSETTLED pair with unchanged candidates, that
+/// silence can only mean the pair's periodic budget
+/// (`MAX_PERIODIC_ATTEMPTS` = 5) is EXHAUSTED — an un-exhausted budget
+/// would have re-punched within one 5s sweep. This is the round-4 tests'
+/// budget-exhaustion technique: consume the initial trigger punches plus
+/// all 5 periodic re-punches (worst case ~5 x 5s + the final quiet window,
+/// so callers must budget ~35s of wall time for it).
+async fn drain_periodic_budget(stream: &mut tonic::Streaming<SyncMessage>) {
+    while next_punch(stream, SETTLED_SILENCE).await.is_ok() {}
 }
 
 /// (a) The core skip: once BOTH members' latest reports mark the OTHER as
@@ -476,5 +499,191 @@ async fn non_snapshot_empty_report_keeps_settled_skip() {
     assert!(
         b_after.is_err(),
         "a non-snapshot empty report must not wipe settled states, but B received: {b_after:?}"
+    );
+}
+
+// --- Round 4: re-brokering on the settled -> unsettled EDGE ----------------
+//
+// The authoritative case-4 (relay-wedge) run exposed the remaining gap: a
+// pair that SETTLES (both relayed) and later falls off the relay needs the
+// broker to re-synchronize its direct punches — but by then the pair's
+// periodic budget was exhausted during establishment and nothing ever
+// resets it (candidate sets are unchanged, no reconnect happens). The
+// broker knows the pair fell off settled the moment a member's snapshot
+// report flips its stored peer state out of {direct, relayed} — that EDGE
+// must (i) reset the pair's periodic budget and (ii) trigger an immediate
+// synchronized emit for the pair. Crucially, ONLY the edge: a report that
+// merely keeps an already-unsettled pair unsettled grants nothing (else
+// every steady-state snapshot from a struggling pair would become a
+// re-broker storm — the very thing the settled-skip fix ended).
+//
+// These three tests are authored ahead of the implementation: the first two
+// are EXPECTED-RED at runtime against the current broker (they compile —
+// no new API surface is needed at the wire level), the third pins the
+// no-storm guard that must stay green before and after.
+
+/// (round 4, a — RED) A settled pair with an EXHAUSTED periodic budget must
+/// be re-punched on BOTH streams as soon as one member's snapshot report
+/// unsettles it. Today: the budget is empty, the candidates are unchanged,
+/// no reconnect happened — so nothing emits, ever, and the two gateways
+/// are left punching on unsynchronized self-timers (the case-4 red).
+#[tokio::test]
+async fn unsettle_report_rebrokes_pair_despite_exhausted_budget() {
+    let h = TestController::start().await;
+    let a = enroll_one(&h, "aws", "10.0.0.0/16").await;
+    let b = enroll_one(&h, "gcp", "10.1.0.0/16").await;
+
+    let mut a_stream = a.open_sync().await;
+    let mut b_stream = b.open_sync().await;
+
+    let a_endpoint = "10.0.0.1:51820";
+    let b_endpoint = "10.1.0.1:51820";
+    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
+    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+
+    // Exhaust the pair's periodic budget while it is still unsettled: the
+    // sweep re-punches every 5s until MAX_PERIODIC_ATTEMPTS (5) is spent,
+    // after which a full sweep interval of silence proves exhaustion.
+    tokio::join!(drain_periodic_budget(&mut a_stream), drain_periodic_budget(&mut b_stream));
+
+    // NOW settle both sides (each marks the other "relayed" — the case-4
+    // establishment shape). Settling consumes no budget and emits nothing.
+    a.report_with_peer_paths(0, &[a_endpoint], &[(b.id(), "relayed")])
+        .await
+        .expect("A reports peer_paths relayed");
+    b.report_with_peer_paths(0, &[b_endpoint], &[(a.id(), "relayed")])
+        .await
+        .expect("B reports peer_paths relayed");
+    drain_punches(&mut a_stream).await;
+    drain_punches(&mut b_stream).await;
+
+    // The pair falls off the relay: B's next snapshot flips its stored peer
+    // state to "disconnected" (same candidates — no candidate-change reset
+    // can mask the edge trigger). settled -> unsettled: the broker must
+    // reset the pair's budget AND emit a synchronized punch pair promptly.
+    b.report_with_peer_paths(0, &[b_endpoint], &[(a.id(), "disconnected")])
+        .await
+        .expect("B reports the unsettling snapshot");
+
+    let a_punch = next_punch(&mut a_stream, PUNCH_TIMEOUT)
+        .await
+        .expect("unsettle edge must re-broker the pair despite an exhausted budget: A got nothing");
+    let b_punch = next_punch(&mut b_stream, PUNCH_TIMEOUT)
+        .await
+        .expect("unsettle edge must re-broker the pair despite an exhausted budget: B got nothing");
+    assert_eq!(a_punch.peer_gateway_id, b.id(), "A's punch must target B");
+    assert_eq!(b_punch.peer_gateway_id, a.id(), "B's punch must target A");
+}
+
+/// (round 4, b — RED) The unsettle edge must RESET the periodic budget, not
+/// just fire a one-shot emit: after the edge, the still-unsettled pair gets
+/// periodic re-punches again (each due within one 5s sweep). Distinct from
+/// the test above because a one-shot-emit-only implementation would pass it
+/// while leaving the pair with zero retry budget — one missed simultaneous
+/// window (the norm under NAT jitter) and the pair is stranded again.
+#[tokio::test]
+async fn unsettle_edge_resets_periodic_budget_for_further_sweeps() {
+    let h = TestController::start().await;
+    let a = enroll_one(&h, "aws", "10.0.0.0/16").await;
+    let b = enroll_one(&h, "gcp", "10.1.0.0/16").await;
+
+    let mut a_stream = a.open_sync().await;
+    let mut b_stream = b.open_sync().await;
+
+    let a_endpoint = "10.0.0.1:51820";
+    let b_endpoint = "10.1.0.1:51820";
+    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
+    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+    tokio::join!(drain_periodic_budget(&mut a_stream), drain_periodic_budget(&mut b_stream));
+
+    a.report_with_peer_paths(0, &[a_endpoint], &[(b.id(), "relayed")])
+        .await
+        .expect("A reports peer_paths relayed");
+    b.report_with_peer_paths(0, &[b_endpoint], &[(a.id(), "relayed")])
+        .await
+        .expect("B reports peer_paths relayed");
+    drain_punches(&mut a_stream).await;
+    drain_punches(&mut b_stream).await;
+
+    b.report_with_peer_paths(0, &[b_endpoint], &[(a.id(), "disconnected")])
+        .await
+        .expect("B reports the unsettling snapshot");
+
+    // The edge-triggered emit itself...
+    next_punch(&mut a_stream, PUNCH_TIMEOUT)
+        .await
+        .expect("edge-triggered punch missing on A");
+    next_punch(&mut b_stream, PUNCH_TIMEOUT)
+        .await
+        .expect("edge-triggered punch missing on B");
+
+    // ...and then the REFRESHED periodic budget: with the pair still
+    // unsettled and candidates unchanged, at least two further periodic
+    // re-punches must arrive on each stream (sweeps run every 5s; each is
+    // comfortably inside PUNCH_TIMEOUT). Before the fix there is no budget
+    // left, so this is where a one-shot implementation — and the current
+    // broker — go red.
+    for round in 1..=2 {
+        next_punch(&mut a_stream, PUNCH_TIMEOUT).await.unwrap_or_else(|e| {
+            panic!("post-edge periodic re-punch #{round} missing on A (budget not reset?): {e:?}")
+        });
+        next_punch(&mut b_stream, PUNCH_TIMEOUT).await.unwrap_or_else(|e| {
+            panic!("post-edge periodic re-punch #{round} missing on B (budget not reset?): {e:?}")
+        });
+    }
+}
+
+/// (round 4, c — GREEN guard, must stay green) ONLY the settled->unsettled
+/// EDGE re-brokers. A snapshot report that keeps an already-unsettled pair
+/// unsettled — even one that CHANGES the stored state (connecting ->
+/// disconnected, both outside {direct, relayed}) — must grant no fresh
+/// budget and trigger no emit once the periodic budget is exhausted.
+/// Otherwise every steady-state snapshot from a pair that is struggling to
+/// connect would re-arm the punch storm the settled-skip fix ended.
+#[tokio::test]
+async fn report_keeping_pair_unsettled_grants_no_fresh_budget() {
+    let h = TestController::start().await;
+    let a = enroll_one(&h, "aws", "10.0.0.0/16").await;
+    let b = enroll_one(&h, "gcp", "10.1.0.0/16").await;
+
+    let mut a_stream = a.open_sync().await;
+    let mut b_stream = b.open_sync().await;
+
+    let a_endpoint = "10.0.0.1:51820";
+    let b_endpoint = "10.1.0.1:51820";
+    // Stored states are unsettled from the very first report — the pair
+    // NEVER passes through settled, so no edge can ever legitimately fire.
+    a.report_with_peer_paths(0, &[a_endpoint], &[(b.id(), "connecting")])
+        .await
+        .expect("A reports candidate + connecting peer state");
+    b.report_with_peer_paths(0, &[b_endpoint], &[(a.id(), "connecting")])
+        .await
+        .expect("B reports candidate + connecting peer state");
+
+    // Exhaust the periodic budget (the unsettled pair is re-punched by the
+    // sweep until the 5 attempts are spent).
+    tokio::join!(drain_periodic_budget(&mut a_stream), drain_periodic_budget(&mut b_stream));
+
+    // B's stored peer state CHANGES, but stays outside {direct, relayed}:
+    // unsettled -> unsettled is not an edge. Same candidates, so no
+    // candidate-change reset applies either. Nothing may emit across a full
+    // sweep window on either stream.
+    b.report_with_peer_paths(0, &[b_endpoint], &[(a.id(), "disconnected")])
+        .await
+        .expect("B reports a still-unsettled snapshot");
+
+    let (a_after, b_after) = tokio::join!(
+        next_punch(&mut a_stream, SETTLED_SILENCE),
+        next_punch(&mut b_stream, SETTLED_SILENCE),
+    );
+    assert!(
+        a_after.is_err(),
+        "an unsettled->unsettled report must not re-arm the punch budget, but A received: \
+         {a_after:?}"
+    );
+    assert!(
+        b_after.is_err(),
+        "an unsettled->unsettled report must not re-arm the punch budget, but B received: \
+         {b_after:?}"
     );
 }
