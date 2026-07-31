@@ -3,8 +3,9 @@
 **Date:** 2026-07-27 (zolab live deployment, while onboarding the first
 off-cluster gateway).
 **Status:** gateway-side fix LANDED 2026-07-27 (keepalive on the Sync
-channel, with hostname support + per-reconnect DNS re-resolution); the
-controller-side keepalive mirror is a still-open follow-up.
+channel, with hostname support + per-reconnect DNS re-resolution); the relay
+Sync client and controller-side keepalive mirrors LANDED 2026-07-30
+(Backlog 2 — see below).
 
 ## Symptom
 
@@ -68,22 +69,39 @@ re-resolves DNS (hostname support landed in the same change — see
 `operator-remote-deployment-notes.md` Finding 3), so a rotated DDNS address
 heals too.
 
-**Still open (follow-up):**
+**Both mirrors: LANDED 2026-07-30 (Backlog 2):**
 
-- Mirror with `http2_keepalive_interval/timeout` on the controller's Sync
-  server so both sides detect (the controller currently holds its half-open
-  roster entry until the next Report). The gateway's reconnect loop already
-  handled a surfaced error correctly — the whole bug was that no error was
-  ever surfaced.
-- The **relay Sync client** (`wiremesh-relay/src/lib.rs::run_sync`) has the
-  identical bug: TLS-only channel, no keepalive, no `connect_timeout`, and it
-  still takes a fixed `SocketAddr`. Its Watch stream carries only
-  `revoked_serials`, so the failure mode is a **security** one: a half-open
+- **Controller side**: `http2_keepalive_interval/timeout` on the Sync
+  listener's server builder
+  (`wiremesh-controller/src/lib.rs::serve()` —
+  `SYNC_HTTP2_KEEPALIVE_INTERVAL/TIMEOUT`, the same 15s/10s), so the
+  controller also detects a dead client and reaps its Watch stream instead
+  of holding the half-open roster entry until a Report that never comes.
+  Sync listener only — the Admin (UDS + loopback TCP) and Enrollment
+  surfaces carry short unary RPCs with nothing to go silently half-open.
+- **Relay Sync client** (`wiremesh-relay/src/lib.rs::run_sync`): had the
+  identical bug — TLS-only channel, no keepalive, no `connect_timeout`, and
+  a fixed `SocketAddr` target. Its Watch stream carries only
+  `revoked_serials`, so the failure mode was a **security** one: a half-open
   relay silently enforces a stale revocation denylist — a certificate revoked
   after the stream went dead keeps being accepted by that relay until it
   restarts (the offline-persisted denylist only covers what arrived before
-  the stream died). Needs the same keepalive constants + per-dial
-  re-resolution as the gateway.
+  the stream died). Now mirrors the gateway exactly: the same 15s/10s/10s
+  figures (`wiremesh_relay::SYNC_KEEPALIVE_INTERVAL/SYNC_KEEPALIVE_TIMEOUT/
+  SYNC_CONNECT_TIMEOUT`, `keep_alive_while_idle`), a `host:port` target
+  resolved inside every `run_sync` call (per-dial DNS re-resolution), and
+  the gateway's boot-time `validate_host_port` on the bin's `--controller`
+  flag, so an IPv6 or typo'd IPv4-shaped literal exits non-zero at boot —
+  same posture as `--controller-sync`. The shared pieces — the bounded
+  resolver, the boot-time validation, and the CANONICAL keepalive constants
+  from which all three crates now derive their figures (so the client and
+  server sides can't drift apart) — were extracted to `wiremesh-enroll` and
+  are re-exported under the original gateway/relay paths. Pinned by
+  `wiremesh-relay/tests/{sync_hostname,sync_keepalive}.rs` and
+  `wiremesh-controller/tests/sync_server_keepalive.rs`.
+
+**Still open (follow-up):**
+
 - Consider also alerting on roster `applied_version` lag (controller side),
   which is what actually exposed this.
 - **Sync session generation**: per-boot nonce in Watch+Report so a delayed

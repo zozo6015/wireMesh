@@ -49,6 +49,28 @@ use wiremesh_trust::{CertificateIssuer, EmbeddedTrust};
 /// expected to run for years uninterrupted.
 const SERVER_IDENTITY_TTL: StdDuration = StdDuration::from_secs(365 * 24 * 3600);
 
+/// Server-side HTTP/2 PING cadence on the SYNC listener — the controller's
+/// half of the Sync keepalive mirror
+/// (`docs/research/ops-finding-sync-half-open-stream.md`). The client-side
+/// keepalives (gateway PR #28, relay mirror) let CLIENTS detect a dead link;
+/// without a server-side PING the controller keeps holding a half-open
+/// client's Watch stream — and the roster/broker state hanging off it —
+/// until a Report that never comes. The VALUE is the canonical
+/// `wiremesh_enroll::SYNC_KEEPALIVE_INTERVAL` — the exact same constant the
+/// gateway/relay clients build their channels from (the ops doc recommends
+/// no distinct server-side figure), so client and server figures can't
+/// silently drift apart: long-lived server-streaming Watch responses are
+/// exactly the idle-on-the-wire case the PING must cover from BOTH ends.
+/// `pub` because tonic's built server exposes no inspectable surface, so
+/// `tests/sync_server_keepalive.rs` pins construction via these consts.
+pub const SYNC_HTTP2_KEEPALIVE_INTERVAL: StdDuration = wiremesh_enroll::SYNC_KEEPALIVE_INTERVAL;
+
+/// How long an unanswered server-side keepalive PING may go unacknowledged
+/// before the controller declares the connection dead and reaps its streams.
+/// Same shared value as the clients' — see
+/// [`SYNC_HTTP2_KEEPALIVE_INTERVAL`].
+pub const SYNC_HTTP2_KEEPALIVE_TIMEOUT: StdDuration = wiremesh_enroll::SYNC_KEEPALIVE_TIMEOUT;
+
 /// Capacity of the [`projection::ChangeEvent`] broadcast channel shared by
 /// every service that can mutate the projection (currently just
 /// `EnrollmentSvc` — see [`services::enrollment`]) and every live
@@ -694,7 +716,16 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         .client_ca_root(Certificate::from_pem(&ca_bundle_pem));
 
     let (sync_shutdown_tx, sync_shutdown_rx) = oneshot::channel::<()>();
+    // Server-side keepalive on the SYNC listener ONLY (see
+    // [`SYNC_HTTP2_KEEPALIVE_INTERVAL`]): Sync is the one surface with
+    // long-lived, idle-on-the-wire Watch streams to clients across
+    // NATs/middleboxes. The Admin listeners (UDS + loopback-only TCP) and
+    // the Enrollment listener carry short unary RPCs — nothing there can go
+    // silently half-open the way a Watch stream can, so they keep tonic's
+    // defaults.
     let sync_server = Server::builder()
+        .http2_keepalive_interval(Some(SYNC_HTTP2_KEEPALIVE_INTERVAL))
+        .http2_keepalive_timeout(Some(SYNC_HTTP2_KEEPALIVE_TIMEOUT))
         .tls_config(sync_tls_config)
         .context("configuring Sync server mTLS")?
         .add_service(SyncServer::new(sync_svc))
