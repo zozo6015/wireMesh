@@ -21,12 +21,23 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
     let client = ctx.client.clone();
     let oref = owner_ref(cr.as_ref())?;
 
-    // Server-side-apply the three child objects (owner-referenced → GC'd with
-    // the CR). Namespace is stamped here since the builders are namespace-free.
-    let mut pvc = workloads::controller_pvc(&name, &cr.spec);
-    pvc.metadata.namespace = Some(ns.clone());
-    pvc.metadata.owner_references = Some(vec![oref.clone()]);
-    apply(&Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns), &pvc).await?;
+    // Server-side-apply the child objects (owner-referenced → GC'd with the
+    // CR). Namespace is stamped here since the builders are namespace-free.
+    //
+    // The PVC is CREATE-ONLY (shared `pvc_needs_create` guard, same as the
+    // gateway/relay reconcilers): a bound PVC's `storageClassName` /
+    // `resources.requests.storage` are immutable, so re-applying it on every
+    // pass 422s permanently the moment a user edits `spec.storageSize`/
+    // `storageClass` on the CR — wedging the whole reconcile (the Service and
+    // Deployment applies below would never run again).
+    let pvc_api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns);
+    let existing_pvc = pvc_api.get_opt(&format!("{name}-data")).await?;
+    if super::pvc_needs_create(existing_pvc.as_ref()) {
+        let mut pvc = workloads::controller_pvc(&name, &cr.spec);
+        pvc.metadata.namespace = Some(ns.clone());
+        pvc.metadata.owner_references = Some(vec![oref.clone()]);
+        apply(&pvc_api, &pvc).await?;
+    }
 
     let mut svc = workloads::controller_service(&name, &cr.spec);
     svc.metadata.namespace = Some(ns.clone());
@@ -93,6 +104,11 @@ pub async fn run(ctx: Arc<Context>) {
     Controller::new(Api::<WiremeshController>::all(client.clone()), watcher::Config::default())
         .owns(Api::<Deployment>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
         .owns(Api::<Service>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
+        // Watch the data PVC too (parity with the gateway/relay reconcilers):
+        // a deleted or externally-edited PVC enqueues its owning CR at once
+        // rather than waiting out the 300s requeue. The apply itself stays
+        // CREATE-ONLY (`pvc_needs_create`) — this only affects when we look.
+        .owns(Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
             match res {

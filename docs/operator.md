@@ -4,14 +4,14 @@ Deploy and run a WireMesh zero-trust fabric declaratively on Kubernetes. You
 `kubectl apply` a few custom resources; the operator brings up the controller,
 deploys gateways/relays, and keeps the segment/policy config reconciled.
 
-> **Status:** the operator's reconcilers, the admin transport, and the install
-> artifacts are complete and **unit-tested**; the reconcile loops, the exec
-> transport, and these manifests **compile and pass unit tests but have not yet
-> been validated end-to-end on a live cluster** — that is the current next step.
+> **Status:** the operator has been **validated end-to-end on a real cluster**
+> (k3s/arm64: operator deploys the controller, a gateway enrolls through the
+> in-cluster Service and its data plane comes up Running). Controller,
+> gateway, **and relay** identities are all persisted on per-instance PVCs, so
+> pod restarts/reschedules no longer wedge on a spent enrollment token.
 > By design, the **controller + fabric (segments/policy)** path needs no extra
 > setup; **gateways/relays** additionally require the CA bundle published (see
-> [CA bundle](#ca-bundle)) and, for restart durability, PVC-backed state (see
-> [Limitations](#limitations)).
+> [CA bundle](#ca-bundle)).
 
 ## Architecture
 
@@ -36,7 +36,8 @@ WiremeshRelay CR      ─▶ operator ─▶ mint token → Secret → relay pod
 ## Prerequisites
 
 - Kubernetes ≥ 1.28 (the admin-exec sidecar uses standard `pods/exec`).
-- A default StorageClass (for the controller PVC) — or set `spec.storageClass`.
+- A default StorageClass (for the controller/gateway/relay identity PVCs) — or
+  set `spec.storageClass` on the respective CRs.
 - The `wiremesh-*` images reachable from the cluster. The defaults point at
   `ghcr.io/zozo6015/*`; mirror them to any registry and override the image
   registry/owner (Helm `image.registry`/`image.owner`, or a kustomize `images:`
@@ -103,6 +104,7 @@ All five CRDs are **cluster-scoped**, group `wiremesh.io/v1alpha1`. The
 controller is single-tenant — one `WiremeshController` per cluster.
 
 ### WiremeshController (`wmctrl`)
+
 | field | default | purpose |
 |-------|---------|---------|
 | `image` | `ghcr.io/zozo6015/wiremesh-controller:latest` | controller image |
@@ -115,12 +117,14 @@ controller is single-tenant — one `WiremeshController` per cluster.
 Status: `ready`, `adminEndpoint` (the sync-tcp Service DNS), `conditions`.
 
 ### WiremeshSegment (`wmseg`)
+
 | field | purpose |
 |-------|---------|
 | `segmentName` | fabric segment name |
 | `cidrs` | list of IPv4 CIDRs in the segment |
 
 ### WiremeshPolicy (`wmpol`)
+
 | field | purpose |
 |-------|---------|
 | `from` / `to` | source / destination segment names |
@@ -130,6 +134,7 @@ Status: `ready`, `adminEndpoint` (the sync-tcp Service DNS), `conditions`.
 Default-deny: only what a policy allows passes.
 
 ### WiremeshGateway (`wmgw`)
+
 | field | default | purpose |
 |-------|---------|---------|
 | `segmentRef` | — | the `WiremeshSegment` (by `.metadata.name`) this gateway fronts |
@@ -137,15 +142,46 @@ Default-deny: only what a policy allows passes.
 | `wgPort` | `51820` | WireGuard listen port |
 | `tun` | `wg0` | tun interface name |
 | `image` | `…/wiremesh-gateway:latest` | gateway image |
+| `storageSize` | `128Mi` | identity PVC (`<name>-gateway-data`) size |
+| `storageClass` | cluster default | identity PVC storage class |
+| `observeEndpoint` | controller Service ClusterIP | override for the gateway's `--observe` target (`host:port`, DNS ok). Use when kube-proxy SNATs the ClusterIP UDP path (poisoning the observed public mapping) — point at a source-preserving UDP LB instead |
+| `syncEndpoint` | controller Service ClusterIP | override for `--controller-sync` (`host:port`, DNS ok) — controllers reached through an external LB / DDNS name |
 
-Status: `enrolled`, `gatewayId`, `pathState`, `conditions`.
+Both overrides are validated when the CR is reconciled and **fail closed**
+(`host:port`; DNS names allowed, IPv6 literals and port `0` rejected) — a
+malformed value is reported on the CR instead of rolling out a CrashLooping
+pod. The enroll init-container always uses the in-cluster enroll endpoint — the
+`observeEndpoint`/`syncEndpoint` overrides never affect enrollment.
+
+Editing the referenced segment's **CIDRs** after enrollment automatically mints
+a **rebind token** (a `kind: rebind` token whose authorization scope is the
+segment id — the one token type allowed to replace a segment's already-active
+gateway) and refreshes the token Secret; the Secret also records the CIDR set
+it was minted against, compared as a set on later passes. Without this, a later
+re-enroll would be rejected both on the stale CIDR binding and on the
+one-gateway-per-segment invariant. The CIDR change also rolls the pod
+(`Recreate`), since the CIDRs are part of the enroll init-container's args.
+**Latency:** the gateway reconciler does not watch `WiremeshSegment`, so a CIDR
+edit is picked up on the CR's next requeue — **up to 300s** for an enrolled
+gateway. Force it sooner by touching the `WiremeshGateway` CR (adding a
+`.watches` mapping from Segment → dependent Gateways is the tracked follow-up).
+
+Status: `enrolled`, `gatewayId`, `pathState`, `conditions` — reported from the
+segment's **active** roster row (stale drained/replaced rows are ignored).
+Because that row is active-filtered, `pathState` is effectively degenerate
+today: it mirrors the roster status, which is `active` whenever a row is found
+and absent otherwise — it does **not** surface the data-plane
+`Direct`/`Relayed`/`Degraded` path state.
 
 ### WiremeshRelay (`wmrelay`)
-| field | purpose |
-|-------|---------|
-| `endpoint` | the relay's public IPv4 `ip:port` (advertised to gateways) |
-| `nodeName` | pin the relay pod |
-| `image` | relay image |
+
+| field | default | purpose |
+|-------|---------|---------|
+| `endpoint` | — | the relay's public IPv4 `ip:port` (advertised to gateways) |
+| `nodeName` | — | pin the relay pod |
+| `image` | `…/wiremesh-relay:latest` | relay image |
+| `storageSize` | `128Mi` | identity PVC (`<name>-relay-data`) size |
+| `storageClass` | cluster default | identity PVC storage class |
 
 ## CA bundle
 
@@ -270,10 +306,32 @@ otherwise identical. Confirm what your cluster serves with
 
 ## Limitations
 
-- **Gateway restart durability:** gateway identity currently lives in an
-  `emptyDir`, so a gateway pod restart loses its identity and its single-use
-  enrollment token is already spent. Treat gateway pods as non-restartable for
-  now; PVC-backed gateway state is the tracked fix.
+- **Restart durability: fixed.** Controller, gateway, and relay identities are
+  all persisted on per-instance PVCs (`<name>-data`, `<name>-gateway-data`,
+  `<name>-relay-data`); both enroll init-containers are idempotent (they skip
+  when a complete identity is already on the volume, so a restart never
+  re-redeems the spent single-use token); and the token mint is keyed off
+  whether the identity is durably persisted. (Gateway PVC identity was
+  validated on a live cluster; the relay PVC + idempotent relay enroll ship
+  with this round.) All three Deployments use the `Recreate` strategy — an RWO
+  PVC must never surge a second pod.
+- **Segment-CIDR edits are not watched:** the gateway reconciler watches its own
+  CR (and its Deployment/PVC), not `WiremeshSegment`, so an automatic rebind can
+  lag a CIDR edit by up to the 300s requeue. Follow-up: a `.watches` mapping
+  from Segment → the Gateways referencing it.
+- **`status.pathState` is degenerate:** it reports the controller roster status
+  of the segment's active row (so, in practice, `active`), not the data-plane
+  `Direct`/`Relayed`/`Degraded` path state.
+- **Teardown order:** delete dependent CRs (`WiremeshGateway`,
+  `WiremeshSegment`, …) **before** the `WiremeshController` CR so their
+  finalizers can drain/deregister through the controller. If the controller is
+  already gone (e.g. `kubectl delete -f all.yaml` in one shot), the finalizers
+  do **not** wedge in `Terminating`: they log a warning naming the skipped
+  cleanup (gateway drain / segment delete) and complete — any surviving
+  controller elsewhere then needs a manual `fabricctl` cleanup.
+- One-gateway-per-segment is a design invariant; running two `WiremeshGateway`
+  CRs against one segment disables the automatic stale-id adoption drain (the
+  operator will never risk draining a live peer).
 - The `Relayed → Direct` make-before-break cutover and relay multiplexing are
   data-plane fast-follows (see the project CLAUDE.md).
 

@@ -157,6 +157,20 @@ pub struct WiremeshGatewaySpec {
     /// persisted identity is a few KB). Parity with `WiremeshControllerSpec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_size: Option<String>,
+    /// Override for the gateway's `--observe` target (`host:port`; DNS hostnames
+    /// are accepted — the gateway re-resolves per tick). Needed when the
+    /// ClusterIP observe path is SNAT'd by kube-proxy (poisoning the observed
+    /// public mapping); point this at a source-preserving UDP LB instead.
+    /// Absent → the controller Service ClusterIP (today's default). The enroll
+    /// init-container is NEVER affected by this override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observe_endpoint: Option<String>,
+    /// Override for the gateway's `--controller-sync` target (`host:port`; DNS
+    /// hostnames accepted — re-resolved per reconnect). For controllers reached
+    /// through an external LB / DDNS name. Absent → the controller Service
+    /// ClusterIP. The enroll init-container is NEVER affected by this override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_endpoint: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
@@ -191,6 +205,14 @@ pub struct WiremeshRelaySpec {
     pub node_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// StorageClass for the per-relay identity PVC (`<name>-relay-data`).
+    /// Omitted → the cluster default class. Parity with `WiremeshGatewaySpec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    /// Size of the per-relay identity PVC. Omitted → the 128Mi default (the
+    /// enrolled certs are a few KB). Parity with `WiremeshGatewaySpec`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_size: Option<String>,
 }
 
 /// All five CRDs, for the `crdgen` binary and for the operator's install/verify.
@@ -227,8 +249,8 @@ mod tests {
         let _ = WiremeshController::new("wm", WiremeshControllerSpec::default_for_test());
         let _ = WiremeshSegment::new("s", WiremeshSegmentSpec { segment_name: "s".into(), cidrs: vec![] });
         let _ = WiremeshPolicy::new("p", WiremeshPolicySpec { from: "a".into(), to: "b".into(), rules: vec![] });
-        let _ = WiremeshGateway::new("g", WiremeshGatewaySpec { segment_ref: "s".into(), node_name: None, node_selector: None, wg_port: None, tun: None, image: None, storage_class: None, storage_size: None });
-        let _ = WiremeshRelay::new("r", WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None });
+        let _ = WiremeshGateway::new("g", WiremeshGatewaySpec { segment_ref: "s".into(), node_name: None, node_selector: None, wg_port: None, tun: None, image: None, storage_class: None, storage_size: None, observe_endpoint: None, sync_endpoint: None });
+        let _ = WiremeshRelay::new("r", WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None });
         // Kind names are what the apiserver registers.
         assert_eq!(WiremeshSegment::kind(&()), "WiremeshSegment");
     }
@@ -248,6 +270,8 @@ mod tests {
             image: None,
             storage_class: Some("fast-ssd".into()),
             storage_size: Some("256Mi".into()),
+            observe_endpoint: None,
+            sync_endpoint: None,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(
@@ -271,6 +295,8 @@ mod tests {
             image: None,
             storage_class: None,
             storage_size: None,
+            observe_endpoint: None,
+            sync_endpoint: None,
         };
         let vb = serde_json::to_value(&bare).unwrap();
         assert!(vb.get("storageClass").is_none(), "storageClass omitted when unset");

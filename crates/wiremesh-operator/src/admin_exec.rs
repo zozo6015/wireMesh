@@ -38,6 +38,39 @@ pub struct GatewayRow {
     pub applied_version: u64,
 }
 
+/// The exec-transport argv for a REBIND mint (past `operator-admin`; the
+/// `--socket` flag is appended by the exec caller) — the exec-side twin of
+/// [`crate::admin::rebind_mint_request`], which `operator_admin.rs` forwards
+/// verbatim into `MintTokenRequest`. Keeps ONE definition of the encoding per
+/// transport: `--kind rebind` (never `gateway`), the segment id, and NO
+/// `--cidr` (a rebind token carries no CIDR binding).
+pub fn rebind_mint_args(rebind_segment_id: u64) -> Vec<String> {
+    vec![
+        "mint-token".to_string(),
+        "--kind".to_string(),
+        crate::admin::REBIND_TOKEN_KIND.to_string(),
+        "--rebind-segment-id".to_string(),
+        rebind_segment_id.to_string(),
+    ]
+}
+
+/// A relay roster row — the shape both transports return (the gRPC path maps
+/// the proto `Relay`; the exec path parses the sidecar's JSON).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelayRow {
+    #[allow(dead_code)]
+    pub id: u64,
+    #[allow(dead_code)]
+    pub name: String,
+    /// The relay's advertised `ip:port` — the ONLY field the operator can match
+    /// a `WiremeshRelay` CR against: the controller names an enrolled relay
+    /// `relay-<token-hash>` (`services/enrollment.rs`), never the CR's name,
+    /// whereas the endpoint is the CR's `spec.endpoint` verbatim.
+    pub endpoint: String,
+    #[allow(dead_code)]
+    pub status: String,
+}
+
 pub enum AdminExec {
     /// Direct gRPC to `addr` (host:port) with a bearer `token`.
     Grpc { addr: String, token: String },
@@ -144,8 +177,24 @@ impl AdminExec {
             .with_context(|| format!("parsing operator-admin JSON (stdout={out:?} stderr={err:?})"))
     }
 
-    fn is_grpc(&self) -> bool {
+    /// Whether this is the direct-gRPC transport (`WIREMESH_ADMIN_ADDR` set).
+    /// Public because a caller may need to know the admin API is reachable
+    /// WITHOUT an in-cluster controller pod — see
+    /// `controllers::controller_cleanup_skip`.
+    pub fn is_grpc(&self) -> bool {
         matches!(self, AdminExec::Grpc { .. })
+    }
+
+    /// The label selector this transport resolves the controller pod with
+    /// (honoring `WIREMESH_CONTROLLER_LABEL`), or `None` on the gRPC transport,
+    /// which needs no pod. Callers that probe for the controller pod must use
+    /// THIS selector rather than re-deriving the default, or they can conclude
+    /// "controller gone" while the admin channel is healthy.
+    pub fn pod_label(&self) -> Option<&str> {
+        match self {
+            AdminExec::Exec { pod_label, .. } => Some(pod_label),
+            AdminExec::Grpc { .. } => None,
+        }
     }
 
     /// Apply a fabric (segments + policy) in one transaction.
@@ -169,6 +218,45 @@ impl AdminExec {
             args.push(c);
         }
         token_of(self.exec_json(&args, None).await?)
+    }
+
+    /// Mint a single-use REBIND token scoped to `rebind_segment_id` (non-zero).
+    /// At redemption the controller replaces the segment's active gateway
+    /// instead of rejecting the enroll with `SegmentAlreadyBound`.
+    ///
+    /// Wire encoding: [`rebind_mint_args`] / [`crate::admin::rebind_mint_request`]
+    /// — `kind = "rebind"` + EMPTY `bound_cidrs` + the segment id. The
+    /// controller keys rebind off the KIND alone and only reads
+    /// `rebind_segment_id` in that arm.
+    pub async fn mint_gateway_rebind_token(
+        &self,
+        rebind_segment_id: u64,
+    ) -> anyhow::Result<String> {
+        if self.is_grpc() {
+            return self.grpc().await?.mint_gateway_rebind_token(rebind_segment_id).await;
+        }
+        anyhow::ensure!(
+            rebind_segment_id != 0,
+            "a rebind token needs a non-zero segment id (0 means 'no rebind' on the wire)"
+        );
+        let owned = rebind_mint_args(rebind_segment_id);
+        let args: Vec<&str> = owned.iter().map(String::as_str).collect();
+        token_of(self.exec_json(&args, None).await?)
+    }
+
+    /// Resolve a segment's controller-side id by name (`None` if unregistered).
+    pub async fn segment_id_by_name(&self, name: &str) -> anyhow::Result<Option<u64>> {
+        if self.is_grpc() {
+            return self.grpc().await?.segment_id_by_name(name).await;
+        }
+        let v = self.exec_json(&["segment-id", "--name", name], None).await?;
+        match v.get("id") {
+            Some(serde_json::Value::Null) | None => Ok(None),
+            Some(id) => id
+                .as_u64()
+                .map(Some)
+                .ok_or_else(|| anyhow!("segment-id: non-numeric id in {v}")),
+        }
     }
 
     /// Mint a single-use relay enrollment token.
@@ -217,6 +305,24 @@ impl AdminExec {
         }
         let v = self.exec_json(&["list-gateways"], None).await?;
         Ok(serde_json::from_value(v).context("parsing gateway roster")?)
+    }
+
+    /// The controller's relay roster.
+    pub async fn list_relays(&self) -> anyhow::Result<Vec<RelayRow>> {
+        if self.is_grpc() {
+            let rows = self.grpc().await?.list_relays().await?;
+            return Ok(rows
+                .into_iter()
+                .map(|r| RelayRow {
+                    id: r.id,
+                    name: r.name,
+                    endpoint: r.endpoint,
+                    status: r.status,
+                })
+                .collect());
+        }
+        let v = self.exec_json(&["list-relays"], None).await?;
+        Ok(serde_json::from_value(v).context("parsing relay roster")?)
     }
 
     /// Drain a gateway by id (driven by the Gateway finalizer).

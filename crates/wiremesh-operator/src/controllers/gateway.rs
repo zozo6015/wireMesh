@@ -3,8 +3,14 @@
 //! `status.enrolled`/`gateway_id`. Finalizer drains the gateway on delete.
 
 use super::{apply, apply_deployment, owner_ref, Context, Error};
+use crate::admin_exec::GatewayRow;
 use crate::crd::{Condition, WiremeshGateway, WiremeshGatewayStatus, WiremeshSegment};
 use crate::workloads;
+
+// The PVC create-only guard now lives at the shared `controllers` scope (the
+// controller and relay reconcilers use the same choke point); re-exported here
+// so existing gateway-side callers/importers stay stable.
+pub use super::pvc_needs_create;
 use futures::StreamExt;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret};
@@ -56,12 +62,153 @@ pub fn should_mint_token(identity_persisted: bool, token_secret: Option<&Secret>
     !identity_persisted || needs_token(token_secret)
 }
 
-/// The gateway identity PVC is CREATE-ONLY: create it when absent, and NEVER
-/// apply/patch an existing one. A bound PVC's `storageClassName` and
-/// `resources.requests.storage` are immutable, so re-applying them on every
-/// reconcile churns or errors. Mirrors the `needs_token` create-once guard.
-pub fn pvc_needs_create(existing: Option<&PersistentVolumeClaim>) -> bool {
-    existing.is_none()
+/// The roster row for `segment` whose `status == "active"` — never a
+/// drained/replaced/draining/revoked row, regardless of roster ordering.
+///
+/// `Db::list_gateways` returns EVERY status ordered by id, so a stale drained
+/// row (lower id) can precede the live active row. A first-match-by-segment
+/// would return the stale row — mis-reporting status, draining the WRONG id on
+/// CR delete, and (worst) making a drained-only roster read as "active" →
+/// `identity_persisted` true → mint suppressed while the pod Init:Errors on a
+/// spent token (the mint-suppression deadlock). This selector is the single
+/// choke point every roster lookup routes through.
+pub fn active_in_segment<'a>(roster: &'a [GatewayRow], segment: &str) -> Option<&'a GatewayRow> {
+    roster.iter().find(|g| g.segment == segment && g.status == "active")
+}
+
+/// The rebind decision: compare the CIDRs the CURRENT token Secret was minted
+/// against (`bound_cidrs`) with the segment's CURRENT CIDRs, as SETS (order is
+/// cosmetic — rebinding on order churn would re-mint on every CR edit).
+///
+/// * `None` → no recorded binding (legacy pre-fix Secret) → `false`: we cannot
+///   know what the token was bound to, and churning a rebind every reconcile
+///   would be worse than waiting for the record to appear at the next
+///   legitimate mint. (First-mint is owned by `should_mint_token`.)
+/// * `Some(set-equal)` → `false`. `Some(differs)` → `true` → mint a REBIND
+///   token and refresh the Secret.
+pub fn needs_rebind(bound_cidrs: Option<&[String]>, segment_cidrs: &[String]) -> bool {
+    match bound_cidrs {
+        None => false,
+        Some(bound) => {
+            let bound: std::collections::HashSet<&str> = bound.iter().map(String::as_str).collect();
+            let current: std::collections::HashSet<&str> =
+                segment_cidrs.iter().map(String::as_str).collect();
+            bound != current
+        }
+    }
+}
+
+/// The Secret data key under which [`token_secret_body`] records the CIDRs a
+/// token was minted against (as a JSON array), so the next reconcile can read
+/// that binding back for the [`needs_rebind`] decision. Absent on legacy
+/// (pre-fix) Secrets → an UNKNOWN binding.
+const BOUND_CIDRS_KEY: &str = "bound_cidrs";
+
+/// Build the gateway enrollment-token Secret: the `token` key keeps its
+/// existing shape (the enroll init-container mounts it as-is), plus a record of
+/// the CIDRs the token was minted against (`BOUND_CIDRS_KEY`, JSON) so
+/// [`bound_cidrs_of`] can recover them for the rebind decision.
+/// Namespace/ownerRefs are stamped by the reconciler, as before.
+pub fn token_secret_body(gateway_name: &str, token: &str, bound_cidrs: &[String]) -> Secret {
+    let mut data = BTreeMap::new();
+    data.insert("token".to_string(), ByteString(token.as_bytes().to_vec()));
+    data.insert(
+        BOUND_CIDRS_KEY.to_string(),
+        ByteString(serde_json::to_vec(bound_cidrs).expect("a CIDR list serializes to JSON")),
+    );
+    let mut sec = Secret {
+        metadata: kube::core::ObjectMeta {
+            name: Some(token_secret_name(gateway_name)),
+            ..Default::default()
+        },
+        data: Some(data),
+        ..Default::default()
+    };
+    sec.type_ = Some("Opaque".into());
+    sec
+}
+
+/// What the mint step must do this reconcile — see [`mint_action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintAction {
+    /// Roster unreadable while a rebind is pending: mint NOTHING and do not
+    /// touch the token Secret (the pending rebind must stay derivable).
+    Defer,
+    /// Mint an ordinary gateway token bound to the segment CIDRs and (re)write
+    /// the Secret's bound-CIDR record.
+    MintOrdinary,
+    /// Mint a `kind = "rebind"` token scoped to the segment id and refresh the
+    /// Secret.
+    MintRebind,
+    /// Steady state: nothing to do.
+    None,
+}
+
+/// The whole mint decision, pure — the reconciler matches on the result and
+/// owns only the I/O (the mint calls, the Secret apply, the deferral warning).
+///
+/// `identity_persisted` is [`identity_persisted`]'s output
+/// (`pvc_exists && gateway_active`); `gateway_active` is passed separately
+/// because the rebind arm keys off it directly, and because a roster FAILURE
+/// forces it false while `pvc_exists` may well be true.
+///
+/// # Why the order is load-bearing
+///
+/// `Defer` MUST come first. A failed `list_gateways` yields an empty roster,
+/// which makes `gateway_active` false → `identity_persisted` false →
+/// `should_mint_token` true, so the ordinary-mint arm is REACHABLE on a mere
+/// controller hiccup. Taking it while a rebind is pending is doubly wrong:
+///   * it mints a PLAIN token, which a still-occupied segment rejects with
+///     `SegmentAlreadyBound`; and
+///   * it rewrites the Secret's bound-CIDR record (via [`token_secret_body`]),
+///     so [`needs_rebind`] reads false from then on and the required rebind is
+///     PERMANENTLY LOST — nothing re-derives it. The gateway then sits on an
+///     unusable plain token and wedges at the next re-enroll.
+/// Deferring costs nothing: the not-enrolled requeue is 15s and the pending
+/// rebind stays derivable from the untouched Secret.
+///
+/// The ordinary-mint arm also deliberately precedes the rebind arm: an
+/// unpersisted identity (e.g. a replaced PVC) has nothing to keep, so it needs
+/// an unspent ORDINARY token — the rebind arm is for an ENROLLED gateway whose
+/// CIDRs moved underneath it.
+pub fn mint_action(
+    roster_ok: bool,
+    gateway_active: bool,
+    identity_persisted: bool,
+    rebind_pending: bool,
+    token_secret: Option<&Secret>,
+) -> MintAction {
+    if rebind_pending && !roster_ok {
+        MintAction::Defer
+    } else if should_mint_token(identity_persisted, token_secret) {
+        MintAction::MintOrdinary
+    } else if gateway_active && rebind_pending {
+        MintAction::MintRebind
+    } else {
+        MintAction::None
+    }
+}
+
+/// Reader half of the [`token_secret_body`] roundtrip: the exact CIDR set the
+/// Secret's token was minted against, or `None` for a legacy Secret with no
+/// record (an UNKNOWN binding — distinct from a recorded-empty one).
+pub fn bound_cidrs_of(secret: &Secret) -> Option<Vec<String>> {
+    let raw = secret.data.as_ref()?.get(BOUND_CIDRS_KEY)?;
+    match serde_json::from_slice(&raw.0) {
+        Ok(cidrs) => Some(cidrs),
+        Err(e) => {
+            // A PRESENT-but-corrupt record reads as "unknown" (→ no rebind), the
+            // same as a legacy Secret — deliberately quiet in the control flow,
+            // but never silent: a hand-edited/truncated record would otherwise
+            // suppress rebinds forever with no trace of why.
+            tracing::debug!(
+                "token Secret {name:?}: ignoring unparseable {BOUND_CIDRS_KEY} record ({e}); \
+                 treating the binding as UNKNOWN (no rebind until the next legitimate mint)",
+                name = secret.metadata.name,
+            );
+            None
+        }
+    }
 }
 
 /// Decide whether a genuine emptyDir→PVC ADOPTION requires draining a stale
@@ -149,6 +296,22 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     let secrets = Api::<Secret>::namespaced(client.clone(), &ns);
     let token_secret = token_secret_name(&name);
 
+    // FAIL CLOSED on a malformed endpoint override (mirrors the relay's
+    // `endpoint` validation): these flow verbatim into the gateway's argv, and
+    // the binary rejects a bad `host:port` at boot — deploying it anyway would
+    // just CrashLoopBackOff a pod. Erroring here surfaces the reason on the CR's
+    // reconcile instead. Validated BEFORE any mint/PVC/Deployment side effect.
+    for (field, value) in [
+        ("observeEndpoint", gw.spec.observe_endpoint.as_deref()),
+        ("syncEndpoint", gw.spec.sync_endpoint.as_deref()),
+    ] {
+        if let Some(v) = value {
+            workloads::validate_dial_target(v).map_err(|e| {
+                Error::Admin(anyhow::anyhow!("WiremeshGateway {name}: spec.{field}: {e}"))
+            })?;
+        }
+    }
+
     // Resolve the segment's CIDRs (the token is bound to them).
     let seg = Api::<WiremeshSegment>::all(client.clone())
         .get(&gw.spec.segment_ref)
@@ -172,20 +335,27 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // fresh token. That is harmless — a spare token simply goes unused once the
     // persisted identity makes the enroll init skip — and it avoids wedging the
     // reconcile on a transient controller hiccup.
-    let roster = match ctx.admin.list_gateways().await {
-        Ok(rows) => rows,
+    // `roster_ok` distinguishes "the controller says there is no active gateway"
+    // from "we could not ask". Both yield an empty roster, but they must NOT be
+    // treated alike by the rebind arm below — see the pending-rebind guard.
+    let (roster, roster_ok) = match ctx.admin.list_gateways().await {
+        Ok(rows) => (rows, true),
         Err(e) => {
             tracing::warn!(
                 "gateway {name}: controller roster query failed ({e}); treating gateway as \
                  not-active (conservative: mint a spare enrollment token)"
             );
-            Vec::new()
+            (Vec::new(), false)
         }
     };
-    // Find THIS CR's segment row in the roster ONCE and reuse it for the mint
-    // decision, the adoption-drain decision, and the status below (matched by
-    // segment NAME — the only key the roster carries).
-    let seg_row = roster.iter().find(|g| g.segment == seg.spec.segment_name);
+    // Find THIS CR's segment's ACTIVE row in the roster ONCE and reuse it for
+    // the mint decision, the adoption-drain decision, and the status below.
+    // ACTIVE-filtered (`active_in_segment`), never first-match-by-segment: the
+    // roster is ordered by id and keeps drained/replaced rows, so a stale
+    // drained row (lower id) would otherwise shadow the live active row —
+    // mis-reporting status AND (via `gateway_active`) suppressing the mint a
+    // drained-only segment actually needs (the mint-suppression deadlock).
+    let seg_row = active_in_segment(&roster, &seg.spec.segment_name);
     let gateway_active = seg_row.is_some();
 
     // ADOPTION DETECTION (v0.2.2 — see docs/research/ops-finding-pvc-adoption-
@@ -280,8 +450,10 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
                 });
             match (roster_recheck, recount_recheck) {
                 (Ok(rows_now), Ok(recount_now)) => {
+                    // ACTIVE-filtered like the snapshot read — a stale drained
+                    // row must not masquerade as the segment's live gateway.
                     let active_id_now =
-                        rows_now.iter().find(|g| g.segment == seg.spec.segment_name).map(|g| g.id);
+                        active_in_segment(&rows_now, &seg.spec.segment_name).map(|g| g.id);
                     if drain_still_authorized(recount_now, active_id_now, stale_id) {
                         tracing::info!(
                             "gateway {name}: adoption: draining stale gateway id {stale_id} to free \
@@ -324,22 +496,104 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // unredeemed orphan simply lapses. A stronger guarantee would need a
     // controller-side idempotency key on MintToken (a possible follow-up).
     let identity_persisted = identity_persisted(pvc_exists, gateway_active);
-    if should_mint_token(identity_persisted, secrets.get_opt(&token_secret).await?.as_ref()) {
-        let token = ctx.admin.mint_gateway_token(&cidrs).await.map_err(Error::Admin)?;
-        let mut data = BTreeMap::new();
-        data.insert("token".to_string(), ByteString(token.into_bytes()));
-        let mut sec = Secret {
-            metadata: kube::core::ObjectMeta {
-                name: Some(token_secret.clone()),
-                namespace: Some(ns.clone()),
-                owner_references: Some(vec![owner_ref(gw)?]),
-                ..Default::default()
-            },
-            data: Some(data),
-            ..Default::default()
-        };
-        sec.type_ = Some("Opaque".into());
-        apply(&secrets, &sec).await?;
+    let existing_secret = secrets.get_opt(&token_secret).await?;
+    // Evaluated INDEPENDENTLY of the roster: whether the segment's CIDRs moved
+    // since this Secret's token was minted is a fact about the Secret, not about
+    // the controller's view of the gateway.
+    let rebind_pending =
+        needs_rebind(existing_secret.as_ref().and_then(bound_cidrs_of).as_deref(), &cidrs);
+
+    // The decision itself is pure and lives in ONE place (`mint_action`), so a
+    // future edit cannot silently reorder the arms — in particular it cannot
+    // let the ordinary-mint arm run ahead of the pending-rebind guard and
+    // destroy the Secret's bound-CIDR record. Everything below is just the I/O
+    // for whichever action was chosen.
+    match mint_action(
+        roster_ok,
+        gateway_active,
+        identity_persisted,
+        rebind_pending,
+        existing_secret.as_ref(),
+    ) {
+        MintAction::Defer => {
+            // PENDING-REBIND GUARD (see `mint_action`'s doc for why this must
+            // win over every other arm). Deferring costs nothing: the requeue
+            // below is 15s while not-enrolled, and the pending rebind stays
+            // derivable from the untouched Secret.
+            tracing::warn!(
+                "gateway {name}: segment {segment} CIDRs changed but the controller roster is \
+                 unreadable — DEFERRING the mint to a later reconcile. Minting now would issue a \
+                 plain token the occupied segment rejects AND overwrite the Secret's bound-CIDR \
+                 record, losing the pending rebind.",
+                segment = seg.spec.segment_name,
+            );
+        }
+        MintAction::MintOrdinary => {
+            let token = ctx.admin.mint_gateway_token(&cidrs).await.map_err(Error::Admin)?;
+            // `token_secret_body` also RECORDS the CIDRs the token was minted
+            // against, so later reconciles can detect a segment-CIDR change and
+            // issue a rebind (see the rebind arm below).
+            let mut sec = token_secret_body(&name, &token, &cidrs);
+            sec.metadata.namespace = Some(ns.clone());
+            sec.metadata.owner_references = Some(vec![owner_ref(gw)?]);
+            apply(&secrets, &sec).await?;
+        }
+        MintAction::MintRebind => {
+        // REBIND (segment-CIDR change on an enrolled gateway): the stored token
+        // was minted against the OLD CIDR set, so any future re-enroll (fresh
+        // PVC, adoption, node loss) would be rejected — on the CIDR set
+        // (`BoundCidrMismatch`) and, since the segment still has an active
+        // gateway, on the one-gateway-per-segment invariant
+        // (`SegmentAlreadyBound`). Mint a REBIND token instead: `kind =
+        // "rebind"` with EMPTY bound CIDRs and this segment's id as its scope
+        // (`mint_gateway_rebind_token` — the controller keys the rebind path
+        // off the KIND, and a rebind token's authorization IS the segment id).
+        // At redemption the controller replaces (revokes) the segment's active
+        // gateway rather than rejecting the enroll. Then force-apply the
+        // refreshed Secret (SSA replaces the stale token). The Secret still
+        // records the NEW segment CIDRs — that record is operator-side
+        // bookkeeping for the next `needs_rebind` decision, independent of the
+        // (empty) CIDRs on the wire.
+        //
+        // Pod recreation: NOT triggered separately — the segment CIDRs feed the
+        // enroll init-container argv (`--cidr`) via `gateway_deployment`, so
+        // the CIDR change itself alters the pod template and the Deployment's
+        // Recreate strategy replaces the pod on the apply below. The idempotent
+        // enroll init then redeems the rebind token if the persisted identity
+        // is absent, and skips otherwise (the live identity stays valid; the
+        // fabric apply already routes the new CIDRs, and the refreshed token
+        // covers every future re-enroll).
+            match ctx.admin.segment_id_by_name(&seg.spec.segment_name).await {
+                Ok(Some(segment_id)) => {
+                    let token = ctx
+                        .admin
+                        .mint_gateway_rebind_token(segment_id)
+                        .await
+                        .map_err(Error::Admin)?;
+                    let mut sec = token_secret_body(&name, &token, &cidrs);
+                    sec.metadata.namespace = Some(ns.clone());
+                    sec.metadata.owner_references = Some(vec![owner_ref(gw)?]);
+                    apply(&secrets, &sec).await?;
+                    tracing::info!(
+                        "gateway {name}: segment {segment} CIDRs changed — minted a rebind token \
+                         and refreshed the token Secret (new bound CIDRs: {cidrs:?})",
+                        segment = seg.spec.segment_name,
+                    );
+                }
+                Ok(None) => {
+                    // The fabric apply that introduces/renames the segment hasn't
+                    // landed controller-side yet; the requeue will retry the rebind.
+                    tracing::warn!(
+                        "gateway {name}: rebind needed but segment {segment} is not registered \
+                         in the controller yet; deferring to the next reconcile",
+                        segment = seg.spec.segment_name,
+                    );
+                }
+                Err(e) => return Err(Error::Admin(e)),
+            }
+        }
+        // Steady state: single-use tokens must not be re-minted every reconcile.
+        MintAction::None => {}
     }
 
     // Persist the gateway identity on a per-gateway PVC (owner-referenced → GC'd
@@ -388,6 +642,24 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
 }
 
 async fn cleanup_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Error> {
+    // BEST-EFFORT with respect to a GONE controller (see the `controllers`
+    // module doc's *Teardown order*): if the WiremeshController CR was deleted
+    // before this Gateway CR (`kubectl delete -f all.yaml`), every admin call
+    // below can only fail forever and this CR would wedge in `Terminating`.
+    // Skip-with-a-loud-warning and complete the finalizer — the roster state
+    // died with the controller. A controller that is PRESENT but erroring still
+    // hard-fails below (finalizer retry).
+    if super::controller_cleanup_skip(ctx).await {
+        tracing::warn!(
+            "gateway {name} finalizer: controller is GONE (WiremeshController CR absent or no \
+             Running controller pod) — SKIPPING the controller-side drain (status gateway_id: \
+             {id:?}). If a controller still exists elsewhere, drain manually: `fabricctl drain`.",
+            name = gw.name_any(),
+            id = gw.status.as_ref().and_then(|s| s.gateway_id),
+        );
+        return Ok(Action::await_change());
+    }
+
     // Drain the gateway in the controller (withdraw + revoke) before the
     // workload is GC'd with the CR. Prefer the id we recorded in status — the
     // referenced Segment CR may already be deleted, so we must NOT depend on
@@ -396,19 +668,62 @@ async fn cleanup_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, 
         Some(id) => Some(id),
         None => {
             // Fallback: resolve via the segment name if the CR still exists.
+            // ACTIVE-filtered: a stale drained/replaced roster row must never
+            // pick the drain target (draining the wrong id when stale entries
+            // precede the live row was the reported bug).
+            //
+            // SOLE-CR GUARD (mirrors the adoption path): with no
+            // `status.gateway_id`, this CR can prove NOTHING about which id is
+            // its own — it may never have enrolled at all. The roster keys a
+            // gateway to its segment by NAME only, so if a PEER
+            // `WiremeshGateway` CR also targets this segment, the segment's
+            // active id may be that peer's LIVE gateway and draining it would
+            // be an outage. Only drain when this CR is the sole gateway CR for
+            // the segment (it is still listed during its own finalizer, so the
+            // expected sole count is 1). SAFE FALLBACK on a list failure:
+            // never drain — a missed drain is a manual `fabricctl drain`, a
+            // wrong drain kills a live peer.
             let seg_name = Api::<WiremeshSegment>::all(ctx.client.clone())
                 .get_opt(&gw.spec.segment_ref)
                 .await?
                 .map(|s| s.spec.segment_name);
             match seg_name {
-                Some(name) => ctx
-                    .admin
-                    .list_gateways()
-                    .await
-                    .map_err(Error::Admin)?
-                    .iter()
-                    .find(|g| g.segment == name)
-                    .map(|g| g.id),
+                Some(name) => {
+                    let sole = match Api::<WiremeshGateway>::all(ctx.client.clone())
+                        .list(&ListParams::default())
+                        .await
+                    {
+                        Ok(list) => {
+                            list.items
+                                .iter()
+                                .filter(|g| g.spec.segment_ref == gw.spec.segment_ref)
+                                .count()
+                                == 1
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "gateway {gwname} cleanup: listing WiremeshGateway CRs failed \
+                                 ({e}); treating as NOT the sole gateway for segment {name} \
+                                 (conservative: skip the fallback drain)",
+                                gwname = gw.name_any(),
+                            );
+                            false
+                        }
+                    };
+                    if !sole {
+                        tracing::warn!(
+                            "gateway {gwname} cleanup: no recorded gateway_id and this CR is \
+                             not the sole WiremeshGateway for segment {name} — SKIPPING the \
+                             fallback drain (the segment's active id may be a live peer's \
+                             gateway). Drain manually if a stale id remains.",
+                            gwname = gw.name_any(),
+                        );
+                        None
+                    } else {
+                        let roster = ctx.admin.list_gateways().await.map_err(Error::Admin)?;
+                        active_in_segment(&roster, &name).map(|g| g.id)
+                    }
+                }
                 None => None,
             }
         }

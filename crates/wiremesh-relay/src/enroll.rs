@@ -47,8 +47,54 @@ fn write_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Whether `certdir` already holds a COMPLETE relay identity — all three of
+/// [`IDENTITY_FILES`] present and non-empty. Mirrors the gateway's
+/// `Identity::probe` classification:
+///
+///   * complete → `Ok(true)`: skip (never redeem the token again).
+///   * absent, or PARTIAL / empty (a crash between the three writes) →
+///     `Ok(false)`: proceed with the real enrollment, which overwrites.
+///   * any other IO failure (EACCES/EIO/EISDIR) → `Err`: PROPAGATE. An
+///     unreadable-but-possibly-present identity must never be read as "absent"
+///     and clobbered by redeeming the single-use token.
+pub fn probe_identity(certdir: &Path) -> anyhow::Result<bool> {
+    let mut complete = 0usize;
+    for name in IDENTITY_FILES {
+        let path = certdir.join(name);
+        match fs::metadata(&path) {
+            // A zero-length file is a half-written identity, not an identity.
+            Ok(m) if m.len() > 0 => complete += 1,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| format!("probing {}", path.display()));
+            }
+        }
+    }
+    Ok(complete == IDENTITY_FILES.len())
+}
+
 /// Enroll and persist the relay identity.
+///
+/// **Idempotent**, exactly like `wiremesh-gateway enroll`: if `--certdir`
+/// already holds a complete identity ([`probe_identity`]), this is a no-op — it
+/// logs a skip and returns `Ok(())` WITHOUT reading the CA or dialing the
+/// controller. This is what makes the operator's PVC-backed relay durable: the
+/// enroll init-container runs on EVERY pod start, enrolls once into a fresh
+/// PVC, and skips on every later start — so a node reboot/upgrade/eviction no
+/// longer re-redeems a SPENT single-use token and wedges the pod in
+/// `Init:Error`. (A partial identity still proceeds to a real enrollment.)
 pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
+    // MUST come before the CA read and the controller dial so a re-run never
+    // redeems a (now spent) single-use token.
+    if probe_identity(&args.certdir)? {
+        eprintln!(
+            "wiremesh-relay: already enrolled (identity present in {}), skipping",
+            args.certdir.display()
+        );
+        return Ok(());
+    }
+
     let ca_pem = fs::read_to_string(&args.ca_path)
         .with_context(|| format!("reading CA bundle {}", args.ca_path.display()))?;
 
@@ -86,14 +132,16 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
 /// (`User=wiremesh` in `deploy/packages/systemd/wiremesh-relay.service`).
 pub const SERVICE_USER: &str = "wiremesh";
 
-/// Best-effort handoff of the enrolled identity to the packaged service
-/// user — called by the `wiremesh-relay-enroll` BINARY (not by
-/// [`run_enroll`], which stays a pure library step for the K8s operator's
-/// init-container and the tests).
-///
-/// The three identity files [`run_enroll`] generates inside `certdir`.
+/// The three identity files [`run_enroll`] generates inside `certdir` — also
+/// what [`probe_identity`] requires (all three, non-empty) to call an identity
+/// complete.
 const IDENTITY_FILES: [&str; 3] = ["ca.pem", "relay.pem", "relay.key"];
 
+/// Best-effort handoff of the enrolled identity to the packaged service user —
+/// called by the `wiremesh-relay-enroll` BINARY (not by [`run_enroll`], which
+/// stays a pure library step for the K8s operator's init-container and the
+/// tests).
+///
 /// Rationale (ops finding 2026-07-27/28, "Relay Finding A",
 /// `docs/research/ops-finding-multi-gateway-convergence.md`):
 /// `wiremesh-relay-enroll` is documented as a `sudo` step, so the identity

@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         client: client.clone(),
         namespace: namespace.clone(),
         admin: Arc::new(admin_from_env(client, &namespace)),
+        fabric_apply_lock: Arc::new(tokio::sync::Mutex::new(())),
     });
 
     // Liveness endpoint on :8080.

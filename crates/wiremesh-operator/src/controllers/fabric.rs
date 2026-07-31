@@ -22,7 +22,21 @@ const SEGMENT_FINALIZER: &str = "wiremesh.io/segment-cleanup";
 
 /// Render + Apply the full fabric from ALL segments + policies. Shared by the
 /// apply path and (after a segment delete) the finalizer's post-delete render.
+///
+/// Serialized on `ctx.fabric_apply_lock`: the CR LIST must happen INSIDE the
+/// critical section, otherwise a concurrent Segment finalizer's
+/// delete+re-render can interleave with an Apply-path render that still saw
+/// the segment — resurrecting the ghost segment into the fabric after its
+/// delete. The finalizer's Cleanup arm holds the same lock across its whole
+/// delete+apply sequence (via [`apply_fabric_locked`], since a tokio `Mutex`
+/// is not reentrant).
 async fn apply_fabric(ctx: &Context) -> Result<(), Error> {
+    let _guard = ctx.fabric_apply_lock.lock().await;
+    apply_fabric_locked(ctx).await
+}
+
+/// The body of [`apply_fabric`]; the caller MUST hold `ctx.fabric_apply_lock`.
+async fn apply_fabric_locked(ctx: &Context) -> Result<(), Error> {
     let client = ctx.client.clone();
     let segs = Api::<WiremeshSegment>::all(client.clone()).list(&ListParams::default()).await?;
     let pols = Api::<WiremeshPolicy>::all(client.clone()).list(&ListParams::default()).await?;
@@ -73,13 +87,34 @@ async fn reconcile(seg: Arc<WiremeshSegment>, ctx: Arc<Context>) -> Result<Actio
                 Ok(Action::requeue(Duration::from_secs(300)))
             }
             Event::Cleanup(seg) => {
+                // BEST-EFFORT with respect to a GONE controller (see the
+                // `controllers` module doc's *Teardown order*): with the
+                // WiremeshController CR (or its pod) already gone, the segment
+                // delete + re-render can only fail forever and this CR would
+                // wedge in `Terminating`. Skip loudly and complete the
+                // finalizer; a present-but-erroring controller still
+                // hard-fails below (finalizer retry).
+                if super::controller_cleanup_skip(&ctx).await {
+                    tracing::warn!(
+                        "segment {name} finalizer: controller is GONE (WiremeshController CR \
+                         absent or no Running controller pod) — SKIPPING the controller-side \
+                         segment delete and the fabric re-render. If a controller still exists \
+                         elsewhere, delete the segment manually (fabricctl).",
+                        name = seg.spec.segment_name,
+                    );
+                    return Ok(Action::await_change());
+                }
                 // Segment removed from the fabric: delete it in the controller,
                 // then re-render so peers/policy referencing it are updated.
+                // The fabric lock is held across the WHOLE delete+re-render so
+                // a concurrent Apply-path render (whose list still saw this
+                // segment) cannot slot in between and resurrect it.
+                let _guard = ctx.fabric_apply_lock.lock().await;
                 ctx.admin
                     .delete_segment_by_name(&seg.spec.segment_name)
                     .await
                     .map_err(Error::Admin)?;
-                apply_fabric(&ctx).await?;
+                apply_fabric_locked(&ctx).await?;
                 Ok(Action::await_change())
             }
         }
