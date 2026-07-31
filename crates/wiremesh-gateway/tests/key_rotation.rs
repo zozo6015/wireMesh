@@ -1233,3 +1233,560 @@ async fn old_epoch_device_is_torn_down_after_rotation() {
     drop(lab);
     eprintln!("\nDONE-BAR PASSED: the old epoch's Device (wg0) is torn down after its rotation retires, the mesh keeps working on the new tun, and policy changes keep reaching the live tun (Step 2+3: epoch-aware device unification + retire/teardown).");
 }
+
+// --- restart-durability helpers (Backlog 3 Task 1) ---------------------------
+
+/// Minimal base64 decoder for a 32-byte WG key — duplicated from
+/// `tunnelset_netns.rs` (`wiremesh_gateway::uapi`'s own decoder is
+/// `pub(crate)`-only, invisible to integration tests). Used solely to turn
+/// base64 pubkeys into the lowercase hex boringtun's UAPI speaks.
+fn base64_decode_32(s: &str) -> [u8; 32] {
+    fn val(c: u8) -> u32 {
+        match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("invalid base64 char in test pubkey: {:?}", c as char),
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|&c| c != b'=' && !c.is_ascii_whitespace()).collect();
+    let mut out = Vec::new();
+    for chunk in bytes.chunks(4) {
+        let mut n = 0u32;
+        for (i, &c) in chunk.iter().enumerate() {
+            n |= val(c) << (18 - 6 * i);
+        }
+        out.push((n >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
+    }
+    out.try_into().expect("WG pubkey must decode to exactly 32 bytes")
+}
+
+/// Lowercase hex of a base64-encoded 32-byte WG pubkey (the UAPI wire form).
+fn base64_pub_to_hex(b64: &str) -> String {
+    base64_decode_32(b64).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Panics loudly unless `python3` actually RUNS in `ns`. Called before every
+/// UAPI probe so an absent/broken interpreter can never be mistaken for a
+/// legitimate "socket not up yet" `None` — which would otherwise make the
+/// restart case fail with a completely misleading diagnosis (or, anywhere a
+/// `None` is tolerated, pass vacuously).
+///
+/// Probed exactly ONCE per process: a netns isolates only networking, and
+/// `Ns::exec`'s `nsenter --mount=<pin>` mount namespace differs from the
+/// container root's only in the private `/var/run/wireguard` tmpfs, so
+/// `/usr/bin/python3` is the same file in every `Ns` — one probe answers for
+/// all of them.
+fn require_python3(ns: &Ns) {
+    static PROBED: std::sync::Once = std::sync::Once::new();
+    PROBED.call_once(|| {
+        ns.exec(&["python3", "-c", "pass"]).expect(
+            "python3 is REQUIRED by this netns suite (the UAPI probe below, and \
+             spawn_listener/tcp_connect) but did not run in the gateway netns. The dev \
+             container gets python3 implicitly from the rust:1-bookworm base — \
+             dev/Dockerfile does not install it explicitly — so a base-image change can \
+             remove it. This is an ENVIRONMENT failure, not a gateway failure",
+        );
+    });
+}
+
+/// Raw `get=1` UAPI response of `ifname`'s Device INSIDE the gateway's
+/// namespaces. Unlike `tunnelset_netns.rs`'s in-process probe, this test
+/// stays in the root namespaces while each gateway's UAPI socket lives on a
+/// PRIVATE `/var/run/wireguard` tmpfs in that gateway `Ns`'s persistent
+/// mount namespace (see `wiremesh-testkit/src/netns.rs`'s `MOUNTNS_DIR`), so
+/// the probe must be a subprocess run through `Ns::exec` (which
+/// `nsenter --mount=<pin>`s first). boringtun 0.6.0 reports the device's own
+/// identity as a non-standard `own_public_key=<hex>` line (and omits
+/// `private_key=`), which the real `wg` CLI silently ignores — so this talks
+/// to the socket directly (Task-6 divergence,
+/// `docs/research/keyrot-task6-uapi-pubkey-note.md`). `None` while the
+/// Device/socket isn't up (connect refused / no such file) — callers poll.
+///
+/// **`python3` is a hard requirement of this file's netns suite** (this probe
+/// plus `spawn_listener`/`tcp_connect`). The dev container provides it
+/// IMPLICITLY — `dev/Dockerfile`'s explicit apt list does not name it; it
+/// arrives transitively with the `rust:1-bookworm` base (verified:
+/// `/usr/bin/python3`, Python 3.11.2, owned by `python3-minimal`). Because
+/// nothing pins that, a base-image bump could silently remove it — hence
+/// `require_python3` below: a missing interpreter must NOT masquerade as
+/// "the Device's UAPI socket isn't up yet".
+fn uapi_get_device(ns: &Ns, ifname: &str) -> Option<String> {
+    require_python3(ns);
+    let script = format!(
+        r#"
+import socket, sys
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(3)
+try:
+    s.connect("/var/run/wireguard/{ifname}.sock")
+    s.sendall(b"get=1\n\n")
+    buf = b""
+    while b"\n\n" not in buf:
+        d = s.recv(4096)
+        if not d:
+            break
+        buf += d
+except Exception as e:
+    sys.stderr.write(str(e))
+    sys.exit(1)
+sys.stdout.write(buf.decode())
+"#
+    );
+    let out = ns.exec(&["python3", "-c", &script]).ok()?;
+    let resp = String::from_utf8_lossy(&out.stdout).into_owned();
+    if resp.is_empty() {
+        None
+    } else {
+        Some(resp)
+    }
+}
+
+/// First `key=` value in a UAPI `get=1` response. For the device-level
+/// fields this test reads (`own_public_key`, `listen_port`) first-wins is
+/// correct: boringtun emits the device header before any peer section.
+fn uapi_field(resp: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    resp.lines().find_map(|l| l.strip_prefix(prefix.as_str()).map(str::to_string))
+}
+
+/// BACKLOG 3 TASK 1 done bar (SECURITY): a completed rotation must SURVIVE a
+/// gateway crash+restart — the promoted epoch is durable and the retired
+/// private key is durably GONE.
+///
+/// Today rotation's promote/retire lifecycle is process-local:
+/// `EpochKeys::promote`/`retire` have zero callers, boot unconditionally
+/// brings up epoch 0 from the identity key (`main.rs` ~238), and
+/// `EpochKeys::load` (~463) is only a mint base. So after the rotation this
+/// test completes, SIGKILLing gwA and restarting it from the same state dir
+/// resurrects the RETIRED epoch-0 key — while the controller (which
+/// promoted epoch 1) has every peer advertising only the new key: the
+/// restarted gateway is a fabric-wide black hole, and the "retired" private
+/// key was never actually destroyed.
+///
+/// Choreography: case 1's direct-mesh setup + rotation, then case 4's
+/// bounded wait for the retire/teardown to land (wg0 gone, wg0e1 present) so
+/// the retire step has provably run before the crash. Then SIGKILL gwA's
+/// process (a real crash — no graceful shutdown path) and restart the same
+/// binary from the same `--state-dir`. Assertions, in fail-first order:
+///
+///   (a) the restarted Device's OWN key — read via UAPI `get=1`
+///       `own_public_key` — is the NEW epoch's pubkey, never the retired
+///       epoch-0 one. **RED TODAY: this fails first** (the reboot comes up
+///       on the identity key = epoch 0).
+///   (b) `epoch_keys.json` no longer contains the retired private key — by
+///       raw byte-grep AND through the reloaded store's API.
+///   (c) wlA <-> wlB traffic resumes within 90s (bound derivation below).
+///   (d) per OD-1 the reboot RE-NORMALIZES: the new epoch's key runs on the
+///       BASE tun `wg0` at the BASE port 51820 (asserted via the UAPI
+///       socket probed being wg0's and its `listen_port`), regardless of the
+///       pre-reboot state (pre-crash the live device was `wg0e1` at 51821).
+///       `wg0e1` must not be resurrected. A reboot tears all sessions
+///       anyway, and peers' stored candidates are base-port — so base-port
+///       is the only endpoint peers can find the restarted gateway at.
+///
+/// Recovery bound for (c) — 90s, derived from the harness's existing
+/// patterns rather than invented: worst case, gwB only notices its
+/// established path to gwA died via the path state machine's
+/// Direct -> Degraded transition at 45s of rx-silence (`path.rs`; pinned by
+/// `nat_matrix.rs` case 4) before it re-enters the punch/re-establish
+/// ladder; from there, re-establishment is bounded by this file's own
+/// standard 45s initial mesh-up window (every case here waits 45s for the
+/// first handshake under the mandatory 20ms netem). 45 + 45 = 90s — also
+/// exactly the bound `poll_rotation_complete` already uses. Typically far
+/// faster: the REBOOTED side re-initiates immediately (fail-static apply +
+/// punch ladder from boot), it doesn't wait for gwB's silence detection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rotation_survives_gateway_restart_on_new_epoch() {
+    // Underlay bridge in the root netns; controller binds its routable IP.
+    setup_bridge();
+    let _root_guard = RootNetGuard;
+
+    let h = TestController::start_on(CTRL_IP.parse().unwrap()).await;
+
+    // ICMP-both-ways fabric BEFORE enrollment (same as case 1).
+    let diff = h.apply(FABRIC_ICMP).await;
+    assert!(
+        diff.policy_updated,
+        "fabric apply must compile a real policy, got: {diff:?}"
+    );
+
+    // Real per-gateway WG keypairs; enroll into the existing segments.
+    // NB: `a_priv` IS epoch 0's private key (the identity key `from_legacy`
+    // migrates at first boot) — it is the exact byte string that must be
+    // GONE from epoch_keys.json once the rotation's retire has run.
+    let (a_priv, a_pub) = wg_keypair();
+    let (b_priv, b_pub) = wg_keypair();
+    let ga = enroll_into(&h, "10.10.1.0/24", &a_pub).await;
+    let gb = enroll_into(&h, "10.10.2.0/24", &b_pub).await;
+
+    // netns lab: two gateways, two workloads.
+    let mut lab = Lab::new("gwrst").expect("lab");
+    let gwa = lab.ns("a").expect("gwA netns");
+    let gwb = lab.ns("b").expect("gwB netns");
+    let wla = lab.ns("wa").expect("wlA netns");
+    let wlb = lab.ns("wb").expect("wlB netns");
+
+    // Underlay veths from the bridge into each gateway netns.
+    attach_underlay(&gwa, "a", "10.9.0.1");
+    attach_underlay(&gwb, "b", "10.9.0.2");
+
+    // MANDATORY real one-way latency on both underlays (Phase-0 Finding 2) —
+    // must be applied AFTER the underlay `und` device exists.
+    apply_netem(&gwa, "und", 20).expect("netem on gwA underlay");
+    apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
+
+    // Segment veths + workload default routes.
+    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
+        .expect("seg-a veth");
+    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
+        .expect("seg-b veth");
+    wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
+        .expect("wlA default route");
+    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
+        .expect("wlB default route");
+
+    // Provision identity dirs and spawn the two REAL gateway binaries.
+    let sda = tempfile::tempdir().unwrap();
+    let sdb = tempfile::tempdir().unwrap();
+    write_identity(&ga, &a_priv, sda.path());
+    write_identity(&gb, &b_priv, sdb.path());
+    let logdir = tempfile::tempdir().unwrap();
+
+    let sync_addr = h.sync_tcp_addr().to_string();
+    let observe_addr = h.observe_addr().to_string();
+
+    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
+    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+
+    // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
+    let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
+    if !up {
+        dump_diag(
+            "mesh-not-up",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!("SETUP FAILED: workload A -> workload B ICMP (policy-permitted) never passed over the direct tunnel before rotation");
+    }
+    eprintln!("SETUP PASS: direct mesh is up (ICMP crosses wlA -> wlB)");
+
+    // ===== Rotate gwA's key (case-1 choreography) =====
+    h.admin_client()
+        .await
+        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .await
+        .expect("Admin.RotateKey");
+    eprintln!("Admin.RotateKey submitted for gwA (epoch 0 -> 1)");
+
+    let (completed, final_states) =
+        poll_rotation_complete(&h, ga.id(), Duration::from_secs(90)).await;
+    if !completed {
+        dump_diag(
+            "rotation-timeout",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "ROTATION TIMEOUT: gwA's key rotation (epoch 0 -> 1) did not complete within 90s \
+             (epoch 1 active + epoch 0 gone/retiring). Last observed debug_key_states: \
+             {final_states:?}"
+        );
+    }
+    eprintln!("ROTATION COMPLETE: {final_states:?}");
+
+    // ===== Wait for the retire/teardown to land BEFORE crashing =====
+    // Same bounded wait as `old_epoch_device_is_torn_down_after_rotation`:
+    // the retire grace is a handful of keepalives after every peer stays
+    // rx-corroborated live on the new tun. Waiting for gwA's `wg0` to be
+    // GONE (and `wg0e1` present) proves `service_retire` has run — so the
+    // durable-retire assertion (b) below is judged only after the point the
+    // ratified fix says the private key must have been scrubbed from disk.
+    let teardown_deadline = Instant::now() + Duration::from_secs(30);
+    let mut torn_down = false;
+    loop {
+        let wg0_gone = gwa.exec(&["ip", "link", "show", "wg0"]).is_err();
+        let wg0e1_present = gwa.exec(&["ip", "link", "show", "wg0e1"]).is_ok();
+        if wg0_gone && wg0e1_present {
+            torn_down = true;
+            break;
+        }
+        if Instant::now() >= teardown_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if !torn_down {
+        dump_diag(
+            "old-epoch-not-torn-down-pre-crash",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SETUP FAILED: gwA's epoch-0 retire/teardown (wg0 gone, wg0e1 present) never \
+             landed within 30s of the rotation completing — cannot test restart durability \
+             of a retire that hasn't happened"
+        );
+    }
+    eprintln!("PRE-CRASH: retire landed (gwA wg0 gone, wg0e1 present, live at offset port)");
+
+    // Capture the NEW epoch's key material from the persisted store while
+    // gwA is still up. `handle_rotate` persists the mint, so epoch 1 is in
+    // epoch_keys.json today (state "pending" — unpromoted, the bug) and
+    // post-fix (state "active"). No state assertions HERE, deliberately:
+    // every durable-state judgment happens post-restart so that assertion
+    // (a) is the first thing that can fail.
+    let pre_crash_store = match wiremesh_gateway::epochkeys::EpochKeys::load(sda.path()) {
+        Ok(Some(s)) => s,
+        other => {
+            pa.kill();
+            pb.kill();
+            panic!(
+                "gwA must have persisted an epoch_keys.json (boot migration + rotation \
+                 mint); load returned: {other:?}"
+            );
+        }
+    };
+    let Some(new_key) = pre_crash_store.by_epoch(1).cloned() else {
+        pa.kill();
+        pb.kill();
+        panic!(
+            "gwA's epoch_keys.json has no epoch-1 entry after a completed rotation; \
+             store: {pre_crash_store:?}"
+        );
+    };
+    let new_pub_hex = base64_pub_to_hex(&new_key.pubkey_b64);
+    let old_pub_hex = base64_pub_to_hex(&a_pub);
+    if new_pub_hex == old_pub_hex {
+        pa.kill();
+        pb.kill();
+        panic!("sanity: rotation minted a distinct key");
+    }
+
+    // ===== SIGKILL gwA (a real crash) =====
+    // `pkill -KILL -f <state-dir>`: the state-dir path is in gwA's argv and
+    // unique to it (a tempdir), so this reaches the actual gateway process
+    // (and its nsenter/ip-netns wrapper chain) without touching gwB — the
+    // same reach-the-real-process reasoning as case 1's `pkill -INT ping`.
+    // SIGKILL specifically: no signal handler, no graceful persist — the
+    // durability under test must come from what was ALREADY on disk.
+    let sda_str = sda.path().to_str().unwrap().to_string();
+    let killed = Command::new("pkill")
+        .args(["-KILL", "-f", &sda_str])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !killed {
+        // `pkill` exits 1 when NOTHING matched — gwA's process is not where
+        // this test thinks it is, so the "restart" would be meaningless.
+        pa.kill();
+        pb.kill();
+        panic!("pkill -KILL -f {sda_str} matched no process — could not crash gwA");
+    }
+    pa.kill(); // reap the wrapper Child + drain threads
+    // The crash must actually take the data plane down (tun devices die with
+    // their owning process's fds) before the restart re-creates it.
+    let dead = wait_until(Duration::from_secs(10), || {
+        gwa.exec(&["ip", "link", "show", "wg0e1"]).is_err()
+    });
+    if !dead {
+        pb.kill();
+        panic!(
+            "gwA's wg0e1 still present 10s after SIGKILL — the kill did not reach the \
+             gateway process; the restart below would not be a real crash-recovery"
+        );
+    }
+    eprintln!("CRASH: gwA SIGKILLed; data plane gone");
+
+    // ===== Restart gwA from the SAME state dir =====
+    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a-restart");
+
+    // ===== (a) THE RED ASSERTION: the restarted Device runs the NEW key =====
+    // Boot is controller-independent (fail-static), so the base tun must
+    // appear well inside 30s (the same bound style as the teardown wait).
+    // Poll until wg0's UAPI socket answers at all, THEN judge the key once.
+    let mut resp = None;
+    let probe_ok = wait_until(Duration::from_secs(30), || {
+        resp = uapi_get_device(&gwa, "wg0");
+        resp.as_deref().map_or(false, |r| uapi_field(r, "own_public_key").is_some())
+    });
+    if !probe_ok {
+        dump_diag(
+            "restart-no-wg0-uapi",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "RESTART FAILED: gwA's wg0 UAPI never answered get=1 within 30s of restart \
+             (last resp: {resp:?})"
+        );
+    }
+    let resp = resp.expect("probe_ok implies a response");
+    let own_hex = uapi_field(&resp, "own_public_key").expect("checked in probe");
+    if own_hex == old_pub_hex {
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SECURITY (Backlog 3 Task 1, RED): the restarted gateway RESURRECTED the \
+             RETIRED epoch-0 identity key — boot ignored the promoted epoch and came up \
+             on `Identity::wg_private_key_b64`. Peers advertise only the new epoch's key \
+             (the controller promoted it), so this gateway is now a fabric-wide black \
+             hole AND the \"retired\" private key was never destroyed. \
+             own_public_key={own_hex} == retired epoch-0 pubkey"
+        );
+    }
+    if own_hex != new_pub_hex {
+        dump_diag(
+            "restart-unexpected-own-key",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "restarted wg0's own_public_key is neither the retired epoch-0 key nor the \
+             promoted epoch-1 key — boot selected some unexpected identity"
+        );
+    }
+    eprintln!("RESTART KEY PASS: wg0 came up with the promoted epoch-1 key");
+
+    // ===== (b) durable retire: the old private key is GONE from disk =====
+    // Every failure below kills both gateway processes FIRST (the file-wide
+    // convention) so a failing assertion can never leave two real gateway
+    // binaries running against the lab's netns.
+    let raw = match std::fs::read_to_string(sda.path().join("epoch_keys.json")) {
+        Ok(r) => r,
+        Err(e) => {
+            pa.kill();
+            pb.kill();
+            panic!("reading gwA epoch_keys.json post-restart: {e}");
+        }
+    };
+    if raw.contains(&a_priv) {
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SECURITY: the retired epoch-0 PRIVATE key is still in gwA's epoch_keys.json \
+             after retire + restart — retirement never durably destroyed it:\n{raw}"
+        );
+    }
+    let store = match wiremesh_gateway::epochkeys::EpochKeys::load(sda.path()) {
+        Ok(Some(s)) => s,
+        other => {
+            pa.kill();
+            pb.kill();
+            panic!("re-reading gwA epoch_keys.json (must exist): {other:?}");
+        }
+    };
+    if store.epochs.iter().any(|k| k.private_key_b64 == a_priv) {
+        pa.kill();
+        pb.kill();
+        panic!("no store entry may still carry the retired epoch-0 private key: {store:?}");
+    }
+    let Some(active) = store.active() else {
+        pa.kill();
+        pb.kill();
+        panic!("post-rotation store must have an ACTIVE epoch for boot to select: {store:?}");
+    };
+    if active.pubkey_b64 != new_key.pubkey_b64 {
+        let got = active.pubkey_b64.clone();
+        pa.kill();
+        pb.kill();
+        panic!(
+            "the store's active entry must be the promoted epoch-1 key (got {got}, \
+             want {})",
+            new_key.pubkey_b64
+        );
+    }
+    eprintln!("DURABLE RETIRE PASS: epoch-0 private key absent from disk; epoch 1 active");
+
+    // ===== (c) traffic resumes within the derived 90s bound =====
+    let resumed = wait_until(Duration::from_secs(90), || ping_ok(&wla, "10.10.2.2"));
+    if !resumed {
+        dump_diag(
+            "post-restart-traffic-never-resumed",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "POST-RESTART FAILED: wlA -> wlB ICMP did not resume within 90s of gwA's \
+             restart (bound = 45s peer-side Direct->Degraded silence detection + 45s \
+             standard mesh-establishment window). Peers hold base-port candidates and \
+             the restarted gateway is on the base port, so the normal punch/re-establish \
+             ladder should have reconverged"
+        );
+    }
+    eprintln!("RECOVERY PASS: wlA <-> wlB traffic resumed after the restart");
+
+    // ===== (d) OD-1 re-normalization: base tun, base port, no zombie e-tun =====
+    // The key already proved to live on wg0 (that's the socket probed in (a));
+    // its listen_port must be the BASE port — pre-crash the live device was
+    // wg0e1 at 51821, and a reboot must NOT preserve that offset (peers'
+    // stored candidates are base-port; sessions were torn by the reboot).
+    let Some(port) = uapi_field(&resp, "listen_port") else {
+        pa.kill();
+        pb.kill();
+        panic!("boringtun's get=1 always reports listen_port; response was:\n{resp}");
+    };
+    if port != "51820" {
+        dump_diag(
+            "restart-not-on-base-port",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "OD-1: the restarted gateway must re-normalize to the BASE WireGuard port \
+             regardless of the pre-reboot epoch offset (was on 51821 pre-crash)"
+        );
+    }
+    if gwa.exec(&["ip", "link", "show", "wg0"]).is_err() {
+        dump_diag(
+            "restart-no-base-tun",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!("OD-1: the restarted gateway's device must be the base tun wg0");
+    }
+    if gwa.exec(&["ip", "link", "show", "wg0e1"]).is_ok() {
+        dump_diag(
+            "restart-resurrected-offset-tun",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "OD-1: the restarted gateway must NOT resurrect the pre-crash epoch-offset tun \
+             wg0e1 — the promoted epoch runs on the base tun after a reboot"
+        );
+    }
+    eprintln!("OD-1 PASS: restarted gateway is on wg0 at the base port, no wg0e1");
+
+    // Teardown.
+    pa.kill();
+    pb.kill();
+    drop(lab);
+    eprintln!("\nDONE-BAR PASSED: a completed rotation survives a crash+restart — the promoted epoch boots (on wg0/base port per OD-1), the retired private key is durably gone, and traffic reconverges.");
+}

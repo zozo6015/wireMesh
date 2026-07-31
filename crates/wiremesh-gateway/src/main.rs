@@ -154,8 +154,10 @@ const RETIRE_POLL_PERIOD: Duration = Duration::from_millis(500);
 struct ActiveTunInfo {
     /// The active tun's interface name (`wg0` or `wg0e<N>`).
     ifname: String,
-    /// The active tun's WireGuard private key (epoch 0's identity key, or the
-    /// rotated epoch's key after a Role-A cutover).
+    /// The active tun's WireGuard private key (the boot key selected by
+    /// `EpochKeys::select_boot_key` — the store's active epoch, else the
+    /// legacy identity key — or the rotated epoch's key after a Role-A
+    /// cutover).
     priv_key: String,
     /// The active tun's WireGuard listen port (base port, or the rotation
     /// epoch's offset port after a cutover).
@@ -227,17 +229,46 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     if let Err(e) = routes::set_rp_filter_loose() {
         eprintln!("wiremesh-gateway: could not set loose rp_filter (continuing): {e}");
     }
-    // Bring the boot epoch (0) up INTO the `TunnelSet` rather than as a
+    // Boot-key selection (Backlog 3 Task 1 — durable promote/retire): the
+    // persisted epoch store's ACTIVE entry wins over the legacy identity key,
+    // so a rebooted post-rotation gateway comes up on the PROMOTED epoch's
+    // key rather than resurrecting the retired epoch-0 key (which no peer
+    // advertises once the controller has promoted — the black-hole bug, see
+    // docs/research/key-rotation-teardown-notes.md item C). With no store or
+    // no active entry this falls back to `Identity::wg_private_key_b64`,
+    // byte-identical to the pre-fix boot. Per OD-1 the selection changes the
+    // KEY only, never the tun/port: boot is ALWAYS the base tun (`wg0`) at
+    // the base listen port regardless of the selected epoch — a reboot tears
+    // every WG session anyway, and peers hold base-port candidates for us,
+    // so re-normalizing is what lets the punch/re-establish ladder converge.
+    let epoch_store = EpochKeys::load(&cfg.state_dir).context("loading epoch key store")?;
+    let boot_key = EpochKeys::select_boot_key(epoch_store.as_ref(), &id.wg_private_key_b64)
+        .context("selecting boot key")?;
+    if boot_key.epoch != 0 {
+        eprintln!(
+            "wiremesh-gateway: booting on promoted epoch {} key (base tun/port per OD-1)",
+            boot_key.epoch
+        );
+    }
+    // Bring the boot epoch up INTO the `TunnelSet` rather than as a
     // standalone `Tunnel`, so that once a rotation retires it the old epoch's
     // Device can actually be torn down (its boringtun Device dropped +
     // `ip link del`). `bring_up` creates the boringtun Device, brings the tun
-    // link up at `TUN_MTU`, and applies epoch 0's private key + listen port
-    // with an EMPTY peer set; `apply_state` (boot fail-static below, and every
-    // Sync snapshot) fills in the peers.
+    // link up at `TUN_MTU`, and applies the boot epoch's private key + listen
+    // port with an EMPTY peer set; `apply_state` (boot fail-static below, and
+    // every Sync snapshot) fills in the peers. Keyed by the boot key's EPOCH
+    // number so a later rotation's retire (`old_epoch` = the store's active
+    // epoch at mint time) tears down THIS entry.
     let mut tunnels = TunnelSet::new();
-    tunnels.bring_up(0, &cfg.tun_ifname, &id.wg_private_key_b64, cfg.wg_listen_port, TUN_MTU)?;
+    tunnels.bring_up(
+        boot_key.epoch,
+        &cfg.tun_ifname,
+        &boot_key.private_key_b64,
+        cfg.wg_listen_port,
+        TUN_MTU,
+    )?;
     routes::install_mss_clamp(&cfg.tun_ifname, MSS)?;
-    // All live L4 enforcers, keyed by epoch (0 = boot tun `wg0`; `wg0e<N>` per
+    // All live L4 enforcers, keyed by epoch (boot epoch = boot tun `wg0`; `wg0e<N>` per
     // rotation). `apply_state` applies the current policy to EVERY entry so a
     // policy update reaches every tun that may be carrying traffic during a
     // rotation overlap (not just `wg0`). A `tokio::sync::Mutex` (same as the
@@ -246,7 +277,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // entries are torn down in a later step.
     let enforcers: Arc<Mutex<HashMap<u32, GatewayEnforcer>>> = Arc::new(Mutex::new({
         let mut m = HashMap::new();
-        m.insert(0u32, GatewayEnforcer::attach(&cfg.tun_ifname)?);
+        m.insert(boot_key.epoch, GatewayEnforcer::attach(&cfg.tun_ifname)?);
         m
     }));
 
@@ -267,7 +298,10 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // a continuous flow zero-drop across the make-before-break rotation window.
     let active = Arc::new(std::sync::Mutex::new(ActiveTunInfo {
         ifname: cfg.tun_ifname.clone(),
-        priv_key: id.wg_private_key_b64.clone(),
+        // The SELECTED boot key (store-active epoch, or the legacy identity
+        // key fallback) — must match what `bring_up` just applied, or the
+        // first `apply_state` would silently rekey the base tun.
+        priv_key: boot_key.private_key_b64.clone(),
         wg_port: cfg.wg_listen_port,
         applied_config: None,
         applied_peers: Vec::new(),
@@ -388,7 +422,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     let kind = match map.values().next().map(|e| e.kind()) {
                         Some(BackendKind::Nftables) => "nftables",
                         // eBPF is also the safe default for the (unreachable)
-                        // empty map — epoch 0 is always present.
+                        // empty map — the boot epoch is always present.
                         Some(BackendKind::Ebpf) | None => "ebpf",
                     };
                     let mut per_tun = Vec::with_capacity(map.len());
@@ -457,17 +491,25 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // Migrate the pre-rotation single identity key into a one-epoch store
     // (epoch 0, "active") the first time a rotation-aware gateway boots, so
     // `generate_next` has a base to mint from. Steady-state (no rotation)
-    // behavior is completely unchanged: epoch 0 already runs on `wg0` at the
-    // base port from the boot above; the epoch store is only consulted when a
-    // rotation actually starts.
-    let mut epoch_keys = match EpochKeys::load(&cfg.state_dir)? {
-        Some(k) => k,
-        None => {
-            let k = EpochKeys::from_legacy(&id.wg_private_key_b64)?;
-            k.persist(&cfg.state_dir)?;
-            k
-        }
-    };
+    // behavior is completely unchanged: the boot epoch already runs on `wg0`
+    // at the base port from the boot above; the epoch store is only consulted
+    // when a rotation actually starts. Uses the store loaded at boot-key
+    // selection above; an EXISTING store is kept verbatim even when
+    // `select_boot_key` fell back to the legacy key (a pending-only store
+    // from a crash-mid-mint) — overwriting it with `from_legacy` here would
+    // destroy the persisted mint. Shared (`Arc<Mutex<_>>`) because the
+    // lifecycle now has three writers: `handle_rotate` (sync loop) mints,
+    // the rotation tick's Role-A cutover promotes, and `service_retire`
+    // (run task) retires — each persisting its transition (Backlog 3 Task 1).
+    let epoch_keys: Arc<std::sync::Mutex<EpochKeys>> =
+        Arc::new(std::sync::Mutex::new(match epoch_store {
+            Some(k) => k,
+            None => {
+                let k = EpochKeys::from_legacy(&id.wg_private_key_b64)?;
+                k.persist(&cfg.state_dir)?;
+                k
+            }
+        }));
     // `tunnels` (created at boot — it owns the boot epoch-0 Device now, and the
     // per-rotation Devices below) stays owned by THIS (`block_on`'d) task,
     // never moved into a spawned task, since boringtun's `DeviceHandle` is not
@@ -497,6 +539,8 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         desired: ctx.desired.clone(),
         live_endpoints: live_endpoints.clone(),
         retire_ready: Arc::new(std::sync::Mutex::new(None)),
+        epoch_keys: epoch_keys.clone(),
+        collapse_ready: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     tokio::spawn(run_rotation_ticks(rot.clone()));
 
@@ -519,6 +563,9 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     // grace elapsed). Done HERE in the run task because it owns
                     // the non-`Send` `tunnels`/`enforcers`.
                     service_retire(&mut tunnels, &enforcers, &rot).await;
+                    // Likewise any completed Role-B collapse (a rotated PEER's
+                    // overlap Device whose reverse make-before-break finished).
+                    service_role_b_collapse(&mut tunnels, &enforcers, &rot).await;
 
                     // Bounded wait so the loop still wakes to service a retire
                     // even while the controller is quiet. `next_event` is
@@ -535,6 +582,15 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     };
                     match ev {
                         Ok(Some(sync::SyncEvent::State(ds))) => {
+                            // (Backlog 3 Task 1 slice of T3 — Role-B collapse
+                            // trigger) BEFORE apply_state, so that when a
+                            // rotating peer's retire delta collapses its key
+                            // set back to active-only, the unpin below takes
+                            // effect in THIS very apply: `wg0` gets rebuilt
+                            // with the peer's NEW active key immediately, and
+                            // the tick's reverse make-before-break can start
+                            // waiting for that session to go live.
+                            maybe_collapse_role_b(&rot, &ds);
                             apply_state(
                                 &enforcers,
                                 applied.as_ref(),
@@ -680,7 +736,6 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 d.epoch
                             );
                             if let Err(e) = handle_rotate(
-                                &mut epoch_keys,
                                 &mut tunnels,
                                 &enforcers,
                                 &rot,
@@ -2494,9 +2549,69 @@ async fn service_retire(
         eprintln!("wiremesh-gateway: tearing down retired epoch {epoch} Device failed: {e}");
     }
     enforcers.lock().await.remove(&epoch);
+    // Durable retire (Backlog 3 Task 1 — the SECURITY half): tearing the
+    // Device down only destroys the live in-process copy of the old private
+    // key; `retire` REMOVES the epoch's store entry and `persist` rewrites
+    // `epoch_keys.json` without it — the retired key is scrubbed from
+    // epoch_keys.json (ONLY: the epoch-0 key also lives on in
+    // identity.json/wg_private.key — see epochkeys.rs's scope-of-the-scrub
+    // note), not left dormant next to an "inactive" flag. This persist also
+    // re-writes the cutover's promote, so it is the durable backstop if the
+    // promote-time persist failed. Failure is logged loudly but doesn't
+    // unwind the teardown (the data-plane retire already happened).
+    {
+        let mut ek = rot.epoch_keys.lock().unwrap();
+        match ek.retire(epoch) {
+            Ok(()) => {
+                if let Err(e) = ek.persist(&rot.state_dir) {
+                    eprintln!(
+                        "wiremesh-gateway: CRITICAL: persisting retire of epoch {epoch} failed: \
+                         {e:#} — the retired PRIVATE key is still on disk in epoch_keys.json"
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "wiremesh-gateway: CRITICAL: retiring epoch {epoch} in the key store failed: \
+                 {e:#} — its private key remains in epoch_keys.json"
+            ),
+        }
+    }
     eprintln!(
-        "wiremesh-gateway: retired epoch {epoch} — old Device torn down (key gone), enforcer evicted"
+        "wiremesh-gateway: retired epoch {epoch} — old Device torn down (key gone), enforcer \
+         evicted, store entry scrubbed"
     );
+}
+
+/// Service completed Role-B collapses the rotation tick has signalled via
+/// [`RotationShared::collapse_ready`]: tear each overlap Device down and
+/// evict its enforcer. Runs in the run task (owner of the non-`Send`
+/// `tunnels`), like [`service_retire`], but deliberately does NOT drive the
+/// Role-A [`Rotation`] SM — a Role-B overlap belongs to a PEER's rotation,
+/// not ours. By the time an entry lands here the tick has already proven the
+/// base tun live toward the peer's new key and flipped the routes back
+/// (reverse make-before-break), so tearing the overlap down cannot cut a
+/// still-needed path. `tear_down` on an absent epoch is a no-op, so a stale
+/// signal is harmless. No epoch-key store involvement: the overlap Device
+/// ran this gateway's OWN active key, which stays active.
+async fn service_role_b_collapse(
+    tunnels: &mut TunnelSet,
+    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
+    rot: &RotationShared,
+) {
+    let ready: Vec<(u64, u32)> = std::mem::take(&mut *rot.collapse_ready.lock().unwrap());
+    for (aid, epoch) in ready {
+        if let Err(e) = tunnels.tear_down(epoch) {
+            eprintln!(
+                "wiremesh-gateway: tearing down collapsed Role-B overlap epoch {epoch} (peer \
+                 {aid}) failed: {e}"
+            );
+        }
+        enforcers.lock().await.remove(&epoch);
+        eprintln!(
+            "wiremesh-gateway: Role B overlap for peer {aid} collapsed — epoch-{epoch} Device \
+             torn down, enforcer evicted; wg0 is the routed device on the peer's new key"
+        );
+    }
 }
 
 /// Fold each live enforcer's [`Counters`] into one aggregate for the metrics
@@ -2577,6 +2692,24 @@ struct RotationShared {
     /// flag and [`service_retire`] (in the run task) consumes it. `None` when
     /// nothing is pending.
     retire_ready: Arc<std::sync::Mutex<Option<u32>>>,
+    /// The durable epoch-key store (Backlog 3 Task 1) — the SAME handle the
+    /// sync loop's `handle_rotate` mints through. The tick's Role-A cutover
+    /// drives `promote(new)` + `persist` and `service_retire` drives
+    /// `retire(old)` + `persist`, so the on-disk `epoch_keys.json` tracks the
+    /// data plane's lifecycle transitions and a reboot at any point selects
+    /// the right key (`EpochKeys::select_boot_key`). `persist` (sync file I/O
+    /// + fsync) runs under the guard — brief, and serializing writers through
+    /// the lock is exactly what keeps two transitions from interleaving their
+    /// tmp+rename writes.
+    epoch_keys: Arc<std::sync::Mutex<EpochKeys>>,
+    /// Signal from the rotation tick to the run task: Role-B overlap Devices
+    /// whose COLLAPSE completed its reverse make-before-break (base-tun
+    /// session live toward the peer's new key, routes flipped back to `wg0`)
+    /// and now need their `(peer gateway_id, overlap epoch)` Device torn down
+    /// + enforcer evicted. Same owns-the-non-`Send`-`tunnels` split as
+    /// `retire_ready`, but a separate channel: consuming it must NOT drive
+    /// the Role-A `Rotation` SM (this gateway isn't the one rotating).
+    collapse_ready: Arc<std::sync::Mutex<Vec<(u64, u32)>>>,
 }
 
 /// Role A (this gateway is rotating its own key): the observation the tick
@@ -2616,6 +2749,15 @@ struct RoleB {
     /// Set once we've flipped routes AND reported the live epoch ack — a
     /// completed Role-B cutover for this peer, not re-driven.
     done: bool,
+    /// Set by `maybe_collapse_role_b` when the rotating peer's advertised key
+    /// set collapses back to active-only (its rotation completed — the new
+    /// key IS `peer_pending_hex`'s key, now active). Arms the reverse
+    /// make-before-break in the rotation tick: wait for the peer's session on
+    /// the BASE tun (rekeyed to the new key by the unpinned apply) to become
+    /// rx-corroborated live, THEN flip routes back `wg0e<N>` -> `wg0` and
+    /// tear the overlap Device down. While armed, the normal cutover arm
+    /// skips this entry.
+    collapse_armed: bool,
 }
 
 /// Role A: handle a `RotateDirective`. Mint+persist the new epoch key, bring
@@ -2624,7 +2766,6 @@ struct RoleB {
 /// and arm the observation tick to watch for the peer's live session. Idempotent
 /// against a re-entrant directive (the SM only honors one from `Idle`).
 async fn handle_rotate(
-    epoch_keys: &mut EpochKeys,
     tunnels: &mut TunnelSet,
     enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
     rot: &RotationShared,
@@ -2644,8 +2785,18 @@ async fn handle_rotate(
         anyhow::anyhow!("RotateDirective arrived before any desired state; no peer set to mint against")
     })?;
 
-    let new_key = epoch_keys.generate_next()?.clone();
-    epoch_keys.persist(&rot.state_dir)?;
+    // Mint + persist under one guard (no `.await` in scope) so the persisted
+    // store always contains the mint, and compute the CURRENT active epoch
+    // from the same snapshot — post-reboot-on-a-promoted-epoch this is the
+    // promoted epoch (not 0), which anchors the port offset and, later, which
+    // epoch the retire tears down.
+    let (new_key, active_epoch) = {
+        let mut ek = rot.epoch_keys.lock().unwrap();
+        let new_key = ek.generate_next()?.clone();
+        ek.persist(&rot.state_dir)?;
+        let active_epoch = ek.active().map(|k| k.epoch).unwrap_or(0);
+        (new_key, active_epoch)
+    };
     if new_key.epoch != n {
         eprintln!(
             "wiremesh-gateway: WARNING minted epoch {} != directive epoch {n}; proceeding on the \
@@ -2654,7 +2805,6 @@ async fn handle_rotate(
         );
     }
 
-    let active_epoch = epoch_keys.active().map(|k| k.epoch).unwrap_or(0);
     let offset = u16::try_from(n.saturating_sub(active_epoch)).unwrap_or(0);
     let new_port = rot.base_wg_port.saturating_add(offset);
     let new_tun = format!("{}e{}", rot.base_tun, n);
@@ -2753,7 +2903,14 @@ async fn maybe_start_role_b(
             continue; // couldn't build the peer's offset endpoint — skip this round
         }
 
-        let own_priv = rot.identity.wg_private_key_b64.clone();
+        // This gateway's OWN key for the overlap Device: the CURRENT ACTIVE
+        // key (what the rotating peer's roster advertises for us), not
+        // `identity.wg_private_key_b64` — after our own rotation (and
+        // especially after a post-rotation reboot, Backlog 3 Task 1) the
+        // identity key is the RETIRED epoch-0 key, and an overlap built on it
+        // could never complete the peer's handshake. Pre-rotation the two are
+        // identical, so steady-state behavior is unchanged.
+        let own_priv = rot.active.lock().unwrap().priv_key.clone();
         tunnels.bring_up(pending_epoch, &new_tun, &own_priv, listen_port, TUN_MTU)?;
 
         // SECURITY (fail-closed): attach the L4 enforcer to this overlap
@@ -2805,6 +2962,7 @@ async fn maybe_start_role_b(
                 peer_pending_hex,
                 peer_cidrs: peer.allowed_ips.clone(),
                 done: false,
+                collapse_armed: false,
             },
         );
         eprintln!(
@@ -2813,6 +2971,69 @@ async fn maybe_start_role_b(
         );
     }
     Ok(())
+}
+
+/// Role-B collapse trigger (the minimal reverse-make-before-break slice of
+/// the ratified plan's Task 3 — see key-rotation-teardown-notes finding D):
+/// when a rotating peer's ROSTER key set no longer advertises a real-keyed
+/// pending epoch AND its active key is the very key this gateway overlapped
+/// toward, start collapsing our overlap state. NB the timing: this fires at
+/// the controller's PROMOTE of the peer's new epoch (pending -> active; the
+/// roster may still carry the old key as a `"retiring"` row at that point —
+/// `pending_key()` is what goes `None`), not at the controller's retire.
+/// Rule-4 laggard consequence: on an ack-less grace-promote where the
+/// rotating peer never actually established its new key, this still unpins
+/// and rekeys `wg0` toward that new key at promote time — dropping any
+/// still-working old-key `wg0` session with the peer; the peer is doomed on
+/// the old key anyway once promoted roster-wide, but recovery then waits
+/// until it genuinely runs the new key (e.g. re-normalizes after a reboot).
+/// Sequence:
+///
+///  (a) HERE (sync, before the caller's `apply_state` for the same delta):
+///      unpin `wg0_pins[gid]`, so the apply rebuilds `wg0`'s entry for this
+///      peer with its NEW active key (`device_config_pinned` falls back to
+///      `active_pubkey_b64` once no pin exists; the key change defeats both
+///      the change-guard and the pure-addition incremental path, so a full
+///      rebuild is guaranteed by that very apply);
+///  (b) arm `collapse_armed` — the rotation tick then waits for the peer's
+///      session on the BASE tun to become rx-corroborated live;
+///  (c) the tick flips routes back `wg0e<N>` -> `wg0` and signals the run
+///      task to tear the overlap Device down (`service_role_b_collapse`).
+///
+/// Deliberately does NOT require `b.done`: the controller's ack-less Rule-4
+/// grace-promote can collapse the roster while our cutover never completed —
+/// in that case routes are still on `wg0` (the reverse flip's `ip route
+/// replace` is an idempotent no-op) and the collapse is exactly the recovery
+/// needed. While armed, the tick's normal cutover arm skips the entry.
+fn maybe_collapse_role_b(rot: &RotationShared, ds: &DesiredState) {
+    let mut role_b = rot.role_b.lock().unwrap();
+    for (aid, b) in role_b.iter_mut() {
+        if b.collapse_armed {
+            continue;
+        }
+        let Some(peer) = ds.peers.iter().find(|p| p.gateway_id == *aid) else {
+            // Peer vanished from the roster entirely (removed, not rotated):
+            // out of scope for this slice — see finding D remainders.
+            continue;
+        };
+        if peer.pending_key().is_some() {
+            continue; // still mid-rotation
+        }
+        let new_active_hex = peer
+            .active_key()
+            .and_then(|k| pubkey_b64_to_hex(&k.pubkey_b64));
+        if new_active_hex.as_deref() != Some(b.peer_pending_hex.as_str()) {
+            continue; // active key isn't the one we overlapped toward
+        }
+        rot.wg0_pins.lock().unwrap().remove(aid);
+        b.collapse_armed = true;
+        eprintln!(
+            "wiremesh-gateway: Role B collapse armed for peer {aid} (rotation complete; roster \
+             active-only on the new key) — wg0 unpinned, awaiting live base-tun session before \
+             tearing {} down",
+            b.new_tun
+        );
+    }
 }
 
 /// First host address of an `ip/prefix` CIDR (network address + 1), e.g.
@@ -3013,6 +3234,48 @@ async fn run_rotation_ticks(rot: RotationShared) {
                                 applied_config,
                                 applied_peers,
                             };
+                            // Durable promote (Backlog 3 Task 1): the data
+                            // plane just cut over to epoch `epoch`, so record
+                            // it in the store (new epoch "active", old epoch
+                            // "retiring") and persist — a reboot from here on
+                            // must select the NEW key (`select_boot_key`), not
+                            // resurrect the old one. Failure posture: the
+                            // cutover has ALREADY happened on the data plane,
+                            // so never unwind it — log loudly and continue.
+                            // A failed persist here still gets a durable
+                            // second chance: `service_retire`'s retire+persist
+                            // (>= RETIRE_GRACE later) re-writes the whole
+                            // store, in-memory promote included. A crash
+                            // inside that window reboots on the old key;
+                            // whether peers still honor it then depends on
+                            // the CONTROLLER's roster clock (peers drop their
+                            // old-key pins when the controller's promote SM
+                            // retires the old epoch roster-side), NOT on our
+                            // local RETIRE_GRACE — the two clocks are
+                            // unrelated, so this degraded window is best-
+                            // effort, not guaranteed reachable. And the
+                            // backstop shares the failure domain: a
+                            // persistent disk fault fails the retire persist
+                            // identically, leaving no durable promote at all.
+                            {
+                                let mut ek = rot.epoch_keys.lock().unwrap();
+                                match ek.promote(epoch) {
+                                    Ok(()) => {
+                                        if let Err(e) = ek.persist(&rot.state_dir) {
+                                            eprintln!(
+                                                "wiremesh-gateway: CRITICAL: persisting promoted \
+                                                 epoch {epoch} failed: {e:#} — a reboot before the \
+                                                 retire persist would resurrect the old key"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => eprintln!(
+                                        "wiremesh-gateway: CRITICAL: promoting epoch {epoch} in \
+                                         the key store failed: {e:#} — store diverges from the \
+                                         live data plane"
+                                    ),
+                                }
+                            }
                             eprintln!(
                                 "wiremesh-gateway: Role A cutover — routes flipped onto {} (epoch {epoch})",
                                 a.new_tun
@@ -3058,13 +3321,22 @@ async fn run_rotation_ticks(rot: RotationShared) {
             }
         }
 
-        // Role B: transient overlap Device(s) toward rotating peer(s).
+        // Role B: transient overlap Device(s) toward rotating peer(s). A
+        // collapse-armed entry is excluded — its rotation already completed
+        // roster-side, so driving the (now-moot) cutover/ack arm against it
+        // would fight the collapse below. One-tick race (benign): this
+        // snapshot is taken before the loop's awaits, while arming happens
+        // concurrently in the sync loop — so a single tick can still drive
+        // the cutover arm for an entry armed just after the snapshot
+        // (re-flipping its routes onto the overlap tun / sending a moot
+        // ack). Harmless: the collapse arm flips the routes back once `wg0`
+        // is proven live, and the ack is idempotent controller-side.
         let pending_b: Vec<(u64, RoleB)> = rot
             .role_b
             .lock()
             .unwrap()
             .iter()
-            .filter(|(_, b)| !b.done)
+            .filter(|(_, b)| !b.done && !b.collapse_armed)
             .map(|(k, v)| (*k, v.clone()))
             .collect();
         for (aid, b) in pending_b {
@@ -3106,6 +3378,61 @@ async fn run_rotation_ticks(rot: RotationShared) {
                     "wiremesh-gateway: Role B epoch ack for peer {aid} failed (will retry): {e}"
                 ),
             }
+        }
+
+        // Role B COLLAPSE (reverse make-before-break — Backlog 3 Task 1 slice
+        // of T3): for each collapse-armed entry, watch the BASE tun for a
+        // live, rx-corroborated session toward the peer's NEW active key
+        // (== `peer_pending_hex` — the pending key we overlapped toward is
+        // the one the roster promoted). Ordering guarantee: the overlap
+        // Device `wg0e<N>` is NEVER torn down — and its routes never moved —
+        // before `wg0` is proven live, mirroring (in reverse) the Role-A
+        // cutover's make-before-break. Until `wg0` goes live the overlap
+        // keeps carrying whatever traffic still flows (steady-state
+        // completion), or simply idles (the peer rebooted onto the base
+        // port). No handshake kick here: routes still point at the overlap
+        // tun, so a segment-IP ping can't egress `wg0`; the base tun's
+        // persistent keepalive + the punch/path machinery drive its
+        // handshake instead.
+        let armed_b: Vec<(u64, RoleB)> = rot
+            .role_b
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, b)| b.collapse_armed)
+            .map(|(k, v)| (*k, v.clone()))
+            .collect();
+        for (aid, b) in armed_b {
+            let live =
+                read_live_peers(&rot.base_tun, std::iter::once(b.peer_pending_hex.clone())).await;
+            if !live.map_or(false, |l| l.contains(&b.peer_pending_hex)) {
+                continue; // wg0 not live yet — keep the overlap intact
+            }
+            // wg0 is live on the new key: flip the peer's routes back onto the
+            // base tun (reverse of the Role-B cutover flip; `add_route` is
+            // `ip route replace`, so this atomically moves each CIDR off
+            // `wg0e<N>`)...
+            for cidr in &b.peer_cidrs {
+                if let Err(e) = routes::add_route(cidr, &rot.base_tun) {
+                    eprintln!(
+                        "wiremesh-gateway: Role B collapse route flip {cidr} -> {} failed: {e}",
+                        rot.base_tun
+                    );
+                }
+            }
+            // ...then — and only then — retire the overlap: drop the role_b
+            // entry (so a future rotation of this peer can start fresh) and
+            // signal the run task to tear the Device down + evict its
+            // enforcer (`service_role_b_collapse`; the tick can't touch the
+            // non-`Send` `tunnels`). `wg0_pins` was already unpinned at the
+            // trigger; the live-endpoint pin is left to the path SM.
+            rot.role_b.lock().unwrap().remove(&aid);
+            rot.collapse_ready.lock().unwrap().push((aid, b.pending_epoch));
+            eprintln!(
+                "wiremesh-gateway: Role B collapse — peer {aid} live on {} with its new key; \
+                 routes flipped back, overlap {} teardown signalled",
+                rot.base_tun, b.new_tun
+            );
         }
     }
 }
