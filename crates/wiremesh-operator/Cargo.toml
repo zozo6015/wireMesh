@@ -28,3 +28,14 @@ prost = { workspace = true }
 tower = { version = "0.4", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 wiremesh-proto = { path = "../wiremesh-proto" }
+
+[dev-dependencies]
+# `tests/rebind_redemption_e2e.rs` drives the operator's own `FabricAdmin`
+# rebind mint against a REAL controller and redeems the token with a
+# replacement gateway — the only way to catch a wrong token `kind`, which no
+# shape assertion or controller-side test can see (the controller's own
+# `tests/rebind.rs` hand-writes the request). Default features: the userspace
+# `TestController`/`StubGateway` surface only, never the privileged `netns`
+# harness. Dev-only, and no dependency cycle — `wiremesh-testkit` depends on
+# `wiremesh-controller`, which does not depend on this crate.
+wiremesh-testkit = { path = "../wiremesh-testkit" }

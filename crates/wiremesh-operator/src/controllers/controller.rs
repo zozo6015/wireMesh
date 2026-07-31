@@ -21,12 +21,23 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
     let client = ctx.client.clone();
     let oref = owner_ref(cr.as_ref())?;
 
-    // Server-side-apply the three child objects (owner-referenced → GC'd with
-    // the CR). Namespace is stamped here since the builders are namespace-free.
-    let mut pvc = workloads::controller_pvc(&name, &cr.spec);
-    pvc.metadata.namespace = Some(ns.clone());
-    pvc.metadata.owner_references = Some(vec![oref.clone()]);
-    apply(&Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns), &pvc).await?;
+    // Server-side-apply the child objects (owner-referenced → GC'd with the
+    // CR). Namespace is stamped here since the builders are namespace-free.
+    //
+    // The PVC is CREATE-ONLY (shared `pvc_needs_create` guard, same as the
+    // gateway/relay reconcilers): a bound PVC's `storageClassName` /
+    // `resources.requests.storage` are immutable, so re-applying it on every
+    // pass 422s permanently the moment a user edits `spec.storageSize`/
+    // `storageClass` on the CR — wedging the whole reconcile (the Service and
+    // Deployment applies below would never run again).
+    let pvc_api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ns);
+    let existing_pvc = pvc_api.get_opt(&format!("{name}-data")).await?;
+    if super::pvc_needs_create(existing_pvc.as_ref()) {
+        let mut pvc = workloads::controller_pvc(&name, &cr.spec);
+        pvc.metadata.namespace = Some(ns.clone());
+        pvc.metadata.owner_references = Some(vec![oref.clone()]);
+        apply(&pvc_api, &pvc).await?;
+    }
 
     let mut svc = workloads::controller_service(&name, &cr.spec);
     svc.metadata.namespace = Some(ns.clone());

@@ -15,6 +15,34 @@ use wiremesh_proto::v1::{
     ListSegmentsRequest, MintTokenRequest, RegisterRelayRequest,
 };
 
+/// The token `kind` the controller keys the REBIND path off
+/// (`wiremesh-controller/src/db.rs`: `let is_rebind = kind == "rebind";`).
+///
+/// Load-bearing: `rebind_segment_id` is read ONLY inside that arm, so a token
+/// minted as `"gateway"` with a segment id set is an ORDINARY token whose
+/// stored id is dead data — redeeming it against the (still-occupied) segment
+/// is refused with `SegmentAlreadyBound`. Any value but `"rebind"` silently
+/// degrades the mint.
+pub const REBIND_TOKEN_KIND: &str = "rebind";
+
+/// The exact `MintTokenRequest` an operator rebind mint must send — the single
+/// definition both transports encode.
+///
+/// Byte-for-byte the encoding `crates/wiremesh-controller/tests/rebind.rs`
+/// proves end-to-end: [`REBIND_TOKEN_KIND`], **empty** `bound_cidrs`, and the
+/// segment id. `bound_cidrs` must stay empty: for a rebind token the controller
+/// skips the bound-CIDR scope check entirely and authorizes by segment id
+/// alone, so CIDRs there would be dead, misleading data. (The operator records
+/// the segment's new CIDRs in its own token Secret instead — see
+/// `controllers::gateway::token_secret_body`.)
+pub fn rebind_mint_request(rebind_segment_id: u64) -> MintTokenRequest {
+    MintTokenRequest {
+        kind: REBIND_TOKEN_KIND.to_string(),
+        bound_cidrs: Vec::new(),
+        rebind_segment_id,
+    }
+}
+
 /// A `tonic` interceptor that adds `authorization: Bearer <token>` to every
 /// request — byte-for-byte the header `fabricctl`'s `AuthMode::Bearer` sets.
 #[derive(Clone)]
@@ -74,14 +102,39 @@ impl FabricAdmin {
         self.mint_token("relay", &[]).await
     }
 
+    /// Mint a single-use REBIND token scoped to `rebind_segment_id` (non-zero).
+    /// At redemption the controller REPLACES the segment's active gateway
+    /// instead of rejecting the enroll with `SegmentAlreadyBound`.
+    ///
+    /// Wire encoding: [`rebind_mint_request`] — `kind = "rebind"` + EMPTY
+    /// `bound_cidrs` + the segment id. The controller keys rebind off the KIND
+    /// alone and only reads `rebind_segment_id` in that arm.
+    pub async fn mint_gateway_rebind_token(
+        &mut self,
+        rebind_segment_id: u64,
+    ) -> anyhow::Result<String> {
+        anyhow::ensure!(
+            rebind_segment_id != 0,
+            "a rebind token needs a non-zero segment id (0 means 'no rebind' on the wire)"
+        );
+        self.mint(rebind_mint_request(rebind_segment_id)).await
+    }
+
     async fn mint_token(&mut self, kind: &str, bound_cidrs: &[String]) -> anyhow::Result<String> {
+        self.mint(MintTokenRequest {
+            kind: kind.to_string(),
+            bound_cidrs: bound_cidrs.to_vec(),
+            rebind_segment_id: 0,
+        })
+        .await
+    }
+
+    /// Send one `MintTokenRequest` — the single place the RPC is issued, so
+    /// every mint shape (gateway, relay, rebind) travels the same path.
+    async fn mint(&mut self, req: MintTokenRequest) -> anyhow::Result<String> {
         Ok(self
             .client
-            .mint_token(MintTokenRequest {
-                kind: kind.to_string(),
-                bound_cidrs: bound_cidrs.to_vec(),
-                rebind_segment_id: 0,
-            })
+            .mint_token(req)
             .await
             .context("Admin.MintToken")?
             .into_inner()
@@ -99,9 +152,9 @@ impl FabricAdmin {
             .id)
     }
 
-    /// Delete a segment by its `name` (resolves name→id via `ListSegments`,
-    /// since `DeleteSegment` takes a `segment_id`). No-op if absent.
-    pub async fn delete_segment_by_name(&mut self, name: &str) -> anyhow::Result<()> {
+    /// Resolve a segment's controller-side id by `name` (`None` if the segment
+    /// is not registered).
+    pub async fn segment_id_by_name(&mut self, name: &str) -> anyhow::Result<Option<u64>> {
         let segments = self
             .client
             .list_segments(ListSegmentsRequest {})
@@ -109,9 +162,15 @@ impl FabricAdmin {
             .context("Admin.ListSegments")?
             .into_inner()
             .segments;
-        if let Some(seg) = segments.into_iter().find(|s| s.name == name) {
+        Ok(segments.into_iter().find(|s| s.name == name).map(|s| s.id))
+    }
+
+    /// Delete a segment by its `name` (resolves name→id via `ListSegments`,
+    /// since `DeleteSegment` takes a `segment_id`). No-op if absent.
+    pub async fn delete_segment_by_name(&mut self, name: &str) -> anyhow::Result<()> {
+        if let Some(segment_id) = self.segment_id_by_name(name).await? {
             self.client
-                .delete_segment(DeleteSegmentRequest { segment_id: seg.id })
+                .delete_segment(DeleteSegmentRequest { segment_id })
                 .await
                 .context("Admin.DeleteSegment")?;
         }

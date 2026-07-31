@@ -14,6 +14,30 @@
 //! [`crate::admin_exec`]. The `fabric`/`gateway`/`relay` reconcilers take an
 //! `AdminExec` so the transport is swappable (a gRPC `FabricAdmin` for local
 //! tests, kube `exec` in production).
+//!
+//! # Teardown order (delete-path finalizers)
+//!
+//! The clean teardown order is: **delete the dependent CRs first**
+//! (`WiremeshGateway` → gateway drain; `WiremeshSegment` → controller-side
+//! segment delete; `WiremeshPolicy`/`WiremeshRelay` — no controller-side
+//! cleanup), and delete the **`WiremeshController` CR last**. But
+//! `kubectl delete -f all.yaml` (or a namespace/cluster teardown) makes no such
+//! promise — the controller CR (and with it the controller pod, via owner-ref
+//! GC) may be gone before the dependent finalizers run, at which point every
+//! admin call can only fail and the CRs would wedge in `Terminating` forever.
+//!
+//! So the delete-path cleanup is **best-effort with respect to a GONE
+//! controller** ([`cleanup_should_skip`]): when the `WiremeshController` CR is
+//! absent, or no controller pod is Running, the finalizer logs a loud warning
+//! naming exactly what was skipped (the drain id / the segment delete) and
+//! completes — the controller-side state died with the controller, so there is
+//! nothing left to clean. When the controller IS present, a genuine RPC error
+//! still hard-fails the finalizer (kube retries it) — best-effort is never a
+//! silent swallow of real failures. Accepted trade-off (decided with the
+//! reviewer): a merely-restarting controller pod (CR present, pod briefly not
+//! Running) will skip the cleanup — a missed drain/segment-delete is a manual
+//! `fabricctl` fix, whereas a Terminating-wedged CR blocks whole-namespace
+//! teardown.
 
 pub mod controller;
 pub mod fabric;
@@ -44,6 +68,13 @@ pub struct Context {
     /// How the operator reaches the controller Admin API (UDS exec sidecar in
     /// production; a direct gRPC client in tests). Shared, cheap to clone.
     pub admin: Arc<crate::admin_exec::AdminExec>,
+    /// Serializes every fabric list→render→`Admin.Apply` critical section (and
+    /// the Segment finalizer's delete+re-render). Without it two concurrent
+    /// reconciles can interleave list→apply so an Apply-path render that still
+    /// saw a segment resurrects it into the fabric AFTER its finalizer deleted
+    /// it. The CR **list must happen inside** the locked section — see
+    /// `fabric::apply_fabric`. Arc'd because `Context` is `Clone`.
+    pub fabric_apply_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -59,6 +90,93 @@ pub enum Error {
 /// `<name>.<ns>.svc:<port>` — the in-cluster DNS a peer dials a Service at.
 pub fn service_dns(name: &str, namespace: &str, port: u16) -> String {
     format!("{name}.{namespace}.svc:{port}")
+}
+
+/// Every identity/data PVC the operator owns is CREATE-ONLY: create it when
+/// absent, and NEVER apply/patch an existing one. A bound PVC's
+/// `storageClassName` and `resources.requests.storage` are immutable, so
+/// re-applying them on every reconcile 422s the whole reconcile forever.
+/// Shared choke point for the controller, gateway, and relay reconcilers.
+pub fn pvc_needs_create(
+    existing: Option<&k8s_openapi::api::core::v1::PersistentVolumeClaim>,
+) -> bool {
+    existing.is_none()
+}
+
+/// The delete-path best-effort decision (see the module doc's *Teardown order*
+/// section): should a finalizer SKIP its controller-side cleanup because the
+/// controller is GONE?
+///
+/// * `true` → the `WiremeshController` CR is absent (the CR is the source of
+///   truth — an orphaned pod still matching the selector is being GC'd), or no
+///   controller pod is Running (the admin exec can only fail). Log a loud
+///   warning naming what was skipped and complete the finalizer.
+/// * `false` → the controller is present and Running: perform the cleanup, and
+///   keep hard-failing (→ finalizer retry) on a genuine RPC error.
+pub fn cleanup_should_skip(controller_cr_exists: bool, controller_pod_running: bool) -> bool {
+    !controller_cr_exists || !controller_pod_running
+}
+
+/// Probe the two [`cleanup_should_skip`] inputs from the cluster:
+/// `controller_cr_exists` ← any `WiremeshController` CR listed;
+/// `controller_pod_running` ← a Running pod matching the SAME selector the
+/// admin transport resolves its exec target with (`AdminExec::Exec`'s
+/// `pod_label`, which honors `WIREMESH_CONTROLLER_LABEL`; falling back to
+/// [`crate::workloads::controller_pod_selector`]). Probing a different selector
+/// than the transport actually uses could declare the controller "gone" while
+/// the admin channel works perfectly.
+///
+/// **Never skips in gRPC admin mode.** With `WIREMESH_ADMIN_ADDR` set the
+/// operator dials the Admin API directly — no in-cluster controller pod (and no
+/// `WiremeshController` CR) is required for the cleanup to succeed, so the
+/// "controller is gone" inference does not apply and the cleanup must run.
+///
+/// CONSERVATIVE on a probe failure: treat the controller as PRESENT (don't
+/// skip) — the cleanup then proceeds and a genuine failure hard-fails into the
+/// normal finalizer retry, never silently skipping on a transient apiserver
+/// hiccup.
+pub async fn controller_cleanup_skip(ctx: &Context) -> bool {
+    use k8s_openapi::api::core::v1::Pod;
+    if ctx.admin.is_grpc() {
+        // Direct-gRPC transport: the admin API is reachable independently of
+        // any CR/pod, so there is nothing to infer "gone" from.
+        return false;
+    }
+    let cr_exists = match Api::<WiremeshController>::all(ctx.client.clone())
+        .list(&ListParams::default())
+        .await
+    {
+        Ok(list) => !list.items.is_empty(),
+        Err(e) => {
+            tracing::warn!(
+                "cleanup probe: listing WiremeshController CRs failed ({e}); treating the \
+                 controller as present (cleanup will proceed and retry on failure)"
+            );
+            true
+        }
+    };
+    let selector = ctx
+        .admin
+        .pod_label()
+        .map(|s| s.to_string())
+        .unwrap_or_else(crate::workloads::controller_pod_selector);
+    let pod_running = match Api::<Pod>::namespaced(ctx.client.clone(), &ctx.namespace)
+        .list(&ListParams::default().labels(&selector))
+        .await
+    {
+        Ok(list) => list
+            .items
+            .iter()
+            .any(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running")),
+        Err(e) => {
+            tracing::warn!(
+                "cleanup probe: listing controller pods failed ({e}); treating a controller \
+                 pod as Running (cleanup will proceed and retry on failure)"
+            );
+            true
+        }
+    };
+    cleanup_should_skip(cr_exists, pod_running)
 }
 
 /// An `OwnerReference` to `owner` so the child objects the operator creates are

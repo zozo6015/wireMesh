@@ -69,9 +69,12 @@ USAGE:
     {BIN} --help | --version
 
 operator-admin OPS:
-    apply | mint-token | register-relay | delete-segment | list-gateways | drain
-    Flags (per op): --socket <path>, --kind <k>, --cidr <cidr>, --name <s>,
-    --endpoint <ip:port>, --id <n>.
+    apply | mint-token | register-relay | delete-segment | segment-id |
+    list-gateways | drain
+    Flags (per op): --socket <path>, --kind gateway|relay|rebind,
+    --cidr <cidr>, --name <s>, --endpoint <ip:port>, --id <n>,
+    --rebind-segment-id <n> (required by, and only valid with, --kind rebind;
+    a rebind token takes no --cidr — its scope IS the segment id).
 
 CONFIGURATION (environment variables; the operator takes no flags of its own):
     POD_NAMESPACE <ns>             (optional, default \"default\") Namespace to

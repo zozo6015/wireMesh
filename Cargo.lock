@@ -3612,6 +3612,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "wiremesh-proto",
+ "wiremesh-testkit",
 ]
 
 [[package]]

@@ -22,6 +22,7 @@
 use anyhow::Context;
 use crate::crd::{
     WiremeshControllerSpec, WiremeshGateway, WiremeshGatewaySpec, WiremeshRelay,
+    WiremeshRelaySpec,
 };
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
@@ -141,6 +142,46 @@ fn tcp_port(name: &str, port: i32) -> ContainerPort {
         protocol: Some("TCP".to_string()),
         ..Default::default()
     }
+}
+
+/// Syntax-only validation of a CRD-supplied `host:port` dial target
+/// (`spec.observeEndpoint` / `spec.syncEndpoint`). Mirrors the gateway binary's
+/// own `config::validate_host_port` rules so a bad override is rejected AT
+/// RECONCILE — fail closed, like the relay's `endpoint` — instead of rolling
+/// out a pod whose argv the binary refuses at boot (CrashLoopBackOff).
+/// Duplicated rather than imported: the operator does not (and should not)
+/// depend on the gateway crate, which pulls boringtun + the eBPF enforcer.
+///
+/// Deliberately does NO DNS lookup — a hostname that doesn't resolve right now
+/// must still validate, because the gateway re-resolves per reconnect/tick and
+/// boots fail-static with the resolver down. Rejected:
+/// - no `:port`, an empty host, or a non-`u16` port;
+/// - port `0` ("OS-assigned"; never a reachable dial target — same reasoning as
+///   the relay endpoint check);
+/// - IPv6 literals, bracketed or bare (v1 is IPv4-only end to end);
+/// - an IPv4-SHAPED host (digits and dots only — an all-numeric TLD is not a
+///   legal DNS name) that is not a valid literal, e.g. `10.0.0.300:9600`, which
+///   would otherwise be waved through as a "hostname" that can never resolve.
+pub fn validate_dial_target(s: &str) -> anyhow::Result<()> {
+    let (host, port) = s
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("expected host:port, got {s:?}"))?;
+    if host.is_empty() {
+        anyhow::bail!("empty host in {s:?}");
+    }
+    let port: u16 = port
+        .parse()
+        .with_context(|| format!("invalid port in {s:?}"))?;
+    anyhow::ensure!(port != 0, "port 0 in {s:?} is not a reachable dial target");
+    if host.starts_with('[') || matches!(host.parse(), Ok(std::net::IpAddr::V6(_))) {
+        anyhow::bail!("IPv6 dial target {s:?} is unsupported (v1 is IPv4-only)");
+    }
+    if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
+        s.parse::<std::net::SocketAddr>()
+            .map(|_| ())
+            .with_context(|| format!("invalid IP literal in {s:?}"))?;
+    }
+    Ok(())
 }
 
 /// A CRD-supplied WireGuard interface name flows into the gateway's argv, so
@@ -463,6 +504,24 @@ pub fn gateway_pvc(name: &str, spec: &WiremeshGatewaySpec) -> PersistentVolumeCl
 /// init-container turns the mounted token + CA into an on-disk `Identity`
 /// (shared `state` volume, PVC-backed so it survives pod recreation); the main
 /// container runs the data plane.
+///
+/// **Endpoint overrides** (`spec.observeEndpoint`/`spec.syncEndpoint`): when
+/// set on the CR they replace the ClusterIP-derived `--observe` /
+/// `--controller-sync` targets VERBATIM (single argv elements, no shell — the
+/// gateway binary accepts DNS hostnames on both flags and re-resolves them).
+/// Needed when kube-proxy SNATs the ClusterIP observe path (poisoning the
+/// observed public mapping) or the controller is reached through an external
+/// LB. The enroll init-container deliberately keeps `controller_enroll` — the
+/// one-shot enroll RPC must reach the in-cluster controller and is unaffected
+/// by SNAT observation.
+///
+/// **Pod recreation on CIDR change (rebind):** the segment CIDRs flow into the
+/// enroll init-container argv (`--cidr …`), so a segment-CIDR edit changes the
+/// pod template; with the `Recreate` strategy the apply then replaces the pod
+/// and the (idempotent) enroll init re-runs — redeeming the refreshed rebind
+/// token whenever the persisted identity is absent, and skipping otherwise. No
+/// separate template-annotation bump is needed: the template already carries
+/// the CIDRs.
 pub fn gateway_deployment(
     gw: &WiremeshGateway,
     controller_sync: &str,
@@ -507,12 +566,17 @@ pub fn gateway_deployment(
         ..Default::default()
     };
 
+    // CR-level overrides win over the ClusterIP defaults (observe: SNAT-free
+    // UDP path; sync: external LB / DDNS). Passed through verbatim — the
+    // builder's no-shell invariant keeps them single argv elements.
+    let sync_target = gw.spec.sync_endpoint.as_deref().unwrap_or(controller_sync);
+    let observe_target = gw.spec.observe_endpoint.as_deref().unwrap_or(controller_observe);
     let main = Container {
         name: "gateway".to_string(),
         image: Some(image),
         args: Some(vec![
-            "--controller-sync".to_string(), controller_sync.to_string(),
-            "--observe".to_string(), controller_observe.to_string(),
+            "--controller-sync".to_string(), sync_target.to_string(),
+            "--observe".to_string(), observe_target.to_string(),
             "--tun".to_string(), tun,
             "--wg-port".to_string(), wg_port.to_string(),
             "--state-dir".to_string(), DATA_DIR.to_string(),
@@ -603,9 +667,50 @@ pub fn gateway_deployment(
 // Relay
 // --------------------------------------------------------------------------
 
+/// The relay's identity PVC (`<name>-relay-data`, kind-specific so it never
+/// collides with the gateway's `<name>-gateway-data` or the controller's
+/// `<name>-data`), mounted at `/var/lib/wiremesh`. Persists the enrolled certs
+/// (`ca.pem`/`relay.pem`/`relay.key`) across pod recreation so a node reboot/
+/// upgrade/eviction never destroys them (which would force a re-enroll against
+/// a spent single-use token → `Init:Error` wedge). Mirrors `gateway_pvc`: RWO
+/// (node-local, single writer), instance labels, a small default (128Mi — the
+/// certs are a few KB) overridable via `storageClass`/`storageSize` on the CR.
+pub fn relay_pvc(name: &str, spec: &WiremeshRelaySpec) -> PersistentVolumeClaim {
+    let mut requests = BTreeMap::new();
+    requests.insert(
+        "storage".to_string(),
+        Quantity(spec.storage_size.clone().unwrap_or_else(|| "128Mi".to_string())),
+    );
+    PersistentVolumeClaim {
+        metadata: ObjectMeta {
+            name: Some(format!("{name}-relay-data")),
+            labels: Some(labels(name)),
+            ..Default::default()
+        },
+        spec: Some(PersistentVolumeClaimSpec {
+            access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            resources: Some(VolumeResourceRequirements {
+                requests: Some(requests),
+                ..Default::default()
+            }),
+            storage_class_name: spec.storage_class.clone(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 /// A relay Deployment. An enroll init-container writes the relay's
-/// `ca.pem`/`relay.pem`/`relay.key` into a shared cert dir; the main container
-/// runs the QUIC bridge over it.
+/// `ca.pem`/`relay.pem`/`relay.key` into a shared cert dir (PVC-backed — see
+/// `relay_pvc` — so the identity survives pod recreation) and is IDEMPOTENT:
+/// `wiremesh-relay-enroll` skips when a complete identity is already present
+/// (`wiremesh_relay::enroll::probe_identity`), so a restart never re-redeems
+/// the spent single-use token. The main container runs the QUIC bridge over
+/// that identity. `strategy: Recreate` because the RWO identity
+/// PVC must never surge a second pod (mirror of the gateway/controller
+/// reasoning); the reconciler must apply this through `deployment_apply_body`
+/// (`apply_deployment`) so SSA clears the API-server defaulter's
+/// `rollingUpdate` block (the same 422 the gateway/controller already fixed).
 ///
 /// **Fails closed** on an invalid `endpoint`: v1 is IPv4-only, so the endpoint
 /// must be a valid IPv4 `host:port` (the same `SocketAddrV4` the controller
@@ -686,7 +791,18 @@ pub fn relay_deployment(
         init_containers: Some(vec![enroll]),
         containers: vec![main],
         volumes: Some(vec![
-            Volume { name: "certs".to_string(), empty_dir: Some(EmptyDirVolumeSource::default()), ..Default::default() },
+            // The enrolled identity lives on the per-relay PVC
+            // (`<name>-relay-data`), NOT an emptyDir — an emptyDir is destroyed
+            // on every pod recreation, forcing a re-enroll against a spent
+            // single-use token (Init:Error wedge).
+            Volume {
+                name: "certs".to_string(),
+                persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                    claim_name: format!("{name}-relay-data"),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
             Volume {
                 name: "token".to_string(),
                 secret: Some(SecretVolumeSource { secret_name: Some(token_secret.to_string()), ..Default::default() }),
@@ -716,6 +832,7 @@ pub fn relay_deployment(
         metadata: ObjectMeta { name: Some(name.clone()), labels: Some(labels(&name)), ..Default::default() },
         spec: Some(DeploymentSpec {
             replicas: Some(1),
+            strategy: Some(recreate_strategy()),
             selector: LabelSelector { match_labels: Some(labels(&name)), ..Default::default() },
             template: PodTemplateSpec {
                 metadata: Some(ObjectMeta { labels: Some(labels(&name)), ..Default::default() }),
@@ -753,6 +870,8 @@ mod tests {
             image: None,
             storage_class,
             storage_size,
+            observe_endpoint: None,
+            sync_endpoint: None,
         }
     }
 
@@ -769,6 +888,8 @@ mod tests {
             image: None,
             storage_class: None,
             storage_size: None,
+            observe_endpoint: None,
+            sync_endpoint: None,
         }
     }
 
@@ -997,6 +1118,8 @@ mod tests {
                 image: None,
                 storage_class: None,
                 storage_size: None,
+                observe_endpoint: None,
+                sync_endpoint: None,
             },
         );
         let d = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token", &["10.10.0.0/16".to_string()]);
@@ -1045,6 +1168,8 @@ mod tests {
                 image: None,
                 storage_class: None,
                 storage_size: None,
+                observe_endpoint: None,
+                sync_endpoint: None,
             },
         );
         let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
@@ -1054,6 +1179,8 @@ mod tests {
                 endpoint: "203.0.113.9:4443".into(),
                 node_name: None,
                 image: None,
+                storage_class: None,
+                storage_size: None,
             },
         );
         let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
@@ -1085,7 +1212,7 @@ mod tests {
     fn relay_enrolls_and_binds_endpoint_port() {
         let r = WiremeshRelay::new(
             "relay-eu",
-            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None },
+            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None },
         );
         let d = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "relay-eu-token").unwrap();
         let pod = d.spec.unwrap().template.spec.unwrap();
@@ -1102,7 +1229,7 @@ mod tests {
         for bad in ["not-an-endpoint", "203.0.113.9", "example.com:4443", "[::1]:4443", "203.0.113.9:4443; rm -rf /", "203.0.113.9:0"] {
             let r = WiremeshRelay::new(
                 "r",
-                WiremeshRelaySpec { endpoint: bad.into(), node_name: None, image: None },
+                WiremeshRelaySpec { endpoint: bad.into(), node_name: None, image: None, storage_class: None, storage_size: None },
             );
             assert!(
                 relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").is_err(),
@@ -1190,12 +1317,14 @@ mod tests {
                 image: None,
                 storage_class: None,
                 storage_size: None,
+                observe_endpoint: None,
+                sync_endpoint: None,
             },
         );
         let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
         let r = WiremeshRelay::new(
             "r",
-            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None },
+            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None },
         );
         let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
 
