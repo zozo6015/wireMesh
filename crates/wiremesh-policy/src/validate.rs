@@ -26,20 +26,50 @@ pub fn validate(doc: &PolicyDoc, segments: &[SegmentDef]) -> Vec<CompileError> {
         let ctx = format!("({}\u{2192}{})", block.from, block.to);
 
         let from_seg = segments.iter().find(|s| s.name == block.from);
-        if from_seg.is_none() {
-            errors.push(CompileError {
+        match from_seg {
+            None => errors.push(CompileError {
                 block: Some(block_idx),
                 rule: None,
                 msg: format!("{ctx} unknown segment '{}' in from", block.from),
-            });
+            }),
+            // (Backlog 10 PR-A Item 2a) A referenced segment with zero CIDRs
+            // would compile into an IR block whose side matches nothing — a
+            // silently dead rule on the eBPF backend, malformed `{ }` set
+            // syntax in the nftables codegen. Rejected here, at the same
+            // resolution point that already knows the segment; the
+            // controller's own boundaries mirror this (`enrollment.rs` and
+            // `services/admin.rs`'s CreateSegment both refuse empty `cidrs`),
+            // and `wiremesh_enforcer::flatten` carries the load-time belt for
+            // IR that arrives off the wire without passing through here.
+            Some(seg) if seg.cidrs.is_empty() => errors.push(CompileError {
+                block: Some(block_idx),
+                rule: None,
+                msg: format!(
+                    "{ctx} segment '{}' referenced in from has no CIDRs \
+                     (a segment's cidrs list must not be empty)",
+                    block.from
+                ),
+            }),
+            Some(_) => {}
         }
         let to_seg = segments.iter().find(|s| s.name == block.to);
-        if to_seg.is_none() {
-            errors.push(CompileError {
+        match to_seg {
+            None => errors.push(CompileError {
                 block: Some(block_idx),
                 rule: None,
                 msg: format!("{ctx} unknown segment '{}' in to", block.to),
-            });
+            }),
+            // Dst-side twin of the empty-CIDR check above.
+            Some(seg) if seg.cidrs.is_empty() => errors.push(CompileError {
+                block: Some(block_idx),
+                rule: None,
+                msg: format!(
+                    "{ctx} segment '{}' referenced in to has no CIDRs \
+                     (a segment's cidrs list must not be empty)",
+                    block.to
+                ),
+            }),
+            Some(_) => {}
         }
 
         let pair = (block.from.as_str(), block.to.as_str());
