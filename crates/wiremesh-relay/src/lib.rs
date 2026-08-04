@@ -1720,3 +1720,195 @@ mod registration_tests {
         assert!(decode_registration(&encode_registration("gw-1", "")).is_err());
     }
 }
+
+/// [`DatagramDropLog`] — the per-connection, per-branch rate limiter every
+/// branch of `serve`'s datagram loop logs through.
+///
+/// This is a DoS mitigation, not tidiness: each branch runs once per received
+/// datagram and an attacker holding any valid gateway cert controls the
+/// arrival rate, so an unbounded `eprintln!` on any of them amplifies a few
+/// bytes of work into unbounded stderr I/O. If the limiting silently stops
+/// working the only symptom is an operator's disk — which is exactly the kind
+/// of regression that needs a test rather than a review.
+///
+/// `dest_pinning.rs` exercises only the cross-pair branch; the runt,
+/// `unknown dest` and forward-failure branches have no behavioural coverage,
+/// and none of them can observe the *limiting* itself from outside the
+/// process anyway. Hence unit tests, in-crate because the type is private.
+///
+/// # How the interval boundary is reached without sleeping
+///
+/// `record` reads `Instant::now()` internally, so the elapse boundary is not
+/// reachable through the public behaviour of the type in under
+/// [`DATAGRAM_LOG_INTERVAL`] (10s). It IS reachable from in-crate tests by
+/// backdating the private `last_logged` stamp, which is what
+/// [`set_last_logged_ago`] does — no sleeping, no injectable clock, and no
+/// change to the type. The cost is that these tests are coupled to the
+/// field's representation: a future rewrite of `DatagramDropLog`'s internals
+/// must update `set_last_logged_ago` with them. That is a deliberate trade —
+/// the alternative was leaving the whole re-arm contract unpinned.
+///
+/// The one hairline this cannot resolve is `>=` versus `>` at exactly the
+/// interval: real time advances between backdating and the `Instant::now()`
+/// inside `record`, so the elapsed span is always a few nanos PAST the
+/// interval. Distinguishing those two would need a frozen clock, and the
+/// difference is not operationally meaningful.
+#[cfg(test)]
+mod datagram_drop_log_tests {
+    use super::{DatagramDropLog, DATAGRAM_LOG_INTERVAL};
+    use std::time::{Duration, Instant};
+
+    /// Rewinds a limiter's last-emitted stamp to `ago` in the past, so the
+    /// next `record()` sees that much time as having elapsed.
+    fn set_last_logged_ago(log: &mut DatagramDropLog, ago: Duration) {
+        let t = Instant::now().checked_sub(ago).expect(
+            "cannot rewind the monotonic clock by the test interval — the clock origin is \
+             less than the interval in the past (a machine/container booted seconds ago). \
+             This is a test-environment limitation, not a failure of the limiter.",
+        );
+        log.last_logged = Some(t);
+    }
+
+    #[test]
+    fn the_first_event_on_a_fresh_limiter_always_emits() {
+        // The worst possible failure mode is a SILENT first drop: the
+        // diagnostic never appears at all and the operator has no signal that
+        // anything is being dropped. A fresh limiter must always let the
+        // first event through.
+        let mut log = DatagramDropLog::new();
+        assert_eq!(
+            log.record(),
+            Some(1),
+            "the first event on a fresh limiter must emit, carrying a total of 1"
+        );
+    }
+
+    #[test]
+    fn subsequent_events_within_the_interval_are_suppressed() {
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1), "first event emits");
+        for i in 2..=1000u64 {
+            assert_eq!(
+                log.record(),
+                None,
+                "event {i} arrived within the interval and must be suppressed — this is the \
+                 whole DoS mitigation; emitting here means per-datagram logging is unbounded"
+            );
+        }
+    }
+
+    #[test]
+    fn suppressed_events_are_still_counted_and_surface_in_the_next_emitted_line() {
+        // Counting ALWAYS happens, even when the line is suppressed, so an
+        // eventually-emitted line reports every event rather than only the
+        // logged ones — a suppressed burst stays visible as a number.
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1));
+        for _ in 0..499 {
+            assert_eq!(log.record(), None);
+        }
+
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(
+            log.record(),
+            Some(501),
+            "the next emitted line must carry the total of ALL 501 events, not just the 2 that \
+             were logged — otherwise a suppressed burst is invisible"
+        );
+    }
+
+    #[test]
+    fn a_line_becomes_due_again_once_the_interval_has_elapsed() {
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1));
+        assert_eq!(log.record(), None, "still inside the interval");
+
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(
+            log.record(),
+            Some(3),
+            "once the interval has elapsed the next event must emit again — a limiter that \
+             latches shut after its first line loses the diagnostic entirely"
+        );
+
+        // And emitting must RE-ARM the limiter: if the emit path failed to
+        // refresh `last_logged`, every subsequent event would emit forever
+        // after, which is the unbounded-logging DoS the type exists to stop.
+        assert_eq!(
+            log.record(),
+            None,
+            "emitting must reset the interval, not leave the limiter permanently open"
+        );
+    }
+
+    #[test]
+    fn an_event_well_inside_the_interval_stays_suppressed() {
+        // Brackets the boundary from below: half an interval is not enough.
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1));
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL / 2);
+        assert_eq!(
+            log.record(),
+            None,
+            "half the interval has elapsed — the line is not due yet"
+        );
+    }
+
+    #[test]
+    fn the_running_total_is_cumulative_across_emitted_lines() {
+        // The count is the connection's lifetime total for this branch, not a
+        // per-interval tally: it must never reset when a line is emitted.
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1));
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(log.record(), Some(2));
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(
+            log.record(),
+            Some(3),
+            "the total must accumulate over the connection's life, not restart each interval"
+        );
+    }
+
+    #[test]
+    fn each_limiter_is_independent_so_a_loud_branch_cannot_silence_a_quiet_one() {
+        // The stated reason there are FOUR limiters in `serve` rather than
+        // one: a cross-pair injector sending at line rate would hold a shared
+        // token permanently and suppress the `unknown dest` line — the exact
+        // line an operator greps for during a `registration_key` lockstep
+        // upgrade, when a version-skewed pair's only symptom is that it never
+        // rendezvouses. Each kind must surface within one interval no matter
+        // how loud the others are.
+        let mut loud = DatagramDropLog::new();
+        let mut quiet = DatagramDropLog::new();
+
+        assert_eq!(loud.record(), Some(1));
+        for _ in 0..10_000 {
+            let _ = loud.record();
+        }
+
+        assert_eq!(
+            quiet.record(),
+            Some(1),
+            "a quiet branch's FIRST event must emit even after another branch has recorded \
+             10,000 — the limiters must not share state"
+        );
+
+        // Their totals are independent too.
+        set_last_logged_ago(&mut loud, DATAGRAM_LOG_INTERVAL);
+        set_last_logged_ago(&mut quiet, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(loud.record(), Some(10_002), "loud branch's own running total");
+        assert_eq!(quiet.record(), Some(2), "quiet branch's own running total");
+    }
+
+    #[test]
+    fn the_log_interval_is_the_documented_ten_seconds() {
+        // Deliberately a restatement of the constant. It exists because the
+        // interval is a production tuning value that a later test-author
+        // might be tempted to shorten in order to test the elapse boundary by
+        // sleeping. Backdating (see this module's doc comment) is how that
+        // boundary is reached instead; this assertion makes the shortcut fail
+        // loudly if anyone takes it.
+        assert_eq!(DATAGRAM_LOG_INTERVAL, Duration::from_secs(10));
+    }
+}

@@ -445,7 +445,23 @@ enum RelaySpec<'a> {
 /// [`Scenario`]'s lifetime (or, for `Killable`, evicted early by case 3).
 enum RelayHandle {
     InProcess(tempfile::TempDir, tokio::task::JoinHandle<()>),
-    Killable(tempfile::TempDir, quinn::Endpoint, tokio::task::JoinHandle<()>),
+    /// Only the `quinn::Endpoint` is ever read (by [`RelayHandle::evict`] and
+    /// [`RelayHandle::open_connections`]). The other two are held purely so
+    /// they outlive the running relay — the same reason the [`Scenario`]'s
+    /// `_`-prefixed fields and `wiremesh-testkit`'s `_state_dir` exist, but a
+    /// tuple variant has no field names to `_`-prefix:
+    ///   * the `TempDir` owns the relay's certdir, which the serve task reads
+    ///     from; dropping it early would delete the certs out from under a
+    ///     live relay;
+    ///   * the `JoinHandle` keeps the serve task's identity to hand and
+    ///     documents the variant's ownership. (Dropping a tokio `JoinHandle`
+    ///     detaches rather than aborts, so this one is for symmetry with
+    ///     `InProcess` and for a future case that needs to await/abort it.)
+    Killable(
+        #[allow(dead_code)] tempfile::TempDir,
+        quinn::Endpoint,
+        #[allow(dead_code)] tokio::task::JoinHandle<()>,
+    ),
 }
 
 impl RelayHandle {
@@ -739,7 +755,13 @@ struct Scenario {
     gwa: Ns,
     gwb: Ns,
     wla: Ns,
-    wlb: Ns,
+    /// Held for symmetry with `wla`, so a case can drive traffic in the
+    /// reverse direction (wlB -> wlA) without re-deriving the handle. Every
+    /// case so far pings only wlA -> wlB, so it is `_`-prefixed per this
+    /// struct's convention for fields that are kept but not read. `Ns` is a
+    /// non-owning handle — the `Lab` still owns netns teardown — so this is
+    /// not a lifetime holder and carries no Drop-order hazard.
+    _wlb: Ns,
     /// The two NAT router namespaces, kept so a case can mutate in-transit
     /// reachability mid-test (case 4 lifts the `block_direct` blackholes via
     /// [`unblock_direct`]). `Ns` is a non-owning handle — the `Lab` still
@@ -1003,7 +1025,7 @@ async fn build_scenario(
         gwa,
         gwb,
         wla,
-        wlb,
+        _wlb: wlb,
         ra,
         rb,
         _lab: lab,
