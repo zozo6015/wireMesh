@@ -76,12 +76,16 @@ if command -v systemctl >/dev/null 2>&1; then systemctl daemon-reload || true; f
 
 # `ca.key` is THE marker for "a real controller lives here". Deliberately not
 # `controller.db` as well:
-#   - controller.db is not evidence of anything. The controller opens (and
-#     fully migrates) its DB before the CA guard gets a chance to refuse, so a
-#     single boot against the wrong directory leaves a complete, empty schema
-#     behind. Accepting it made a mis-started NEW_DIR look permanently
-#     occupied, which silently disabled the pin below — forever, and with no
-#     message at all.
+#   - controller.db is not evidence of anything. It USED to be actively
+#     harmful: the controller opened (and fully migrated) its DB before the CA
+#     guard got a chance to refuse, so a single boot against the wrong
+#     directory left a complete, empty schema behind, and accepting it made a
+#     mis-started NEW_DIR look permanently occupied — silently disabling the
+#     pin below, forever, with no message at all. The controller now opens its
+#     trust store first, so a refused boot leaves no residue (pinned by
+#     crates/wiremesh-controller/tests/boot_leaves_no_residue.rs). This marker
+#     stays narrow anyway, as defence in depth: the two halves of that fix are
+#     independent, and either one alone closes the bug.
 #   - ca.pem is not usable either: a legacy relay identity is ca.pem +
 #     relay.pem + relay.key in this same shared directory, so ca.pem would
 #     false-positive on a relay-only host.
