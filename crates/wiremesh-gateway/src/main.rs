@@ -22,7 +22,7 @@ use wiremesh_gateway::policy_apply::needs_policy_write;
 use wiremesh_gateway::punch_backoff::{PunchBackoff, PunchDecision};
 use wiremesh_gateway::relay::{RelayDeathReason, RelayTransport};
 use wiremesh_gateway::rotation::{Rotation, RotationAction, RotationPhase};
-use wiremesh_gateway::state::DesiredState;
+use wiremesh_gateway::state::{DesiredState, FailStaticWriter};
 use wiremesh_gateway::tunnelset::TunnelSet;
 use wiremesh_gateway::uapi::DeviceConfig;
 use wiremesh_gateway::{netif, observe, punch, reconcile, routes, sync, uapi};
@@ -569,6 +569,11 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     let live_endpoints = Arc::new(std::sync::Mutex::new(HashMap::<u64, String>::new()));
 
     let mut applied: Option<DesiredState> = DesiredState::load(&cfg.state_dir)?;
+    // Every fail-static write goes through this (Backlog item 1 follow-up):
+    // the enforcer apply is asynchronous now, so the save below is no longer
+    // gated by an IR decode that would have killed the process first. See
+    // `FailStaticWriter` for what it refuses to persist and why.
+    let mut fail_static = FailStaticWriter::seeded_from(applied.as_ref());
     if let Some(ds) = &applied {
         eprintln!("wiremesh-gateway: fail-static boot from state.json rev {}", ds.revision);
         apply_state(None, ds, &active, &wg0_pins, &live_endpoints).await?;
@@ -965,7 +970,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             //    stall of the Punch/rotation/scrape paths,
                             //    which is what this item exists to remove.
                             policy_apply.publish(ds.clone());
-                            ds.save(&cfg.state_dir)?;
+                            fail_static.save(&ds, &cfg.state_dir)?;
                             // (Key-rotation Role B) If desired state now shows a
                             // peer that is rotating (a real-keyed `pending`
                             // epoch advertised alongside its `active` one),

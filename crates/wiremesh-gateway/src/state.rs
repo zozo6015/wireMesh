@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
+use wiremesh_policy::PolicyIR;
 use wiremesh_proto::v1::{Delta, Peer, RelayInfo, StateSnapshot};
 
 /// One advertised key-epoch entry for a peer, as reported by the controller
@@ -194,6 +195,150 @@ impl DesiredState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).context("reading state.json"),
         }
+    }
+}
+
+/// Is `policy_ir` something THIS build can actually install?
+///
+/// [`crate::enforce::GatewayEnforcer::apply_if_changed`] is its only
+/// production consumer, and it funnels every non-empty `policy_ir` through
+/// [`PolicyIR::from_json`], which rejects any `schema` other than 1. An IR
+/// that fails there can never be installed by this binary — not on this
+/// boot, and not on any future one.
+///
+/// **Cost, because this runs on every Sync `State` event:** an emptiness
+/// test and a 12-byte prefix compare. [`PolicyIR::to_canonical_json`] is
+/// plain `serde_json::to_string` over a struct whose first field is
+/// `schema` — canonical *by construction*, an invariant `wiremesh-policy`'s
+/// `ir.rs` documents and explicitly forbids changing — so every well-formed
+/// schema-1 IR begins `{"schema":1,`. The full decode below is reached only
+/// by an IR that does NOT look like one, i.e. precisely the broken case (or
+/// a hypothetical future change to the canonical form, where it keeps this
+/// correct rather than fast). It is never a second decode of a healthy IR
+/// on the steady-state path.
+pub fn policy_ir_is_decodable(policy_ir: &[u8]) -> bool {
+    // "No policy yet" — `apply_if_changed` synthesizes an empty schema-1 IR
+    // for this, so there is nothing undecodable to persist.
+    if policy_ir.is_empty() {
+        return true;
+    }
+    if policy_ir.starts_with(br#"{"schema":1,"#) {
+        return true;
+    }
+    PolicyIR::from_json(policy_ir).is_ok()
+}
+
+/// Persists [`DesiredState`] for fail-static boot, never writing a
+/// `policy_ir` this build cannot decode.
+///
+/// # Why this exists
+///
+/// The enforcer apply used to run INLINE in the Sync loop, and its `?` fired
+/// BEFORE the save — so a snapshot carrying an IR the gateway could not
+/// decode killed the process and never reached disk. Backlog item 1 moved
+/// that apply into an off-loop worker, which makes the save unconditional.
+/// Without this type, a schema-2 (or malformed) `policy_ir` would be
+/// persisted and then replayed through the same failing worker on every
+/// subsequent fail-static boot: the failure would outlive reboots and
+/// outlive a controller rollback, and on a gateway with no prior good policy
+/// it would come up with nothing installed — default-deny, so fail-closed,
+/// but durable and much quieter than the crash it replaced.
+///
+/// # What it writes instead
+///
+/// The peer/device half of the snapshot is persisted EXACTLY as before —
+/// fail-static's job is unchanged and a newly enrolled peer must still reach
+/// disk. Only the `(policy_version, policy_ir)` pair is substituted, with
+/// the newest pair this build could decode, so a boot from this file comes
+/// up enforcing the last policy the gateway actually understood. That is
+/// what fail-static means. A gateway that has never seen a decodable pair
+/// falls back to the "no policy yet" pair (`0` / empty), which
+/// `apply_if_changed` turns into an empty schema-1 IR: the same default-deny
+/// the datapath already has, reported as `applied_version = 0` — which reads
+/// as "no policy" rather than as a version that was never installed.
+///
+/// # Why substituting the pair desynchronizes nothing
+///
+/// `revision` and `policy_version` are already independent by design, not by
+/// accident. Every sparse (non-policy) delta advances `revision` and leaves
+/// the policy pair untouched — see [`DesiredState::apply_delta`]'s
+/// `policy_version != 0` guard — so a persisted state whose revision is
+/// newer than its policy is the routine shape any `EndpointObserved` delta
+/// produces, not a new one invented here. `policy_ir` and `policy_version`
+/// are substituted together, so they always describe each other.
+#[derive(Debug, Default)]
+pub struct FailStaticWriter {
+    /// Newest `(policy_version, policy_ir)` this build could decode.
+    last_good: Option<(u64, Vec<u8>)>,
+    /// `policy_version` of the last undecodable IR warned about, so peer
+    /// churn under a broken controller does not re-log once per event.
+    warned: Option<u64>,
+}
+
+impl FailStaticWriter {
+    /// Seed from the state loaded at boot, so the first substitution after a
+    /// restart still has a good policy to fall back on rather than dropping
+    /// to the empty pair. A `state.json` written by a pre-fix binary can
+    /// itself carry an undecodable IR; that seeds `None` — and its own boot
+    /// install fails loudly, which is correct.
+    pub fn seeded_from(persisted: Option<&DesiredState>) -> FailStaticWriter {
+        let last_good = persisted
+            .filter(|ds| policy_ir_is_decodable(&ds.policy_ir))
+            .map(|ds| (ds.policy_version, ds.policy_ir.clone()));
+        FailStaticWriter { last_good, warned: None }
+    }
+
+    /// Persist `ds`, substituting its policy pair if the IR is undecodable.
+    pub fn save(&mut self, ds: &DesiredState, state_dir: &Path) -> anyhow::Result<()> {
+        if policy_ir_is_decodable(&ds.policy_ir) {
+            // Remember the pair only when the version actually moves: the
+            // clone is the IR itself, and `State` events (peer churn,
+            // endpoint observations, reconnect snapshots) are far more
+            // frequent than policy updates.
+            if self.last_good.as_ref().map(|(v, _)| *v) != Some(ds.policy_version) {
+                self.last_good = Some((ds.policy_version, ds.policy_ir.clone()));
+            }
+            self.warned = None;
+            return ds.save(state_dir);
+        }
+
+        let mut sanitized = ds.clone();
+        let kept = match &self.last_good {
+            Some((v, ir)) => {
+                sanitized.policy_version = *v;
+                sanitized.policy_ir = ir.clone();
+                Some(*v)
+            }
+            None => {
+                sanitized.policy_version = 0;
+                sanitized.policy_ir = Vec::new();
+                None
+            }
+        };
+        if self.warned != Some(ds.policy_version) {
+            self.warned = Some(ds.policy_version);
+            match kept {
+                Some(v) => eprintln!(
+                    "wiremesh-gateway: CRITICAL: the controller sent policy version {} in an IR \
+                     format this build cannot decode (only schema 1 is supported — is the \
+                     controller newer than this gateway?). The datapath keeps the last policy \
+                     it understood and state.json is being written with THAT policy (version \
+                     {v}) instead, so a restart does not inherit an uninstallable one. Peers \
+                     and routes are persisted normally. Upgrade this gateway.",
+                    ds.policy_version
+                ),
+                None => eprintln!(
+                    "wiremesh-gateway: CRITICAL: the controller sent policy version {} in an IR \
+                     format this build cannot decode (only schema 1 is supported — is the \
+                     controller newer than this gateway?), and this gateway has never installed \
+                     a policy it could read. NO policy is live: every tun is default-denying and \
+                     ALL fabric traffic is being dropped. state.json is being written with no \
+                     policy rather than an uninstallable one. Upgrade this gateway.",
+                    ds.policy_version
+                ),
+            }
+        }
+        sanitized.save(state_dir)
     }
 }
 
