@@ -1226,27 +1226,53 @@ async fn an_unreadable_deadline_is_a_counted_retry_and_never_an_ungated_apply() 
     );
 }
 
-/// **Retry backoff, and its reset on adoption.** Consecutive failures double
-/// the pause (to `RETRY_BACKOFF_MAX`) so an un-appliable policy cannot flood
-/// the log, but a CORRECTED policy must not inherit the wedged one's
-/// punishment — that is the operator recovery path, and making them wait out
-/// a grown backoff would be a self-inflicted outage extension.
+/// **The retry pause is interruptible, and adoption resets the cadence.**
 ///
-/// The measurement is the gap between the FIRST and SECOND attempt at the
-/// corrected state. The first attempt's own latency is not measured: the
-/// worker is asleep in the grown pause when the new state is published and
-/// only adopts it on waking, which is expected and unchanged by the reset.
+/// Consecutive failures double the pause (toward `RETRY_BACKOFF_MAX`) so an
+/// un-appliable policy cannot flood the log. But that backoff is a sentence
+/// the BAD policy earned, and a CORRECTED policy must serve none of it —
+/// this is the operator's outage-response path, entered right after they
+/// watched the gateway reject the previous version.
 ///
-/// Arithmetic at `RETRY_AFTER` = 50ms — attempts at 0/50/150/350/750ms, so
-/// after the fifth failure the pause has grown to 800ms and the next
-/// doubling is 1600ms. With the reset the measured gap is ~50ms; without it,
-/// ~1600ms. The 400ms threshold sits 8x above the former and 4x below the
-/// latter.
+/// Two distinct properties, both measured in one wedge episode:
 ///
-/// Sabotage that must turn this red: drop `backoff = retry_after` from the
-/// re-adoption arm.
+///  1. **The corrected state's FIRST attempt is prompt** — it must not wait
+///     out the pause already in flight. (An earlier revision used a plain
+///     `tokio::time::sleep(backoff)`, so it did; that is what this now pins
+///     away.)
+///  2. **The cadence resets** — its SECOND attempt follows at
+///     `retry_after`, not at the grown backoff. Waking early but keeping the
+///     grown backoff would fix the first attempt and leave the next one
+///     ~1.6s out.
+///
+/// **Residual-latency case pinned here: ZERO outstanding grace.** Every
+/// entry has `ready_at: None` and the fake's forced failure short-circuits
+/// before writing anything, so no generation flipped and there is no grace
+/// to serve — the common wedge (a policy rejected by `check_lpm_capacity` or
+/// the IR decoder, which fails before any flip). The remaining latency is
+/// therefore one `spawn_blocking` round trip, and `RESPONSIVE_WITHIN` is a
+/// fair budget. The non-zero-grace case — where waking early must NOT let
+/// the corrected state jump a genuinely outstanding grace — is the separate
+/// safety pin in `waking_early_still_waits_out_an_outstanding_reap_grace`.
+///
+/// Arithmetic at `RETRY_AFTER` = 50ms: attempts at 0/50/150/350/750ms, so
+/// when the fifth failure is observed the worker is in an 800ms pause and
+/// the next doubling would be 1600ms. Property 1 measures ~1ms against a
+/// 250ms budget (old behaviour: ~800ms). Property 2 measures ~50ms against
+/// a 400ms budget (no reset: ~1600ms).
+///
+/// The publish may land just BEFORE the worker reaches the pause; that is
+/// fine and deliberately not synchronized against. `watch` tracks changes
+/// with a channel-side version counter rather than inside the `changed()`
+/// future, so a change published before the select is entered still resolves
+/// its mailbox arm immediately.
+///
+/// Sabotage that must turn each red: (1) replace `pause_or_wake` with a
+/// plain `sleep(backoff)` — the first attempt arrives ~800ms late;
+/// (2) drop `backoff = retry_after` from the `Pause::Adopted` arm — the
+/// second attempt arrives ~1.6s late.
 #[tokio::test]
-async fn adopting_a_corrected_policy_resets_the_retry_backoff() {
+async fn a_corrected_policy_wakes_the_retry_pause_and_gets_a_fresh_cadence() {
     let (target, mut sig) = FakeTarget::new();
     target.fail_next(u64::MAX);
     let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
@@ -1258,24 +1284,42 @@ async fn adopting_a_corrected_policy_resets_the_retry_backoff() {
         assert_eq!((v, ok), (1, false), "wedged attempt {attempt} must fail");
     }
 
-    // The corrected policy. Kept un-appliable for now, so the retry cadence
-    // stays observable rather than ending at the first success.
+    // The corrected policy, published into an ~800ms pause. Kept
+    // un-appliable for now, so the retry cadence stays observable rather
+    // than ending at the first success.
+    let published_at = Instant::now();
     handle.publish(ds(2));
 
+    // (1) Promptness. `next_failed_attempt_at` returns on the first attempt
+    // carrying version 2, so this latency is measured to the corrected
+    // state's OWN first attempt — which also proves the publish was neither
+    // lost nor slept through: a worker that dropped it would keep attempting
+    // v1 until the recv budget expired.
     next_failed_attempt_at(&mut sig, 2).await;
+    let first_attempt_latency = published_at.elapsed();
+    assert!(
+        first_attempt_latency < RESPONSIVE_WITHIN,
+        "the corrected policy's FIRST attempt came {first_attempt_latency:?} after it was \
+         published (budget {RESPONSIVE_WITHIN:?}) — it sat out the remainder of a pause \
+         the REJECTED policy earned. Nothing was flipped by the failed attempts, so there \
+         is no reap grace to serve here; the only legitimate delay is one spawn_blocking \
+         round trip."
+    );
+
+    // (2) Cadence reset.
     let first_v2_attempt = Instant::now();
     next_failed_attempt_at(&mut sig, 2).await;
     let gap = first_v2_attempt.elapsed();
-
     assert!(
         gap < Duration::from_millis(400),
         "the corrected policy's second attempt came {gap:?} after its first — it \
          inherited the wedged state's grown backoff instead of getting a fresh \
-         {RETRY_AFTER:?} cadence. A corrected policy is the operator's recovery path; \
-         it must not be made to serve the previous policy's sentence."
+         {RETRY_AFTER:?} cadence. Waking early is only half the fix if the state that \
+         woke us then serves the previous policy's sentence anyway."
     );
 
-    // And it still lands once it can.
+    // And a state the worker adopted must actually get installed, not merely
+    // attempted: it lands as soon as it can.
     target.stop_failing();
     loop {
         let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(10), "an install").await;
@@ -1289,6 +1333,91 @@ async fn adopting_a_corrected_policy_resets_the_retry_backoff() {
         vec![2],
         "the wedged state must never have been installed — only the corrected one"
     );
+}
+
+/// **The counterpart safety pin: waking early must not skip a real grace.**
+///
+/// Making the retry pause interruptible creates exactly one new way to get
+/// this wrong — treating "the operator is waiting, go now" as licence to
+/// install without re-reading the deadline. The backoff is a courtesy and
+/// can be cut short; the reap grace protects outer-array slots that in-flight
+/// packets may still be reading, and cannot.
+///
+/// **Residual-latency case pinned here: NON-ZERO outstanding grace** — the
+/// case the zero-grace test above deliberately excludes. The fixture arms a
+/// real deadline at the moment the corrected state is published, modelling a
+/// previous attempt that flipped a generation before failing.
+///
+/// Two bounds, and the second is why the fixture has a second entry:
+///
+///  - **Lower** — the corrected state must land no EARLIER than the grace.
+///    This is the safety property.
+///  - **Upper** — and no later than the grace plus a small margin, because
+///    the grace is the only delay it still owes. `gates_the_dead_state_only`
+///    is already on v2, so it is filtered out for the state actually being
+///    installed but gates the SUPERSEDED v1 with a 2s deadline. A worker
+///    that adopts the new state late — at step (4) instead of at the pause
+///    site — therefore loops back and `sleep_until`s a deadline computed for
+///    a state it already knows is dead, landing at ~2s instead of ~500ms.
+///    Without that second entry the upper bound would be near-vacuous, since
+///    at this point in the episode the backoff is only ~50ms.
+///
+/// Sabotage that must turn this red: install straight after `Pause::Adopted`
+/// without looping back to re-read the deadline (lands at ~0ms — lower bound);
+/// or move adoption out of the pause site back to step (4) (lands at ~2s —
+/// upper bound).
+#[tokio::test]
+async fn waking_early_still_waits_out_an_outstanding_reap_grace() {
+    let (target, mut sig) = FakeTarget::new();
+    target.fail_next(1); // exactly one wedged attempt, then the backend is fine
+    // A deliberately roomy `retry_after` for this test only: it is the window
+    // the test has to arm the fixture and publish before the pause could
+    // elapse on its own. Nothing here measures the backoff — the grace does
+    // all the gating — so a longer one costs nothing and removes a race that
+    // would otherwise show up as the wrong version being installed.
+    let handle = spawn_policy_apply_worker(target.clone(), Duration::from_millis(300));
+
+    handle.publish(ds(1));
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the wedged attempt").await;
+    assert_eq!((v, ok), (1, false));
+
+    // Armed BEFORE the publish (which is what wakes the worker), so both
+    // entries are already in effect by the time the deadline is re-read.
+    let grace_until = Instant::now() + Duration::from_millis(500);
+    let dead_state_grace = Instant::now() + Duration::from_secs(2);
+    target.set_entries(vec![
+        // The enforcer the corrected state must write: a real grace
+        // outstanding, as if the failed attempt had flipped it.
+        FakeEntry { applied_version: None, ready_at: Some(grace_until) },
+        // Already on v2, so irrelevant to the state being installed — but it
+        // gates the superseded v1 heavily. Only a worker still holding the
+        // dead state when it queries the deadline can see this.
+        FakeEntry { applied_version: Some(2), ready_at: Some(dead_state_grace) },
+    ]);
+    handle.publish(ds(2));
+
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the install").await;
+    assert_eq!((v, ok), (2, true), "the corrected state lands");
+
+    let landed = target.installs()[1].started_at;
+    assert!(
+        landed >= grace_until,
+        "the corrected state was installed {:?} BEFORE the outstanding reap grace \
+         expired. Waking the retry pause early is a courtesy owed to the operator; the \
+         grace protects in-flight packets from reading a slot that is being overwritten, \
+         and is not negotiable.",
+        grace_until.saturating_duration_since(landed)
+    );
+    assert!(
+        landed < grace_until + RESPONSIVE_WITHIN,
+        "the corrected state landed {:?} after its own grace expired — the grace is the \
+         ONLY delay it still owes. This much overshoot means the deadline was queried \
+         (and slept on) for the SUPERSEDED state, i.e. the new state was adopted too \
+         late to keep the worker off a dead state's deadline.",
+        landed.saturating_duration_since(grace_until)
+    );
+    settle_counters().await;
+    assert_eq!(handle.failures(), 1, "only the original wedged attempt failed");
 }
 
 // --- (E) the metric ------------------------------------------------------
