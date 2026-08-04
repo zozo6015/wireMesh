@@ -110,6 +110,52 @@ impl PolicyApplyHandle {
     }
 }
 
+/// How an interruptible retry pause ended. See [`pause_or_wake`].
+enum Pause {
+    /// The pause ran to completion; retry the same desired state.
+    Elapsed,
+    /// A newer desired state was published during the pause; it supersedes
+    /// whatever we were retrying, and the retry cadence starts over.
+    Adopted(DesiredState),
+    /// A `None` was published — unreachable today (`publish` only ever sends
+    /// `Some`); go back to waiting for a real state.
+    Empty,
+    /// Every handle is gone; the worker should exit.
+    Closed,
+}
+
+/// Wait out `backoff`, but wake IMMEDIATELY if a new desired state arrives.
+///
+/// This is the operator's outage-response path: a wedged policy has driven
+/// the backoff up (toward [`RETRY_BACKOFF_MAX`]), the operator pushes a
+/// corrected one, and it must not sit out the remainder of a pause that the
+/// BAD policy earned. A plain `sleep` made the corrected state's very first
+/// attempt up to a full `RETRY_BACKOFF_MAX` late, with no feedback, right
+/// after the operator watched the gateway reject the previous version.
+///
+/// `biased` so the mailbox arm is polled first: when both are ready the
+/// change wins. Nothing can be lost either way — `watch` tracks changes with
+/// a version counter, not with the `changed()` future, so a `changed()`
+/// dropped by the timer arm leaves the flag set for the caller's next read.
+async fn pause_or_wake(
+    rx: &mut watch::Receiver<Option<DesiredState>>,
+    backoff: Duration,
+) -> Pause {
+    tokio::select! {
+        biased;
+        r = rx.changed() => {
+            if r.is_err() {
+                return Pause::Closed;
+            }
+            match rx.borrow_and_update().clone() {
+                Some(newer) => Pause::Adopted(newer),
+                None => Pause::Empty,
+            }
+        }
+        _ = tokio::time::sleep(backoff) => Pause::Elapsed,
+    }
+}
+
 /// Spawn the policy-apply worker onto the current runtime and return its
 /// mailbox handle. The task exits once the last [`PolicyApplyHandle`] is
 /// dropped.
@@ -121,6 +167,19 @@ impl PolicyApplyHandle {
 /// the last good policy and the gateway keeps running", not to a dead
 /// process — and not to a log flood either, which is why the backoff exists
 /// (the counter, not the log line, is the alertable signal).
+///
+/// **A newly published state never waits out a backoff it did not earn.**
+/// The retry pause is interruptible ([`pause_or_wake`]): a publish during it
+/// wakes the worker at once, the new state is adopted there and then, and
+/// the deadline query at step (2) is re-run for THAT state rather than the
+/// superseded one. The remaining latency before its first install attempt is
+/// therefore exactly: one `spawn_blocking` round trip for the deadline read,
+/// plus any genuine reap grace still outstanding (up to the backend's 10s) if
+/// a partially-applied previous attempt flipped a generation. That grace is
+/// the safety property, not backoff — it cannot be skipped, and in the common
+/// wedge case (a policy rejected by `check_lpm_capacity` or the IR decoder,
+/// which fails BEFORE any flip) there is no grace outstanding and the
+/// attempt is immediate.
 pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
     target: Arc<T>,
     retry_after: Duration,
@@ -183,11 +242,20 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                             eprintln!(
                                 "wiremesh-gateway: policy-apply deadline query failed (policy \
                                  version {}): {e}; NOT applying without a reap-grace reading, \
-                                 retrying in {backoff:?}",
+                                 retrying in {backoff:?} (or sooner if a new policy arrives)",
                                 ds.policy_version
                             );
-                            tokio::time::sleep(backoff).await;
-                            backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                            match pause_or_wake(&mut rx, backoff).await {
+                                Pause::Elapsed => {
+                                    backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                                }
+                                Pause::Adopted(newer) => {
+                                    ds = newer;
+                                    backoff = retry_after;
+                                }
+                                Pause::Empty => break,
+                                Pause::Closed => return,
+                            }
                             continue;
                         }
                     }
@@ -251,15 +319,16 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                 match res {
                     Ok(Ok(())) => break,
                     // (6) Logged, counted, retried — never fatal, never
-                    // wedged. The retry re-enters this loop, so a corrected
-                    // policy published while a bad one is failing is picked
-                    // up on the next attempt instead of grinding forever on
-                    // the state the backend rejects.
+                    // wedged. The pause below is interruptible, so a
+                    // corrected policy published while a bad one is failing
+                    // is adopted the moment it arrives rather than after the
+                    // wedged state's grown backoff.
                     Ok(Err(e)) => {
                         failures.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "wiremesh-gateway: policy apply failed (policy version {}): {e:#}; \
-                             retrying in {backoff:?} — datapath keeps the last good policy",
+                             retrying in {backoff:?} (or sooner if a new policy arrives) — \
+                             datapath keeps the last good policy",
                             ds.policy_version
                         );
                     }
@@ -267,13 +336,25 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                         failures.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "wiremesh-gateway: policy apply task panicked (policy version {}): \
-                             {e}; retrying in {backoff:?}",
+                             {e}; retrying in {backoff:?} (or sooner if a new policy arrives)",
                             ds.policy_version
                         );
                     }
                 }
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                match pause_or_wake(&mut rx, backoff).await {
+                    Pause::Elapsed => backoff = (backoff * 2).min(RETRY_BACKOFF_MAX),
+                    // Adopted HERE rather than falling through to step (4):
+                    // looping back with the superseded `ds` would query the
+                    // deadline — and possibly sleep on it — for a state we
+                    // already know is dead, which would give back most of
+                    // what waking early just bought.
+                    Pause::Adopted(newer) => {
+                        ds = newer;
+                        backoff = retry_after;
+                    }
+                    Pause::Empty => break,
+                    Pause::Closed => return,
+                }
             }
         }
     });

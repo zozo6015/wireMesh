@@ -119,7 +119,15 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
     /// gauge (and the report derived from it) never claims a version the
     /// datapath does not have.
     fn install(&self, ds: &DesiredState) -> anyhow::Result<()> {
-        let mut deferred: Vec<u32> = Vec::new();
+        // `(epoch, how much of its grace is left)` for every entry this call
+        // refused to write. Both halves are in the error text below: the
+        // epoch says WHICH tun is still on the old policy, and the remaining
+        // duration says how long the retry will take to finish the job —
+        // without them an operator reading a `policy_apply_failures_total`
+        // bump has no way to tell a benign rotation race from a real
+        // rejection.
+        let mut deferred: Vec<(u32, Duration)> = Vec::new();
+        let mut installed: Vec<u32> = Vec::new();
         let mut failure: Option<anyhow::Error> = None;
         {
             let mut map = self.enforcers.blocking_lock();
@@ -128,14 +136,19 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
                 if enforcer.applied_version() == Some(ds.policy_version) {
                     continue; // nothing would be written; nothing to gate on
                 }
-                if enforcer.apply_ready_at().is_some_and(|t| t > now) {
-                    deferred.push(*epoch);
-                    continue;
+                if let Some(left) =
+                    enforcer.apply_ready_at().map(|t| t.saturating_duration_since(now))
+                {
+                    if !left.is_zero() {
+                        deferred.push((*epoch, left));
+                        continue;
+                    }
                 }
                 if let Err(err) = enforcer.apply_if_changed(ds) {
                     failure = Some(err.context(format!("applying policy to epoch {epoch}")));
                     break;
                 }
+                installed.push(*epoch);
             }
         }
         if let Some(e) = failure {
@@ -155,10 +168,25 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
             // Not a policy error — a race with a rotation insert. Reported
             // as `Err` purely so the worker retries; the counter ticking is
             // acceptable and honest ("this apply did not fully land").
+            //
+            // This message is the ONLY place this condition is ever visible:
+            // the worker only sees an opaque `anyhow::Error`, so no test can
+            // assert its contents. It must therefore say, on its own, what
+            // happened, what is stale right now, and what will fix it.
+            let longest = deferred.iter().map(|(_, left)| *left).max().unwrap_or_default();
+            let epochs: Vec<String> =
+                deferred.iter().map(|(e, left)| format!("{e} ({left:?} left)")).collect();
             anyhow::bail!(
-                "epoch(s) {deferred:?} were inserted after the apply deadline was read and are \
-                 still inside their reap grace; deferring policy version {} for them",
-                ds.policy_version
+                "policy version {} was installed on epoch(s) {installed:?} but NOT on {} — \
+                 [{}] are still inside their post-flip reap grace. They were created after this \
+                 apply's deadline was read (a key rotation starting concurrently with a policy \
+                 update), so writing them now could pull maps out from under in-flight packets. \
+                 No policy is lost: the worker retries and the longest outstanding grace is \
+                 {longest:?}. Persistent repeats of this for the SAME epoch mean a rotation tun \
+                 is stuck flipping, not a bad policy.",
+                ds.policy_version,
+                deferred.len(),
+                epochs.join(", "),
             );
         }
         self.applied_version.store(ds.policy_version, Ordering::Relaxed);
