@@ -192,3 +192,92 @@ window. This removes B8's only dependency on the deferred proto block.
 | H | Relay-observed ALPN counter as the `/0` horizon | OPEN, recommended |
 | I | Shared precursor: `PathCtx` → rotation-overlap handle (also B5/B7) | OPEN |
 | J | Per-relay connect dedup + relay-choice cursor | OPEN — `try_start_relay_connect` keys on `gid` (`main.rs:1449-1455`) and `relay_next_idx` is per-peer (`main.rs:2363-2369`), so an eviction fan-out spawns N connections to N relays, defeating mux exactly when it matters. "Reconnect ONCE" has no mechanism behind it today. |
+
+---
+
+# Addendum, 2026-08-05: what item 3a shipped, and what writing case5 revealed
+
+## Shipped in 3a (branch `fix/relay-injection-and-pairid`)
+
+1. **Cross-pair injection closed.** `serve` now computes the one legal dest after
+   registration and drops anything else. Drop, never close: closing buys nothing against
+   an attacker who can reconnect, and a QUIC handshake plus registration costs the *relay*
+   far more than the compare that dropped the datagram — an amplification the attacker
+   would choose. Against a *bug* (a version-skewed gateway during the lockstep window
+   below) dropping leaves a static greppable failure where closing would be a fleet-wide
+   reconnect storm.
+2. **Key widened 32 → 64 bits.** Raw `digest[..8]`; header size unchanged.
+3. **`register_decision` extracted** as a pure public function, with `RegEntry` gaining
+   `peer` so the relay can finally tell a reconnect from a collision. Owner mismatch
+   rejects *first and unconditionally* — the peer half is attacker-chosen and must never
+   upgrade a rejection into a replace.
+4. **All four per-datagram log branches bounded** by a `DatagramDropLog` type. Three were
+   unbounded; the fourth (runt datagrams) logged *nothing at all*, so malformed traffic was
+   invisible. Per-branch limiters, not shared, so a loud injector cannot suppress the
+   `unknown dest` line operators grep during a lockstep upgrade.
+
+**This is a LOCKSTEP upgrade.** Wire format is otherwise untouched — same 8-byte header
+both directions, same registration framing and ack, same ALPN, same MTU floor, no proto or
+gateway change — but relay and both gateways recompute the derivation independently, so a
+version split means the pair silently never rendezvouses (old relay: `unknown dest`; new
+relay: dropped as cross-pair; gateway: nothing). Relay and both gateways of any relayed
+pair must move together. The dest check and collision rejection are relay-side only.
+
+## The width bug is ADVERSARIAL, which §1 above understated
+
+§1 re-graded the collision from "permanent fail-closed outage" to "self-healing mutual
+exclusion" and that is correct **for accidents**. Writing the tests surfaced the other
+half: **`peer_identity` is not cert-bound.** `serve` enforces `my_identity ==
+cert_identity` (explicit SECURITY comment, `lib.rs:566-576`) and never checks the peer
+half — it is free-form wire input.
+
+So an attacker holding *any* valid gateway cert can brute-force a string `P` with
+`registration_key("gw-C", P) == registration_key("gw-A", "gw-B")` — a 32-bit target
+preimage, ~4.3e9 single-block SHA-256, minutes on a laptop. Then `gw-C` registers
+`(gw-C, P)`, occupies A's slot, and:
+
+- A's own registration is **rejected** (`existing.owner != cert_identity`, close code 3)
+  for as long as C holds the connection;
+- B's datagrams addressed to `K(A,B)` are **delivered to C**.
+
+WireGuard E2E holds, so no confidentiality break — but it is a targeted, attacker-chosen
+DoS plus interception of a chosen pair's relay leg, by one compromised enrolled gateway.
+At 64 bits the search is ~1.8e19. The old doc comment's "collision-safe at v1's
+≤50-segment scale" was true for accidents and false adversarially; both failure modes are
+now separated in the code.
+
+## The peer-departure wedge is SELF-PERPETUATING (new, and it strengthens 3b's case)
+
+§3 established that a peer leaving the relay is undetectable. Writing `case5` established
+something worse: **the pair cannot recover by any path on its own.**
+
+A peer can only leave the relay by reaching `Direct`. A punch needs both sides. And the
+survivor discards every punch — including controller-brokered directives — while
+`relay_pointed` holds (`directive_should_punch(Some(Relayed), true) == false`). So the
+survivor's pin is precisely what prevents the peer from producing the event that would
+clear it. It is circular, and no amount of waiting resolves it.
+
+This also made the *graceful* departure unreachable in the netns harness, because the bug
+blocks the very transition the test would need. `case5` therefore has the peer **lose** the
+relay (blackholed in its router only) instead. That differs in the peer's own experience
+and in ~30s of registration-reap latency, and in **nothing the survivor can observe** —
+relay healthy, our connection healthy, peer's route gone. Exactly the input set `NO_ROUTE`
+would act on. Reproducing a graceful departure needs a production seam (on-demand
+per-peer relay teardown) that does not exist.
+
+`case5` is committed `#[ignore]`d and failing, with a right-reason guard set that panics on
+premise failures *before* the verdict so a harness fault cannot masquerade as the finding.
+Verified: it fails on the verdict, at the documented site, with all eight premises
+satisfied. Un-ignore when `healthy_relay`'s check (`main.rs:2731`) stops meaning "the QUIC
+connection is alive" and starts meaning "this peer is reachable through this relay" —
+§3 hazard 1, which §4's stale-pin sweep needs identically, so build it once.
+
+## Decisions closed by 3a
+
+| # | Was | Now |
+|---|---|---|
+| A | Unfold the width fix from the mux break | **DONE** — shipped standalone |
+| B | Ship the `/0` dest-pinning check as a patch | **DONE** |
+| D | Netns case pinning peer-departure red against `/0` | **DONE** — `case5`, `#[ignore]`d |
+
+E, F, G, H, I, J remain open and belong to 3b.
