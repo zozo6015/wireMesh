@@ -185,7 +185,7 @@ window. This removes B8's only dependency on the deferred proto block.
 | A | Unfold the width fix from the mux break | **DECIDED: yes — ship separately** |
 | B | Ship the `/0` dest-pinning check now as a patch | **DECIDED: yes** |
 | C | Re-motivate interest sets as a fix, not parity | adopted (affects the netns case) |
-| D | Netns case pinning peer-departure RED against `/0` first | **DECIDED: yes** |
+| D | Netns case pinning peer-departure RED against `/0` first | **DONE in 3a** — the TEST shipped (`case5`, `#[ignore]`d and failing). The GAP IS STILL OPEN; the fix belongs to 3b |
 | E | Split `teardown_relay_transport` per-peer vs per-connection | hard requirement if mux proceeds |
 | F | Channel semantics: truncated epoch, or opaque tunnel-instance id | OPEN |
 | G | Specify the forwarded (relay→gateway) header | OPEN — load-bearing |
@@ -281,3 +281,48 @@ connection is alive" and starts meaning "this peer is reachable through this rel
 | D | Netns case pinning peer-departure red against `/0` | **DONE** — `case5`, `#[ignore]`d |
 
 E, F, G, H, I, J remain open and belong to 3b.
+
+
+## Addendum 2: two things the analysis above left implicit
+
+### Mixed-version rollout for the width change (was unstated)
+
+"Lockstep" needs an order, or an operator will pick one and pick wrong. The derivation is
+recomputed independently by three parties, and a relayed pair needs all three in agreement,
+so:
+
+1. **Relays first, one at a time.** A restarted relay drops its registry; both gateways of
+   every pair using it re-register on their next `MarkRelayNeeded`. Between the restart and
+   the gateway upgrades, pairs on that relay cannot rendezvous — old gateways compute the
+   old key, the new relay computes the new one and drops it as cross-pair. Expect the
+   dest-pinning counter to climb during the window; that is the fix working, not a fault.
+2. **Then gateways**, in any order. A pair recovers the moment its *second* member is
+   upgraded — not the first.
+3. **Multi-relay fabrics degrade more gracefully**: `relay_next_idx` rotates per attempt
+   (`main.rs:2363-2369`), so a pair that fails on an upgraded relay tries the next one, and
+   an un-upgraded relay still serves un-upgraded pairs.
+
+The window is bounded by how long a pair tolerates no relay path, not by the upgrade
+itself. On a single-relay fabric with symmetric NAT, that window is a hard outage for
+affected pairs — schedule accordingly. There is no compatibility shim and deliberately so:
+a dual-derivation relay would have to accept BOTH keys, which re-opens the 32-bit slot to
+an attacker for as long as it is supported.
+
+### The `/0` observation horizon is not fleet-complete
+
+The proposed rule — remove `/0` once a relay has observed zero `/0` registrations for a
+window — is sound per relay and **unsound across a fleet**. A relay only ever sees the
+gateways that chose it, and `relay_next_idx` means a gateway may not touch a given relay
+for a long time; a pair that only ever relays through R1 is invisible to R2's counter. So
+"R2 saw no `/0`" is not evidence that no `/0` gateway exists.
+
+Two ways to make it whole, neither requiring X-6:
+- **Aggregate across all relays** and additionally require that every enrolled gateway has
+  been *seen at all* in the window — a gateway absent from every relay's counter is
+  unobserved, not upgraded.
+- Or invert it: have the relay report its per-ALPN counts to the controller (it already
+  holds a Sync connection for the denylist), so the controller can compare observed
+  gateways against its own roster. That is the only place the full roster exists.
+
+Until one of those is built, treat the per-relay counter as a *necessary but not
+sufficient* signal, and pair it with a calendar horizon stated in release notes.
