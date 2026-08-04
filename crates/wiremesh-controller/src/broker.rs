@@ -221,9 +221,14 @@ impl Broker {
     /// `set_local_candidates` — `local_endpoints` being the ORIGINAL
     /// instance of this race, predating this field.
     ///
-    /// Four residuals, all deliberate. The first two are accepted for good;
-    /// the last two are known gaps with a stated reason for not closing them
-    /// in this item — do not read them as settled:
+    /// The gate is applied by every mutating gateway->controller RPC —
+    /// `Sync.Report` AND `Sync.SubmitEpochKey` — through the one shared
+    /// predicate in `SyncSvc::check_session_generation`. A new mutating RPC
+    /// must call it too.
+    ///
+    /// Three residuals, all deliberate. The first two are accepted for good;
+    /// the last is a known gap with a stated reason for not closing it in
+    /// this item — do not read it as settled:
     ///
     /// - **The UDP observe path is NOT covered.** `crate::observe`'s
     ///   `handle_probe` writes the same candidate table (via
@@ -277,24 +282,18 @@ impl Broker {
     ///   `on_gateway_connected` join handle — holding the lock while awaiting
     ///   a spawned task that wants the same lock is the one way to deadlock
     ///   this design.
-    /// - **`Sync.SubmitEpochKey` is NOT gated, and should be.** Same class as
-    ///   `report`, and NOT harmless. `Db::set_epoch_pubkey` is a
-    ///   compare-and-swap (`... AND pubkey = 'awaiting-submission'`), so a
-    ///   stale submission can never overwrite a real key and a duplicate is
-    ///   already rejected — but it CAN win the CAS. Reachable shape: a
-    ///   submission is in flight when the gateway restarts; because
-    ///   [`Broker::send_rotate_if_pending`] re-issues a `RotateDirective`
-    ///   for any pending epoch still carrying the sentinel, the new process
-    ///   mints a DIFFERENT key and submits it for the same epoch, and
-    ///   whichever lands first wins. If the pre-restart key wins, the
-    ///   controller advertises a pubkey the restarted gateway is not serving
-    ///   on that epoch's tun. No peer can then ack it — and
-    ///   `rotation::decide`'s rule 4 promotes on the `GRACE_PROMOTE` timeout
-    ///   REGARDLESS of ack state, so this does not abort cleanly: it
-    ///   promotes the wrong key to `active`. Closing it needs a
-    ///   `session_generation` field on `SubmitEpochKeyRequest` (field 3 is
-    ///   free) — a proto change, deliberately out of scope for this item and
-    ///   flagged rather than made silently.
+    ///
+    /// A NOTE ON WHAT IS *NOT* A RESIDUAL HERE. `Sync.SubmitEpochKey` was one
+    /// — a stale submission could WIN `Db::set_epoch_pubkey`'s
+    /// compare-and-swap onto the `awaiting-submission` sentinel and install a
+    /// key the restarted gateway is not serving. It is now gated by the same
+    /// shared predicate, so it is closed. What that investigation surfaced
+    /// and did NOT close is a key-rotation-side hazard, recorded as
+    /// `docs/research/key-rotation-teardown-notes.md` §E: `rotation::decide`
+    /// rule 4 promotes a real-keyed pending epoch on the `GRACE_PROMOTE`
+    /// timeout REGARDLESS of ack state, so a wrong-but-real key does not fail
+    /// safe — it is promoted to `active` rather than aborting. That belongs
+    /// to the key-rotation item, not to this one.
     ///
     /// `reporter_gateway_id` is the AUTHENTICATED gateway id `Sync.Report`
     /// resolved from the mTLS peer certificate — never anything

@@ -139,6 +139,53 @@ REMOVED from the roster mid-overlap leaks its overlap Device/routes (no collapse
 fires); (5) the original post-cutover CIDR-churn note above still stands for the
 overlap's lifetime.
 
+## E. A wrong-but-real epoch key does NOT fail safe — rule 4 promotes it anyway (found 2026-08-04)
+
+Found while assessing whether `Sync.SubmitEpochKey` needed the Sync session-generation
+gate (Backlog item 2). The *submission* race is now closed there; **this half is not, and
+belongs to the key-rotation item.**
+
+`rotation::decide` (rotation.rs:55-99) has no path that rejects a real key nobody can use:
+
+- **Rule 2** refuses to promote a pending epoch still holding the `awaiting-submission`
+  sentinel, and past `ABORT_AFTER` it aborts. This is the ONLY abort path — its own
+  comment at rotation.rs:89-92 says so: *"abort is only reachable via rule 2's no-real-key
+  branch."*
+- **Rule 3** promotes early once every expected peer has acked live.
+- **Rule 4** promotes on the `GRACE_PROMOTE` timeout **regardless of ack state**.
+
+So the ack signal is an accelerator, never a veto. If the controller ends up advertising a
+real pubkey that the gateway is not actually serving on that epoch's tun, no peer can
+establish a session, no peer can ack — and rule 4 promotes it to `active` at 90s anyway.
+The rotation completes "successfully" onto a key that cannot carry traffic, and the prior
+active epoch is subsequently retired. That is a wedged gateway, reached without any
+component reporting an error.
+
+How the controller could come to advertise such a key (the shape that led here, now closed
+on the Sync side): `Db::set_epoch_pubkey` (db.rs:1903-1908) is a compare-and-swap onto the
+sentinel, first writer wins. With a submission in flight across a gateway restart,
+`Broker::send_rotate_if_pending` (broker.rs:426-432) re-issues a `RotateDirective` for the
+still-sentinel epoch; the new process mints a *different* key (`EpochKeys::generate_next`
+allocates `max(epoch)+1`, epochkeys.rs:79) but submits it under the *directive* epoch —
+there is even a WARNING log for that mismatch at main.rs:3680-3686 — so two different
+pubkeys race for one epoch and the pre-restart one usually lands first. Session generation
+now rejects the stale submission, so this particular producer is gone.
+
+**Why it still matters:** the CAS race was one producer, not the only one. Rule 4's
+unconditional promote means *any* future path that installs a key the gateway is not
+serving degrades from "rotation stalls and aborts" to "rotation promotes a dead key". The
+fail-safe is missing, not merely unused.
+
+FIX (key-rotation item, not scoped here): rule 4 should not promote with **zero** live
+acks when `expected_peers` is non-empty — that state is indistinguishable from "the key we
+advertised is unusable". Options: abort instead of promoting when `live_acks.is_empty() &&
+!expected_peers.is_empty()` at the grace deadline; or keep promoting but only after a
+longer no-ack deadline, so a genuinely quiet-but-correct fabric still converges. Note the
+tension rule 4 exists to resolve — a peer that is simply offline must not block a rotation
+forever — so the fix is a threshold question, not a straight inversion. Needs a decision
+plus a `decide()` unit case (the module is pure and injectable-`now`, so it is cheap to
+pin).
+
 ---
 ## Concrete implementation plan for Fast-follow A (worked out 2026-07-22, ready for a fresh session)
 Exact code sites (main.rs / reconcile.rs on branch worktree-key-rotation @ a530c33):

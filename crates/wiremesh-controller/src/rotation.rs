@@ -90,6 +90,17 @@ pub fn decide(s: &RotationState, now: Instant) -> RotationDecision {
     // state (GRACE_PROMOTE < ABORT_AFTER, so a real-keyed rotation always
     // promotes by 90s — abort is only reachable via rule 2's no-real-key
     // branch).
+    //
+    // KNOWN HAZARD (recorded, not fixed — see
+    // `docs/research/key-rotation-teardown-notes.md` §E): because this
+    // promotes with ZERO acks, the ack signal is an accelerator and never a
+    // veto. A real key the gateway is not actually serving on that epoch's
+    // tun can therefore never be acked by anyone, yet is promoted to
+    // `active` here at the deadline — the rotation "succeeds" onto a key
+    // that cannot carry traffic instead of aborting. Do not "simplify" this
+    // rule without reading §E; the fix is a threshold decision, because rule
+    // 4 legitimately exists so an offline peer cannot block a rotation
+    // forever.
     if now.saturating_duration_since(s.started_at) >= GRACE_PROMOTE {
         return RotationDecision::Promote { epoch: s.pending_epoch };
     }

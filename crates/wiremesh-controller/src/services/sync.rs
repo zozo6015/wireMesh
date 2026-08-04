@@ -210,6 +210,65 @@ impl SyncSvc {
             .unwrap_or(0)
     }
 
+    /// (Sync session generation) THE gate. The single definition of the
+    /// reject predicate, shared by every mutating gateway->controller RPC —
+    /// currently `Sync.Report` and `Sync.SubmitEpochKey`. Deliberately one
+    /// function rather than a copy per handler: this is a correctness-
+    /// critical predicate whose two fail-open legs are easy to "simplify"
+    /// away independently, and divergence between copies is precisely the
+    /// failure class this program has been bitten by before. A new mutating
+    /// RPC should call this, not re-derive it.
+    ///
+    /// Returns `Err(FAILED_PRECONDITION)` iff the caller's generation
+    /// CONFLICTS with the one recorded at that gateway's current Watch open:
+    ///
+    /// ```text
+    /// reject iff stored != 0 && req != 0 && stored != req
+    /// ```
+    ///
+    /// The predicate is NOT "the values differ". Both zero-legs are
+    /// load-bearing fail-opens:
+    ///
+    ///  - `req == 0` — a LEGACY client that does not implement the scheme.
+    ///    It must keep working.
+    ///  - `stored == 0` — UNKNOWN. `sessions` is in-memory, so after a
+    ///    CONTROLLER restart every gateway reads 0 until its Watch reopens.
+    ///    A plain `stored != req` would reject every call in that window:
+    ///    candidate publication stops, the broker stops learning path
+    ///    states, punches stop, epoch submissions fail — trading a narrow
+    ///    correctness race for a broad availability outage. Unknown must
+    ///    fail OPEN.
+    ///
+    /// This is also what fixes the gateway's nonce as necessarily NONZERO: 0
+    /// is the wire's legacy/unknown sentinel (see `sync.proto` and
+    /// `wiremesh_gateway::sync::session_generation`).
+    ///
+    /// `rpc` names the calling RPC for the log/status line only.
+    fn check_session_generation(
+        &self,
+        gateway_id: i64,
+        req_generation: u64,
+        rpc: &str,
+    ) -> Result<(), Status> {
+        let stored = self.recorded_session_generation(gateway_id);
+        if stored != 0 && req_generation != 0 && stored != req_generation {
+            // One line per rejection. There is no Prometheus surface in this
+            // crate, so the log IS the operator signal; both values are named
+            // so a rejection can be tied to a specific gateway restart.
+            eprintln!(
+                "wiremesh-controller: rejecting {rpc} from gateway {gateway_id} — session \
+                 generation {req_generation} does not match the generation {stored} recorded at \
+                 its current Sync.Watch open; this call is from a previous gateway process"
+            );
+            return Err(Status::failed_precondition(format!(
+                "{rpc} session_generation {req_generation} does not match the session_generation \
+                 {stored} recorded for this gateway's current Sync.Watch; reconnect Watch before \
+                 retrying"
+            )));
+        }
+        Ok(())
+    }
+
     /// (Cycle-4c Task 6; CodeRabbit round 3) Re-reads the current
     /// active-relay set + persisted revision as ONE atomic pair
     /// (`Db::relays_snapshot`, single lock hold) and publishes ONE
@@ -966,47 +1025,9 @@ impl Sync for SyncSvc {
         // `local_endpoints` is the ORIGINAL instance of this stale-report
         // race (see `Broker::on_report`'s note).
         //
-        // The predicate is NOT "the values differ". Two cases must be
-        // accepted even though they differ from a naive comparison:
-        //
-        //  - A LEGACY client sends 0. It never opened a Watch carrying a
-        //    generation either, so `stored` is also 0 — equal, accepted —
-        //    but if it ever reports before its Watch, `req == 0` alone must
-        //    still be enough to accept.
-        //  - The CONTROLLER-RESTART window. `sessions` is in-memory, so
-        //    after a controller restart `stored` is 0 for every gateway
-        //    while their Watches reconnect. A plain `stored != req` would
-        //    reject EVERY report in that window: candidate publication would
-        //    stop, the broker would stop learning path states, punches would
-        //    stop, and the fabric would degrade — trading a narrow
-        //    correctness race for a broad availability outage. Unknown must
-        //    fail OPEN.
-        //
-        // Hence: reject iff BOTH sides are nonzero AND they conflict. This
-        // also fixes the gateway's nonce as necessarily NONZERO (0 is the
-        // legacy/unknown sentinel on the wire — see `sync.proto` and
-        // `wiremesh_gateway::sync::session_generation`).
-        let stored_generation = self.recorded_session_generation(gw.id);
-        if stored_generation != 0
-            && req.session_generation != 0
-            && stored_generation != req.session_generation
-        {
-            // One line per rejection. There is no Prometheus surface in this
-            // crate, so the log IS the operator signal; both values are
-            // named so a rejection can be tied to a specific gateway restart.
-            eprintln!(
-                "wiremesh-controller: rejecting Sync.Report from gateway {} — session generation \
-                 {} does not match the generation {} recorded at its current Sync.Watch open; \
-                 this is a report from a previous gateway process and must not restore stale \
-                 peer_paths/local_endpoints/relay_health",
-                gw.id, req.session_generation, stored_generation
-            );
-            return Err(Status::failed_precondition(format!(
-                "Sync.Report session_generation {} does not match the session_generation {} \
-                 recorded for this gateway's current Sync.Watch; reconnect Watch before reporting",
-                req.session_generation, stored_generation
-            )));
-        }
+        // The predicate itself (and why it is not simply "the values
+        // differ") lives in ONE place — see `check_session_generation`.
+        self.check_session_generation(gw.id, req.session_generation, "Sync.Report")?;
 
         // (Directive-storm fix) Record this gateway's per-peer path states
         // FIRST — before `set_local_candidates` below can publish an
@@ -1262,6 +1283,25 @@ impl Sync for SyncSvc {
             })?;
 
         let req = request.into_inner();
+
+        // (Sync session generation) Same gate, same predicate, same
+        // fail-open legs as `report` — and NOT belt-and-braces.
+        // `Db::set_epoch_pubkey` is a compare-and-swap that only ever
+        // overwrites the `awaiting-submission` sentinel, so a stale
+        // submission cannot clobber a real key; but it CAN WIN that swap.
+        // With a submission in flight across a gateway restart,
+        // `Broker::send_rotate_if_pending` re-issues a `RotateDirective` for
+        // the still-sentinel epoch, the new process mints a DIFFERENT key
+        // and submits it under the same epoch, and whichever lands first
+        // wins — the pre-restart one usually, since it was sent first. The
+        // controller would then advertise a pubkey the restarted gateway is
+        // not serving on that epoch's tun; no peer could ack it, and
+        // `rotation::decide` rule 4 promotes on the grace timeout REGARDLESS
+        // of ack state, so the wrong key goes `active` rather than the
+        // rotation aborting (see `docs/research/key-rotation-teardown-notes.md`
+        // §E). Gating here makes the FRESH submission the one that wins.
+        self.check_session_generation(gw.id, req.session_generation, "Sync.SubmitEpochKey")?;
+
         self.db
             .set_epoch_pubkey(gw.id, req.epoch, req.pubkey)
             .await

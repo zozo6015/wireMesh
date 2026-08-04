@@ -1090,6 +1090,11 @@ impl StubGateway {
             .submit_epoch_key(SubmitEpochKeyRequest {
                 epoch,
                 pubkey: pubkey.to_string(),
+                // `session_generation: 0` — the legacy/unknown sentinel, as
+                // in this stub's `watch`/`report` helpers, so the gate stays
+                // inert for existing stub-driven tests. A test exercising
+                // the gate should drive the generation explicitly.
+                session_generation: 0,
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.SubmitEpochKey failed: {status}"))?;

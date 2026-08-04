@@ -249,13 +249,25 @@ pub async fn report(
 /// leaves the gateway. The controller overwrites the epoch's
 /// `awaiting-submission` sentinel with `pubkey`, then fans it out to peers so
 /// they can bring up their overlap Device toward the real key.
+///
+/// Stamps [`session_generation`] itself, like [`watch`] and [`report`] — this
+/// is the crate's only `SubmitEpochKey` call site, so the nonce cannot be
+/// forgotten by a future caller. It matters here specifically: the
+/// controller's swap onto the sentinel is first-writer-wins, so a submission
+/// still in flight from a PREVIOUS process can beat this one and install a
+/// key this gateway is not serving (see the field's doc in `sync.proto`).
+/// The generation is what makes the live process's submission the winner.
 pub async fn submit_epoch_key(
     client: &mut SyncClient<Channel>,
     epoch: u32,
     pubkey: String,
 ) -> anyhow::Result<()> {
     client
-        .submit_epoch_key(SubmitEpochKeyRequest { epoch, pubkey })
+        .submit_epoch_key(SubmitEpochKeyRequest {
+            epoch,
+            pubkey,
+            session_generation: session_generation(),
+        })
         .await
         .map_err(|s| anyhow!("Sync.SubmitEpochKey failed: {s}"))?;
     Ok(())
