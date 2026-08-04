@@ -56,17 +56,27 @@ runs) before touching anything.
 - Check whether the drops cluster at the cutover instant or are spread — the former is a
   real property of the handover, the latter is scheduling noise.
 
-## Second sighting, 2026-08-04 (same day, later)
+## Second sighting, 2026-08-04 (same day, later) — UNCLASSIFIED
 
-`key_rotation.rs` failed **once in four runs** during item-2 verification — three of
-those runs were under an unrelated sabotage (`send_epoch_ack`'s `local_endpoints`
-reverted), and the failure did not reproduce in the two subsequent sabotaged runs, so it
-was correctly called a flake rather than a detection. The specific test name was not
-captured.
+`key_rotation.rs` failed **once** during item-2 verification. Deliberately left
+unattributed, because the evidence does not support attributing it:
 
-`direct_rotation_is_zero_drop` lives in `key_rotation.rs`, and this profile — one failure
-in four, non-reproducing, in a full-suite run — matches the distribution recorded above.
-Treat it as the same flake unless a captured failure says otherwise.
+- The failing test name was **not captured** (the runner's grep filter dropped the
+  `failures:` block).
+- It occurred in a run under an **unrelated sabotage** (`send_epoch_ack`'s
+  `local_endpoints` reverted), and did **not** reproduce in two further runs of that same
+  sabotage.
 
-Running total for full-suite runs at clean HEAD: gap 2, 3, 2, plus this uncaptured
-failure and the earlier gap-4 failure under sabotage. The margin remains one packet.
+`direct_rotation_is_zero_drop` lives in `key_rotation.rs`, so it is a *candidate* — but so
+is every other test in that file. Do not fold this into the distribution below without a
+captured name.
+
+## Observations, kept separate
+
+**Clean HEAD, full suite:** gap 2, gap 3, gap 2 — all passing, margin as low as zero.
+**Clean HEAD, isolated:** gap 2 ×4 — all passing.
+**Under unrelated sabotage:** one gap-4 failure (2026-08-04, item-1 verification), plus
+one uncaptured `key_rotation` failure (2026-08-04, item-2 verification).
+
+Only the clean-HEAD rows characterise the flake. The sabotage rows are recorded so nobody
+re-derives them as new sightings, not as evidence about the margin.
