@@ -145,7 +145,7 @@ Found while assessing whether `Sync.SubmitEpochKey` needed the Sync session-gene
 gate (Backlog item 2). The *submission* race is now closed there; **this half is not, and
 belongs to the key-rotation item.**
 
-`rotation::decide` (rotation.rs:55-99) has no path that rejects a real key nobody can use:
+`rotation::decide` (rotation.rs:55-110) has no path that rejects a real key nobody can use:
 
 - **Rule 2** refuses to promote a pending epoch still holding the `awaiting-submission`
   sentinel, and past `ABORT_AFTER` it aborts. This is the ONLY abort path — its own
@@ -164,7 +164,7 @@ component reporting an error.
 How the controller could come to advertise such a key (the shape that led here, now closed
 on the Sync side): `Db::set_epoch_pubkey` (db.rs:1903-1908) is a compare-and-swap onto the
 sentinel, first writer wins. With a submission in flight across a gateway restart,
-`Broker::send_rotate_if_pending` (broker.rs:426-432) re-issues a `RotateDirective` for the
+`Broker::send_rotate_if_pending` (broker.rs:482-502) re-issues a `RotateDirective` for the
 still-sentinel epoch; the new process mints a *different* key (`EpochKeys::generate_next`
 allocates `max(epoch)+1`, epochkeys.rs:79) but submits it under the *directive* epoch —
 there is even a WARNING log for that mismatch at main.rs:3680-3686 — so two different

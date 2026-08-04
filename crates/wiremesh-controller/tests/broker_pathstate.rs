@@ -695,7 +695,7 @@ async fn report_keeping_pair_unsettled_grants_no_fresh_budget() {
 
 // --- Sync session generation: rejecting a delayed pre-restart Report -------
 //
-// The race these five tests pin (see `Broker::on_report` and
+// The race these six tests pin (see `Broker::on_report` and
 // `SyncSvc::sessions`): `Broker::on_gateway_connected` CLEARS a reconnecting
 // gateway's stored `peer_paths`, because a restarted gateway may have no
 // tunnel at all and its stale "direct" claims must not suppress the punches
