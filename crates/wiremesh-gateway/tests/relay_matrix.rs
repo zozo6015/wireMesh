@@ -444,7 +444,16 @@ enum RelaySpec<'a> {
 /// A running relay, however it was started — kept alive for the
 /// [`Scenario`]'s lifetime (or, for `Killable`, evicted early by case 3).
 enum RelayHandle {
-    InProcess(tempfile::TempDir, tokio::task::JoinHandle<()>),
+    /// Neither field is ever read — both are held purely so they outlive the
+    /// running relay, for exactly the reasons spelled out on `Killable` below
+    /// (the `TempDir` owns the certdir the serve task reads from; dropping a
+    /// tokio `JoinHandle` detaches rather than aborts, so it is kept for a
+    /// future case that needs to await or abort the task). A tuple variant has
+    /// no field names to `_`-prefix, hence the allow.
+    InProcess(
+        #[allow(dead_code)] tempfile::TempDir,
+        #[allow(dead_code)] tokio::task::JoinHandle<()>,
+    ),
     /// Only the `quinn::Endpoint` is ever read (by [`RelayHandle::evict`] and
     /// [`RelayHandle::open_connections`]). The other two are held purely so
     /// they outlive the running relay — the same reason the [`Scenario`]'s
