@@ -79,7 +79,11 @@
 //!     /// and DROPS the lock before returning — returning a plain
 //!     /// `Option<Instant>` (not a guard) is what structurally forbids
 //!     /// holding the map lock across the worker's wait.
-//!     fn ready_at(&self, ds: &DesiredState) -> Option<std::time::Instant>;
+//!     ///
+//!     /// `ds_is_newest` means the same as on `install`; it is passed here
+//!     /// only so the two agree on WHICH entries will be written.
+//!     fn ready_at(&self, ds: &DesiredState, ds_is_newest: bool)
+//!         -> Option<std::time::Instant>;
 //!
 //!     /// Perform the (now fast) install: re-lock the enforcer map and
 //!     /// `apply_if_changed(ds)` every live entry. BLOCKING by contract —
@@ -92,7 +96,15 @@
 //!     /// implementation must re-check each entry's own deadline UNDER THE
 //!     /// LOCK and defer (returning `Err`, so the worker retries) rather
 //!     /// than write it.
-//!     fn install(&self, ds: &DesiredState) -> anyhow::Result<()>;
+//!     ///
+//!     /// `ds_is_newest` is true iff nothing has been published since the
+//!     /// worker picked `ds` up. It disambiguates the one case `ds` alone
+//!     /// cannot: an enforcer AHEAD of `ds.policy_version`. False means our
+//!     /// snapshot is stale and writing it would DOWNGRADE a rotation tun
+//!     /// that already has the newer policy; true means the controller
+//!     /// genuinely rolled back and we must converge onto `ds`.
+//!     fn install(&self, ds: &DesiredState, ds_is_newest: bool)
+//!         -> anyhow::Result<()>;
 //! }
 //!
 //! /// Latest-wins mailbox handle. Cheap to clone (the Sync loop publishes
@@ -207,6 +219,8 @@ struct Install {
     version: u64,
     started_at: Instant,
     ok: bool,
+    /// What the worker reported for `ds_is_newest` on this call.
+    ds_is_newest: bool,
     /// `true` when the attempt failed because at least one entry was still
     /// inside its own reap grace at install time (the rotation-insert race),
     /// as opposed to a test-forced backend rejection. Diagnostic only — the
@@ -237,6 +251,30 @@ impl FakeEntry {
     }
 }
 
+/// The three-way write predicate, mirroring `main.rs`'s `needs_policy_write`.
+/// `ready_at` and `install` MUST agree on it — the trait's contract is that
+/// the deadline covers exactly the entries the install will write, and a
+/// disagreement shows up as a spurious deferral.
+///
+/// The only interesting arm is AHEAD. An enforcer whose applied version is
+/// past `version` got there in one of two ways, needing opposite answers:
+///
+///  - `ds_is_newest == false` — our snapshot is stale and a rotation insert
+///    already applied a newer one to that entry. Writing ours DOWNGRADES a
+///    traffic-carrying tun. Skip.
+///  - `ds_is_newest == true` — the controller genuinely rolled back (a DB
+///    restore, a repoint at a different controller). Ours really is desired
+///    and the datapath is ahead of it. Write, or the gateway never
+///    converges.
+fn needs_write(e: &FakeEntry, version: u64, ds_is_newest: bool) -> bool {
+    match e.applied_version {
+        None => true,
+        Some(av) if av < version => true,
+        Some(av) if av > version => ds_is_newest,
+        Some(_) => false, // already exactly this version
+    }
+}
+
 /// In-test stand-in for the live enforcer map. Records every `install`,
 /// signals every `ready_at`/install-start/install-finish so tests can
 /// synchronize on the worker's progress instead of sleeping and hoping, and
@@ -244,10 +282,10 @@ impl FakeEntry {
 struct FakeTarget {
     /// The modelled enforcer map. Starts as one [`FakeEntry::fresh`].
     entries: Mutex<Vec<FakeEntry>>,
-    /// Every `ds.policy_version` handed to `ready_at`, in call order — lets
-    /// a test pin that the deadline was read for the state actually being
-    /// installed, not a stale or default one.
-    ready_at_versions: Mutex<Vec<u64>>,
+    /// Every `(ds.policy_version, ds_is_newest)` handed to `ready_at`, in
+    /// call order — lets a test pin that the deadline was read for the state
+    /// actually being installed, not a stale or default one.
+    ready_at_calls: Mutex<Vec<(u64, bool)>>,
     installs: Mutex<Vec<Install>>,
     /// Signalled once per `ready_at()` call — the observation point that
     /// tells a test "the worker has picked the state up and is about to
@@ -285,7 +323,7 @@ impl FakeTarget {
         let (install_done, done_rx) = unbounded_channel();
         let t = Arc::new(FakeTarget {
             entries: Mutex::new(vec![FakeEntry::fresh()]),
-            ready_at_versions: Mutex::new(Vec::new()),
+            ready_at_calls: Mutex::new(Vec::new()),
             installs: Mutex::new(Vec::new()),
             ready_calls,
             install_started,
@@ -332,7 +370,12 @@ impl FakeTarget {
 
     /// Every `ds.policy_version` the worker asked a deadline for, in order.
     fn ready_at_versions(&self) -> Vec<u64> {
-        self.ready_at_versions.lock().unwrap().clone()
+        self.ready_at_calls.lock().unwrap().iter().map(|(v, _)| *v).collect()
+    }
+
+    /// The same calls with the `ds_is_newest` flag the worker reported.
+    fn ready_at_calls(&self) -> Vec<(u64, bool)> {
+        self.ready_at_calls.lock().unwrap().clone()
     }
 
     fn set_block_for(&self, d: Duration) {
@@ -369,10 +412,9 @@ impl FakeTarget {
 
 impl PolicyApplyTarget for FakeTarget {
     /// Mirrors the real adapter: the max deadline over only those entries
-    /// the install would actually WRITE — entries already on
-    /// `ds.policy_version` are filtered out, because `apply_if_changed`
-    /// would not touch them.
-    fn ready_at(&self, ds: &DesiredState) -> Option<Instant> {
+    /// the install would actually WRITE, per the shared [`needs_write`]
+    /// predicate — so `ready_at` and `install` agree on the entry set.
+    fn ready_at(&self, ds: &DesiredState, ds_is_newest: bool) -> Option<Instant> {
         let version = ds.policy_version;
 
         // No mutex guard may be alive when this panics: a poisoned fixture
@@ -383,7 +425,7 @@ impl PolicyApplyTarget for FakeTarget {
             if panics != u64::MAX {
                 self.panic_ready_at.store(panics - 1, Ordering::SeqCst);
             }
-            self.ready_at_versions.lock().unwrap().push(version);
+            self.ready_at_calls.lock().unwrap().push((version, ds_is_newest));
             let _ = self.ready_calls.send(());
             panic!("fake ready_at panic (policy version {version})");
         }
@@ -392,7 +434,7 @@ impl PolicyApplyTarget for FakeTarget {
             let entries = self.entries.lock().unwrap();
             entries
                 .iter()
-                .filter(|e| e.applied_version != Some(version))
+                .filter(|e| needs_write(e, version, ds_is_newest))
                 .filter_map(|e| e.ready_at)
                 .max()
         };
@@ -405,14 +447,14 @@ impl PolicyApplyTarget for FakeTarget {
             self.entries.lock().unwrap().push(entry);
         }
 
-        self.ready_at_versions.lock().unwrap().push(version);
+        self.ready_at_calls.lock().unwrap().push((version, ds_is_newest));
         // Send AFTER reading, so a test woken by this signal is guaranteed
         // the worker has already taken the value it will wait on.
         let _ = self.ready_calls.send(());
         deadline
     }
 
-    fn install(&self, ds: &DesiredState) -> anyhow::Result<()> {
+    fn install(&self, ds: &DesiredState, ds_is_newest: bool) -> anyhow::Result<()> {
         let version = ds.policy_version;
         let started_at = Instant::now();
         let _ = self.install_started.send(version);
@@ -450,7 +492,7 @@ impl PolicyApplyTarget for FakeTarget {
             let mut entries = self.entries.lock().unwrap();
             let now = Instant::now();
             for e in entries.iter_mut() {
-                if e.applied_version == Some(version) {
+                if !needs_write(e, version, ds_is_newest) {
                     continue; // nothing would be written; nothing to gate on
                 }
                 if e.ready_at.is_some_and(|t| t > now) {
@@ -462,10 +504,13 @@ impl PolicyApplyTarget for FakeTarget {
         }
 
         let ok = !forced_fail && deferred == 0;
-        self.installs
-            .lock()
-            .unwrap()
-            .push(Install { version, started_at, ok, deferred: deferred > 0 });
+        self.installs.lock().unwrap().push(Install {
+            version,
+            started_at,
+            ok,
+            ds_is_newest,
+            deferred: deferred > 0,
+        });
         let _ = self.install_done.send((version, ok));
 
         if ok {
@@ -940,6 +985,156 @@ async fn an_entry_inserted_after_the_deadline_read_is_deferred_then_landed_by_th
     assert_quiet(&mut sig.done_rx, Duration::from_millis(300), "installs").await;
 }
 
+// --- rollback: an enforcer AHEAD of the target version --------------------
+
+/// **A genuine controller rollback must converge.** A DB restore takes the
+/// controller from v100 back to v50; the operator pushes v51; every gateway
+/// is holding v100. Under a purely monotone "only ever move forward" filter
+/// those gateways skip v51 — and every version after it — until the
+/// controller has climbed back past 100. The fabric would sit on an
+/// abandoned policy with no error anywhere, and the only recovery would be
+/// restarting every gateway mid-incident. A DB restore is this project's
+/// documented recovery path, so this is not an exotic case.
+///
+/// `ds_is_newest` is what distinguishes it from the transient case: nothing
+/// newer has been published, so v51 really is the desired state and the
+/// datapath being ahead of it is the thing to fix, not to preserve.
+///
+/// Sabotage that must turn this red: make the AHEAD arm of the write
+/// predicate a flat `false` (pure monotone) — the entry stays on v100
+/// forever and the datapath never converges. Note the install still returns
+/// `Ok` in that case (nothing was deferred, nothing errored), which is
+/// exactly why this asserts on the ENTRY STATE and not on the result: a
+/// monotone skip is silent, and silence is the bug.
+#[tokio::test]
+async fn a_rollback_is_installed_when_our_snapshot_is_the_newest() {
+    let (target, mut sig) = FakeTarget::new();
+    // The datapath is ahead: the controller was at v100 before the restore.
+    target.set_entries(vec![FakeEntry { applied_version: Some(100), ready_at: None }]);
+    let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
+
+    // The post-restore push. Nothing else is published, so this IS the
+    // newest state.
+    handle.publish(ds(51));
+
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the rollback install").await;
+    assert_eq!((v, ok), (51, true));
+    assert_eq!(
+        target.entries()[0].applied_version,
+        Some(51),
+        "an enforcer AHEAD of the newest desired state must be rolled back onto it — a \
+         monotone skip leaves the gateway pinned to a policy the operator has abandoned, \
+         silently, until the controller climbs back past v100"
+    );
+    assert!(
+        target.installs()[0].ds_is_newest,
+        "the worker must report this snapshot as the newest one — that flag is the ONLY \
+         thing distinguishing an authorized rollback from a stale snapshot racing a \
+         rotation insert"
+    );
+    assert_eq!(target.ready_at_calls(), vec![(51, true)], "one deadline read, same verdict");
+    settle_counters().await;
+    assert_eq!(handle.failures(), 0, "a rollback is a normal install, not a failure");
+}
+
+/// The mixed datapath the coordinator called out: one enforcer AHEAD (v100,
+/// from before the restore) and one BEHIND (v40, a tun that never caught
+/// up). Installing v51 must write BOTH, leaving the datapath uniformly on
+/// v51 — the ahead one rolled back, the behind one rolled forward, in the
+/// same pass.
+///
+/// **What this does NOT pin — read before trusting it.** The
+/// `wiremesh_gateway_applied_policy_version` gauge is computed inside
+/// `main.rs`'s adapter (`live_max`, the `max` over live enforcers' applied
+/// versions, stored only on full success). It is not part of the
+/// `PolicyApplyTarget` surface, so it is invisible from this seam and I have
+/// not faked it — a fake gauge would only be asserting my own arithmetic.
+/// What IS pinned here is the ground truth that gauge is derived from: after
+/// this install every live enforcer holds exactly v51, so any correct
+/// derivation reports 51. That the adapter uses `max`-over-live rather than
+/// a running `fetch_max` (which would report 100 here) needs review, or a
+/// unit test inside `main.rs`; see my report.
+///
+/// Sabotage that must turn this red: monotone AHEAD arm — the v100 entry is
+/// skipped, the datapath is left split at v100/v51, and no gauge derivation
+/// can report a single honest number for it.
+#[tokio::test]
+async fn a_rollback_converges_a_mixed_ahead_and_behind_datapath() {
+    let (target, mut sig) = FakeTarget::new();
+    target.set_entries(vec![
+        FakeEntry { applied_version: Some(100), ready_at: None }, // ahead
+        FakeEntry { applied_version: Some(40), ready_at: None },  // behind
+    ]);
+    let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
+
+    handle.publish(ds(51));
+
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the install").await;
+    assert_eq!((v, ok), (51, true));
+    for (i, e) in target.entries().iter().enumerate() {
+        assert_eq!(
+            e.applied_version,
+            Some(51),
+            "entry {i} must hold exactly the installed version — a split datapath \
+             (one tun ahead, one behind) is precisely the case a running-maximum gauge \
+             reports wrongly, and it must not arise in the first place"
+        );
+    }
+    assert_eq!(target.installs().len(), 1, "one pass writes both directions");
+    settle_counters().await;
+    assert_eq!(handle.failures(), 0);
+}
+
+/// **The rollback write is authorized, not exempt.** Being allowed to write
+/// an entry that is ahead of us says nothing about WHEN — the ahead entry
+/// has its own post-flip reap grace, and pulling its maps out from under
+/// in-flight packets is the same hazard as for any other write.
+///
+/// This also pins that `ready_at` and `install` agree on the entry set: the
+/// ahead entry must be INCLUDED in the deadline (because it will be written)
+/// so the grace is waited out up front, in the worker's async
+/// `sleep_until`, rather than discovered by the under-the-lock re-check.
+///
+/// Sabotage that must turn this red: filter the ahead entry out of
+/// `ready_at` while still writing it in `install` (e.g. apply the flag in
+/// one and not the other) — the deadline comes back `None`, the install
+/// starts at ~0ms, the re-check defers it, and both `installs().len() == 1`
+/// and `failures() == 0` go red. Or skip the re-check on the rollback path
+/// specifically, and the lower bound goes red.
+#[tokio::test]
+async fn a_rollback_write_still_waits_out_the_ahead_entrys_reap_grace() {
+    let (target, mut sig) = FakeTarget::new();
+    let grace_until = Instant::now() + Duration::from_millis(500);
+    target.set_entries(vec![FakeEntry {
+        applied_version: Some(100),
+        ready_at: Some(grace_until),
+    }]);
+    let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
+
+    handle.publish(ds(51));
+
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the rollback install").await;
+    assert_eq!((v, ok), (51, true));
+
+    let started = target.installs()[0].started_at;
+    assert!(
+        started >= grace_until,
+        "the rollback wrote the ahead enforcer {:?} before its reap grace expired. \
+         Authorizing a write says which entries may be written, never when — the grace \
+         protects in-flight packets and applies to the rollback path identically.",
+        grace_until.saturating_duration_since(started)
+    );
+    assert_eq!(
+        target.installs().len(),
+        1,
+        "the grace must be waited out UP FRONT: the ahead entry belongs in `ready_at`'s \
+         answer because it will be written, so a second attempt here means `ready_at` \
+         and `install` disagree about the entry set and the re-check had to catch it"
+    );
+    settle_counters().await;
+    assert_eq!(handle.failures(), 0, "a correctly-scheduled rollback defers nothing");
+}
+
 // --- (D) the Sync loop keeps running while an apply is in flight ----------
 
 /// **The headline property, structurally.** A `current_thread` runtime is the
@@ -1353,14 +1548,16 @@ async fn a_corrected_policy_wakes_the_retry_pause_and_gets_a_fresh_cadence() {
 ///  - **Lower** — the corrected state must land no EARLIER than the grace.
 ///    This is the safety property.
 ///  - **Upper** — and no later than the grace plus a small margin, because
-///    the grace is the only delay it still owes. `gates_the_dead_state_only`
-///    is already on v2, so it is filtered out for the state actually being
-///    installed but gates the SUPERSEDED v1 with a 2s deadline. A worker
-///    that adopts the new state late — at step (4) instead of at the pause
-///    site — therefore loops back and `sleep_until`s a deadline computed for
-///    a state it already knows is dead, landing at ~2s instead of ~500ms.
-///    Without that second entry the upper bound would be near-vacuous, since
-///    at this point in the episode the backoff is only ~50ms.
+///    the grace is the only delay it still owes. The second entry is already
+///    on v2, so it is skipped outright when v2 is the target. A worker that
+///    adopts the new state late — at step (4) instead of at the pause site —
+///    instead queries the deadline while still holding the superseded v1,
+///    and by then the pause's `changed()` has already consumed the change
+///    flag, so it queries v1 as its NEWEST state: the entry is AHEAD of v1,
+///    the rollback rule authorizes writing it, and its 2s deadline becomes
+///    binding. That worker lands at ~2s instead of ~500ms. Without the
+///    second entry the upper bound would be near-vacuous, since at this
+///    point in the episode the backoff is only ~50ms.
 ///
 /// Sabotage that must turn this red: install straight after `Pause::Adopted`
 /// without looping back to re-read the deadline (lands at ~0ms — lower bound);
