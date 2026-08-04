@@ -22,6 +22,27 @@ impl GatewayEnforcer {
         self.inner.kind()
     }
 
+    /// The backend's published apply deadline (see
+    /// [`wiremesh_enforcer::Enforcer::apply_ready_at`]). `&self` and
+    /// non-blocking on purpose: `crate::policy_apply`'s adapter reads this
+    /// across every live epoch's enforcer under the map lock and then DROPS
+    /// that lock before waiting the deadline out, so the metrics scrape,
+    /// retire, Role-B collapse and rotation-insert paths keep the map
+    /// available for the whole grace.
+    pub fn apply_ready_at(&self) -> Option<std::time::Instant> {
+        self.inner.apply_ready_at()
+    }
+
+    /// The policy version this enforcer currently has live, or `None` before
+    /// its first apply. Exposed (Backlog item 1) so `crate::policy_apply`'s
+    /// adapter can tell which entries an install would actually WRITE:
+    /// the reap deadline of an entry already on `ds.policy_version` is
+    /// irrelevant, because [`GatewayEnforcer::apply_if_changed`] will not
+    /// touch it.
+    pub fn applied_version(&self) -> Option<u64> {
+        self.applied_version
+    }
+
     /// Deserialize + apply the desired IR iff its version changed (or first
     /// apply). Empty `policy_ir` bytes mean "no policy yet" -> empty IR v1.
     pub fn apply_if_changed(&mut self, ds: &DesiredState) -> anyhow::Result<bool> {

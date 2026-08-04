@@ -555,13 +555,22 @@ fn atomic_generation_flip_under_continuous_udp_traffic_has_zero_deficit() {
     let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    // (Review finding) The default `reap_grace` (10s) would make each
-    // non-first `apply()` below block for up to 10s, so this test's 20
-    // flips -- meant to happen concurrently with the ~3.5s UDP traffic
-    // window -- would badly overrun it and only the first couple would
-    // actually overlap live traffic. Shrink `reap_grace` so all 20 flips
-    // genuinely land inside the sender's active window, matching this
-    // test's "under continuous traffic" intent.
+    // (Review finding, REWRITTEN for Backlog item 1 -- the reason this
+    // override exists inverted, but the override itself is now MORE
+    // load-bearing, not less.)
+    //
+    // `apply()` no longer sleeps out the previous flip's reap grace; it
+    // publishes it via `apply_ready_at()` and the CALLER honors it. So this
+    // is no longer "shrink an internal block so the loop fits the traffic
+    // window" -- it is what makes this test's own 175ms inter-flip sleep
+    // (below) a sufficient honoring of the grace. At the default 10s, that
+    // 175ms spacing would overwrite each just-vacated outer-array slot far
+    // inside its grace, under live traffic, which is exactly the unsafe
+    // overwrite the grace exists to prevent; at 50ms, 175ms clears it with
+    // room to spare and all 20 flips still land inside the sender's ~3.5s
+    // window, matching this test's "under continuous traffic" intent.
+    // Do not remove this override without replacing the 175ms sleep with an
+    // explicit `apply_ready_at()` wait.
     let cfg = wiremesh_enforcer::EnforcerConfig {
         reap_grace: Duration::from_millis(50),
         ..wiremesh_enforcer::EnforcerConfig::default()
@@ -594,7 +603,9 @@ policy:
     let sender = spawn_udp_sender(&a, "10.10.0.2", 7000, 350, 0.01); // ~3.5s total
 
     // 20 flips of the SAME allow policy, spread across the sender's ~3.5s
-    // window (~175ms apart) -- concurrent with the live traffic.
+    // window (~175ms apart) -- concurrent with the live traffic. The 175ms
+    // is now the CALLER-side honoring of the 50ms grace configured above
+    // (see that comment), not merely a pacing choice.
     for i in 0..20 {
         enforcer
             .apply(&ir)
@@ -835,9 +846,14 @@ policy:
          across v1/v2 despite shifting from idx0 to idx1"
     );
 
-    // apply() may internally block out the remainder of v1's post-flip reap
-    // grace (>=10s total since v1's flip) before returning -- acceptable
-    // per the coordinator's note; no explicit sleep needed here.
+    // (Backlog item 1) apply() no longer blocks out the remainder of v1's
+    // post-flip reap grace; it publishes the deadline via apply_ready_at()
+    // and returns. No caller-side wait is added here on purpose: this test
+    // asserts on COUNTERS and sends no traffic between v1 and v2, so nothing
+    // it depends on can be reading the slot v1 vacated. (Weaker than "the
+    // wire is silent" -- the listeners and earlier connects can still leave
+    // teardown segments crossing wg0 -- but nothing here observes them.)
+    // 10s of dead time would buy the suite nothing.
     enforcer.apply(&v2).expect(
         "v2 (the same 2 rules plus 1 new rule inserted before A, 3 total -- no padding needed, \
          small policies apply fast) must apply",
@@ -992,9 +1008,12 @@ policy:
          across v1/v2 despite shifting from idx1 to idx0"
     );
 
-    // apply() may internally block out the remainder of v1's post-flip reap
-    // grace (>=10s total since v1's flip) before returning -- acceptable,
-    // no explicit sleep needed here.
+    // (Backlog item 1) apply() no longer blocks out the remainder of v1's
+    // post-flip reap grace; it publishes the deadline via apply_ready_at()
+    // and returns. As in the sibling counter test above, no caller-side wait
+    // is added: this test observes only counters across the flip, so no
+    // assertion of its depends on a packet crossing it (stray teardown
+    // segments may still exist; none are observed).
     enforcer.apply(&v2).expect(
         "v2 (B only, A removed -- no padding needed, small policies apply fast) must apply",
     );

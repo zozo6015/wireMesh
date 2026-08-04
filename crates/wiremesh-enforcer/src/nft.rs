@@ -436,6 +436,16 @@ impl Enforcer for NftEnforcer {
         Ok(())
     }
 
+    /// Always `None` — a literal, permanent "no constraint", not a
+    /// not-yet-implemented stub. This backend replaces the entire ruleset in
+    /// one atomic `nft -f -` transaction: there are no generations, no
+    /// outer-array slots, and nothing a later apply could overwrite while
+    /// in-flight packets still read it. Fabricating any `Some` here would
+    /// needlessly delay every policy update on the fallback backend.
+    fn apply_ready_at(&self) -> Option<std::time::Instant> {
+        None
+    }
+
     /// A direct, unmodified read of `nft -j list counters table ip
     /// wiremesh_<iface>` — no accumulator to combine it with. Survival
     /// across a policy re-apply is nft's OWN behavior for a rule that stays
