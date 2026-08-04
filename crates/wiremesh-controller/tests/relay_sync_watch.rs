@@ -162,7 +162,14 @@ async fn open_relay_watch(
              CA); only the Sync.Watch authorization decision is under test",
         );
     SyncClient::new(channel)
-        .watch(WatchRequest {})
+        // (Sync session generation) A relay sends 0 — it is outside the
+        // scheme entirely: it never calls `Sync.Report`, so there is no
+        // per-relay reported state a stale report could corrupt, and
+        // `SyncSvc::watch_relay` deliberately never records the field (relay
+        // row ids collide with gateway row ids, so recording one under a
+        // relay id would clobber a real gateway's entry). Matches what the
+        // real `wiremesh_relay::run_sync` sends.
+        .watch(WatchRequest { session_generation: 0 })
         .await
         .map(|resp| resp.into_inner())
 }

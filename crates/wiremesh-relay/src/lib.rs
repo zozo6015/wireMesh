@@ -1132,8 +1132,18 @@ pub async fn run_sync(
     let mut client = SyncClient::new(channel);
     eprintln!("relay: sync[{relay_id}] connected to controller at {sync_addr} ({resolved})");
 
+    // `session_generation: 0` deliberately. The Sync session-generation
+    // scheme exists to reject a delayed pre-restart `Sync.Report` that would
+    // otherwise restore stale per-gateway state (peer paths, local
+    // candidates, relay health) over the fresh state a reconnect just
+    // cleared. A relay NEVER calls `Sync.Report` — its Watch is
+    // revocation-scoped only (`SyncSvc::watch_relay`), it registers nothing
+    // in the broker, and there is no relay-side state a stale report could
+    // corrupt. Relays are therefore outside the scheme, and `watch_relay`
+    // ignores this field entirely (only `watch_gateway` records it). 0 is the
+    // wire's legacy/unknown sentinel — see `sync.proto`.
     let mut stream = client
-        .watch(WatchRequest {})
+        .watch(WatchRequest { session_generation: 0 })
         .await
         .map_err(|s| anyhow::anyhow!("Sync.Watch failed: {s}"))?
         .into_inner();

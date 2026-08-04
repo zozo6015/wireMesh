@@ -6,7 +6,25 @@ service Sync {
   rpc Report(ReportRequest) returns (ReportResponse);
   rpc SubmitEpochKey(SubmitEpochKeyRequest) returns (SubmitEpochKeyResponse);
 }
-message WatchRequest {}
+// Note: `WatchRequest` carries NO identity — identity is derived exclusively
+// from the mTLS peer certificate's subject CN (see `services::sync`). The one
+// field below is a per-PROCESS liveness nonce, not a credential.
+message WatchRequest {
+  // (Sync session generation) The reporting process's per-BOOT nonce, chosen
+  // once per gateway process (NOT per connection — the rotation tick's unary
+  // `Report` uses its own short-lived channel and would otherwise carry a
+  // value that never matched the last Watch). Opening a Watch RECORDS this
+  // value against the authenticated gateway id; a subsequent `Report` whose
+  // `session_generation` conflicts with the recorded one is a delayed
+  // pre-restart report and is rejected wholesale (`FAILED_PRECONDITION`).
+  //
+  // MUST be NONZERO for clients that implement the scheme: 0 is the
+  // legacy/unknown sentinel, and the controller treats a 0 on either side as
+  // "no opinion" and accepts (see the reject predicate in `services::sync`).
+  // Relays also open `Sync.Watch` but never `Report`, so they are outside the
+  // scheme entirely and send 0; `watch_relay` ignores the field.
+  uint64 session_generation = 1;
+}
 message SyncMessage { oneof body { StateSnapshot snapshot = 1; Delta delta = 2; PunchDirective punch = 3; RotateDirective rotate = 4; } }
 // Broker-issued NAT-traversal instruction: sent to one gateway of a pair,
 // carrying the *other* gateway's candidate set, so both sides can fire a
@@ -19,6 +37,15 @@ message PunchDirective {
   uint64 go_unix_ms = 3;           // synchronized fire instant (best-effort corroboration
                                     // of the broker's back-to-back sends, which are the
                                     // primary go-skew guarantee)
+  // FIELD 4 IS DELIBERATELY FREE. The session-generation design originally
+  // proposed `peer_session_generation = 4` here, and it was CUT: its only
+  // intended consumer was the `Relayed -> Direct` cutover's backoff reset,
+  // and the cutover is a separate (gateway-local) item. The restart
+  // asymmetry it was meant to signal is already handled controller-side by
+  // `Broker::on_gateway_connected`'s `clear_reported_states` plus
+  // `pair_settled`'s both-directions requirement — the session generation is
+  // precisely what makes that clear STICK. A later item may claim field 4 if
+  // it can name a real consumer; do not add it speculatively.
 }
 // Controller->gateway, sent to the addressed gateway's own Watch stream
 // (like PunchDirective, explicit addressing — not the subject_gateway_id()
@@ -32,6 +59,28 @@ message RotateDirective {
 message SubmitEpochKeyRequest {
   uint32 epoch = 1;
   string pubkey = 2;
+  // (Sync session generation) The submitting gateway's per-PROCESS nonce —
+  // the same value it sends on `WatchRequest`/`ReportRequest`, from the same
+  // `OnceLock`. The controller rejects a submission whose generation
+  // conflicts with the one recorded at this gateway's last Watch open.
+  //
+  // This is NOT belt-and-braces. `Db::set_epoch_pubkey` is a
+  // compare-and-swap that only ever overwrites the `awaiting-submission`
+  // sentinel, so a stale submission cannot clobber a real key — but it CAN
+  // WIN that swap. When a submission is in flight across a gateway restart,
+  // the controller re-issues a `RotateDirective` for the still-sentinel
+  // epoch, the new process mints a DIFFERENT key and submits it for the same
+  // epoch, and whichever lands first wins. If the pre-restart key wins, the
+  // controller advertises a pubkey the restarted gateway is not serving on
+  // that epoch's tun, no peer can ever ack it, and the rotation promotes it
+  // anyway on the grace timeout (see `rotation::decide` rule 4 and
+  // `docs/research/key-rotation-teardown-notes.md` §E). The generation makes
+  // the fresh submission the one that wins.
+  //
+  // 0 = legacy/unknown, accepted (a 0 on EITHER side accepts — see the
+  // shared predicate in `services::sync`). Relays never submit epoch keys
+  // and are outside the scheme entirely.
+  uint64 session_generation = 3;
 }
 message SubmitEpochKeyResponse {}
 message PeerKey { uint32 epoch = 1; string pubkey = 2; string state = 3; } // pending|active|retiring
@@ -74,6 +123,43 @@ message Delta {
   // possibly empty); false = sparse delta, relays unchanged.
   bool relays_updated = 9;
 }
+// DESIGN FINDING (recorded, NOT fixed here — see the field-by-field
+// justification in `wiremesh-gateway`'s `send_epoch_ack`):
+//
+// `ReportRequest` conflates TWO different messages behind one RPC — a
+// periodic FULL-STATE SNAPSHOT (the sync loop's steady-state report) and a
+// SPARSE EVENT (the rotation tick's unary epoch ack, which dials its own
+// short-lived channel). Its fields carry three incompatible update
+// semantics, and the controller applies most of them unconditionally:
+//
+//   full REPLACE, empty == CLEAR : local_endpoints, peer_paths (when
+//                                  peer_paths_snapshot == true)
+//   last-writer-wins scalar      : applied_version
+//   sparse, empty == no-op       : relay_health, epoch_acks
+//
+// The consequence is that a sender wanting to deliver ONE field must
+// nonetheless reconstruct every replace/LWW field, or it destroys
+// controller-side state by omission. That has already produced two live
+// bugs at a single call site: `applied_version: 0` zeroing the roster
+// version on every rotation ack, and `local_endpoints: []` wiping the
+// gateway's LAN/hairpin punch candidates (and publishing the shrunk set to
+// peers) mid-rotation.
+//
+// Note the defenses are ad-hoc and were added one at a time, which is why
+// coverage is uneven: `peer_paths` got an EXPLICIT opt-out (the
+// `peer_paths_snapshot` flag), `relay_health`/`epoch_acks` got an IMPLICIT
+// one (a controller-side `!is_empty()` guard), and `local_endpoints` /
+// `applied_version` got NEITHER. So this is not "one call site keeps
+// forgetting fields" — the call site is a symptom. The message shape makes
+// destruction-by-omission the default.
+//
+// Two directions for whoever takes this on, neither in scope for the
+// session-generation item: split the RPC (`Report` snapshot vs. a separate
+// sparse ack/event RPC), or give every replace-semantics field explicit
+// presence (proto3 `optional`, absent == "leave alone") so a sparse sender
+// physically cannot clear what it did not mean to touch. Until then, EVERY
+// new `ReportRequest` construction site must justify all fields, not just
+// the ones it cares about.
 message ReportRequest {
   uint64 applied_version = 1;
   repeated string local_endpoints = 2;  // gateway's own routable local ip:wg_port
@@ -104,6 +190,19 @@ message ReportRequest {
                                           // rotation-tick unary epoch-ack report,
                                           // which is not a path snapshot and must
                                           // never wipe stored states).
+  // (Sync session generation) The reporting gateway's per-PROCESS nonce —
+  // the same value it sent on `WatchRequest.session_generation`, from the
+  // same `OnceLock`, so the rotation tick's unary Report (which dials its
+  // own short-lived channel) matches too. The controller rejects the WHOLE
+  // report when this conflicts with the generation recorded at the
+  // gateway's last Watch open: a report from before a gateway restart must
+  // not be allowed to restore stale `peer_paths`/`local_endpoints`/
+  // `relay_health` over the fresh state the reconnect just cleared.
+  //
+  // 0 = legacy/unknown (an old client, or a report racing a controller
+  // restart that emptied the in-memory generation store). A 0 on EITHER
+  // side is accepted — see the exact predicate in `services::sync`.
+  uint64 session_generation = 7;
 }
 message EpochAck { uint64 peer_gateway_id = 1; uint32 epoch = 2; bool live = 3; }
 // One entry of `ReportRequest.peer_paths`: `state` is the reporting gateway's
