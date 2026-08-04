@@ -216,8 +216,16 @@ impl PolicyApplyHandle {
         });
     }
 
-    /// Installs that returned `Err` since boot; the source of the
+    /// Failed policy-apply attempts since boot; the source of the
     /// `wiremesh_gateway_policy_apply_failures_total` counter.
+    ///
+    /// An attempt counts here in three cases, not just the obvious one: the
+    /// install returned `Err` (a rejected IR, or a deferred entry — see
+    /// [`needs_policy_write`]), the install task panicked, or the deadline
+    /// query could not be completed, in which case no install was attempted
+    /// at all. Worth knowing before alerting on the counter: a rotation
+    /// racing a policy update bumps it legitimately, and the deferral message
+    /// is what distinguishes that from a bad policy.
     pub fn failures(&self) -> u64 {
         self.failures.load(Ordering::Relaxed)
     }

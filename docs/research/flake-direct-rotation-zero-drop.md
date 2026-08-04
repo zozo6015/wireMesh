@@ -9,7 +9,7 @@ see it red has the distribution rather than a single data point.
 `crates/wiremesh-gateway/tests/key_rotation.rs`'s `direct_rotation_is_zero_drop` failed
 once in roughly a dozen runs across the session:
 
-```
+```text
 ZERO-DROP FAILED: ping flood during rotation dropped too many packets
 (transmitted=13, received=9, allowed gap=3)
 ```
