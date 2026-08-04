@@ -206,26 +206,25 @@ impl DesiredState {
 /// that fails there can never be installed by this binary — not on this
 /// boot, and not on any future one.
 ///
-/// **Cost, because this runs on every Sync `State` event:** an emptiness
-/// test and a 12-byte prefix compare. [`PolicyIR::to_canonical_json`] is
-/// plain `serde_json::to_string` over a struct whose first field is
-/// `schema` — canonical *by construction*, an invariant `wiremesh-policy`'s
-/// `ir.rs` documents and explicitly forbids changing — so every well-formed
-/// schema-1 IR begins `{"schema":1,`. The full decode below is reached only
-/// by an IR that does NOT look like one, i.e. precisely the broken case (or
-/// a hypothetical future change to the canonical form, where it keeps this
-/// correct rather than fast). It is never a second decode of a healthy IR
-/// on the steady-state path.
+/// This asks the real decoder, with no heuristic in front of it, because
+/// there is no cheap test that is also EXACT. An earlier version returned
+/// `true` for anything starting with the canonical `{"schema":1,` prefix on
+/// the theory that "doesn't look like a schema-1 IR" and "is broken" are the
+/// same set. They are not, in either direction: `{"schema":1,` itself, a
+/// document truncated mid-`blocks`, and `{"schema":1,"version":"four",...}`
+/// all match the prefix and all fail [`PolicyIR::from_json`] — so exactly
+/// the corruption cases this guard exists for (a partial write of the
+/// controller's `policy_version.compiled_ir` column, a damaged backup) were
+/// waved through and persisted.
+///
+/// The "have I already decoded these exact bytes" fast path belongs to
+/// [`FailStaticWriter`], which keeps the last decodable IR and can answer it
+/// with a memcmp — exact rather than approximate, and independent of serde
+/// field order. See [`FailStaticWriter::save`].
 pub fn policy_ir_is_decodable(policy_ir: &[u8]) -> bool {
     // "No policy yet" — `apply_if_changed` synthesizes an empty schema-1 IR
     // for this, so there is nothing undecodable to persist.
-    if policy_ir.is_empty() {
-        return true;
-    }
-    if policy_ir.starts_with(br#"{"schema":1,"#) {
-        return true;
-    }
-    PolicyIR::from_json(policy_ir).is_ok()
+    policy_ir.is_empty() || PolicyIR::from_json(policy_ir).is_ok()
 }
 
 /// Persists [`DesiredState`] for fail-static boot, never writing a
@@ -288,46 +287,57 @@ impl FailStaticWriter {
         FailStaticWriter { last_good, warned: None }
     }
 
+    /// `policy_version` of the last undecodable IR this writer warned about,
+    /// or `None` if the most recent save was clean. Exposed so the
+    /// once-per-distinct-bad-version dedupe is assertable — the warning
+    /// itself goes to stderr, which an in-process test cannot capture.
+    pub fn warned_version(&self) -> Option<u64> {
+        self.warned
+    }
+
     /// Persist `ds`, substituting its policy pair if the IR is undecodable.
     pub fn save(&mut self, ds: &DesiredState, state_dir: &Path) -> anyhow::Result<()> {
+        // Fast path: byte-identical to the IR we last decoded successfully,
+        // so it is KNOWN decodable — a memcmp, no parse, and exact (unlike
+        // any shape heuristic, it cannot be fooled and cannot rot if the
+        // canonical JSON form changes). This is the steady-state case: peer
+        // churn, endpoint observations and every reconnect snapshot re-send
+        // the same policy.
+        if self.last_good.as_ref().is_some_and(|(_, ir)| ir == &ds.policy_ir) {
+            self.warned = None;
+            return ds.save(state_dir);
+        }
+        // The IR genuinely changed (or this is the first save), so it has to
+        // be decoded. That is one parse per policy CHANGE, on the same event
+        // where `apply_if_changed` is about to parse it anyway — not one per
+        // `State` event.
         if policy_ir_is_decodable(&ds.policy_ir) {
-            // Remember the pair only when the version actually moves: the
-            // clone is the IR itself, and `State` events (peer churn,
-            // endpoint observations, reconnect snapshots) are far more
-            // frequent than policy updates.
-            if self.last_good.as_ref().map(|(v, _)| *v) != Some(ds.policy_version) {
-                self.last_good = Some((ds.policy_version, ds.policy_ir.clone()));
-            }
+            self.last_good = Some((ds.policy_version, ds.policy_ir.clone()));
             self.warned = None;
             return ds.save(state_dir);
         }
 
         let mut sanitized = ds.clone();
-        let kept = match &self.last_good {
-            Some((v, ir)) => {
-                sanitized.policy_version = *v;
-                sanitized.policy_ir = ir.clone();
-                Some(*v)
-            }
-            None => {
-                sanitized.policy_version = 0;
-                sanitized.policy_ir = Vec::new();
-                None
-            }
-        };
+        let (kept_version, kept_ir) = self.last_good.clone().unwrap_or((0, Vec::new()));
+        sanitized.policy_version = kept_version;
+        sanitized.policy_ir = kept_ir;
         if self.warned != Some(ds.policy_version) {
             self.warned = Some(ds.policy_version);
-            match kept {
-                Some(v) => eprintln!(
+            // Keyed on what was actually WRITTEN, not on whether `last_good`
+            // was set: a `last_good` of the "no policy yet" pair must produce
+            // the blackhole wording, not "keeps the last policy (version 0)".
+            if !sanitized.policy_ir.is_empty() {
+                eprintln!(
                     "wiremesh-gateway: CRITICAL: the controller sent policy version {} in an IR \
                      format this build cannot decode (only schema 1 is supported — is the \
                      controller newer than this gateway?). The datapath keeps the last policy \
                      it understood and state.json is being written with THAT policy (version \
-                     {v}) instead, so a restart does not inherit an uninstallable one. Peers \
-                     and routes are persisted normally. Upgrade this gateway.",
+                     {kept_version}) instead, so a restart does not inherit an uninstallable \
+                     one. Peers and routes are persisted normally. Upgrade this gateway.",
                     ds.policy_version
-                ),
-                None => eprintln!(
+                );
+            } else {
+                eprintln!(
                     "wiremesh-gateway: CRITICAL: the controller sent policy version {} in an IR \
                      format this build cannot decode (only schema 1 is supported — is the \
                      controller newer than this gateway?), and this gateway has never installed \
@@ -335,7 +345,7 @@ impl FailStaticWriter {
                      ALL fabric traffic is being dropped. state.json is being written with no \
                      policy rather than an uninstallable one. Upgrade this gateway.",
                     ds.policy_version
-                ),
+                );
             }
         }
         sanitized.save(state_dir)
