@@ -150,9 +150,15 @@ async fn same_owner_colliding_registration_must_not_silently_replace() {
                 "search invariant: the two peers must actually collide"
             );
             assert_ne!(peer1, peer2, "search invariant: the two peers must be distinct");
+            // The key is a raw 8-byte digest prefix, NOT printable ASCII, so
+            // it is rendered as hex — the relay's own `key=<16 hex chars>`
+            // stderr format, so this line can be correlated against the relay
+            // log. This branch is dead in practice now that the key is 64
+            // bits wide, which is precisely why the rendering matters: if the
+            // derivation ever regresses, this is the line someone reads.
+            let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
             eprintln!(
-                "found a same-owner collision: K(gw-A, {peer1:?}) == K(gw-A, {peer2:?}) == {:?}",
-                String::from_utf8_lossy(&key)
+                "found a same-owner collision: K(gw-A, {peer1:?}) == K(gw-A, {peer2:?}) == {key_hex}"
             );
 
             // The incumbent: gw-A registers its pair with peer1.

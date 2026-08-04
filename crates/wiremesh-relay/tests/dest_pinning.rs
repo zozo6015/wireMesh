@@ -331,7 +331,16 @@ async fn relay_must_not_forward_a_datagram_addressed_outside_the_senders_own_pai
         leftover.is_err(),
         "gw-A received a SECOND datagram after gw-B's legitimate one: {:?} — the relay \
          forwarded gw-C's cross-pair injection into slot K(gw-A, gw-B)",
-        leftover.map(|r| r.map(|(s, d)| (String::from_utf8_lossy(&s).to_string(), String::from_utf8_lossy(&d).to_string())))
+        // The src key is a raw 8-byte digest prefix, NOT printable ASCII —
+        // rendering it lossily would print mojibake at exactly the moment
+        // someone is reading this failure. Hex matches the relay's own
+        // `key=<16 hex chars>` stderr format, so a failure here can be
+        // correlated against the relay's log. The payload stays lossy: it is
+        // the ASCII marker `INJECTED-BY-GW-C`, and reading it is the point.
+        leftover.map(|r| r.map(|(s, d)| (
+            s.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            String::from_utf8_lossy(&d).to_string(),
+        )))
     );
 
     // The victim pair must still be usable afterwards: rejecting a cross-pair
