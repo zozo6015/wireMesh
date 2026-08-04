@@ -135,6 +135,15 @@ async fn report_applied_version(gw: &StubGateway, sync_addr: SocketAddr, version
             epoch_acks: vec![],
             peer_paths: vec![],
             peer_paths_snapshot: false,
+            // (Sync session generation) 0 = the wire's legacy/unknown
+            // sentinel. This local helper dials its own channel and never
+            // opens a `Sync.Watch`, so there is no recorded generation to
+            // match; sending 0 keeps the controller's gate inert, which is
+            // the documented legacy-client contract (a 0 on EITHER side is
+            // accepted). Deliberately NOT `gw.session_generation()` — this
+            // helper predates `StubGateway::report`/`report_raw` and is kept
+            // hand-rolled precisely to exercise a raw, non-testkit client.
+            session_generation: 0,
         })
         .await
         .expect("Sync.Report");

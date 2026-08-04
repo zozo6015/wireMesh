@@ -645,6 +645,43 @@ pub struct StubGateway {
     // replacement gateway in `tests/rebind.rs`, which never calls
     // `segment_id()`).
     segment_id: Option<i64>,
+    // (Sync session generation) This stub's per-"process" nonce, sent on
+    // BOTH `Sync.Watch` (`dial_sync_with`) and every `Sync.Report` helper —
+    // exactly as `wiremesh_gateway::sync::session_generation` does for a
+    // real gateway.
+    //
+    // DELIBERATELY NONZERO BY DEFAULT, and randomised per instance. 0 is the
+    // wire's legacy/unknown sentinel, which makes the controller's
+    // generation gate inert; a stub that sent 0 would be a stub of something
+    // no real gateway is, and the gate would go completely unexercised by
+    // the existing stub-driven suites (so a regression that started
+    // rejecting ordinary reports — or one that stopped rejecting stale ones
+    // — could only ever be caught by the handful of tests written
+    // specifically for it). With a nonzero default, every existing
+    // watch-then-report sequence in the suite doubles as a live positive
+    // control for the gate's ACCEPT path.
+    //
+    // The scheme is per-PROCESS, not per-connection: `open_sync`/
+    // `reconnect`/`reconnect_from_disk` all resend the SAME value, so a
+    // reconnect never invalidates this stub's own in-flight reports. A test
+    // that wants to model a gateway process RESTART bumps it explicitly via
+    // [`StubGateway::set_session_generation`] and then re-opens Sync.
+    session_generation: u64,
+}
+
+/// (Sync session generation) A uniformly random NONZERO `u64` — the same
+/// shape of value `wiremesh_gateway::sync::session_generation` mints for a
+/// real gateway process, and generated the same way: retried rather than
+/// forced (`| 1`, `saturating_add`) so the distribution stays uniform and the
+/// intent — "anything but the 0 legacy/unknown sentinel" — stays obvious.
+/// `next_u64` returning 0 is a ~1-in-2^64 event, so this never spins.
+fn random_nonzero_u64() -> u64 {
+    loop {
+        let v = rand::thread_rng().next_u64();
+        if v != 0 {
+            return v;
+        }
+    }
 }
 
 impl StubGateway {
@@ -732,6 +769,9 @@ impl StubGateway {
             _state_dir: state_dir,
             state_dir_path,
             segment_id: None,
+            // (Sync session generation) See the field's doc comment for why
+            // the default is nonzero.
+            session_generation: random_nonzero_u64(),
         })
     }
 
@@ -801,6 +841,12 @@ impl StubGateway {
             &cert_pem,
             &key_pem,
             &ca_bundle_pem,
+            // (Sync session generation) The identity comes off DISK, but the
+            // nonce deliberately does NOT: this models the same process
+            // re-dialing after a CONTROLLER restart (what `fail_static.rs`
+            // drives), not a gateway restart. A gateway restart is
+            // `set_session_generation` + `open_sync`.
+            self.session_generation,
         )
         .await
     }
@@ -809,18 +855,34 @@ impl StubGateway {
     /// connects to `addr` presenting this gateway's cert/key and trusting the
     /// controller's CA bundle, then opens the `Sync.Watch` stream.
     async fn dial_sync(&self, addr: SocketAddr) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
-        Self::dial_sync_with(addr, &self.cert_pem, &self.key_pem, &self.ca_bundle_pem).await
+        Self::dial_sync_with(
+            addr,
+            &self.cert_pem,
+            &self.key_pem,
+            &self.ca_bundle_pem,
+            self.session_generation,
+        )
+        .await
     }
 
     /// Free-function core of [`Self::dial_sync`]: takes the identity PEMs
     /// explicitly (rather than reading `self`) so [`Self::reconnect_from_disk`]
     /// can dial with bytes read fresh off disk instead of `self`'s in-memory
     /// copies.
+    ///
+    /// `session_generation` is the per-"process" nonce this Watch open
+    /// RECORDS against the authenticated gateway id controller-side (see
+    /// [`StubGateway::session_generation`]); every subsequent `Sync.Report`
+    /// carrying a DIFFERENT nonzero value is rejected with
+    /// `FAILED_PRECONDITION`. Taken explicitly rather than read off `self`
+    /// because this is the free-function core `reconnect_from_disk` also
+    /// calls.
     async fn dial_sync_with(
         addr: SocketAddr,
         cert_pem: &str,
         key_pem: &str,
         ca_bundle_pem: &str,
+        session_generation: u64,
     ) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
         let uri = format!("https://{addr}");
         let tls = ClientTlsConfig::new()
@@ -843,7 +905,7 @@ impl StubGateway {
 
         let mut client = SyncClient::new(channel);
         let stream = client
-            .watch(WatchRequest {})
+            .watch(WatchRequest { session_generation })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Watch failed: {status}"))?
             .into_inner();
@@ -901,22 +963,39 @@ impl StubGateway {
         }
     }
 
-    /// (Cycle-4b Task 4) Calls `Sync.Report{applied_version, local_endpoints}`
-    /// against the controller, over a FRESH mTLS channel presenting this
-    /// gateway's own enrolled identity — the same dial recipe `open_sync`
-    /// uses, just a plain unary `Report` call instead of a `Watch` stream
-    /// (so it can't reuse `dial_sync`'s streaming return type). Promoted
-    /// here from what had been a hand-rolled private helper duplicated in
-    /// `wiremesh-testkit/tests/end_to_end_policy.rs` and
-    /// `fabricctl/tests/cli.rs` (each predating `local_endpoints`, so each
-    /// only ever sent an empty list) — this is the one shared place that
-    /// now also exercises reporting a gateway's own local candidate
-    /// endpoints (spec §6.1).
-    pub async fn report(
+    /// (Sync session generation) The single dial-and-send core behind every
+    /// `report*` helper below: opens a FRESH mTLS channel presenting this
+    /// gateway's own enrolled identity (the same recipe `open_sync` uses —
+    /// modelling the real gateway's rotation tick, which dials its own
+    /// short-lived channel per report) and sends `req` VERBATIM.
+    ///
+    /// Verbatim is the point. The four public helpers all stamp
+    /// `self.session_generation` and hard-code most other fields; a test
+    /// that needs to send something no honest gateway would — most
+    /// importantly a STALE `session_generation`, i.e. one from before a
+    /// simulated process restart — has to bypass them.
+    ///
+    /// Returns the raw `tonic::Response` on success. On an RPC failure the
+    /// `tonic::Status` is placed in the `anyhow::Error` UNSTRINGIFIED, so a
+    /// caller can recover it and assert on the CODE rather than on message
+    /// text:
+    ///
+    /// ```ignore
+    /// let err = gw.report_raw(req).await.expect_err("must be rejected");
+    /// let status = err
+    ///     .downcast_ref::<tonic::Status>()
+    ///     .expect("the failure must be a gRPC Status, not a transport error");
+    /// assert_eq!(status.code(), tonic::Code::FailedPrecondition);
+    /// ```
+    ///
+    /// Dial/TLS failures still surface as ordinary `anyhow` errors, so a
+    /// `downcast_ref::<tonic::Status>()` returning `None` genuinely means
+    /// "the request never reached the handler" — which is why the snippet
+    /// above `expect`s rather than defaulting.
+    pub async fn report_raw(
         &self,
-        applied_version: u64,
-        local_endpoints: &[&str],
-    ) -> anyhow::Result<()> {
+        req: ReportRequest,
+    ) -> anyhow::Result<tonic::Response<wiremesh_proto::v1::ReportResponse>> {
         let uri = format!("https://{}", self.sync_addr);
         let tls = ClientTlsConfig::new()
             .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
@@ -934,25 +1013,69 @@ impl StubGateway {
                 )
             })?;
 
+        // `anyhow::Error::new(status)` — NOT `anyhow!("...: {status}")`.
+        // `tonic::Status` implements `std::error::Error`, so wrapping it
+        // preserves the concrete type for `downcast_ref`; formatting it into
+        // a string would throw the code away and force callers to
+        // substring-match the message.
         SyncClient::new(channel)
-            .report(ReportRequest {
-                applied_version,
-                local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
-                relay_health: vec![],
-                epoch_acks: vec![],
-                peer_paths: vec![],
-                peer_paths_snapshot: false,
-            })
+            .report(req)
             .await
-            .map_err(|status| anyhow::anyhow!("Sync.Report failed: {status}"))?;
+            .map_err(anyhow::Error::new)
+    }
+
+    /// (Cycle-4b Task 4) Calls `Sync.Report{applied_version, local_endpoints}`
+    /// against the controller, over a FRESH mTLS channel presenting this
+    /// gateway's own enrolled identity — the same dial recipe `open_sync`
+    /// uses, just a plain unary `Report` call instead of a `Watch` stream
+    /// (so it can't reuse `dial_sync`'s streaming return type). Promoted
+    /// here from what had been a hand-rolled private helper duplicated in
+    /// `wiremesh-testkit/tests/end_to_end_policy.rs` and
+    /// `fabricctl/tests/cli.rs` (each predating `local_endpoints`, so each
+    /// only ever sent an empty list) — this is the one shared place that
+    /// now also exercises reporting a gateway's own local candidate
+    /// endpoints (spec §6.1).
+    ///
+    /// (Sync session generation) Now a thin wrapper over
+    /// [`StubGateway::report_raw`] — the four helpers' channel setups were
+    /// byte-identical — stamping this stub's own `session_generation`, which
+    /// is what a real gateway does and what makes this helper's report
+    /// ACCEPTED after an `open_sync()` and REJECTED after a simulated
+    /// restart it hasn't re-watched through.
+    pub async fn report(
+        &self,
+        applied_version: u64,
+        local_endpoints: &[&str],
+    ) -> anyhow::Result<()> {
+        self.report_raw(ReportRequest {
+            applied_version,
+            local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
+            relay_health: vec![],
+            epoch_acks: vec![],
+            peer_paths: vec![],
+            peer_paths_snapshot: false,
+            session_generation: self.session_generation,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Sync.Report failed: {e}"))?;
         Ok(())
     }
 
-    /// (Key-rotation Task 2) Submits this gateway's REAL WireGuard public
-    /// key for a pending rotation `epoch` via `Sync.SubmitEpochKey`, over a
-    /// fresh mTLS channel using this gateway's own identity — mirrors
-    /// [`Self::report`]'s connection setup exactly.
-    pub async fn submit_epoch_key(&self, epoch: u32, pubkey: &str) -> anyhow::Result<()> {
+    /// (Sync session generation) The dial-and-send core behind
+    /// [`Self::submit_epoch_key`] — the `Sync.SubmitEpochKey` counterpart to
+    /// [`Self::report_raw`], with the same contract: `req` is sent VERBATIM,
+    /// and on an RPC failure the `tonic::Status` rides in the
+    /// `anyhow::Error` UNSTRINGIFIED so a caller can `downcast_ref` it and
+    /// assert on the CODE.
+    ///
+    /// Needed for the same reason `report_raw` is: `SubmitEpochKey` is now
+    /// gated on the session generation, and the only way to exercise that
+    /// gate is to send a nonce the honest helper would never send — the one
+    /// from before a simulated process restart.
+    pub async fn submit_epoch_key_raw(
+        &self,
+        req: SubmitEpochKeyRequest,
+    ) -> anyhow::Result<tonic::Response<wiremesh_proto::v1::SubmitEpochKeyResponse>> {
         let uri = format!("https://{}", self.sync_addr);
         let tls = ClientTlsConfig::new()
             .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
@@ -973,13 +1096,33 @@ impl StubGateway {
                 )
             })?;
 
+        // See `report_raw`: `anyhow::Error::new(status)`, not a formatted
+        // string, so `downcast_ref::<tonic::Status>()` still works.
         SyncClient::new(channel)
-            .submit_epoch_key(SubmitEpochKeyRequest {
-                epoch,
-                pubkey: pubkey.to_string(),
-            })
+            .submit_epoch_key(req)
             .await
-            .map_err(|status| anyhow::anyhow!("Sync.SubmitEpochKey failed: {status}"))?;
+            .map_err(anyhow::Error::new)
+    }
+
+    /// (Key-rotation Task 2) Submits this gateway's REAL WireGuard public
+    /// key for a pending rotation `epoch` via `Sync.SubmitEpochKey`, over a
+    /// fresh mTLS channel using this gateway's own identity — mirrors
+    /// [`Self::report`]'s connection setup exactly.
+    ///
+    /// (Sync session generation) Stamps this stub's own nonce, like every
+    /// other helper here — see the `session_generation` field's doc comment.
+    /// `SubmitEpochKey` is gated on it because `Db::set_epoch_pubkey`'s swap
+    /// onto the `awaiting-submission` sentinel is first-writer-wins: a
+    /// submission from a gateway's PREVIOUS process can win it and install a
+    /// key the live process is not serving.
+    pub async fn submit_epoch_key(&self, epoch: u32, pubkey: &str) -> anyhow::Result<()> {
+        self.submit_epoch_key_raw(SubmitEpochKeyRequest {
+            epoch,
+            pubkey: pubkey.to_string(),
+            session_generation: self.session_generation,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Sync.SubmitEpochKey failed: {e}"))?;
         Ok(())
     }
 
@@ -995,51 +1138,33 @@ impl StubGateway {
     /// `RelayInfo.relay_id`. `report` itself is left untouched (it keeps
     /// sending the hardcoded empty `relay_health: vec![]`) so every existing
     /// caller is unaffected by this addition.
+    ///
+    /// (Sync session generation) Routes through
+    /// [`StubGateway::report_raw`], stamping this stub's own nonce — see
+    /// [`StubGateway::report`].
     pub async fn report_with_relay_health(
         &self,
         applied_version: u64,
         local_endpoints: &[&str],
         relay_health: &[(i64, bool)],
     ) -> anyhow::Result<()> {
-        let uri = format!("https://{}", self.sync_addr);
-        let tls = ClientTlsConfig::new()
-            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
-            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
-            .domain_name("127.0.0.1");
-        let channel = Channel::from_shared(uri)
-            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
-            .tls_config(tls)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "configuring StubGateway mTLS for Sync.Report (relay health): {e}"
-                )
-            })?
-            .connect()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "connecting to the controller's Sync (mTLS) TCP port for Sync.Report \
-                     (relay health): {e}"
-                )
-            })?;
-
-        SyncClient::new(channel)
-            .report(ReportRequest {
-                applied_version,
-                local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
-                relay_health: relay_health
-                    .iter()
-                    .map(|(relay_id, healthy)| wiremesh_proto::v1::RelayHealth {
-                        relay_id: *relay_id as u64,
-                        healthy: *healthy,
-                    })
-                    .collect(),
-                epoch_acks: vec![],
-                peer_paths: vec![],
-                peer_paths_snapshot: false,
-            })
-            .await
-            .map_err(|status| anyhow::anyhow!("Sync.Report (relay health) failed: {status}"))?;
+        self.report_raw(ReportRequest {
+            applied_version,
+            local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
+            relay_health: relay_health
+                .iter()
+                .map(|(relay_id, healthy)| wiremesh_proto::v1::RelayHealth {
+                    relay_id: *relay_id as u64,
+                    healthy: *healthy,
+                })
+                .collect(),
+            epoch_acks: vec![],
+            peer_paths: vec![],
+            peer_paths_snapshot: false,
+            session_generation: self.session_generation,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Sync.Report (relay health) failed: {e}"))?;
         Ok(())
     }
 
@@ -1060,51 +1185,33 @@ impl StubGateway {
     /// full-REPLACE empty-list-clears semantics — a peer-path report must be
     /// able to re-assert the candidate set it isn't changing. Mirrors
     /// [`Self::report_with_relay_health`]'s connection setup exactly.
+    ///
+    /// (Sync session generation) Routes through
+    /// [`StubGateway::report_raw`], stamping this stub's own nonce — see
+    /// [`StubGateway::report`].
     pub async fn report_with_peer_paths(
         &self,
         applied_version: u64,
         local_endpoints: &[&str],
         peer_paths: &[(u64, &str)],
     ) -> anyhow::Result<()> {
-        let uri = format!("https://{}", self.sync_addr);
-        let tls = ClientTlsConfig::new()
-            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
-            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
-            .domain_name("127.0.0.1");
-        let channel = Channel::from_shared(uri)
-            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
-            .tls_config(tls)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "configuring StubGateway mTLS for Sync.Report (peer paths): {e}"
-                )
-            })?
-            .connect()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "connecting to the controller's Sync (mTLS) TCP port for Sync.Report \
-                     (peer paths): {e}"
-                )
-            })?;
-
-        SyncClient::new(channel)
-            .report(ReportRequest {
-                applied_version,
-                local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
-                relay_health: vec![],
-                epoch_acks: vec![],
-                peer_paths: peer_paths
-                    .iter()
-                    .map(|(peer_gateway_id, state)| wiremesh_proto::v1::PeerPath {
-                        peer_gateway_id: *peer_gateway_id,
-                        state: state.to_string(),
-                    })
-                    .collect(),
-                peer_paths_snapshot: true,
-            })
-            .await
-            .map_err(|status| anyhow::anyhow!("Sync.Report (peer paths) failed: {status}"))?;
+        self.report_raw(ReportRequest {
+            applied_version,
+            local_endpoints: local_endpoints.iter().map(|s| s.to_string()).collect(),
+            relay_health: vec![],
+            epoch_acks: vec![],
+            peer_paths: peer_paths
+                .iter()
+                .map(|(peer_gateway_id, state)| wiremesh_proto::v1::PeerPath {
+                    peer_gateway_id: *peer_gateway_id,
+                    state: state.to_string(),
+                })
+                .collect(),
+            peer_paths_snapshot: true,
+            session_generation: self.session_generation,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Sync.Report (peer paths) failed: {e}"))?;
         Ok(())
     }
 
@@ -1118,51 +1225,37 @@ impl StubGateway {
     /// WireGuard session with rotating-gateway A's epoch-n key" — the ack is
     /// recorded against A (the rotating gateway), not B (the reporter).
     /// Mirrors [`Self::report_with_relay_health`]'s connection setup exactly.
+    ///
+    /// (Sync session generation) Routes through
+    /// [`StubGateway::report_raw`], stamping this stub's own nonce — see
+    /// [`StubGateway::report`]. This is also the helper that models the real
+    /// gateway's rotation-tick unary ack, which is precisely the report the
+    /// controller's whole-handler gating can drop if it fires while the
+    /// gateway's Watch has been replaced (an accepted residual — see
+    /// `SyncSvc::sessions`).
     pub async fn report_epoch_acks(
         &self,
         applied_version: u64,
         acks: &[(u64, u32, bool)],
     ) -> anyhow::Result<()> {
-        let uri = format!("https://{}", self.sync_addr);
-        let tls = ClientTlsConfig::new()
-            .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
-            .ca_certificate(Certificate::from_pem(&self.ca_bundle_pem))
-            .domain_name("127.0.0.1");
-        let channel = Channel::from_shared(uri)
-            .map_err(|e| anyhow::anyhow!("controller Sync TCP addr must form a valid URI: {e}"))?
-            .tls_config(tls)
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "configuring StubGateway mTLS for Sync.Report (epoch acks): {e}"
-                )
-            })?
-            .connect()
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "connecting to the controller's Sync (mTLS) TCP port for Sync.Report \
-                     (epoch acks): {e}"
-                )
-            })?;
-
-        SyncClient::new(channel)
-            .report(ReportRequest {
-                applied_version,
-                local_endpoints: vec![],
-                relay_health: vec![],
-                epoch_acks: acks
-                    .iter()
-                    .map(|(peer_gateway_id, epoch, live)| wiremesh_proto::v1::EpochAck {
-                        peer_gateway_id: *peer_gateway_id,
-                        epoch: *epoch,
-                        live: *live,
-                    })
-                    .collect(),
-                peer_paths: vec![],
-                peer_paths_snapshot: false,
-            })
-            .await
-            .map_err(|status| anyhow::anyhow!("Sync.Report (epoch acks) failed: {status}"))?;
+        self.report_raw(ReportRequest {
+            applied_version,
+            local_endpoints: vec![],
+            relay_health: vec![],
+            epoch_acks: acks
+                .iter()
+                .map(|(peer_gateway_id, epoch, live)| wiremesh_proto::v1::EpochAck {
+                    peer_gateway_id: *peer_gateway_id,
+                    epoch: *epoch,
+                    live: *live,
+                })
+                .collect(),
+            peer_paths: vec![],
+            peer_paths_snapshot: false,
+            session_generation: self.session_generation,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Sync.Report (epoch acks) failed: {e}"))?;
         Ok(())
     }
 
@@ -1243,6 +1336,43 @@ impl StubGateway {
     /// `enroll()` itself reads it straight off the enrollment response.
     pub fn id(&self) -> u64 {
         self.gateway_id as u64
+    }
+
+    /// (Sync session generation) The per-"process" nonce this stub currently
+    /// stamps on `Sync.Watch` and every `Sync.Report` — see the
+    /// `session_generation` field's doc comment. Always NONZERO unless a
+    /// test deliberately set it to the legacy sentinel.
+    ///
+    /// Capture this BEFORE [`StubGateway::set_session_generation`] when
+    /// modelling a restart: the captured value is the "previous process's"
+    /// generation, i.e. the one a delayed pre-restart report would carry.
+    pub fn session_generation(&self) -> u64 {
+        self.session_generation
+    }
+
+    /// (Sync session generation) Simulates a gateway PROCESS RESTART by
+    /// replacing this stub's nonce. Nothing is sent by this call on its own
+    /// — the new value only reaches the controller on the NEXT
+    /// `open_sync()`/`reconnect()`, which is what records it against this
+    /// gateway id and thereby invalidates the previous process's reports.
+    ///
+    /// The idiomatic restart is therefore:
+    ///
+    /// ```ignore
+    /// let previous = gw.session_generation();
+    /// drop(stream);                       // the old process's Watch dies
+    /// gw.set_session_generation(previous + 1);
+    /// let stream = gw.open_sync().await;  // the new process registers
+    /// ```
+    ///
+    /// after which a `report_raw` carrying `previous` is exactly the
+    /// delayed pre-restart report the scheme exists to reject.
+    ///
+    /// Passing 0 is legal and meaningful: it models a LEGACY client (or one
+    /// that does not implement the scheme), for which the controller's gate
+    /// must stay inert in both directions.
+    pub fn set_session_generation(&mut self, generation: u64) {
+        self.session_generation = generation;
     }
 
     /// (Task 10) This gateway's `observe_key` — the random per-gateway

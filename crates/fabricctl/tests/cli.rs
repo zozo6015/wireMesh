@@ -89,6 +89,12 @@ async fn report_applied_version(gw: &StubGateway, sync_addr: SocketAddr, version
             epoch_acks: vec![],
             peer_paths: vec![],
             peer_paths_snapshot: false,
+            // (Sync session generation) 0 = the wire's legacy/unknown
+            // sentinel; see the identical note in
+            // `wiremesh-testkit/tests/end_to_end_policy.rs`. A 0 on either
+            // side is accepted, so this hand-rolled raw client keeps its
+            // pre-scheme behaviour whether or not the stub ever watched.
+            session_generation: 0,
         })
         .await
         .expect("Sync.Report");

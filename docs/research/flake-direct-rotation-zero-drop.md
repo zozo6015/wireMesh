@@ -55,3 +55,29 @@ runs) before touching anything.
   measurement window is the lever, not the tolerance.
 - Check whether the drops cluster at the cutover instant or are spread — the former is a
   real property of the handover, the latter is scheduling noise.
+
+## Second sighting, 2026-08-04 (same day, later) — UNCLASSIFIED
+
+`key_rotation.rs` failed **once** during item-2 verification. Deliberately left
+unattributed, because the evidence does not support attributing it:
+
+- The failing test name was **not captured** (the runner's grep filter dropped the
+  `failures:` block).
+- It occurred in a run under an **unrelated sabotage** (`send_epoch_ack`'s
+  `local_endpoints` reverted), and did **not** reproduce in two further runs of that same
+  sabotage.
+
+`direct_rotation_is_zero_drop` lives in `key_rotation.rs`, so it is a *candidate* — but so
+is every other test in that file. Do not fold this into the distribution below without a
+captured name.
+
+## Observations, kept separate
+
+**Clean HEAD, full suite:** gap 2, gap 3, gap 2, gap 2 — all passing, margin as low as zero.
+(The fourth is 2026-08-04 item-2 final verification: `transmitted=13 received=11`.)
+**Clean HEAD, isolated:** gap 2 ×4 — all passing.
+**Under unrelated sabotage:** one gap-4 failure (2026-08-04, item-1 verification), plus
+one uncaptured `key_rotation` failure (2026-08-04, item-2 verification).
+
+Only the clean-HEAD rows characterise the flake. The sabotage rows are recorded so nobody
+re-derives them as new sightings, not as evidence about the margin.
