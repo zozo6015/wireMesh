@@ -260,7 +260,13 @@ fn rotate_directive_message_roundtrips() {
 fn submit_epoch_key_request_roundtrips() {
     // Key-rotation Task 1: a gateway submits its newly generated per-epoch
     // WireGuard public key to the controller via SubmitEpochKeyRequest.
-    let req = SubmitEpochKeyRequest { epoch: 5, pubkey: "REALKEY==".into() };
+    let req = SubmitEpochKeyRequest {
+        epoch: 5,
+        pubkey: "REALKEY==".into(),
+        // (Sync session generation) 0 here; the field's own coverage lives in
+        // `session_generation_roundtrips_on_watch_report_and_submit_epoch_key`.
+        session_generation: 0,
+    };
 
     let bytes = req.encode_to_vec();
     let decoded = SubmitEpochKeyRequest::decode(bytes.as_slice())
@@ -381,13 +387,20 @@ fn report_request_peer_paths_roundtrips() {
 }
 
 #[test]
-fn session_generation_roundtrips_on_watch_and_report() {
+fn session_generation_roundtrips_on_watch_report_and_submit_epoch_key() {
     // (Sync session generation) `WatchRequest` gains `uint64
     // session_generation = 1;` — its FIRST field ever, on a message that was
-    // deliberately empty — and `ReportRequest` gains `uint64
-    // session_generation = 7;`. The gateway stamps the SAME per-boot nonce on
-    // both, and the controller rejects a Report whose value conflicts with
-    // the one recorded at that gateway's last Watch open.
+    // deliberately empty — `ReportRequest` gains `uint64 session_generation
+    // = 7;`, and `SubmitEpochKeyRequest` gains `uint64 session_generation =
+    // 3;`. The gateway stamps the SAME per-boot nonce on all three, and the
+    // controller rejects a Report or a SubmitEpochKey whose value conflicts
+    // with the one recorded at that gateway's last Watch open.
+    //
+    // All three are covered here because the shared predicate
+    // (`SyncSvc::check_session_generation`) is only as good as the field
+    // reaching it: a `SubmitEpochKeyRequest` whose nonce did not survive the
+    // wire would read as 0 and silently take the legacy fail-open path — the
+    // gate would look present and do nothing.
     //
     // Two properties, and the SECOND is the load-bearing one:
     //
@@ -432,7 +445,22 @@ fn session_generation_roundtrips_on_watch_and_report() {
     );
     assert_eq!(decoded, report, "no other ReportRequest field may be disturbed");
 
-    // Absent (legacy client) => 0, on both messages.
+    let submit = SubmitEpochKeyRequest {
+        epoch: 5,
+        pubkey: "REALKEY==".into(),
+        session_generation: nonce,
+    };
+    let decoded = SubmitEpochKeyRequest::decode(submit.encode_to_vec().as_slice())
+        .expect("decoding the encoded SubmitEpochKeyRequest");
+    assert_eq!(
+        decoded.session_generation, nonce,
+        "SubmitEpochKeyRequest.session_generation must survive the wire intact — it is what \
+         lets the controller reject a pre-restart submission that would otherwise WIN \
+         `Db::set_epoch_pubkey`'s swap onto the sentinel"
+    );
+    assert_eq!(decoded, submit, "no other SubmitEpochKeyRequest field may be disturbed");
+
+    // Absent (legacy client) => 0, on all three messages.
     let decoded = WatchRequest::decode([].as_slice())
         .expect("an empty WatchRequest (the legacy client's literal wire form) must decode");
     assert_eq!(
@@ -447,5 +475,14 @@ fn session_generation_roundtrips_on_watch_and_report() {
         decoded.session_generation, 0,
         "an absent ReportRequest.session_generation must decode as the 0 legacy/unknown \
          sentinel — a 0 on either side is ACCEPTED, so legacy clients keep working"
+    );
+
+    let decoded = SubmitEpochKeyRequest::decode([].as_slice())
+        .expect("an empty SubmitEpochKeyRequest must decode");
+    assert_eq!(
+        decoded.session_generation, 0,
+        "an absent SubmitEpochKeyRequest.session_generation must decode as the 0 \
+         legacy/unknown sentinel — a legacy gateway must still be able to complete a \
+         rotation it was directed into"
     );
 }

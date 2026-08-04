@@ -1061,11 +1061,21 @@ impl StubGateway {
         Ok(())
     }
 
-    /// (Key-rotation Task 2) Submits this gateway's REAL WireGuard public
-    /// key for a pending rotation `epoch` via `Sync.SubmitEpochKey`, over a
-    /// fresh mTLS channel using this gateway's own identity — mirrors
-    /// [`Self::report`]'s connection setup exactly.
-    pub async fn submit_epoch_key(&self, epoch: u32, pubkey: &str) -> anyhow::Result<()> {
+    /// (Sync session generation) The dial-and-send core behind
+    /// [`Self::submit_epoch_key`] — the `Sync.SubmitEpochKey` counterpart to
+    /// [`Self::report_raw`], with the same contract: `req` is sent VERBATIM,
+    /// and on an RPC failure the `tonic::Status` rides in the
+    /// `anyhow::Error` UNSTRINGIFIED so a caller can `downcast_ref` it and
+    /// assert on the CODE.
+    ///
+    /// Needed for the same reason `report_raw` is: `SubmitEpochKey` is now
+    /// gated on the session generation, and the only way to exercise that
+    /// gate is to send a nonce the honest helper would never send — the one
+    /// from before a simulated process restart.
+    pub async fn submit_epoch_key_raw(
+        &self,
+        req: SubmitEpochKeyRequest,
+    ) -> anyhow::Result<tonic::Response<wiremesh_proto::v1::SubmitEpochKeyResponse>> {
         let uri = format!("https://{}", self.sync_addr);
         let tls = ClientTlsConfig::new()
             .identity(Identity::from_pem(&self.cert_pem, &self.key_pem))
@@ -1086,18 +1096,33 @@ impl StubGateway {
                 )
             })?;
 
+        // See `report_raw`: `anyhow::Error::new(status)`, not a formatted
+        // string, so `downcast_ref::<tonic::Status>()` still works.
         SyncClient::new(channel)
-            .submit_epoch_key(SubmitEpochKeyRequest {
-                epoch,
-                pubkey: pubkey.to_string(),
-                // `session_generation: 0` — the legacy/unknown sentinel, as
-                // in this stub's `watch`/`report` helpers, so the gate stays
-                // inert for existing stub-driven tests. A test exercising
-                // the gate should drive the generation explicitly.
-                session_generation: 0,
-            })
+            .submit_epoch_key(req)
             .await
-            .map_err(|status| anyhow::anyhow!("Sync.SubmitEpochKey failed: {status}"))?;
+            .map_err(anyhow::Error::new)
+    }
+
+    /// (Key-rotation Task 2) Submits this gateway's REAL WireGuard public
+    /// key for a pending rotation `epoch` via `Sync.SubmitEpochKey`, over a
+    /// fresh mTLS channel using this gateway's own identity — mirrors
+    /// [`Self::report`]'s connection setup exactly.
+    ///
+    /// (Sync session generation) Stamps this stub's own nonce, like every
+    /// other helper here — see the `session_generation` field's doc comment.
+    /// `SubmitEpochKey` is gated on it because `Db::set_epoch_pubkey`'s swap
+    /// onto the `awaiting-submission` sentinel is first-writer-wins: a
+    /// submission from a gateway's PREVIOUS process can win it and install a
+    /// key the live process is not serving.
+    pub async fn submit_epoch_key(&self, epoch: u32, pubkey: &str) -> anyhow::Result<()> {
+        self.submit_epoch_key_raw(SubmitEpochKeyRequest {
+            epoch,
+            pubkey: pubkey.to_string(),
+            session_generation: self.session_generation,
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("Sync.SubmitEpochKey failed: {e}"))?;
         Ok(())
     }
 
