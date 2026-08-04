@@ -73,7 +73,8 @@ captured name.
 
 ## Observations, kept separate
 
-**Clean HEAD, full suite:** gap 2, gap 3, gap 2 — all passing, margin as low as zero.
+**Clean HEAD, full suite:** gap 2, gap 3, gap 2, gap 2 — all passing, margin as low as zero.
+(The fourth is 2026-08-04 item-2 final verification: `transmitted=13 received=11`.)
 **Clean HEAD, isolated:** gap 2 ×4 — all passing.
 **Under unrelated sabotage:** one gap-4 failure (2026-08-04, item-1 verification), plus
 one uncaptured `key_rotation` failure (2026-08-04, item-2 verification).
