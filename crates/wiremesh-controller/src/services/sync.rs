@@ -12,9 +12,11 @@
 //! already validated (`Request::peer_certs`) — specifically its subject
 //! CN, looked up against `gateway.name` (the same value `EnrollmentSvc`
 //! derived from the enrollment token and stamped as the issued leaf's
-//! subject CN; see `services::enrollment`). Nothing client-supplied (e.g. a
-//! field in `WatchRequest`) is trusted as identity — `WatchRequest` is
-//! (deliberately) an empty message.
+//! subject CN; see `services::enrollment`). Nothing client-supplied is
+//! trusted as identity: `WatchRequest`'s single field
+//! (`session_generation`) is a per-boot liveness nonce used only to reject
+//! reports from a gateway process that has since been replaced — it never
+//! selects or influences WHICH gateway the request is treated as.
 
 use std::collections::{BTreeSet, HashMap};
 use std::pin::Pin;
@@ -103,6 +105,50 @@ pub struct SyncSvc {
     /// same reason as `relay_health` — the guard is held across `.await`
     /// points (DB reads/writes) in the read-decide-write critical section.
     rotations: Arc<Mutex<HashMap<i64, RotationTracker>>>,
+    /// (Sync session generation) `gateway_id -> the per-BOOT nonce that
+    /// gateway sent on its most recent `Sync.Watch` open`. Read by [`report`]
+    /// to reject a `Sync.Report` from a gateway process that has since been
+    /// replaced.
+    ///
+    /// # What this closes
+    ///
+    /// `Broker::on_gateway_connected` clears a reconnecting gateway's stored
+    /// `peer_paths` (a restarted gateway may have no tunnel at all, so its
+    /// stale "direct" claims must not suppress the punches it now needs). A
+    /// `Report` issued by that gateway's PREVIOUS process, delayed on the
+    /// network, could land after the clear and — being a snapshot — restore
+    /// the pre-restart claims. Same shape for `local_endpoints` (the
+    /// original instance of the race) and `relay_health`. With the
+    /// generation recorded at Watch-open, such a report is identifiable and
+    /// rejected synchronously, with no DB hop.
+    ///
+    /// # Deliberately NOT persisted, and deliberately NOT learned from a Report
+    ///
+    /// In-memory only. A controller restart empties it, which makes every
+    /// gateway "unknown" (stored 0) and therefore ACCEPTED until its Watch
+    /// reopens seconds later — the fail-open direction, chosen because the
+    /// alternative degrades the whole fabric during the restart window (see
+    /// the predicate in `report`).
+    ///
+    /// It is also never written from a `Report`, only from a Watch open. A
+    /// report-write would let a stale report install the stale generation
+    /// and then reject the FRESH reports that follow — strictly worse than
+    /// the bug being fixed.
+    ///
+    /// # No eviction on stream drop
+    ///
+    /// Entries are overwritten, never removed. Removing on stream drop would
+    /// be wrong twice over: the drop of a dying OLD connection can be
+    /// observed after the NEW connection has already recorded its
+    /// generation (erasing it), and keeping the entry across a momentary
+    /// Watch outage is what lets the rotation tick's unary epoch-ack Report
+    /// — which dials its own short-lived channel — still be accepted.
+    ///
+    /// A `std::sync::Mutex` (unlike the two above): the guard only ever
+    /// spans a single synchronous map read or write and is never held across
+    /// an `.await`. `Arc` so the map is shared regardless of whether tonic
+    /// holds this service behind an `Arc` or clones it per request.
+    sessions: Arc<std::sync::Mutex<HashMap<i64, u64>>>,
 }
 
 /// (Key-rotation Task 3) One gateway's in-flight rotation bookkeeping, kept
@@ -130,7 +176,38 @@ impl SyncSvc {
             broker,
             relay_health: Arc::new(Mutex::new(HashMap::new())),
             rotations: Arc::new(Mutex::new(HashMap::new())),
+            sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    /// (Sync session generation) Records `generation` as `gateway_id`'s
+    /// current Sync session, overwriting any previous value. Called from
+    /// [`SyncSvc::watch_gateway`] and NOWHERE else — see the
+    /// [`SyncSvc::sessions`] doc for why a `Report` must never write here.
+    ///
+    /// A `generation` of 0 (a legacy gateway, or any client that does not
+    /// implement the scheme) is recorded verbatim: it makes the gate inert
+    /// for that gateway, which is exactly the intended legacy behavior.
+    ///
+    /// A poisoned lock is swallowed: the gate is an optimization over
+    /// accepting everything, and turning a poisoned mutex into a failed
+    /// `Watch` would take the fabric down over bookkeeping.
+    fn record_session_generation(&self, gateway_id: i64, generation: u64) {
+        if let Ok(mut sessions) = self.sessions.lock() {
+            sessions.insert(gateway_id, generation);
+        }
+    }
+
+    /// (Sync session generation) The generation currently recorded for
+    /// `gateway_id`, or 0 for "unknown" — no Watch has been seen for it since
+    /// this controller process started. A poisoned lock also reads as
+    /// unknown, i.e. fail-open (accept), for the reason above.
+    fn recorded_session_generation(&self, gateway_id: i64) -> u64 {
+        self.sessions
+            .lock()
+            .ok()
+            .and_then(|sessions| sessions.get(&gateway_id).copied())
+            .unwrap_or(0)
     }
 
     /// (Cycle-4c Task 6; CodeRabbit round 3) Re-reads the current
@@ -582,11 +659,28 @@ impl SyncSvc {
     /// peers + policy + relays, then live deltas + broker-driven punches).
     /// Behavior is byte-for-byte what the pre-T6 `watch` method did once the
     /// CN resolved to a gateway — only its home moved.
+    ///
+    /// `session_generation` is the client-supplied per-BOOT nonce from
+    /// `WatchRequest` (see [`SyncSvc::sessions`]). It is NOT identity — the
+    /// authenticated `gw` came from the mTLS peer cert — it only labels which
+    /// process of that gateway this stream belongs to.
     async fn watch_gateway(
         &self,
         gw: GatewayIdentity,
         self_cert_pem: String,
+        session_generation: u64,
     ) -> Result<Response<WatchStream>, Status> {
+        // (Sync session generation) FIRST statement, and the ordering is
+        // LOAD-BEARING — before `change_tx.subscribe()`, before
+        // `broker.register`, and above all before the `tokio::spawn` of
+        // `on_gateway_connected` (whose `clear_reported_states` is what this
+        // whole mechanism exists to make STICK). Recorded any later and a
+        // pre-restart `Report` landing in the window between the clear and
+        // the record would still read a stale/absent generation, be accepted,
+        // and re-install the very state the clear just removed — the race
+        // would survive verbatim.
+        self.record_session_generation(gw.id, session_generation);
+
         // Subscribe BEFORE building the snapshot. `build_snapshot` has
         // internal `await` points (each `DbHandle` call hops onto
         // `spawn_blocking`), so a `ChangeEvent` published in the window
@@ -813,6 +907,13 @@ impl Sync for SyncSvc {
         request: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         let (identity_cn, self_cert_pem) = peer_identity(&request)?;
+        // (Sync session generation) Read before dispatch; passed ONLY to the
+        // gateway path. `watch_relay` deliberately never sees it — a relay
+        // never calls `Sync.Report`, so there is no per-relay reported state
+        // a stale report could corrupt, and relay row ids collide with
+        // gateway row ids (see `watch_relay`'s doc comment), so recording one
+        // under a relay id would corrupt a real gateway's entry.
+        let session_generation = request.get_ref().session_generation;
 
         if let Some(gw) = self
             .db
@@ -820,7 +921,7 @@ impl Sync for SyncSvc {
             .await
             .map_err(|e| Status::internal(format!("looking up gateway by cert CN: {e}")))?
         {
-            return self.watch_gateway(gw, self_cert_pem).await;
+            return self.watch_gateway(gw, self_cert_pem, session_generation).await;
         }
 
         if let Some(relay_id) = self
@@ -855,6 +956,57 @@ impl Sync for SyncSvc {
             })?;
 
         let req = request.into_inner();
+
+        // (Sync session generation) The gate, evaluated after the gateway is
+        // authenticated and BEFORE any state this handler writes. It covers
+        // the WHOLE handler deliberately — `Broker::on_report`,
+        // `set_applied_version`, `set_local_candidates` (+ its
+        // `EndpointObserved` publish), the relay-health pipeline, and the
+        // epoch-ack pipeline all consume the same request, and
+        // `local_endpoints` is the ORIGINAL instance of this stale-report
+        // race (see `Broker::on_report`'s note).
+        //
+        // The predicate is NOT "the values differ". Two cases must be
+        // accepted even though they differ from a naive comparison:
+        //
+        //  - A LEGACY client sends 0. It never opened a Watch carrying a
+        //    generation either, so `stored` is also 0 — equal, accepted —
+        //    but if it ever reports before its Watch, `req == 0` alone must
+        //    still be enough to accept.
+        //  - The CONTROLLER-RESTART window. `sessions` is in-memory, so
+        //    after a controller restart `stored` is 0 for every gateway
+        //    while their Watches reconnect. A plain `stored != req` would
+        //    reject EVERY report in that window: candidate publication would
+        //    stop, the broker would stop learning path states, punches would
+        //    stop, and the fabric would degrade — trading a narrow
+        //    correctness race for a broad availability outage. Unknown must
+        //    fail OPEN.
+        //
+        // Hence: reject iff BOTH sides are nonzero AND they conflict. This
+        // also fixes the gateway's nonce as necessarily NONZERO (0 is the
+        // legacy/unknown sentinel on the wire — see `sync.proto` and
+        // `wiremesh_gateway::sync::session_generation`).
+        let stored_generation = self.recorded_session_generation(gw.id);
+        if stored_generation != 0
+            && req.session_generation != 0
+            && stored_generation != req.session_generation
+        {
+            // One line per rejection. There is no Prometheus surface in this
+            // crate, so the log IS the operator signal; both values are
+            // named so a rejection can be tied to a specific gateway restart.
+            eprintln!(
+                "wiremesh-controller: rejecting Sync.Report from gateway {} — session generation \
+                 {} does not match the generation {} recorded at its current Sync.Watch open; \
+                 this is a report from a previous gateway process and must not restore stale \
+                 peer_paths/local_endpoints/relay_health",
+                gw.id, req.session_generation, stored_generation
+            );
+            return Err(Status::failed_precondition(format!(
+                "Sync.Report session_generation {} does not match the session_generation {} \
+                 recorded for this gateway's current Sync.Watch; reconnect Watch before reporting",
+                req.session_generation, stored_generation
+            )));
+        }
 
         // (Directive-storm fix) Record this gateway's per-peer path states
         // FIRST — before `set_local_candidates` below can publish an

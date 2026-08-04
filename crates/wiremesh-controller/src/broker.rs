@@ -190,20 +190,54 @@ impl Broker {
     ///   never wipe stored states (an epoch ack mid-rotation must not make
     ///   the broker start re-punching a settled pair).
     ///
-    /// KNOWN RACE (owner-adjudicated: valid but DEFERRED): a Report from a
-    /// gateway's PREVIOUS session — network-delayed past its restart — can
-    /// be processed after [`Broker::on_gateway_connected`]'s clear, and,
-    /// being `snapshot == true`, REPLACE the fresh (empty) state with
-    /// pre-restart claims. Impact is bounded: the settled skip is an
-    /// OPTIMIZATION over 4b's punch-blindly behavior, `pair_settled` needs
-    /// BOTH directions to agree, the gateway's own tick-driven `StartPunch`
-    /// recovery is directive-independent, and any later fresh snapshot (or
-    /// reconnect) corrects the stored states. The same stale-report race
-    /// predates this field for `local_endpoints` and `relay_health`; the
-    /// shared fix is a per-boot session generation carried in Watch+Report
-    /// (the controller rejecting mismatches), tracked as a Sync-hardening
-    /// fast-follow alongside the keepalive mirrors — see
-    /// `docs/research/ops-finding-sync-half-open-stream.md`.
+    /// # The stale pre-restart report — CLOSED by the Sync session generation
+    ///
+    /// The race: a Report from a gateway's PREVIOUS process — network-delayed
+    /// past its restart — is processed after
+    /// [`Broker::on_gateway_connected`]'s clear and, being `snapshot ==
+    /// true`, REPLACEs the fresh (empty) state with pre-restart claims. A
+    /// restarted gateway with no tunnel at all then looks settled, the
+    /// settled skip in [`Broker::emit_pair`] suppresses the synchronized
+    /// punch it now needs, and nothing re-arms: the two gateways are left
+    /// punching on unsynchronized self-timers, which a port-restricted pair
+    /// can never land (see the settled → UNSETTLED edge section below, and
+    /// the gateway's `path.rs`). This is an AVAILABILITY bug, not a bounded
+    /// deferral — an earlier version of this comment argued the impact was
+    /// bounded because the gateway's tick-driven `StartPunch` recovery is
+    /// directive-independent; the authoritative case-4 run falsified exactly
+    /// that, which is why the unsettle edge below exists at all. Do not
+    /// re-derive that bound.
+    ///
+    /// The fix (Sync session generation): the gateway stamps a per-BOOT
+    /// nonce on both `WatchRequest` and `ReportRequest`
+    /// (`wiremesh_gateway::sync::session_generation`). The controller records
+    /// the nonce as the FIRST thing `SyncSvc::watch_gateway` does — before
+    /// the `on_gateway_connected` spawn that performs the clear — and
+    /// `SyncSvc::report` rejects the WHOLE report with `FAILED_PRECONDITION`
+    /// when the recorded and reported generations are both nonzero and
+    /// conflict. So a pre-restart report can no longer reach this function,
+    /// and the clear STICKS. The gating is whole-handler because the same
+    /// stale report also drives `set_applied_version` and
+    /// `set_local_candidates` — `local_endpoints` being the ORIGINAL
+    /// instance of this race, predating this field.
+    ///
+    /// Two residuals, both deliberate:
+    ///
+    /// - **The UDP observe path is NOT covered.** `crate::observe`'s
+    ///   `handle_probe` writes the same candidate table (via
+    ///   `Db::set_candidate_endpoint` and the sibling `EndpointObserved`
+    ///   publish) with no generation at all. Its probe is a fixed-length
+    ///   MAC'd datagram (`PROBE_LEN`) with no room for one, so carrying a
+    ///   generation there is a wire break, not an additive field.
+    /// - **Whole-handler gating can drop a rotation epoch ack.** The
+    ///   gateway's rotation tick reports over its own short-lived unary
+    ///   channel; if it fires while that gateway's Watch has dropped and a
+    ///   NEW Watch (new process, new nonce) has already recorded, the old
+    ///   process's in-flight ack is rejected along with everything else it
+    ///   carried. Accepted: the rotation state machine re-acks on its next
+    ///   tick, and admitting a stale report to save an ack would reopen the
+    ///   race this closes. (This is also why the controller never evicts a
+    ///   generation on stream drop — see `SyncSvc::sessions`.)
     ///
     /// `reporter_gateway_id` is the AUTHENTICATED gateway id `Sync.Report`
     /// resolved from the mTLS peer certificate — never anything

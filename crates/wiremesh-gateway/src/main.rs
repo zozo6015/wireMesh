@@ -805,6 +805,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         live_endpoints: live_endpoints.clone(),
         retire_ready: Arc::new(std::sync::Mutex::new(None)),
         epoch_keys: epoch_keys.clone(),
+        applied_version: applied_version.clone(),
         collapse_ready: Arc::new(std::sync::Mutex::new(Vec::new())),
     };
     tokio::spawn(run_rotation_ticks(rot.clone()));
@@ -998,7 +999,15 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // also feeds the prompt debounce below — a State
                             // apply IS a fresh snapshot, so any pending
                             // prompt is satisfied by it).
-                            let _ = send_paths_snapshot_report(
+                            // Logged, not swallowed: a report the controller
+                            // REJECTS (e.g. the session-generation gate
+                            // returning `FAILED_PRECONDITION`) is otherwise
+                            // completely invisible in this gateway's logs,
+                            // even though it means the controller's view of
+                            // this gateway is frozen. Matches the
+                            // prompt-report path above. Non-fatal — the next
+                            // event or the reconnect re-reports.
+                            if let Err(e) = send_paths_snapshot_report(
                                 &mut client,
                                 &ctx,
                                 cfg.wg_listen_port,
@@ -1013,7 +1022,12 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 // window rather than at the next event.
                                 applied_version.load(Ordering::Relaxed),
                             )
-                            .await;
+                            .await
+                            {
+                                eprintln!(
+                                    "wiremesh-gateway: steady-state path-snapshot report failed: {e}"
+                                );
+                            }
                             prompt_report_pending = false;
                             last_prompt_report = Some(Instant::now());
                             // NB: `applied_version` is deliberately NOT stored
@@ -3549,6 +3563,25 @@ struct RotationShared {
     /// the lock is exactly what keeps two transitions from interleaving their
     /// tmp+rename writes.
     epoch_keys: Arc<std::sync::Mutex<EpochKeys>>,
+    /// The live "version actually installed in the datapath" counter — the
+    /// SAME `Arc<AtomicU64>` the policy-apply worker writes and the sync
+    /// loop's steady-state report reads.
+    ///
+    /// Needed here because [`send_epoch_ack`] issues a REAL `Sync.Report`
+    /// (a unary one, over its own short-lived channel) and the controller
+    /// writes `set_applied_version(gw.id, req.applied_version)`
+    /// UNCONDITIONALLY. Sending the previous hard-coded `0` therefore ZEROED
+    /// this gateway's roster `applied_version` on every rotation epoch ack,
+    /// and — because reports are event-driven rather than periodic — it
+    /// could stay zeroed until the next unrelated event, poisoning the
+    /// roster-lag alerting follow-up in
+    /// `docs/research/ops-finding-sync-half-open-stream.md`.
+    ///
+    /// Fixed on the SENDING side rather than by making the controller
+    /// conditional: the controller should be able to trust what a gateway
+    /// tells it, and an ack that reports the real installed version is
+    /// simply a correct (if partial) report.
+    applied_version: Arc<AtomicU64>,
     /// Signal from the rotation tick to the run task: Role-B overlap Devices
     /// whose COLLAPSE completed its reverse make-before-break (base-tun
     /// session live toward the peer's new key, routes flipped back to `wg0`)
@@ -3984,7 +4017,35 @@ async fn send_epoch_ack(rot: &RotationShared, ack: EpochAck) -> anyhow::Result<(
     // `peer_paths_snapshot=false` shape: a snapshot-flagged empty list would
     // wipe the broker's stored path states for this gateway MID-ROTATION,
     // reopening settled pairs to re-punching for no reason.
-    sync::report(&mut client, 0, vec![], vec![], vec![ack], None).await
+    //
+    // `applied_version` is the REAL installed version, not the `0` this used
+    // to hard-code: the controller applies `set_applied_version`
+    // unconditionally, so a hard-coded 0 silently reset this gateway's roster
+    // version on every rotation ack (see `RotationShared::applied_version`).
+    // `relay_health: vec![]` is safe — the controller's relay-health block is
+    // guarded by `if !req.relay_health.is_empty()`, so an empty list is a
+    // genuine no-op there.
+    //
+    // KNOWN RESIDUAL, NOT FIXED HERE: `local_endpoints: vec![]` is NOT safe
+    // in the same way. `Db::set_local_candidates` is a full REPLACE where
+    // empty means "clear", and the controller calls it unconditionally — so
+    // this unary ack also wipes this gateway's local candidate set (and
+    // publishes the shrunk set to peers via `EndpointObserved`) until the
+    // next steady-state report rebuilds it. That is the SAME bug shape as
+    // the `applied_version` zeroing fixed above, found at the same line, but
+    // fixing it means deciding which port a mid-rotation gateway should
+    // advertise its locals on (`base_wg_port` vs. the Role-A offset port in
+    // `rot.active`), which is a separate call. Left deliberately, and
+    // reported as a finding rather than fixed silently.
+    sync::report(
+        &mut client,
+        rot.applied_version.load(Ordering::Relaxed),
+        vec![],
+        vec![],
+        vec![ack],
+        None,
+    )
+    .await
 }
 
 /// The rotation observation driver: every `ROTATION_TICK_PERIOD`, watch any

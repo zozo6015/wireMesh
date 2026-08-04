@@ -842,8 +842,12 @@ impl StubGateway {
             })?;
 
         let mut client = SyncClient::new(channel);
+        // `session_generation: 0` — the legacy/unknown sentinel; see the
+        // matching note on this stub's `report` helpers. Recording a 0 leaves
+        // the controller with no opinion for this gateway, so the generation
+        // gate stays inert for every existing stub-driven test.
         let stream = client
-            .watch(WatchRequest {})
+            .watch(WatchRequest { session_generation: 0 })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Watch failed: {status}"))?
             .into_inner();
@@ -942,6 +946,14 @@ impl StubGateway {
                 epoch_acks: vec![],
                 peer_paths: vec![],
                 peer_paths_snapshot: false,
+                // `session_generation: 0` — the wire's legacy/unknown
+                // sentinel, so these helpers keep their pre-scheme semantics
+                // and are never rejected by the controller's generation gate
+                // (which only rejects when BOTH sides are nonzero and
+                // differ). A test that wants to EXERCISE the gate should
+                // drive the generation explicitly rather than relying on
+                // these defaults.
+                session_generation: 0,
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report failed: {status}"))?;
@@ -1037,6 +1049,14 @@ impl StubGateway {
                 epoch_acks: vec![],
                 peer_paths: vec![],
                 peer_paths_snapshot: false,
+                // `session_generation: 0` — the wire's legacy/unknown
+                // sentinel, so these helpers keep their pre-scheme semantics
+                // and are never rejected by the controller's generation gate
+                // (which only rejects when BOTH sides are nonzero and
+                // differ). A test that wants to EXERCISE the gate should
+                // drive the generation explicitly rather than relying on
+                // these defaults.
+                session_generation: 0,
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report (relay health) failed: {status}"))?;
@@ -1102,6 +1122,14 @@ impl StubGateway {
                     })
                     .collect(),
                 peer_paths_snapshot: true,
+                // `session_generation: 0` — the wire's legacy/unknown
+                // sentinel, so these helpers keep their pre-scheme semantics
+                // and are never rejected by the controller's generation gate
+                // (which only rejects when BOTH sides are nonzero and
+                // differ). A test that wants to EXERCISE the gate should
+                // drive the generation explicitly rather than relying on
+                // these defaults.
+                session_generation: 0,
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report (peer paths) failed: {status}"))?;
@@ -1160,6 +1188,14 @@ impl StubGateway {
                     .collect(),
                 peer_paths: vec![],
                 peer_paths_snapshot: false,
+                // `session_generation: 0` — the wire's legacy/unknown
+                // sentinel, so these helpers keep their pre-scheme semantics
+                // and are never rejected by the controller's generation gate
+                // (which only rejects when BOTH sides are nonzero and
+                // differ). A test that wants to EXERCISE the gate should
+                // drive the generation explicitly rather than relying on
+                // these defaults.
+                session_generation: 0,
             })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Report (epoch acks) failed: {status}"))?;

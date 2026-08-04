@@ -99,8 +99,73 @@ pub async fn connect(sync_addr: &str, id: &Identity) -> anyhow::Result<SyncClien
     Ok(SyncClient::new(channel))
 }
 
+/// This process's Sync session generation — a per-BOOT nonce, generated once
+/// and then constant for the lifetime of the gateway process.
+///
+/// # Why it exists
+///
+/// The controller's broker stores per-gateway reported state (`peer_paths`,
+/// `local_endpoints`, `relay_health`). When a gateway reconnects, the
+/// controller CLEARS that state (`Broker::on_gateway_connected` ->
+/// `clear_reported_states`) because a restarted gateway may have no tunnel at
+/// all and its stale "direct" claims must not suppress the punches it now
+/// needs. But a `Report` issued by the PREVIOUS process and delayed on the
+/// network can land AFTER that clear and — being a snapshot — REPLACE the
+/// fresh empty state with pre-restart claims. The controller then believes a
+/// pair is settled, skips brokering the synchronized punch, and the pair
+/// never lands (unsynchronized self-timers do not work for a port-restricted
+/// pair — see `path.rs`'s settled-boundary notes). Tagging every Watch and
+/// every Report with this nonce lets the controller reject a report from a
+/// generation that is not the one its live Watch registered.
+///
+/// # Why per-PROCESS and not per-connection
+///
+/// Two reasons, both load-bearing:
+/// - The rotation observation tick's unary epoch-ack Report dials its OWN
+///   short-lived channel (`send_epoch_ack`), entirely outside the sync loop's
+///   Watch. A per-connection value would make every one of those acks
+///   mismatch and be rejected.
+/// - Every Sync reconnect would otherwise invalidate reports still in flight
+///   from the connection that just dropped, turning ordinary reconnect churn
+///   into spurious rejections.
+///
+/// # Why nonzero
+///
+/// 0 is the wire's legacy/unknown sentinel: the controller accepts any report
+/// where either side's value is 0 (an old client, or a report arriving while
+/// the controller's in-memory store is empty after ITS own restart). A
+/// gateway that implements the scheme must therefore never send 0, or it
+/// silently opts itself out.
+pub fn session_generation() -> u64 {
+    static SESSION_GENERATION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SESSION_GENERATION.get_or_init(|| {
+        use rand::RngCore as _;
+        // Retry rather than `| 1` / `saturating_add`: biasing the value would
+        // be harmless here, but a plain loop keeps the distribution uniform
+        // and the intent (nonzero) obvious. `next_u64` returning 0 is a
+        // ~1-in-2^64 event, so this never spins in practice.
+        loop {
+            let v = rand::rngs::OsRng.next_u64();
+            if v != 0 {
+                return v;
+            }
+        }
+    })
+}
+
+/// Opens the desired-state `Sync.Watch` stream.
+///
+/// Fills [`session_generation`] ITSELF rather than taking it as a parameter:
+/// there is exactly one `watch` wrapper and one [`report`] wrapper in this
+/// crate, so having each stamp the nonce makes "every place it must be sent"
+/// structurally closed — a new call site cannot forget it, because there is
+/// no way to construct the request without going through here.
 pub async fn watch(client: &mut SyncClient<Channel>) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
-    Ok(client.watch(WatchRequest {}).await.map_err(|s| anyhow!("Sync.Watch failed: {s}"))?.into_inner())
+    Ok(client
+        .watch(WatchRequest { session_generation: session_generation() })
+        .await
+        .map_err(|s| anyhow!("Sync.Watch failed: {s}"))?
+        .into_inner())
 }
 
 /// `local_endpoints` (cycle4b §5/§6.1) is the gateway's COMPLETE current
@@ -145,6 +210,13 @@ pub async fn watch(client: &mut SyncClient<Channel>) -> anyhow::Result<tonic::St
 ///   epoch-ack report): sends the legacy shape (empty list,
 ///   `peer_paths_snapshot: false`), a broker NO-OP that must never wipe
 ///   the states the last real snapshot established mid-rotation.
+///
+/// `session_generation` is stamped HERE, from the process-wide
+/// [`session_generation`] nonce — deliberately not a parameter, for the
+/// reason given on [`watch`]. Both report paths (the sync loop's steady-state
+/// snapshot report and the rotation tick's unary epoch ack, which dials its
+/// own channel) route through this one function, so neither can be missed and
+/// neither needed a signature change.
 pub async fn report(
     client: &mut SyncClient<Channel>,
     applied_version: u64,
@@ -165,6 +237,7 @@ pub async fn report(
             epoch_acks,
             peer_paths,
             peer_paths_snapshot,
+            session_generation: session_generation(),
         })
         .await
         .map_err(|s| anyhow!("Sync.Report failed: {s}"))?;
