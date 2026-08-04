@@ -3,7 +3,7 @@ use prost::Message;
 use wiremesh_proto::v1::{
     StateSnapshot, Peer, sync_message::Body, SyncMessage, PunchDirective, ReportRequest,
     RelayInfo, RelayHealth, Delta, EnrollRequest, RotateDirective, SubmitEpochKeyRequest,
-    EpochAck, PeerPath,
+    EpochAck, PeerPath, WatchRequest,
 };
 
 #[test]
@@ -69,6 +69,7 @@ fn report_request_local_endpoints_roundtrips() {
         epoch_acks: vec![],
         peer_paths: vec![],
         peer_paths_snapshot: false,
+        session_generation: 0,
     };
     let bytes = with_endpoints.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
@@ -83,6 +84,7 @@ fn report_request_local_endpoints_roundtrips() {
         epoch_acks: vec![],
         peer_paths: vec![],
         peer_paths_snapshot: false,
+        session_generation: 0,
     };
     let bytes = no_endpoints.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
@@ -188,6 +190,7 @@ fn report_request_relay_health_roundtrips() {
         epoch_acks: vec![],
         peer_paths: vec![],
         peer_paths_snapshot: false,
+        session_generation: 0,
     };
 
     let bytes = report.encode_to_vec();
@@ -283,6 +286,7 @@ fn report_request_epoch_acks_roundtrips() {
         ],
         peer_paths: vec![],
         peer_paths_snapshot: false,
+        session_generation: 0,
     };
 
     let bytes = with_acks.encode_to_vec();
@@ -305,6 +309,7 @@ fn report_request_epoch_acks_roundtrips() {
         epoch_acks: vec![],
         peer_paths: vec![],
         peer_paths_snapshot: false,
+        session_generation: 0,
     };
     let bytes = no_acks.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
@@ -338,6 +343,7 @@ fn report_request_peer_paths_roundtrips() {
             PeerPath { peer_gateway_id: 3, state: "connecting".into() },
         ],
         peer_paths_snapshot: true,
+        session_generation: 0,
     };
 
     let bytes = with_paths.encode_to_vec();
@@ -363,6 +369,7 @@ fn report_request_peer_paths_roundtrips() {
         epoch_acks: vec![],
         peer_paths: vec![],
         peer_paths_snapshot: false,
+        session_generation: 0,
     };
     let bytes = no_paths.encode_to_vec();
     let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
@@ -370,5 +377,75 @@ fn report_request_peer_paths_roundtrips() {
     assert!(
         !decoded.peer_paths_snapshot,
         "an old-client request (flag never set) must decode peer_paths_snapshot=false"
+    );
+}
+
+#[test]
+fn session_generation_roundtrips_on_watch_and_report() {
+    // (Sync session generation) `WatchRequest` gains `uint64
+    // session_generation = 1;` — its FIRST field ever, on a message that was
+    // deliberately empty — and `ReportRequest` gains `uint64
+    // session_generation = 7;`. The gateway stamps the SAME per-boot nonce on
+    // both, and the controller rejects a Report whose value conflicts with
+    // the one recorded at that gateway's last Watch open.
+    //
+    // Two properties, and the SECOND is the load-bearing one:
+    //
+    //  1. A nonzero value survives a genuine wire roundtrip on both messages
+    //     — otherwise the controller could never see a conflict at all.
+    //  2. An ABSENT field decodes to 0. Proto3 does not emit a zero scalar,
+    //     so a legacy client (which has no such field) and a new client
+    //     sending 0 are byte-identical on the wire — and 0 is exactly the
+    //     "unknown/legacy" sentinel the controller's reject predicate treats
+    //     as "no opinion, accept". If an absent field decoded to anything
+    //     else, every legacy client's Report would start being rejected.
+    //     Decoded here from genuinely EMPTY bytes, which is what an old
+    //     client's `WatchRequest{}` actually puts on the wire.
+
+    // A value with bits set across the full u64 range (not a small int), so a
+    // narrowed/truncated field would be caught rather than surviving by luck.
+    let nonce: u64 = 0xDEAD_BEEF_CAFE_F00D;
+
+    let watch = WatchRequest { session_generation: nonce };
+    let decoded = WatchRequest::decode(watch.encode_to_vec().as_slice())
+        .expect("decoding the encoded WatchRequest");
+    assert_eq!(
+        decoded.session_generation, nonce,
+        "WatchRequest.session_generation must survive the wire intact — the controller \
+         records exactly this value and compares later Reports against it"
+    );
+
+    let report = ReportRequest {
+        applied_version: 9,
+        local_endpoints: vec!["10.0.0.5:51820".into()],
+        relay_health: vec![],
+        epoch_acks: vec![],
+        peer_paths: vec![],
+        peer_paths_snapshot: false,
+        session_generation: nonce,
+    };
+    let decoded = ReportRequest::decode(report.encode_to_vec().as_slice())
+        .expect("decoding the encoded ReportRequest");
+    assert_eq!(
+        decoded.session_generation, nonce,
+        "ReportRequest.session_generation must survive the wire intact"
+    );
+    assert_eq!(decoded, report, "no other ReportRequest field may be disturbed");
+
+    // Absent (legacy client) => 0, on both messages.
+    let decoded = WatchRequest::decode([].as_slice())
+        .expect("an empty WatchRequest (the legacy client's literal wire form) must decode");
+    assert_eq!(
+        decoded.session_generation, 0,
+        "an absent WatchRequest.session_generation must decode as the 0 legacy/unknown \
+         sentinel — the controller records 0 and its gate stays inert for that gateway"
+    );
+
+    let decoded = ReportRequest::decode([].as_slice())
+        .expect("an empty ReportRequest must decode");
+    assert_eq!(
+        decoded.session_generation, 0,
+        "an absent ReportRequest.session_generation must decode as the 0 legacy/unknown \
+         sentinel — a 0 on either side is ACCEPTED, so legacy clients keep working"
     );
 }
