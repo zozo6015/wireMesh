@@ -85,13 +85,35 @@ struct EnforcerApplyTarget {
 /// reap and gets deferred, but on the nftables backend `apply_ready_at` is
 /// permanently `None`, nothing defers it, and the downgrade lands.
 ///
-/// Monotonicity is safe to rely on: the controller assigns
-/// `MAX(version) + 1` per policy version (`controller/src/db.rs`'s
-/// `candidate_version`), so versions only ever increase. A DB reset that
-/// reused versions would already be mishandled by `apply_if_changed`'s own
-/// equality gate; this is no worse.
-fn needs_policy_write(e: &GatewayEnforcer, ds: &DesiredState) -> bool {
-    e.applied_version().is_none_or(|av| av < ds.policy_version)
+/// An enforcer AHEAD of `ds` is the ambiguous case, and `ds_is_newest`
+/// resolves it. Both readings are reachable and they need opposite answers:
+///
+/// - `ds_is_newest == false` — our snapshot is STALE. A newer state was
+///   published and a rotation insert already applied it to this entry.
+///   Skip: writing our older policy would downgrade a traffic-carrying
+///   rotation tun. (On eBPF that entry is additionally inside its post-flip
+///   grace and would be deferred anyway; on nftables `apply_ready_at` is
+///   permanently `None`, nothing defers, and the downgrade would land — the
+///   reason this filter exists at all.) The newer state is already in the
+///   mailbox, so it lands on the worker's next iteration.
+/// - `ds_is_newest == true` — the CONTROLLER rolled back. Its version
+///   counter is normally monotone (`MAX(version) + 1`,
+///   `controller/src/db.rs`'s `candidate_version`), but a DB restore from
+///   backup — a documented step in this project's own controller-migration
+///   runbook — or repointing the gateway at a different controller makes
+///   `ds` genuinely older than what is installed. Write it: `ds` IS the
+///   desired state, and skipping would leave the gateway pinned to a policy
+///   the operator has abandoned until the controller climbed back past it.
+///
+/// The rollback write is NOT a bypass: it goes through exactly the same
+/// per-entry reap-deadline re-check as every other write in `install`.
+fn needs_policy_write(e: &GatewayEnforcer, ds: &DesiredState, ds_is_newest: bool) -> bool {
+    match e.applied_version() {
+        None => true,
+        Some(av) if av < ds.policy_version => true,
+        Some(av) if av > ds.policy_version => ds_is_newest,
+        Some(_) => false, // already exactly this version
+    }
 }
 
 impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
@@ -106,10 +128,10 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
     /// back a plain `Option<Instant>`), which is what keeps the map
     /// available to the metrics scrape, retire, Role-B collapse and
     /// rotation-insert paths for the whole of the worker's wait.
-    fn ready_at(&self, ds: &DesiredState) -> Option<Instant> {
+    fn ready_at(&self, ds: &DesiredState, ds_is_newest: bool) -> Option<Instant> {
         let map = self.enforcers.blocking_lock();
         map.values()
-            .filter(|e| needs_policy_write(e, ds))
+            .filter(|e| needs_policy_write(e, ds, ds_is_newest))
             .filter_map(|e| e.apply_ready_at())
             .max()
     }
@@ -132,10 +154,14 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
     /// reports `Err`, so the worker's retry re-reads the deadline and
     /// completes it once the grace elapses.
     ///
-    /// `applied_version` is stored only after every entry succeeded, so the
-    /// gauge (and the report derived from it) never claims a version the
-    /// datapath does not have.
-    fn install(&self, ds: &DesiredState) -> anyhow::Result<()> {
+    /// `applied_version` is set from what is OBSERVED LIVE on the enforcers
+    /// once the loop is done — the highest version any of them actually
+    /// holds — and only on the fully-successful path. So the gauge, and the
+    /// roster report derived from it, can neither claim a version the
+    /// datapath does not have nor report a regression the datapath did not
+    /// suffer, in either the stale-snapshot or the rollback case. See the
+    /// store itself for why both halves need saying.
+    fn install(&self, ds: &DesiredState, ds_is_newest: bool) -> anyhow::Result<()> {
         // `(epoch, how much of its grace is left)` for every entry this call
         // refused to write. Both halves are in the error text below: the
         // epoch says WHICH tun is still on the old policy, and the remaining
@@ -157,11 +183,15 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
         // installed by a path OTHER than this worker (a rotation insert
         // applies inline before inserting).
         let any_policy_live;
+        // The highest policy version actually live across the map once this
+        // call is done — the gauge is derived from the enforcers themselves
+        // rather than inferred from `ds`. See its use below.
+        let live_max;
         {
             let mut map = self.enforcers.blocking_lock();
             let now = Instant::now();
             for (epoch, enforcer) in map.iter_mut() {
-                if !needs_policy_write(enforcer, ds) {
+                if !needs_policy_write(enforcer, ds, ds_is_newest) {
                     continue; // nothing would be written; nothing to gate on
                 }
                 if let Some(left) =
@@ -179,6 +209,7 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
                 installed.push(*epoch);
             }
             any_policy_live = map.values().any(|e| e.applied_version().is_some());
+            live_max = map.values().filter_map(|e| e.applied_version()).max();
         }
         if let Some(e) = failure {
             if !any_policy_live {
@@ -227,7 +258,43 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
                 epochs.join(", "),
             );
         }
-        self.applied_version.store(ds.policy_version, Ordering::Relaxed);
+        // The gauge is the highest version OBSERVED LIVE on the enforcers,
+        // not `ds.policy_version` and not a running maximum. Deriving it
+        // from ground truth is what makes it correct in both directions at
+        // once, which neither simpler form manages:
+        //
+        //  - A plain `store(ds.policy_version)` is wrong when an older `ds`
+        //    is skipped as stale (`ds_is_newest == false`): every enforcer is
+        //    filtered out, nothing is written, and storing would report a
+        //    regression the datapath never suffered (the CodeRabbit finding
+        //    — invisible before the monotone filter, because back then the
+        //    older snapshot was written everywhere instead, keeping gauge and
+        //    datapath consistent by downgrading the datapath).
+        //  - A `fetch_max(ds.policy_version)` fixes that but is then wrong
+        //    for a genuine controller ROLLBACK: those enforcers really were
+        //    moved back, and a high-water mark would pin the gauge above the
+        //    controller's own latest forever, turning a converged gateway
+        //    into a permanent roster mismatch.
+        //
+        // `live_max` is simply what is installed, so it holds steady in the
+        // first case and follows the datapath down in the second. It is
+        // monotone in normal operation for free, because `apply_if_changed`
+        // only moves an enforcer forward unless a rollback write was
+        // authorized, and evicting a retired epoch cannot lower the maximum
+        // (the boot tun receives every version too).
+        //
+        // This matters beyond cosmetics: `applied_version` is what the
+        // path-snapshot report carries, and controller-side alerting on
+        // roster `applied_version` lag is an outstanding follow-up (see
+        // `docs/research/ops-finding-sync-half-open-stream.md`). A phantom
+        // regression would page as "gateway falling behind" when it is not;
+        // a phantom high-water mark would hide a real rollback convergence.
+        //
+        // `None` only for an empty map, which cannot happen (the boot epoch
+        // is always present) — leave the last value rather than inventing 0.
+        if let Some(v) = live_max {
+            self.applied_version.store(v, Ordering::Relaxed);
+        }
         // Tell the Sync loop to re-report: it already sent its report for
         // this snapshot while the install was still pending, carrying the
         // PREVIOUS applied version. Debounced on the loop side.

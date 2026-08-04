@@ -62,12 +62,19 @@ pub trait PolicyApplyTarget: Send + Sync + 'static {
     /// armed a full grace) would delay a security-relevant TIGHTENING to a
     /// boot tun that is already clear to take it.
     ///
+    /// `ds_is_newest` has the same meaning as in
+    /// [`PolicyApplyTarget::install`]; it is passed here only so the two
+    /// agree on WHICH entries will be written. Getting it wrong here is
+    /// harmless — this is a scheduling hint, and `install` re-checks every
+    /// entry's own deadline under the lock before writing it. The cost of a
+    /// wrong hint is one deferred retry, never an unprotected write.
+    ///
     /// Returning a plain `Option<Instant>` (rather than any kind of guard)
     /// is the load-bearing part of this seam: the real adapter takes the
     /// enforcer-map lock, reads the deadlines and drops the lock before
     /// returning, and the signature makes holding that lock across the
     /// worker's wait structurally impossible.
-    fn ready_at(&self, ds: &DesiredState) -> Option<Instant>;
+    fn ready_at(&self, ds: &DesiredState, ds_is_newest: bool) -> Option<Instant>;
 
     /// Perform the (now fast) install: re-lock the enforcer map and
     /// `apply_if_changed(ds)` every live entry. BLOCKING by contract — the
@@ -80,7 +87,30 @@ pub trait PolicyApplyTarget: Send + Sync + 'static {
     /// therefore re-check each entry's own deadline under the lock and
     /// refuse — with an `Err`, so the worker's retry picks it up — rather
     /// than write an entry whose grace it never consulted.
-    fn install(&self, ds: &DesiredState) -> anyhow::Result<()>;
+    ///
+    /// # `ds_is_newest`
+    ///
+    /// True iff `ds` is still the newest state in the worker's mailbox, i.e.
+    /// nothing has been published since the worker picked it up. It exists
+    /// to disambiguate the ONE case an implementation cannot resolve from
+    /// `ds` alone: **an enforcer whose applied version is AHEAD of `ds`.**
+    /// There are exactly two ways that happens and they need opposite
+    /// answers:
+    ///
+    /// - **`false` — our `ds` is stale.** Something newer was published, and
+    ///   a rotation insert applied it to a brand-new enforcer before putting
+    ///   it in the map. Writing our older `ds` over that entry DOWNGRADES a
+    ///   traffic-carrying rotation tun. Skip it; the newer state is already
+    ///   in the mailbox and lands on the next iteration.
+    /// - **`true` — the controller genuinely rolled back.** A DB restore or
+    ///   a repoint at a different controller means `ds` really is the
+    ///   desired state and the datapath is ahead of it. Write it, or the
+    ///   gateway never converges.
+    ///
+    /// The worker samples this as late as it possibly can — inside the
+    /// blocking task, immediately before calling this method, on the same
+    /// thread that will take the lock.
+    fn install(&self, ds: &DesiredState, ds_is_newest: bool) -> anyhow::Result<()>;
 }
 
 /// Latest-wins mailbox handle. Cheap to clone: the Sync loop publishes
@@ -245,8 +275,18 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                 // moves the lock ACQUISITION off the runtime thread.
                 let deadline = {
                     let target = target.clone();
-                    let probe = ds.clone();
-                    match tokio::task::spawn_blocking(move || target.ready_at(&probe)).await {
+                    let snapshot = ds.clone();
+                    // See step (5) for what this receiver clone is and why
+                    // the sample is taken inside the blocking task. Here it
+                    // only has to agree with `install` about which entries
+                    // will be written; a stale answer costs a deferred retry.
+                    let mailbox = rx.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        let is_newest = !mailbox.has_changed().unwrap_or(false);
+                        target.ready_at(&snapshot, is_newest)
+                    })
+                    .await
+                    {
                         Ok(d) => d,
                         // EXPLICIT CHOICE: a `ready_at` that panics is
                         // treated as a failed attempt, NOT as "no deadline,
@@ -335,10 +375,39 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                 // writes and (nft backend) an `nft -f -` fork/exec are real
                 // blocking work, and this is the other half of the stall the
                 // inline apply used to inflict on the Sync loop.
+                //
+                // `ds_is_newest` is sampled INSIDE the blocking task, on the
+                // same thread that is about to take the enforcer-map lock,
+                // rather than out here — that is as late as the answer can
+                // possibly be taken, and it matters because the window it
+                // closes is exactly "a publish (plus the rotation insert that
+                // follows it) landing after we looked". A cloned
+                // `watch::Receiver` inherits the source's seen-version, and
+                // step (4) above has just consumed the change flag, so
+                // `has_changed()` on the clone means precisely "has anything
+                // been published since we committed to this state".
+                //
+                // Residual: a publish can still land between that sample and
+                // the per-entry write a few instructions later. That degrades
+                // to the `false` case being reported as `true`, i.e. the
+                // transient downgrade, which self-heals on the next iteration
+                // because the newer state is already in the mailbox. It is
+                // additionally gated on the rotation insert winning the map
+                // lock in that same sliver, which it cannot normally do (it
+                // must first attach an enforcer — an eBPF load — after
+                // publishing).
+                //
+                // `Err` from `has_changed` means the sender is gone; nothing
+                // newer can ever arrive, so `true` is the correct answer.
                 let res = {
                     let target = target.clone();
-                    let ds = ds.clone();
-                    tokio::task::spawn_blocking(move || target.install(&ds)).await
+                    let snapshot = ds.clone();
+                    let mailbox = rx.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let is_newest = !mailbox.has_changed().unwrap_or(false);
+                        target.install(&snapshot, is_newest)
+                    })
+                    .await
                 };
                 match res {
                     Ok(Ok(())) => break,
