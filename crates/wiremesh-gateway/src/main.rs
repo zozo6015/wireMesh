@@ -51,12 +51,14 @@ const MSS: u16 = 1240;
 const ROTATION_KEEPALIVE: u16 = 3;
 const OBSERVE_PERIOD: Duration = Duration::from_secs(20);
 
-/// How long the policy-apply worker waits before re-attempting an install
-/// that returned `Err`. Long enough that a persistently unconsumable policy
-/// IR cannot turn into a hot loop of failing kernel work (and a log flood),
-/// short enough that a transient failure costs a scrape interval rather than
-/// a maintenance window. Retries re-read the mailbox, so an operator pushing
-/// a corrected policy is picked up on the next attempt regardless.
+/// The policy-apply worker's FIRST retry pause after an install returns
+/// `Err`; consecutive failures double it up to
+/// `policy_apply::RETRY_BACKOFF_MAX` (60s), so a permanently unconsumable
+/// policy IR degrades to a slow heartbeat rather than a hot loop of failing
+/// kernel work. Short enough that a transient failure costs a scrape
+/// interval rather than a maintenance window. The pause is INTERRUPTIBLE: a
+/// newly published policy wakes the worker immediately, so an operator
+/// pushing a corrected policy never waits out a backoff the bad one earned.
 const POLICY_APPLY_RETRY: Duration = Duration::from_secs(5);
 
 /// The real [`wiremesh_gateway::policy_apply::PolicyApplyTarget`]: the live
@@ -67,23 +69,38 @@ struct EnforcerApplyTarget {
     enforcers: Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
     applied_version: Arc<AtomicU64>,
     report_notify: Arc<tokio::sync::Notify>,
-    /// Set by the first successful install. While it is still false the
-    /// datapath has NO policy at all — every live enforcer is attached and
-    /// default-denying — so a failure is a total blackhole, not the
-    /// "keeps the last good policy" degradation the steady-state retry line
-    /// describes. It gets its own escalated log so a fail-static boot on an
-    /// un-appliable persisted policy cannot hide behind the retry chatter.
-    ever_installed: AtomicBool,
+}
+
+/// Does installing `ds` need to WRITE this enforcer?
+///
+/// Strictly-less-than, not `!=` (review finding). A rotation insert
+/// (`maybe_start_role_a`/`maybe_start_role_b`) applies the CURRENT snapshot
+/// to its new enforcer inline and only then puts it in the map, so a worker
+/// still carrying the previous version can find an entry that is already
+/// AHEAD of it. Under an equality test `Some(v) != Some(v-1)` is true and
+/// the entry gets rewritten with the OLDER policy — a real downgrade of a
+/// rotation overlap tun that is carrying traffic. It self-heals in about one
+/// install round trip (the newer version is already in the mailbox), and on
+/// eBPF it is masked entirely because that fresh entry always has a pending
+/// reap and gets deferred, but on the nftables backend `apply_ready_at` is
+/// permanently `None`, nothing defers it, and the downgrade lands.
+///
+/// Monotonicity is safe to rely on: the controller assigns
+/// `MAX(version) + 1` per policy version (`controller/src/db.rs`'s
+/// `candidate_version`), so versions only ever increase. A DB reset that
+/// reused versions would already be mishandled by `apply_if_changed`'s own
+/// equality gate; this is no worse.
+fn needs_policy_write(e: &GatewayEnforcer, ds: &DesiredState) -> bool {
+    e.applied_version().is_none_or(|av| av < ds.policy_version)
 }
 
 impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
     /// The furthest-out deadline across the enforcers this install would
-    /// actually WRITE — entries already on `ds.policy_version` are skipped,
-    /// because `apply_if_changed` will not touch them and their grace
-    /// therefore protects nothing. Without that filter, a rotation
-    /// overlap's brand-new enforcer (first apply = a full fresh grace)
-    /// would delay a policy TIGHTENING to the boot tun that is already
-    /// clear to take it.
+    /// actually WRITE (see [`needs_policy_write`]) — an entry that will not
+    /// be touched has a grace that protects nothing. Without that filter, a
+    /// rotation overlap's brand-new enforcer (first apply = a full fresh
+    /// grace) would delay a policy TIGHTENING to the boot tun that is
+    /// already clear to take it.
     ///
     /// The guard is dropped on return by construction (the signature hands
     /// back a plain `Option<Instant>`), which is what keeps the map
@@ -92,7 +109,7 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
     fn ready_at(&self, ds: &DesiredState) -> Option<Instant> {
         let map = self.enforcers.blocking_lock();
         map.values()
-            .filter(|e| e.applied_version() != Some(ds.policy_version))
+            .filter(|e| needs_policy_write(e, ds))
             .filter_map(|e| e.apply_ready_at())
             .max()
     }
@@ -129,11 +146,22 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
         let mut deferred: Vec<(u32, Duration)> = Vec::new();
         let mut installed: Vec<u32> = Vec::new();
         let mut failure: Option<anyhow::Error> = None;
+        // "At least one live tun is enforcing SOME policy", evaluated under
+        // the same lock as the loop below. This replaces an `ever_installed`
+        // flag that was only set after a FULLY successful install: an install
+        // that landed on some epochs and then bailed through the deferred
+        // path below left the flag false while the datapath genuinely had
+        // policy, so a later hard failure printed the CRITICAL blackhole line
+        // — the loudest log in the binary — falsely, mid-incident. Reading
+        // the enforcers directly cannot drift, and it is also true of policy
+        // installed by a path OTHER than this worker (a rotation insert
+        // applies inline before inserting).
+        let any_policy_live;
         {
             let mut map = self.enforcers.blocking_lock();
             let now = Instant::now();
             for (epoch, enforcer) in map.iter_mut() {
-                if enforcer.applied_version() == Some(ds.policy_version) {
+                if !needs_policy_write(enforcer, ds) {
                     continue; // nothing would be written; nothing to gate on
                 }
                 if let Some(left) =
@@ -150,19 +178,29 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
                 }
                 installed.push(*epoch);
             }
+            any_policy_live = map.values().any(|e| e.applied_version().is_some());
         }
         if let Some(e) = failure {
-            if !self.ever_installed.load(Ordering::Relaxed) {
+            if !any_policy_live {
                 eprintln!(
-                    "wiremesh-gateway: CRITICAL: NO policy has ever been installed on this \
-                     process and policy version {} cannot be applied — every live tun is \
-                     attached and default-denying, so ALL fabric traffic is being dropped. \
-                     This is a blackhole, not fail-static. Push an installable policy from \
-                     the controller.",
+                    "wiremesh-gateway: CRITICAL: NO policy is installed on ANY live tun and \
+                     policy version {} cannot be applied — every tun is attached and \
+                     default-denying, so ALL fabric traffic is being dropped. This is a \
+                     blackhole, not fail-static. Push an installable policy from the \
+                     controller.",
                     ds.policy_version
                 );
             }
-            return Err(e);
+            // Name what DID land before the failure, so a partial success
+            // followed by a hard failure doesn't read as "nothing worked".
+            return Err(if installed.is_empty() {
+                e
+            } else {
+                e.context(format!(
+                    "policy version {} had already landed on epoch(s) {installed:?}",
+                    ds.policy_version
+                ))
+            });
         }
         if !deferred.is_empty() {
             // Not a policy error — a race with a rotation insert. Reported
@@ -177,20 +215,19 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
             let epochs: Vec<String> =
                 deferred.iter().map(|(e, left)| format!("{e} ({left:?} left)")).collect();
             anyhow::bail!(
-                "policy version {} was installed on epoch(s) {installed:?} but NOT on {} — \
-                 [{}] are still inside their post-flip reap grace. They were created after this \
-                 apply's deadline was read (a key rotation starting concurrently with a policy \
-                 update), so writing them now could pull maps out from under in-flight packets. \
-                 No policy is lost: the worker retries and the longest outstanding grace is \
-                 {longest:?}. Persistent repeats of this for the SAME epoch mean a rotation tun \
-                 is stuck flipping, not a bad policy.",
+                "policy version {} was installed on epoch(s) {installed:?} but NOT on {} of \
+                 them — epoch(s) [{}] are still inside their post-flip reap grace. They were \
+                 created after this apply's deadline was read (a key rotation starting \
+                 concurrently with a policy update), so writing them now could pull maps out \
+                 from under in-flight packets. No policy is lost: the worker retries and the \
+                 longest outstanding grace is {longest:?}. Persistent repeats of this for the \
+                 SAME epoch mean a rotation tun is stuck flipping, not a bad policy.",
                 ds.policy_version,
                 deferred.len(),
                 epochs.join(", "),
             );
         }
         self.applied_version.store(ds.policy_version, Ordering::Relaxed);
-        self.ever_installed.store(true, Ordering::Relaxed);
         // Tell the Sync loop to re-report: it already sent its report for
         // this snapshot while the install was still pending, carrying the
         // PREVIOUS applied version. Debounced on the loop side.
@@ -462,7 +499,6 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
             enforcers: enforcers.clone(),
             applied_version: applied_version.clone(),
             report_notify: path_report_notify.clone(),
-            ever_installed: AtomicBool::new(false),
         }),
         POLICY_APPLY_RETRY,
     );
@@ -870,21 +906,38 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // milliseconds) and must not exit the process
                             // because one policy IR was unconsumable.
                             //
-                            // The ordering genuinely CHANGED and that is
-                            // safe. It used to be device → policy → routes
-                            // (the enforcer apply sat inside `apply_state`,
-                            // between the UAPI write and the route diff); it
-                            // is now device → routes → policy, with the
-                            // policy landing asynchronously up to a reap
-                            // grace later. So a newly enrolled peer's segment
-                            // CIDRs are routed at the tun before the policy
-                            // governing them reaches the datapath — which is
-                            // fail-CLOSED, because the policy still live in
-                            // the datapath is the previous version, which has
-                            // no rule for that new segment and default-denies
-                            // it. The window can only ever deny traffic the
-                            // new policy would allow, never allow traffic it
-                            // would deny.
+                            // The ordering genuinely CHANGED. It used to be
+                            // device → policy → routes (the enforcer apply
+                            // sat inside `apply_state`, between the UAPI
+                            // write and the route diff); it is now device →
+                            // routes → policy, with the policy landing
+                            // asynchronously later. Two distinct consequences
+                            // — do not conflate them:
+                            //
+                            // 1. The ROUTE-vs-policy reorder is fail-closed.
+                            //    A newly enrolled peer's segment CIDRs are
+                            //    routed at the tun before the policy
+                            //    governing them reaches the datapath, but the
+                            //    policy still live there is the previous
+                            //    version, which has no rule for that new
+                            //    segment and default-denies it. That specific
+                            //    window can only deny traffic the new policy
+                            //    would allow.
+                            //
+                            // 2. A policy TIGHTENING is now LATE, and that is
+                            //    a genuine (accepted) regression, not covered
+                            //    by (1). Removing a rule or narrowing a CIDR
+                            //    leaves the looser previous policy live for
+                            //    the install latency — a reap grace (≤10s)
+                            //    plus, if an attempt failed, up to
+                            //    `policy_apply::RETRY_BACKOFF_MAX`. Nothing
+                            //    here can shorten that: the grace is the
+                            //    safety property (see
+                            //    `PolicyApplyTarget::ready_at`'s doc, which
+                            //    calls tightenings out by name). The old
+                            //    inline apply paid for promptness with a 10s
+                            //    stall of the Punch/rotation/scrape paths,
+                            //    which is what this item exists to remove.
                             policy_apply.publish(ds.clone());
                             ds.save(&cfg.state_dir)?;
                             // (Key-rotation Role B) If desired state now shows a

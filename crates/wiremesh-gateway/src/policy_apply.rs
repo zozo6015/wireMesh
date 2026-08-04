@@ -95,12 +95,36 @@ impl PolicyApplyHandle {
     /// Hand `ds` to the worker, superseding any state not yet installed.
     ///
     /// Not `async`, never blocks, never fails — that signature IS the
-    /// guarantee this item exists to deliver, so keep it. `send_replace`
-    /// rather than `send` because `send` reports `Err` when the receiver is
-    /// gone, and a Sync loop that has to think about the worker's liveness
-    /// is back to having an apply it can trip over.
+    /// guarantee this item exists to deliver, so keep it. `send_if_modified`
+    /// (rather than `send`, which reports `Err` when the receiver is gone —
+    /// a Sync loop that has to think about the worker's liveness is back to
+    /// having an apply it can trip over).
+    ///
+    /// **A byte-identical re-publish is dropped**, and that is load-bearing,
+    /// not an optimization. The controller sends a full `StateSnapshot` as
+    /// the first message of EVERY Watch stream, so each Sync reconnect
+    /// re-delivers the current desired state verbatim. Without this, a
+    /// flapping link would start a fresh retry episode on every reconnect —
+    /// resetting the backoff to its floor and re-emitting the failure log —
+    /// which defeats [`RETRY_BACKOFF_MAX`]'s flood protection for exactly
+    /// the wedged-policy case it exists for. Dropping it loses nothing: the
+    /// worker either already installed this state (`apply_if_changed` would
+    /// no-op) or is still retrying it in its own loop.
+    ///
+    /// Residual: a snapshot that differs only in a NON-policy field (a
+    /// candidate endpoint that churned) is still a change and still resets
+    /// the backoff. Bounding that would mean keeping failure state per
+    /// policy version rather than per episode — a bigger change than this
+    /// item, and the resulting install succeeds immediately anyway when the
+    /// policy version is unchanged and already applied.
     pub fn publish(&self, ds: DesiredState) {
-        let _ = self.tx.send_replace(Some(ds));
+        self.tx.send_if_modified(|current| {
+            if current.as_ref() == Some(&ds) {
+                return false;
+            }
+            *current = Some(ds);
+            true
+        });
     }
 
     /// Installs that returned `Err` since boot; the source of the
@@ -247,7 +271,7 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                             );
                             match pause_or_wake(&mut rx, backoff).await {
                                 Pause::Elapsed => {
-                                    backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                                    backoff = backoff.saturating_mul(2).min(RETRY_BACKOFF_MAX);
                                 }
                                 Pause::Adopted(newer) => {
                                     ds = newer;
@@ -342,7 +366,7 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                     }
                 }
                 match pause_or_wake(&mut rx, backoff).await {
-                    Pause::Elapsed => backoff = (backoff * 2).min(RETRY_BACKOFF_MAX),
+                    Pause::Elapsed => backoff = backoff.saturating_mul(2).min(RETRY_BACKOFF_MAX),
                     // Adopted HERE rather than falling through to step (4):
                     // looping back with the superseded `ds` would query the
                     // deadline — and possibly sleep on it — for a state we

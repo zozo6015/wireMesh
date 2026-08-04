@@ -364,10 +364,14 @@ policy:
     // the SECOND apply(); since Backlog item 1 it returns immediately rather
     // than sleeping out v1's ~10s reap grace, so probe2 below runs a
     // fraction of a second after the flow was established rather than ~10s
-    // later. No caller-side wait is added here on purpose: unlike (e), this
-    // test has nothing in flight across the flip (probe1's exchange has
-    // completed and probe2 has not started), and adding 10s of dead time
-    // would only make the suite slower.
+    // later. No caller-side wait is added here on purpose: unlike (e),
+    // nothing this test ASSERTS ON is in flight across the flip -- probe1's
+    // exchange has completed and probe2 has not started. (That is weaker
+    // than "the wire is silent": the netns fixtures can still have stray
+    // teardown/retransmit segments crossing wg0, which is harmless for these
+    // assertions -- do not reuse this reasoning where an in-flight flow IS
+    // the subject.) Adding 10s of dead time would only make the suite
+    // slower.
     let v2 = empty_ir(2);
     enforcer
         .apply(&v2)
@@ -540,8 +544,18 @@ for s in socks:
 /// internally before returning, which is what put the flush after r2 -- the
 /// margin was only ~0.7s. `apply()` no longer sleeps (it publishes the
 /// deadline via `apply_ready_at()`), so the coordinator honors it before
-/// `apply(&v2)`; drop that wait and the flush moves ~8.8s earlier, lands
-/// BEFORE r2, and both the R2 and R3 assertions fail.
+/// `apply(&v2)`.
+///
+/// Drop that wait and, with `T` = client spawn (v1's flip at ~T-0.21, so
+/// its deadline is ~T+9.79): `apply(&v2)` returns at ~T+0.31 instead of
+/// ~T+9.80 and the flush fires at ~T+1.81 instead of ~T+11.30. That is the
+/// flush moving **~9.5s earlier** -- and since r2 lands at ~T+10.6, the
+/// flush goes from ~0.7s AFTER r2 to **~8.8s BEFORE** it. (Both figures get
+/// quoted; they measure different things. ~9.5s is how far the flush moves,
+/// ~8.8s is how far in front of r2 it ends up -- the latter is what an
+/// observer instrumenting the r2/flush gap sees.) r2 then hits a flushed
+/// table under the empty v2, times out, and both the R2 and R3 assertions
+/// fail (R3 because the client guards it behind `if r2_ok:`).
 ///
 /// **Empirically GREEN today, not RED** (same finding as (c), verified as
 /// part of this task's RED-verification step): the flush/apply-independence
