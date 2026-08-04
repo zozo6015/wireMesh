@@ -101,6 +101,43 @@ message Delta {
   // possibly empty); false = sparse delta, relays unchanged.
   bool relays_updated = 9;
 }
+// DESIGN FINDING (recorded, NOT fixed here — see the field-by-field
+// justification in `wiremesh-gateway`'s `send_epoch_ack`):
+//
+// `ReportRequest` conflates TWO different messages behind one RPC — a
+// periodic FULL-STATE SNAPSHOT (the sync loop's steady-state report) and a
+// SPARSE EVENT (the rotation tick's unary epoch ack, which dials its own
+// short-lived channel). Its fields carry three incompatible update
+// semantics, and the controller applies most of them unconditionally:
+//
+//   full REPLACE, empty == CLEAR : local_endpoints, peer_paths (when
+//                                  peer_paths_snapshot == true)
+//   last-writer-wins scalar      : applied_version
+//   sparse, empty == no-op       : relay_health, epoch_acks
+//
+// The consequence is that a sender wanting to deliver ONE field must
+// nonetheless reconstruct every replace/LWW field, or it destroys
+// controller-side state by omission. That has already produced two live
+// bugs at a single call site: `applied_version: 0` zeroing the roster
+// version on every rotation ack, and `local_endpoints: []` wiping the
+// gateway's LAN/hairpin punch candidates (and publishing the shrunk set to
+// peers) mid-rotation.
+//
+// Note the defenses are ad-hoc and were added one at a time, which is why
+// coverage is uneven: `peer_paths` got an EXPLICIT opt-out (the
+// `peer_paths_snapshot` flag), `relay_health`/`epoch_acks` got an IMPLICIT
+// one (a controller-side `!is_empty()` guard), and `local_endpoints` /
+// `applied_version` got NEITHER. So this is not "one call site keeps
+// forgetting fields" — the call site is a symptom. The message shape makes
+// destruction-by-omission the default.
+//
+// Two directions for whoever takes this on, neither in scope for the
+// session-generation item: split the RPC (`Report` snapshot vs. a separate
+// sparse ack/event RPC), or give every replace-semantics field explicit
+// presence (proto3 `optional`, absent == "leave alone") so a sparse sender
+// physically cannot clear what it did not mean to touch. Until then, EVERY
+// new `ReportRequest` construction site must justify all fields, not just
+// the ones it cares about.
 message ReportRequest {
   uint64 applied_version = 1;
   repeated string local_endpoints = 2;  // gateway's own routable local ip:wg_port
