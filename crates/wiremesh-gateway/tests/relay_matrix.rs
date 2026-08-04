@@ -29,8 +29,19 @@
 //! forever on a stale `relay_pointed` pin. See that test fn's doc comment
 //! for the incident and the repro-design rationale.
 //!
+//! Also here, and DELIBERATELY RED (`#[ignore]`d):
+//! `case5_peer_departure_unpins_survivor_from_relayed`, which pins the live
+//! gap `docs/research/relay-mux-design-verification.md` §3 found — a peer
+//! that LEAVES the relay while the relay itself stays healthy and reachable
+//! is structurally undetectable, so the surviving gateway pins in `Relayed`
+//! forever. See that test fn's doc comment for the mechanism, the
+//! right-reason guards, and exactly what would make it pass.
+//!
 //! ./dev.sh run "cargo test -p wiremesh-gateway --test relay_matrix \
 //!   --features netns-tests -- --test-threads=1 --nocapture"
+//!
+//! (Add `--ignored` to run the documented-red case 5 as well; it is expected
+//! to FAIL against current code.)
 //!
 //! (Deliberately `--test relay_matrix`, not the whole crate: this and
 //! `nat_matrix.rs` each build their OWN root-netns bridge/veth names: running
@@ -452,6 +463,31 @@ impl RelayHandle {
             }
         }
     }
+
+    /// How many QUIC connections this relay currently holds open — the
+    /// RELAY's own, authoritative view of who is still connected to it
+    /// (`quinn::Endpoint::open_connections`). Case 5 uses it as its whole
+    /// right-reason apparatus: with one relayed pair there are exactly two
+    /// (one per gateway), so `2 -> 1` is the relay observing that the
+    /// departing gateway is genuinely gone AND that the surviving gateway's
+    /// own connection is genuinely still up — two facts no gateway-side
+    /// signal can establish, and the exact pair of facts that separates
+    /// "the peer left" from "our own leg died" (case 4's subject).
+    ///
+    /// Note the variant this needs: `Killable` is named for case 3's
+    /// eviction, but the thing it actually carries is the `quinn::Endpoint`
+    /// handle, which is equally what this observation needs — case 5 takes a
+    /// `Killable` relay and never closes it. Panics on `InProcess` for the
+    /// same fail-loud reason [`RelayHandle::evict`] does (`spawn_server`
+    /// doesn't hand back the `Endpoint`, so there is nothing to ask).
+    fn open_connections(&self) -> usize {
+        match self {
+            RelayHandle::Killable(_, endpoint, _) => endpoint.open_connections(),
+            RelayHandle::InProcess(..) => {
+                panic!("open_connections() called on an InProcess RelayHandle")
+            }
+        }
+    }
 }
 
 // --- gateway process management ---------------------------------------------
@@ -576,7 +612,16 @@ except Exception as e:
 /// emits (so it transparently picks up `"relayed"` with no changes needed
 /// here).
 fn path_state(ns: &Ns) -> Option<String> {
-    let body = scrape_metrics(ns)?;
+    path_state_in(&scrape_metrics(ns)?)
+}
+
+/// [`path_state`]'s parser, split from the scrape so a caller that needs
+/// SEVERAL metric families per sample (case 5's observation loop wants the
+/// state gauge and a transition counter every 500ms) can pay for one
+/// `/metrics` request instead of one per family — each scrape spawns a
+/// python3 process inside the gateway's netns, and that cost lands on the
+/// same contended container CPU the gateways are being timed on.
+fn path_state_in(body: &str) -> Option<String> {
     for line in body.lines() {
         if let Some(rest) = line.strip_prefix("wiremesh_gateway_path_state{") {
             if let Some(idx) = rest.find("state=\"") {
@@ -588,6 +633,31 @@ fn path_state(ns: &Ns) -> Option<String> {
         }
     }
     None
+}
+
+/// The `wiremesh_gateway_path_transitions_total{from,to}` COUNTER for one
+/// edge (`None` = the scrape itself failed; `Some(0)` = scraped fine, the
+/// edge has never been taken — the counter family omits zero-valued lines).
+///
+/// Why case 5 asserts on a counter rather than on [`path_state`]'s gauge: a
+/// gauge sampled every 500ms can miss a state the gateway occupies briefly,
+/// and the very fix this pins would produce exactly such a state (a
+/// symmetric pair that leaves `Relayed` re-relays via the
+/// `Connecting`-timeout ladder ~12s later, so "left `Relayed`" is a
+/// transient, not an end state). The counter is monotonic: the edge either
+/// was taken or it wasn't, no matter when we look.
+fn path_transitions(ns: &Ns, from: &str, to: &str) -> Option<u64> {
+    Some(path_transitions_in(&scrape_metrics(ns)?, from, to))
+}
+
+/// [`path_transitions`]'s parser — see [`path_state_in`] for why the scrape
+/// and the parse are split.
+fn path_transitions_in(body: &str, from: &str, to: &str) -> u64 {
+    let needle = format!("wiremesh_gateway_path_transitions_total{{from=\"{from}\",to=\"{to}\"}} ");
+    body.lines()
+        .find_map(|l| l.strip_prefix(needle.as_str()))
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// boringtun's latest-handshake unix timestamp for wg0's single peer (0 =
@@ -725,6 +795,56 @@ fn sever_relay(sc: &Scenario) {
     sc.rb
         .exec(&["ip", "route", "add", "blackhole", &format!("{relay_host}/32")])
         .expect("install rb relay blackhole");
+}
+
+/// Case 5's PEER departure: blackholes the relay's address in the PEER's
+/// router (`rb`) ONLY, leaving the surviving gateway's router (`ra`)
+/// untouched. Deliberately one-sided, and that asymmetry is the entire
+/// point of case 5 — contrast [`sever_relay`], which blackholes the relay
+/// in BOTH routers and therefore kills the surviving side's own leg too
+/// (case 4's subject: OUR connection died).
+///
+/// What the surviving gateway sees afterwards: the relay is still up, still
+/// routable, still ACKing everything we send it, our QUIC connection is
+/// perfectly healthy — and the peer is simply no longer there (the relay
+/// drops gwB's connection at ITS 30s idle timer, `remove_if_owner` frees the
+/// registration, and from then on every datagram we send is answered by
+/// nothing but a `relay: unknown dest ...` line in the relay's own log —
+/// `wiremesh-relay/src/lib.rs`, whose comment already names this case:
+/// "benign and expected while the far side is still connecting **or has
+/// just left the relay**").
+///
+/// ## Why this, and not a graceful peer-side departure
+///
+/// The production shape (§3 of `docs/research/relay-mux-design-verification.md`,
+/// and `main.rs`'s own words: "the peer restarted, punched direct, and LEFT
+/// the relay") is a peer that tears its own leg down after cutting over to
+/// direct. That shape is UNREACHABLE in this harness, and not for a harness
+/// reason — it is unreachable *because of the bug under test*: the peer can
+/// only leave the relay by reaching `Direct`, a punch needs both sides, and
+/// the survivor refuses every punch while its `relay_pointed` pin holds
+/// (`path::directive_should_punch` filters even a controller-brokered
+/// directive). The survivor's pin is exactly what prevents the peer from
+/// producing the event that would clear the survivor's pin.
+///
+/// So the peer is made to depart by losing the relay rather than by leaving
+/// it. The two differ in the peer's own experience (and in ~30s of latency
+/// before the relay reaps the registration — folded into
+/// [`CASE5_PEER_DEPART_BUDGET`]), and in nothing at all that the SURVIVING
+/// gateway can observe: relay healthy, our connection healthy, peer's route
+/// gone. Those are precisely the inputs a `NO_ROUTE`/route-presence signal
+/// would act on.
+///
+/// Yes, this reproduces a connection death — on the DEPARTING side, which is
+/// the side we assert nothing about. The surviving side's connection must
+/// survive for the test to mean anything, so case 5 does not take that on
+/// trust: it watches [`RelayHandle::open_connections`] and requires the
+/// relay to still be holding the survivor's connection the whole time.
+fn sever_peer_from_relay(sc: &Scenario) {
+    let relay_host = RELAY_ADDR.split(':').next().expect("RELAY_ADDR has a host");
+    sc.rb
+        .exec(&["ip", "route", "add", "blackhole", &format!("{relay_host}/32")])
+        .expect("install rb-only relay blackhole (peer-side departure)");
 }
 
 /// Builds the full topology: both gateways behind `nat`-kind NAT (cases 1
@@ -1702,6 +1822,409 @@ async fn case4_relay_leg_death_unwedges_direct_punch() {
          gwA={ep_a_direct:?} gwB={ep_b_direct:?}, defers gwA={defers_a} gwB={defers_b}; \
          total test time {:?}).",
         severed_at.elapsed(),
+        start.elapsed()
+    );
+}
+
+/// Case 5's PEER-DEPARTURE budget: how long after [`sever_peer_from_relay`]
+/// the RELAY itself may take to stop holding the departing gateway's
+/// connection (observed directly, via [`RelayHandle::open_connections`]
+/// going `2 -> 1`). The peer stops being reachable instantly, but the relay
+/// only reaps the connection — and with it the pair registration
+/// `remove_if_owner` frees — when its own `max_idle_timeout` (30s, no
+/// keep-alives; `wiremesh-relay/src/lib.rs`'s `transport_config`) expires on
+/// that connection. 45s = the 30s constant + margin for the last datagram
+/// received just before the blackhole (idle timers restart on receipt) and
+/// container CPU jitter. This is pure harness latency, which is why case 5
+/// measures the thing it actually asserts from the departure instant this
+/// budget ends at, not from the blackhole.
+const CASE5_PEER_DEPART_BUDGET: Duration = Duration::from_secs(45);
+
+/// Case 5's SURVIVOR-DETECTION budget, measured from the relay-observed
+/// instant the peer's connection vanished. This is the number the case
+/// actually asserts.
+///
+/// Floor, per `docs/research/relay-mux-design-verification.md` §3: a
+/// `NO_ROUTE`-style signal is only observable when we TRANSMIT, so detection
+/// cannot beat our own send cadence toward the relay — today
+/// `LIVENESS_PROBE_INTERVAL` (20s, `main.rs`), on top of the ~1s path-tick
+/// cadence that turns the resulting `relay_available = false` into
+/// `PathAction::RelayDied`. 45s allows two full probe cycles plus jitter, so
+/// it is loose enough that no plausible implementation of the fix fails it
+/// for timing reasons, and tight enough that "forever" (the current
+/// behavior) is unambiguously outside it.
+const CASE5_SURVIVOR_DETECT_BUDGET: Duration = Duration::from_secs(45);
+
+/// Case 5 (`docs/research/relay-mux-design-verification.md` §3 — LIVE GAP,
+/// owner decision D, 2026-08-04): a peer that LEAVES the relay is
+/// undetectable, so the surviving gateway's path pins in `Relayed` forever.
+///
+/// **This test is expected to FAIL against current code and is committed
+/// `#[ignore]`d for that reason.** It is a documented red, not a broken
+/// test: it is the done-bar that item 3b (`NO_ROUTE`) should have to clear,
+/// in place of the design's parity claim. See "Un-ignoring this" below.
+///
+/// ## What is being pinned
+///
+/// The Cycle-4c design says `NO_ROUTE` "replaces per-pair idle death". There
+/// is no per-pair idle death to replace:
+///
+/// - The relay's 30s `max_idle_timeout` (`wiremesh-relay/src/lib.rs`, no
+///   `keep_alive_interval`) is CONNECTION-scoped, not pair-scoped.
+/// - `relay_available`, the only input `Path::tick`'s `Relayed` arm has, is
+///   computed in `run_path_ticks` as
+///   `relay_transports[gid].transport.is_healthy()` — i.e. QUIC connection
+///   liveness, which says nothing about whether the peer is still on the
+///   other end of the relay.
+/// - The `Relayed` arm itself (`src/path.rs`) has NO liveness requirement at
+///   all: while `relay_available` it stays `Relayed` and emits at most a
+///   rate-limited `ProbeDirect` (which the driver currently no-ops, pending
+///   the forced-rehandshake cutover fast-follow).
+///
+/// So when the peer goes away but the relay stays healthy: our connection is
+/// fine, the relay logs `unknown dest` once per datagram we send, and the
+/// path sits in `Relayed` — a state that claims to be carrying traffic —
+/// indefinitely. Nothing in the gateway can currently learn otherwise. The
+/// v0.3.1 wedge self-heal does not cover this: it covers our own connection
+/// DYING (case 4) and leaked `relay_pointed` pins (the stale-pin sweep), and
+/// both of those hinge on `is_healthy() == false`, which never happens here.
+///
+/// Note also that the pin is proof against every OTHER nudge the fabric has:
+/// once the peer leaves and re-punches, the controller broker will un-skip
+/// the pair and emit synchronized `PunchDirective`s — and
+/// `path::directive_should_punch(Some(Relayed), relay_pointed = true)` is
+/// `false`, so the survivor discards them. It is genuinely stuck.
+///
+/// ## Shape
+///
+/// Case 1's topology exactly (symmetric<->symmetric, one relay, no
+/// direct-lane block): converge both sides to `Relayed`, prove real ping
+/// traffic crosses it. Then the PEER (gwB) departs the relay, via
+/// [`sever_peer_from_relay`] — a blackhole in gwB's router ONLY. The relay
+/// stays alive, unclosed, and fully routable from gwA; gwA's own QUIC
+/// connection to it is never touched. See that fn's doc comment for why the
+/// production shape (peer cuts over to direct and tears its own leg down) is
+/// unreachable in this harness — the survivor's pin is precisely what
+/// prevents it — and why losing the relay is observationally identical at
+/// the surviving gateway.
+///
+/// ## The assertion, and why this one
+///
+/// gwA's `wiremesh_gateway_path_transitions_total{from="relayed",
+/// to="disconnected"}` must increase within [`CASE5_SURVIVOR_DETECT_BUDGET`]
+/// of the departure. That edge is emitted by exactly one thing: the
+/// `Relayed` arm's relay-death branch (`Relayed -> Disconnected` +
+/// `PathAction::RelayDied`; the only other way out of `Relayed` is
+/// `on_handshake`'s cutover to `Direct`). So the assertion reads literally
+/// "gwA noticed and emitted `RelayDied`" — and, because `RelayDied` tears
+/// down the transport, clears the pin, and hands the next `Connecting`
+/// spell a real punch window, it simultaneously covers "left `Relayed`" and
+/// "re-attempted a direct path" without over-specifying which.
+///
+/// It is deliberately NOT asserted that gwA ENDS anywhere in particular. A
+/// symmetric pair with a healthy relay advertised should re-relay one
+/// `Connecting`-timeout later — that is correct behavior (the peer may come
+/// back), and asserting "stays off the relay" would demand a wrong fix. A
+/// monotonic counter also cannot be missed by 500ms gauge sampling the way
+/// that ~12s transient could.
+///
+/// ## Right-reason guards (what could make this pass for the wrong reason)
+///
+/// 1. **Our own connection dying** — case 4's already-covered scenario, and
+///    the one approximation that would make this test a lie. Guarded from
+///    the relay's own vantage point: [`RelayHandle::open_connections`] must
+///    read exactly 2 before the departure, must go to 1 (never 0) at it, and
+///    must stay ≥1 at every sample where gwA still reads `relayed`. The
+///    surviving connection is therefore observed alive, by the relay, right
+///    up to the transition being asserted. (Residual: gwA's QUIC connection
+///    could in principle idle out anyway — but that needs >30s of total send
+///    silence while `LIVENESS_PROBE_INTERVAL` is 20s and boringtun is
+///    additionally retrying handshakes and keepalives over the same socket.
+///    The PASS line prints the observed minimum so a future green is
+///    auditable rather than assumed.)
+/// 2. **The controller evicting the relay under us** (which would clear the
+///    pin via roster pruning). It cannot: the eviction aggregate is
+///    healthy-override — `services/sync.rs` computes
+///    `healthy_agg = votes.values().any(|&h| h)` — and gwA, whose transport
+///    stays healthy, keeps voting `true`, so gwB's negative vote (or its
+///    absence, once gwB tears its dead transport down) cannot flip the relay
+///    to `inactive`. Guard 1 catches it regardless: an eviction would make
+///    gwA close its transport, and `open_connections` would read 0.
+/// 3. **gwA reaching `direct` instead** — impossible for this NAT pairing
+///    (case 1 and `nat_matrix.rs`'s `case2_symmetric_relay_needed`), and
+///    anyway a different edge (`relayed -> direct`) than the one counted.
+///
+/// ## Un-ignoring this
+///
+/// Remove the `#[ignore]` when either of these lands:
+///
+/// - **Item 3b's `NO_ROUTE` control datagram**: the relay tells a sender
+///   that the dest it is addressing has no registration, and the gateway
+///   feeds that back into per-peer route presence.
+/// - **Any per-peer route-presence signal** replacing the connection-health
+///   check in `run_path_ticks`'s `healthy_relay` map — that is the single
+///   line that has to stop meaning "the shared QUIC connection is alive"
+///   and start meaning "this peer is reachable through this relay". §3 of
+///   the verification doc lists it as integration hazard 1, and the
+///   stale-pin sweep needs the same signal (§4), so it should be built once.
+///
+/// One free consequence worth knowing when the fix lands: `to_relay_died`
+/// reads `RelayTransport::death_reason()` before teardown, and for a
+/// route-absence death (connection still alive) that returns `None`, which
+/// falls into the `None => {}` arm — no immediate re-relay, a clean punch
+/// window. That is the right branch for a departed peer, but today it is
+/// right by accident (verification §3, hazard 3); a fix should make it
+/// deliberate.
+///
+/// ## Cost
+///
+/// ~2-3 minutes wall clock, essentially all of it inherent rather than
+/// padding: ~25s to converge and prove the relayed flow, then ~30s of relay
+/// idle-timer before the departure is even real
+/// ([`CASE5_PEER_DEPART_BUDGET`]), then the detection window itself, whose
+/// floor is the gateway's own 20s send cadence
+/// ([`CASE5_SURVIVOR_DETECT_BUDGET`]). On today's code the detection window
+/// always runs to its full length, because nothing ever ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "RED by design: pins the live peer-departure gap (relay-mux-design-verification.md \
+            §3). Un-ignore when NO_ROUTE / per-peer route presence lands (item 3b) — see this \
+            test's doc comment."]
+async fn case5_peer_departure_unpins_survivor_from_relayed() {
+    // `Killable` for its `quinn::Endpoint` handle only — case 5 NEVER closes
+    // the relay (see `RelayHandle::open_connections`). The relay must stay
+    // alive and unclosed for the whole test: a close would sever the
+    // survivor too, which is the one thing this case must not do.
+    let sc = build_scenario(
+        "rm5",
+        vec![RelaySpec::Killable { addr: RELAY_ADDR, csr_tag: "relay-case5" }],
+        NatKind::Symmetric,
+        false,
+    )
+    .await;
+    let start = Instant::now();
+
+    // Phase 1: converge to a genuinely relayed, genuinely FLOWING pair —
+    // identical premise, mechanism and bounds to case 1 (see its doc
+    // comment); the departure below is only meaningful against a real relay
+    // path.
+    let mut last_log = Instant::now() - Duration::from_secs(5);
+    let relayed = wait_until(Duration::from_secs(45), || {
+        if last_log.elapsed() >= Duration::from_secs(5) {
+            eprintln!(
+                "case5: t+{:?} pre-departure gwA={:?} gwB={:?}",
+                start.elapsed(),
+                path_state(&sc.gwa),
+                path_state(&sc.gwb),
+            );
+            last_log = Instant::now();
+        }
+        path_state(&sc.gwa).as_deref() == Some("relayed")
+            && path_state(&sc.gwb).as_deref() == Some("relayed")
+    });
+    if !relayed {
+        dump_diag("case5 reach-relayed", &sc);
+        panic!(
+            "case5: symmetric pair never reached path_state=relayed on both sides \
+             (gwA={:?}, gwB={:?}) within 45s — the departure scenario needs a genuinely \
+             relayed starting point",
+            path_state(&sc.gwa),
+            path_state(&sc.gwb)
+        );
+    }
+    if !wait_until(Duration::from_secs(25), || ping_ok(&sc.wla, "10.10.12.2")) {
+        dump_diag("case5 ping-cross (relayed)", &sc);
+        panic!("case5: wlA -> wlB ping never crossed the relayed tunnel before the departure");
+    }
+    let ep_a = wg_endpoint(&sc.gwa);
+    let ep_b = wg_endpoint(&sc.gwb);
+    if !ep_a.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
+        || !ep_b.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
+    {
+        dump_diag("case5 endpoint-check (relayed)", &sc);
+        panic!(
+            "case5: expected BOTH peers' WG endpoint on the local relay socket while relayed, \
+             got gwA={ep_a:?} gwB={ep_b:?}"
+        );
+    }
+    eprintln!(
+        "case5: PASS pair is genuinely relayed and flowing in {:?} (endpoints gwA={ep_a:?} \
+         gwB={ep_b:?})",
+        start.elapsed()
+    );
+
+    // Phase 2: baseline the relay's own connection census (right-reason
+    // guard 1 — see the doc comment). One relayed pair == exactly one QUIC
+    // connection per gateway.
+    if !wait_until(Duration::from_secs(10), || sc.relays[0].open_connections() == 2) {
+        dump_diag("case5 connection-census", &sc);
+        panic!(
+            "case5: expected the relay to hold exactly 2 open QUIC connections (one per \
+             gateway) before the departure, got {} — without that baseline the '2 -> 1' \
+             observation below cannot distinguish which side left",
+            sc.relays[0].open_connections()
+        );
+    }
+    // Baseline for THE assertion: the `relayed -> disconnected` edge, which
+    // only `PathAction::RelayDied` can produce (doc comment, "The
+    // assertion"). Expected to be 0 here — gwA's path so far is
+    // Connecting -> Relayed — but read rather than assumed.
+    let baseline_a = path_transitions(&sc.gwa, "relayed", "disconnected").unwrap_or_else(|| {
+        dump_diag("case5 transition-baseline", &sc);
+        panic!("case5: could not scrape gwA's path-transition counters before the departure")
+    });
+    eprintln!(
+        "case5: baseline gwA relayed->disconnected = {baseline_a}, relay holds 2 connections"
+    );
+
+    // Phase 3: the PEER departs the relay — and ONLY the peer. gwA's route
+    // to the relay, and gwA's live QUIC connection over it, are untouched.
+    let severed_at = Instant::now();
+    sever_peer_from_relay(&sc);
+    eprintln!(
+        "case5: blackholed the relay in gwB's router ONLY at t+{:?} (relay stays alive, \
+         unclosed, and routable from gwA)",
+        start.elapsed()
+    );
+
+    // Phase 4: observe. Two things are being tracked at once:
+    //
+    //  * `peer_departed_at` — the relay's census dropping 2 -> 1, i.e. the
+    //    instant the peer is really gone from the relay's point of view (its
+    //    registration reaped with the connection). The assertion's clock
+    //    starts HERE, not at the blackhole, so the relay's own 30s idle timer
+    //    is not charged against the gateway's detection latency.
+    //  * `survivor_noticed_at` — gwA's `relayed -> disconnected` counter
+    //    moving off `baseline_a`. THE assertion.
+    //
+    // plus the right-reason guard: at every sample where gwA still reads
+    // `relayed` (i.e. has not noticed), the relay must still be holding
+    // gwA's connection. `min_open_while_relayed` records the worst reading;
+    // a 0 there would mean this run reproduced connection death on the
+    // SURVIVING side, which voids the whole premise.
+    let mut peer_departed_at: Option<Duration> = None;
+    let mut survivor_noticed_at: Option<Duration> = None;
+    let mut min_open_while_relayed = usize::MAX;
+    let mut state_at_departure: Option<String> = None;
+    let deadline = severed_at + CASE5_PEER_DEPART_BUDGET + CASE5_SURVIVOR_DETECT_BUDGET;
+    let mut last_log2 = Instant::now() - Duration::from_secs(10);
+    while Instant::now() < deadline {
+        let open = sc.relays[0].open_connections();
+        // ONE scrape per sample, both families parsed out of it (see
+        // `path_state_in`). gwB is only scraped where it is actually logged.
+        let body_a = scrape_metrics(&sc.gwa);
+        let st_a = body_a.as_deref().and_then(path_state_in);
+        let trans_a = body_a
+            .as_deref()
+            .map(|b| path_transitions_in(b, "relayed", "disconnected"));
+
+        if st_a.as_deref() == Some("relayed") {
+            min_open_while_relayed = min_open_while_relayed.min(open);
+        }
+        if peer_departed_at.is_none() && open < 2 {
+            peer_departed_at = Some(severed_at.elapsed());
+            state_at_departure = st_a.clone();
+            eprintln!(
+                "case5: relay census dropped to {open} at t+{:?} after the blackhole — the \
+                 peer is gone from the relay (gwA={st_a:?}, gwB={:?})",
+                severed_at.elapsed(),
+                path_state(&sc.gwb),
+            );
+        }
+        if matches!(trans_a, Some(n) if n > baseline_a) {
+            survivor_noticed_at = Some(severed_at.elapsed());
+            eprintln!(
+                "case5: gwA emitted relayed->disconnected ({trans_a:?}) at t+{:?} after the \
+                 blackhole (state now {st_a:?}, relay census {open})",
+                severed_at.elapsed()
+            );
+            break;
+        }
+
+        if last_log2.elapsed() >= Duration::from_secs(10) {
+            eprintln!(
+                "case5: t+{:?} post-departure gwA={st_a:?} gwB={:?} relay_conns={open} \
+                 (departed_at={peer_departed_at:?})",
+                severed_at.elapsed(),
+                path_state(&sc.gwb),
+            );
+            last_log2 = Instant::now();
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Premise checks BEFORE the pin's own verdict, so a harness/environment
+    // failure never masquerades as the finding (or as its fix).
+    let Some(peer_departed_at) = peer_departed_at else {
+        dump_diag("case5 peer-never-departed", &sc);
+        panic!(
+            "case5: the relay still held 2 open connections {:?} after gwB's router \
+             blackholed it — the peer never actually left the relay, so nothing about the \
+             surviving gateway was exercised. Check the blackhole and the relay's \
+             max_idle_timeout (expected departure within {CASE5_PEER_DEPART_BUDGET:?})",
+            severed_at.elapsed()
+        );
+    };
+    if state_at_departure.as_deref() != Some("relayed") {
+        dump_diag("case5 ambiguous-departure", &sc);
+        panic!(
+            "case5: the relay's census dropped below 2 while gwA read {state_at_departure:?}, \
+             not `relayed` — which side's connection went away is then ambiguous, so this run \
+             cannot pin anything. Investigate before reading the verdict below"
+        );
+    }
+    if min_open_while_relayed == 0 {
+        dump_diag("case5 survivor-connection-died", &sc);
+        panic!(
+            "case5: the relay's census reached 0 while gwA still read `relayed` — this run \
+             reproduced connection death on the SURVIVING side, which is case 4's scenario, \
+             not this one. The premise (relay healthy and reachable, our leg alive, only the \
+             PEER gone) is void; nothing here pins peer-departure detection"
+        );
+    }
+
+    let Some(survivor_noticed_at) = survivor_noticed_at else {
+        let still_flowing = ping_ok(&sc.wla, "10.10.12.2");
+        dump_diag("case5 pinned-in-relayed", &sc);
+        panic!(
+            "case5: gwA never left `Relayed` — {:?} after the peer departed the relay (which \
+             happened {peer_departed_at:?} after the blackhole), its \
+             relayed->disconnected counter is still {baseline_a} and it reads {:?}, while the \
+             relay it is pointed at is alive, reachable, still holding gwA's own connection \
+             (census stayed >= {min_open_while_relayed}), and no longer has any route to the \
+             peer at all (wlA -> wlB ping crossing: {still_flowing}).\n\
+             \n\
+             THIS IS THE PIN, and today it is EXPECTED: a peer that leaves the relay is \
+             structurally undetectable. `relay_available` is connection health \
+             (`run_path_ticks`'s `healthy_relay` map = `transport.is_healthy()`), the \
+             `Relayed` arm of `Path::tick` has no liveness requirement, and the relay's 30s \
+             idle timeout is connection-scoped, not pair-scoped — so the path pins in a state \
+             that claims to be carrying traffic, forever, carrying none. See \
+             docs/research/relay-mux-design-verification.md §3; the fix is item 3b's NO_ROUTE \
+             or any per-peer route-presence signal replacing that health check (detection \
+             budget here was {CASE5_SURVIVOR_DETECT_BUDGET:?} from the departure, whose floor \
+             is the gateway's own 20s LIVENESS_PROBE_INTERVAL send cadence)",
+            severed_at.elapsed().saturating_sub(peer_departed_at),
+            path_state(&sc.gwa),
+        );
+    };
+
+    let detection_latency = survivor_noticed_at.saturating_sub(peer_departed_at);
+    if detection_latency > CASE5_SURVIVOR_DETECT_BUDGET {
+        dump_diag("case5 slow-detection", &sc);
+        panic!(
+            "case5: gwA did eventually notice the peer's departure, but took \
+             {detection_latency:?} from the departure — over the \
+             {CASE5_SURVIVOR_DETECT_BUDGET:?} budget (whose floor is the 20s \
+             LIVENESS_PROBE_INTERVAL send cadence a NO_ROUTE-style signal rides on)"
+        );
+    }
+
+    eprintln!(
+        "CASE 5 PASS: the surviving gateway detected that its peer had LEFT the relay in \
+         {detection_latency:?} (peer departed {peer_departed_at:?} after the blackhole; \
+         relayed->disconnected went {baseline_a} -> +1), while the relay stayed healthy and \
+         kept holding gwA's own connection throughout (census never below \
+         {min_open_while_relayed}). Total test time {:?}.",
         start.elapsed()
     );
 }
