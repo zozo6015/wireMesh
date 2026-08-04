@@ -12,19 +12,57 @@ EnvironmentFile=/etc/wiremesh/controller.env
 ExecStart=/usr/bin/wiremesh-controller
 Restart=on-failure
 RestartSec=5
-WorkingDirectory=/var/lib/wiremesh
+# Dedicated controller state dir (ops finding 2026-08-01, px migration —
+# docs/runbooks/controller-migration-to-fi.md §"Field notes", item 2): the
+# controller must NOT share /var/lib/wiremesh with the gateway. That directory
+# is the gateway's root-owned 0700 state dir; the controller package used to
+# chown it to wiremesh:wiremesh, and because the gateway unit's
+# CapabilityBoundingSet has no CAP_DAC_OVERRIDE, the (root) gateway then died
+# on "reading identity.json ... Permission denied". StateDirectory= makes
+# systemd create /var/lib/wiremesh-controller owned by this service's
+# User/Group before start (fixing up ownership on mismatch) and grants write
+# access despite ProtectSystem=strict — same precedent as the relay unit.
+# This unit must serve BOTH layouts, because nothing migrates automatically:
+# a host that already had control-plane state in /var/lib/wiremesh stays
+# pinned there by the package postinstall. So StateDirectory= below is the
+# FRESH-install default, and ReadWritePaths= further down also lists the
+# legacy path so a pinned install can still write under ProtectSystem=strict.
+# (StateDirectoryMode applies when systemd CREATES the directory; on an
+# existing one systemd fixes ownership but not mode.)
+StateDirectory=wiremesh-controller
+StateDirectoryMode=0700
+# Always exists (StateDirectory= creates it before chdir), so this is a safe
+# cwd for a pinned legacy install too — the controller only ever uses
+# absolute paths derived from WIREMESH_DATA_DIR.
+WorkingDirectory=/var/lib/wiremesh-controller
 # The controller binds its admin UDS at /run/wiremesh/controller.sock (the
 # WIREMESH_SOCKET_PATH default). RuntimeDirectory creates + owns /run/wiremesh
 # writable BEFORE start — required because ProtectSystem=strict makes /run
-# read-only otherwise, which would fail the socket bind.
+# read-only otherwise, which would fail the socket bind. This stays
+# /run/wiremesh (not /run/wiremesh-controller): it is the documented admin
+# socket path fabricctl dials by default, and nothing else contends for it.
 RuntimeDirectory=wiremesh
 RuntimeDirectoryMode=0700
-# Hardening (control plane holds the CA + DB under /var/lib/wiremesh).
+# Hardening (the control plane holds the CA + DB under WIREMESH_DATA_DIR).
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/wiremesh
+# Redundant with StateDirectory= (which already grants write access to this
+# path — the relay unit omits it for that reason), kept so the one writable
+# location is stated explicitly for anyone auditing against ProtectSystem=strict.
+ReadWritePaths=/var/lib/wiremesh-controller
+# ...and the LEGACY path, for a host the postinstall pinned to /var/lib/wiremesh
+# because it already had control-plane state there. Without this,
+# ProtectSystem=strict makes that directory read-only and a pinned controller
+# cannot open its own DB. The leading '-' means "ignore if absent", which is
+# the normal case on a fresh install — without it, systemd would refuse to set
+# up the namespace and the unit would fail to start on any host that has no
+# /var/lib/wiremesh at all. Note this grants no access the DAC bits do not
+# already allow: on a gateway-only host that directory is root-owned 0700 and
+# the User=wiremesh controller still cannot read it (nor does it try — it is
+# only ever pinned there when the state is already wiremesh-readable).
+ReadWritePaths=-/var/lib/wiremesh
 
 [Install]
 WantedBy=multi-user.target

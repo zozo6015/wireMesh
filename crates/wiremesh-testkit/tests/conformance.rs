@@ -36,6 +36,12 @@
 //!
 //! Run: `./dev.sh run "cargo test -p wiremesh-testkit --features netns \
 //! --test conformance -- --test-threads=1 --nocapture"`.
+// Compiles to an empty test binary unless `netns` is on: `wiremesh_enforcer`
+// and `wiremesh_testkit::conformance` only exist behind that feature, so
+// without this gate a plain `cargo build -p wiremesh-testkit` (or any
+// non-netns `cargo test`) fails to resolve them. Same pattern as
+// `tests/netem.rs`.
+#![cfg(feature = "netns")]
 
 use wiremesh_enforcer::BackendKind;
 use wiremesh_testkit::conformance::{
