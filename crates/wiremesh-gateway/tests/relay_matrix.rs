@@ -1963,16 +1963,21 @@ const CASE5_SURVIVOR_DETECT_BUDGET: Duration = Duration::from_secs(45);
 ///
 /// 1. **Our own connection dying** — case 4's already-covered scenario, and
 ///    the one approximation that would make this test a lie. Guarded from
-///    the relay's own vantage point: [`RelayHandle::open_connections`] must
-///    read exactly 2 before the departure, must go to 1 (never 0) at it, and
-///    must stay ≥1 at every sample where gwA still reads `relayed`. The
-///    surviving connection is therefore observed alive, by the relay, right
-///    up to the transition being asserted. (Residual: gwA's QUIC connection
-///    could in principle idle out anyway — but that needs >30s of total send
-///    silence while `LIVENESS_PROBE_INTERVAL` is 20s and boringtun is
-///    additionally retrying handshakes and keepalives over the same socket.
-///    The PASS line prints the observed minimum so a future green is
-///    auditable rather than assumed.)
+///    the relay's own vantage point, on three exact counts:
+///    [`RelayHandle::open_connections`] must read exactly 2 before the
+///    departure; the departure trigger is a census of **exactly 1** (a
+///    census of 0 while gwA has not yet noticed is a fatal, separately-named
+///    premise failure on the spot, never a departure — see the phase-4
+///    comment for the false green `< 2` would have produced once this case
+///    is un-ignored); and the census must stay ≥1 at every sample where gwA
+///    still reads `relayed`. The surviving connection is therefore observed
+///    alive, by the relay, right up to the transition being asserted.
+///    (Residual: gwA's QUIC connection could in principle idle out anyway —
+///    but that needs >30s of total send silence while
+///    `LIVENESS_PROBE_INTERVAL` is 20s and boringtun is additionally
+///    retrying handshakes and keepalives over the same socket. The PASS line
+///    prints the observed minimum so a future green is auditable rather than
+///    assumed.)
 /// 2. **The controller evicting the relay under us** (which would clear the
 ///    pin via roster pruning). It cannot: the eviction aggregate is
 ///    healthy-override — `services/sync.rs` computes
@@ -1980,7 +1985,8 @@ const CASE5_SURVIVOR_DETECT_BUDGET: Duration = Duration::from_secs(45);
 ///    stays healthy, keeps voting `true`, so gwB's negative vote (or its
 ///    absence, once gwB tears its dead transport down) cannot flip the relay
 ///    to `inactive`. Guard 1 catches it regardless: an eviction would make
-///    gwA close its transport, and `open_connections` would read 0.
+///    gwA close its transport, and the census would read 0 with gwA not yet
+///    having noticed anything — the fatal premise failure, not a departure.
 /// 3. **gwA reaching `direct` instead** — impossible for this NAT pairing
 ///    (case 1 and `nat_matrix.rs`'s `case2_symmetric_relay_needed`), and
 ///    anyway a different edge (`relayed -> direct`) than the one counted.
@@ -2119,27 +2125,40 @@ async fn case5_peer_departure_unpins_survivor_from_relayed() {
 
     // Phase 4: observe. Two things are being tracked at once:
     //
-    //  * `peer_departed_at` — the relay's census dropping 2 -> 1, i.e. the
-    //    instant the peer is really gone from the relay's point of view (its
-    //    registration reaped with the connection). The assertion's clock
-    //    starts HERE, not at the blackhole, so the relay's own 30s idle timer
-    //    is not charged against the gateway's detection latency.
+    //  * `peer_departed_at` — the relay's census going 2 -> EXACTLY 1, i.e.
+    //    the instant the peer is really gone from the relay's point of view
+    //    (its registration reaped with the connection) AND the survivor's own
+    //    connection is demonstrably still there. The assertion's clock starts
+    //    HERE, not at the blackhole, so the relay's own 30s idle timer is not
+    //    charged against the gateway's detection latency.
     //  * `survivor_noticed_at` — gwA's `relayed -> disconnected` counter
     //    moving off `baseline_a`. THE assertion.
     //
-    // plus the right-reason guard: at every sample where gwA still reads
-    // `relayed` (i.e. has not noticed), the relay must still be holding
-    // gwA's connection. `min_open_while_relayed` records the worst reading;
-    // a 0 there would mean this run reproduced connection death on the
-    // SURVIVING side, which voids the whole premise.
+    // The exactness of the departure trigger is load-bearing, and `< 2` would
+    // NOT do (CodeRabbit, post-first-run): a census of 0 means gwA's OWN
+    // connection died as well, which is case 4's scenario and the one thing
+    // this case exists to exclude. Under `< 2` such a run would record a
+    // departure, gwA would then leave `Relayed` BECAUSE ITS OWN LEG DIED,
+    // `survivor_noticed_at` would fire, and the test would report a green for
+    // precisely the cause it was written to rule out. Harmless while the case
+    // is red on its verdict; a silent false pass the moment 3b lands and
+    // someone un-ignores it. So: exactly 1 is a departure, and 0 is an
+    // immediate, explicitly-named premise failure below.
+    //
+    // Third, `min_open_while_relayed` records the worst census seen at any
+    // sample where gwA still read `relayed`. That one is deliberately a FLOOR
+    // across many samples rather than an exact-value test — it is a backstop
+    // for the in-loop zero check, not a transition identifier.
     let mut peer_departed_at: Option<Duration> = None;
     let mut survivor_noticed_at: Option<Duration> = None;
     let mut min_open_while_relayed = usize::MAX;
     let mut state_at_departure: Option<String> = None;
+    let mut last_open = 2usize;
     let deadline = severed_at + CASE5_PEER_DEPART_BUDGET + CASE5_SURVIVOR_DETECT_BUDGET;
     let mut last_log2 = Instant::now() - Duration::from_secs(10);
     while Instant::now() < deadline {
         let open = sc.relays[0].open_connections();
+        last_open = open;
         // ONE scrape per sample, both families parsed out of it (see
         // `path_state_in`). gwB is only scraped where it is actually logged.
         let body_a = scrape_metrics(&sc.gwa);
@@ -2147,21 +2166,48 @@ async fn case5_peer_departure_unpins_survivor_from_relayed() {
         let trans_a = body_a
             .as_deref()
             .map(|b| path_transitions_in(b, "relayed", "disconnected"));
+        let noticed = matches!(trans_a, Some(n) if n > baseline_a);
+
+        // Premise failure, checked FIRST and fatal: the relay is holding
+        // nobody while gwA has not yet noticed anything. gwA's own leg is
+        // therefore gone — case 4's scenario, not this one. Gated on
+        // `!noticed` because a census of 0 AFTER gwA has legitimately
+        // detected the departure is the CORRECT post-fix sequence (the
+        // `RelayDied` handler tears our transport down, and that teardown is
+        // what closes the last connection).
+        if open == 0 && !noticed {
+            dump_diag("case5 survivor-connection-died", &sc);
+            panic!(
+                "case5: the relay's connection census reached 0 at t+{:?} while gwA had not \
+                 yet left `Relayed` (state {st_a:?}, relayed->disconnected still \
+                 {trans_a:?} vs baseline {baseline_a}) — the SURVIVOR's own connection died, \
+                 not just the peer's. That is case 4's scenario (a leg dead of silence, \
+                 already covered by `case4_relay_leg_death_unwedges_direct_punch`), and it is \
+                 exactly what this case exists to exclude: with our own leg dead, gwA would \
+                 leave `Relayed` for a reason that has nothing to do with detecting peer \
+                 ABSENCE. The premise (relay healthy and reachable, our leg alive, only the \
+                 PEER gone) is void — this run pins nothing. Check that \
+                 `sever_peer_from_relay` blackholed the relay in gwB's router ONLY, and that \
+                 gwA's liveness probes are still reaching the relay",
+                severed_at.elapsed()
+            );
+        }
 
         if st_a.as_deref() == Some("relayed") {
             min_open_while_relayed = min_open_while_relayed.min(open);
         }
-        if peer_departed_at.is_none() && open < 2 {
+        if peer_departed_at.is_none() && open == 1 {
             peer_departed_at = Some(severed_at.elapsed());
             state_at_departure = st_a.clone();
             eprintln!(
-                "case5: relay census dropped to {open} at t+{:?} after the blackhole — the \
-                 peer is gone from the relay (gwA={st_a:?}, gwB={:?})",
+                "case5: relay census went 2 -> 1 at t+{:?} after the blackhole — the peer is \
+                 gone from the relay and the survivor's connection is still held \
+                 (gwA={st_a:?}, gwB={:?})",
                 severed_at.elapsed(),
                 path_state(&sc.gwb),
             );
         }
-        if matches!(trans_a, Some(n) if n > baseline_a) {
+        if noticed {
             survivor_noticed_at = Some(severed_at.elapsed());
             eprintln!(
                 "case5: gwA emitted relayed->disconnected ({trans_a:?}) at t+{:?} after the \
@@ -2188,28 +2234,41 @@ async fn case5_peer_departure_unpins_survivor_from_relayed() {
     let Some(peer_departed_at) = peer_departed_at else {
         dump_diag("case5 peer-never-departed", &sc);
         panic!(
-            "case5: the relay still held 2 open connections {:?} after gwB's router \
-             blackholed it — the peer never actually left the relay, so nothing about the \
-             surviving gateway was exercised. Check the blackhole and the relay's \
-             max_idle_timeout (expected departure within {CASE5_PEER_DEPART_BUDGET:?})",
+            "case5: never observed the relay's connection census at EXACTLY 1 in the {:?} \
+             since gwB's router blackholed it (last reading {last_open}). At a steady 2 the \
+             peer never actually left the relay, so nothing about the surviving gateway was \
+             exercised — check the blackhole and the relay's max_idle_timeout (expected \
+             departure within {CASE5_PEER_DEPART_BUDGET:?}). A 2 -> 0 that skipped past 1 \
+             between two 500ms samples would mean BOTH legs went, which is not this case \
+             either; the departure instant is unmeasurable in that run and the latency below \
+             would be meaningless",
             severed_at.elapsed()
         );
     };
     if state_at_departure.as_deref() != Some("relayed") {
         dump_diag("case5 ambiguous-departure", &sc);
         panic!(
-            "case5: the relay's census dropped below 2 while gwA read {state_at_departure:?}, \
-             not `relayed` — which side's connection went away is then ambiguous, so this run \
+            "case5: the relay's census went to 1 while gwA read {state_at_departure:?}, not \
+             `relayed` — which side's connection went away is then ambiguous, so this run \
              cannot pin anything. Investigate before reading the verdict below"
         );
     }
+    // Backstop for the in-loop `open == 0 && !noticed` check above (which is
+    // fatal on the spot, so reaching here with a 0 should be impossible: the
+    // gauge and the counter come from the SAME scrape, so a sample cannot
+    // report `relayed` and a taken `relayed -> disconnected` edge at once).
+    // Kept as the documented FLOOR across the whole observation window —
+    // deliberately an inequality, not an exact-value test: it asserts that
+    // the survivor's connection was continuously present, not that any
+    // particular transition happened.
     if min_open_while_relayed == 0 {
-        dump_diag("case5 survivor-connection-died", &sc);
+        dump_diag("case5 survivor-connection-died (post-loop backstop)", &sc);
         panic!(
-            "case5: the relay's census reached 0 while gwA still read `relayed` — this run \
-             reproduced connection death on the SURVIVING side, which is case 4's scenario, \
-             not this one. The premise (relay healthy and reachable, our leg alive, only the \
-             PEER gone) is void; nothing here pins peer-departure detection"
+            "case5: the relay's census reached 0 at some sample where gwA still read \
+             `relayed` — this run reproduced connection death on the SURVIVING side, which is \
+             case 4's scenario, not this one. The premise (relay healthy and reachable, our \
+             leg alive, only the PEER gone) is void; nothing here pins peer-departure \
+             detection"
         );
     }
 
