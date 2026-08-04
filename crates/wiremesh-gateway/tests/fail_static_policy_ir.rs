@@ -26,14 +26,23 @@
 //! state, save it through the writer, load the file back, assert on what
 //! landed.
 //!
-//! ## Coverage gap — read before trusting the truth table
+//! ## Decodability is exact
 //!
-//! `policy_ir_is_decodable`'s 12-byte fast path returns `true` WITHOUT
-//! decoding, so an IR that starts `{"schema":1,` and is then truncated or
-//! structurally broken is reported decodable and gets persisted. That case
-//! is deliberately NOT asserted here in either direction: asserting `false`
-//! would fail, and asserting `true` would enshrine it. See my report — it is
-//! a finding, not a test gap I chose.
+//! [`policy_ir_is_decodable`] asks the real decoder and nothing else:
+//! `is_empty() || PolicyIR::from_json(..).is_ok()`. An earlier revision put
+//! a 12-byte `{"schema":1,` prefix check in front of it and returned `true`
+//! on a match without decoding, on the theory that "does not look like a
+//! schema-1 IR" and "is broken" are the same set. They are not — the bare
+//! prefix, a document truncated mid-`blocks`, and
+//! `{"schema":1,"version":"four",...}` all match the prefix and all fail to
+//! decode, so precisely the corruption cases this guard exists for were
+//! waved through and persisted. Those three are now asserted below, both at
+//! the predicate and at the save.
+//!
+//! The "have I already decoded these exact bytes" optimization lives in
+//! [`FailStaticWriter::save`] instead, as a memcmp against the last IR that
+//! decoded — exact rather than approximate, and immune to any change in the
+//! canonical JSON form.
 
 use std::path::Path;
 
@@ -127,7 +136,7 @@ fn empty_policy_ir_is_decodable() {
     assert!(policy_ir_is_decodable(b""));
 }
 
-/// A real canonical schema-1 IR, via the fast path.
+/// A real canonical schema-1 IR.
 #[test]
 fn canonical_schema_1_is_decodable() {
     assert!(policy_ir_is_decodable(&good_ir_bytes(1)));
@@ -148,14 +157,8 @@ fn canonical_schema_1_is_decodable() {
 /// JSON" rather than on a successful `from_json`.
 #[test]
 fn schema_2_is_not_decodable() {
-    let bytes = schema2_ir_bytes();
     assert!(
-        bytes.starts_with(br#"{"schema":2,"#),
-        "fixture sanity: a schema-2 IR must not accidentally carry the schema-1 prefix, or \
-         this test would be passing through the fast path instead of the decode"
-    );
-    assert!(
-        !policy_ir_is_decodable(&bytes),
+        !policy_ir_is_decodable(&schema2_ir_bytes()),
         "an IR this build cannot install must never be considered persistable"
     );
 }
@@ -181,79 +184,123 @@ fn garbage_bytes_are_not_decodable() {
     assert!(!policy_ir_is_decodable(&[0xff, 0xfe, 0x00, 0x01]));
 }
 
-/// The slow path is a genuine fallback, not dead code: a schema-1 IR that is
-/// perfectly valid but NOT in canonical byte form (here, one extra space, as
-/// a re-serialization by any other JSON writer would produce) misses the
-/// 12-byte prefix and is still accepted by the full decode behind it.
+/// Decodability is defined by the DECODER, not by byte shape: a schema-1 IR
+/// that is perfectly valid but not in canonical byte form (here, extra
+/// spaces, as re-serialization by any other JSON writer would produce) is
+/// accepted.
 ///
-/// This is the property that makes the fast path an optimization rather than
-/// a format lock-in, so it is worth pinning explicitly.
+/// Newly load-bearing since the optimization moved into the writer: the
+/// memcmp fast path is byte-exact, so an equivalent-but-differently-spelled
+/// IR does NOT match it and falls through to a real decode. That decode must
+/// say yes, or a controller whose JSON writer emits spaces would have every
+/// one of its policies treated as corrupt.
 #[test]
-fn valid_but_non_canonical_schema_1_still_decodes_via_the_slow_path() {
-    let spaced = br#"{"schema": 1, "version": 4, "blocks": []}"#;
+fn valid_but_non_canonical_schema_1_still_decodes() {
     assert!(
-        !spaced.starts_with(br#"{"schema":1,"#),
-        "fixture sanity: this input must MISS the fast path, or it proves nothing"
+        policy_ir_is_decodable(br#"{"schema": 1, "version": 4, "blocks": []}"#),
+        "a valid schema-1 IR in non-canonical byte form must still be persistable"
     );
-    assert!(
-        policy_ir_is_decodable(spaced),
-        "a valid schema-1 IR in non-canonical byte form must still be persistable — the \
-         prefix is a fast path, not the definition of decodable"
-    );
+    // Field order is not part of the contract either — serde accepts any.
+    assert!(policy_ir_is_decodable(br#"{"blocks":[],"version":4,"schema":1}"#));
 }
 
-/// Structurally broken and NOT prefix-matching: caught by the full decode.
-/// (The prefix-MATCHING broken case is the gap documented in this file's
-/// header; it is not asserted here.)
+/// **The cases the old prefix heuristic waved through.** Each of these
+/// begins with the exact 12 bytes `{"schema":1,` and each fails to decode.
+/// They are the corruption shapes this guard exists for — a partial write of
+/// the controller's `policy_version.compiled_ir` column, a damaged backup,
+/// a truncated restore — and the previous implementation reported all three
+/// as persistable.
+///
+/// Sabotage that must turn this red: reintroduce any "looks like schema 1"
+/// short-circuit ahead of `PolicyIR::from_json`.
 #[test]
-fn broken_schema_1_without_the_prefix_is_not_decodable() {
-    // Truncated mid-document, and the space after the colon keeps it off the
-    // fast path.
+fn prefix_matching_but_broken_documents_are_not_decodable() {
+    const PREFIX: &[u8] = br#"{"schema":1,"#;
+    for bytes in [
+        // The bare prefix and nothing else.
+        br#"{"schema":1,"#.as_slice(),
+        // Truncated mid-document, exactly as a partial write would leave it.
+        br#"{"schema":1,"version":1,"blocks":"#.as_slice(),
+        // Complete, valid JSON, right field names — wrong type on `version`.
+        br#"{"schema":1,"version":"four","blocks":[]}"#.as_slice(),
+    ] {
+        assert!(
+            bytes.starts_with(PREFIX),
+            "fixture sanity: this case only means something if it DOES carry the prefix \
+             the old heuristic keyed on"
+        );
+        assert!(
+            !policy_ir_is_decodable(bytes),
+            "carrying the canonical prefix is not evidence of being decodable: {}",
+            String::from_utf8_lossy(bytes)
+        );
+    }
+}
+
+/// Structurally broken without the prefix — the cases the old heuristic did
+/// catch, kept so the fix is not mistaken for a wholesale rewrite of what
+/// counts as broken.
+#[test]
+fn broken_schema_1_documents_are_not_decodable() {
     assert!(!policy_ir_is_decodable(br#"{"schema": 1, "version": 4"#));
-    // Right field names, wrong types.
     assert!(!policy_ir_is_decodable(br#"{"schema": 1, "version": "four", "blocks": []}"#));
-    // `blocks` is not a list.
     assert!(!policy_ir_is_decodable(br#"{"schema": 1, "version": 4, "blocks": {}}"#));
 }
 
-/// Skepticism item, made executable: the fast path is only correct if EVERY
-/// legitimate schema-1 IR serializes with `{"schema":1,` as its first 12
-/// bytes. `PolicyIR`'s fields are declared `schema, version, blocks` with no
-/// `rename`, no `skip_serializing_if` and no map/float members, and
-/// `to_canonical_json` is plain `serde_json::to_string` — so the invariant
-/// holds by construction today. It is not enforced by anything, though: a
-/// field reorder in `wiremesh-policy`'s `ir.rs` would silently demote every
-/// healthy IR to the slow path (a full decode on every Sync `State` event),
-/// and a future `#[serde(skip_serializing_if)]` on `version` with empty
-/// `blocks` could drop the trailing comma outright.
+/// **The property that actually matters**: a save carrying one of those
+/// prefix-matching-but-broken IRs must SUBSTITUTE, not persist. Predicate
+/// tests alone would not have caught the old bug reaching disk.
 ///
-/// Sabotage that must turn this red: reorder `PolicyIR`'s fields, rename
-/// `schema`, or switch `to_canonical_json` to `to_string_pretty`.
+/// Run through the writer three times over, one bad shape each, from a
+/// writer holding a known-good pair — so a regression shows up as the broken
+/// bytes landing in `state.json` and being replayed on every future boot,
+/// which is the whole failure mode this type exists to end.
 #[test]
-fn every_legitimate_schema_1_ir_carries_the_fast_path_prefix() {
-    const PREFIX: &[u8] = br#"{"schema":1,"#;
-    let cases = vec![
-        ("no blocks, version 0", PolicyIR { schema: 1, version: 0, blocks: vec![] }),
-        ("no blocks, version 1", PolicyIR { schema: 1, version: 1, blocks: vec![] }),
-        ("one block", good_ir(1)),
-        ("large version", good_ir(u64::MAX)),
-        ("many blocks", {
-            let mut ir = good_ir(12);
-            let block = ir.blocks[0].clone();
-            ir.blocks = vec![block.clone(), block.clone(), block];
-            ir
-        }),
-    ];
-    for (name, ir) in cases {
-        let json = ir.to_canonical_json();
+fn a_save_carrying_a_prefix_matching_but_broken_ir_substitutes() {
+    for (name, bad) in [
+        ("bare prefix", br#"{"schema":1,"#.to_vec()),
+        ("truncated", br#"{"schema":1,"version":1,"blocks":"#.to_vec()),
+        ("wrong type", br#"{"schema":1,"version":"four","blocks":[]}"#.to_vec()),
+    ] {
+        let dir = TempDir::new().unwrap();
+        let mut w = FailStaticWriter::default();
+        w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("save good");
+
+        w.save(&rich_state(12, 9, bad.clone()), dir.path()).expect("save bad");
+
+        let got = load(dir.path());
+        assert_ne!(got.policy_ir, bad, "{name}: broken bytes must never reach state.json");
+        assert_eq!(got.policy_version, 5, "{name}: the last good version is what is written");
+        assert_eq!(got.policy_ir, good_ir_bytes(5), "{name}: with its IR");
         assert!(
-            json.as_bytes().starts_with(PREFIX),
-            "{name}: a legitimate schema-1 IR must serialize with the fast-path prefix, \
-             otherwise `policy_ir_is_decodable` silently full-decodes every healthy IR on \
-             every Sync State event. Got: {}",
-            &json[..json.len().min(40)]
+            policy_ir_is_decodable(&got.policy_ir),
+            "{name}: whatever lands must be installable on the next boot"
         );
     }
+}
+
+/// The invariant that makes keying `last_good` on IR BYTES sound: two
+/// policies that differ only in version serialize differently, because
+/// `version` is a field of the IR itself. So byte-identical IRs always carry
+/// the same `policy_version`, and the memcmp fast path can never persist a
+/// stale version number alongside matching bytes.
+///
+/// Worth pinning here (unlike the old prefix test, which the gateway no
+/// longer depends on at all) because this IS a live assumption of
+/// `FailStaticWriter::save`. `wiremesh-policy` owns the invariant; the
+/// gateway is the consumer relying on it.
+///
+/// Sabotage that must turn this red: drop `version` from `PolicyIR`'s
+/// serialized form, or make `to_canonical_json` emit only `blocks`.
+#[test]
+fn ir_bytes_encode_the_policy_version() {
+    assert_ne!(
+        good_ir_bytes(5),
+        good_ir_bytes(6),
+        "two IRs differing only in version must differ in bytes — otherwise a byte-keyed \
+         `last_good` could hold a version number that does not describe its own IR"
+    );
+    assert_eq!(good_ir_bytes(5), good_ir_bytes(5), "and the encoding is deterministic");
 }
 
 // --- (b) the three substitution outcomes -----------------------------------
@@ -486,19 +533,139 @@ fn seeded_from_an_empty_ir_state_json_is_equivalent_to_no_policy() {
     assert!(got.policy_ir.is_empty());
 }
 
-// --- (e) repeated bad saves ------------------------------------------------
+// --- the memcmp fast path --------------------------------------------------
 
-/// The behavioural half of the log-dedupe requirement: whatever the writer
-/// logs, repeated saves under a broken controller must keep producing the
-/// same correct file. Peer churn is the realistic driver — every
-/// `EndpointObserved` delta is another `State` event, so this path runs
-/// often while the controller is broken, and each pass must carry the fresh
-/// device half through with the same substituted policy.
+/// A byte-identical re-save is the steady-state case: peer churn, endpoint
+/// observations and every reconnect snapshot re-send the same policy, and
+/// the writer answers them with a memcmp instead of a parse.
 ///
-/// **The dedupe ITSELF is not observable here.** `FailStaticWriter::warned`
-/// is private with no accessor and the CRITICAL line goes to `eprintln!`,
-/// which an in-process integration test cannot capture. I have not faked it
-/// — see my report for the one-line seam that would make it assertable.
+/// **"Does not re-parse" is pinned behaviourally, not by timing.** A timing
+/// assertion on a sub-microsecond memcmp against a sub-millisecond parse
+/// would be noise, and would fail on a loaded container for reasons having
+/// nothing to do with the property. What is asserted instead is the contract
+/// the fast path has to preserve: the same bytes go out verbatim, every
+/// time, with the current device half, and the fast path never becomes a
+/// blanket "we have a last_good, wave it through" — different bytes that are
+/// undecodable must still substitute.
+#[test]
+fn byte_identical_resaves_are_persisted_verbatim() {
+    let dir = TempDir::new().unwrap();
+    let mut w = FailStaticWriter::default();
+    let ir = good_ir_bytes(5);
+
+    // First save: the decode path.
+    w.save(&rich_state(11, 5, ir.clone()), dir.path()).expect("first save");
+
+    // Ten more State events carrying the SAME policy bytes and an advancing
+    // revision — the memcmp path.
+    for revision in 12..=21 {
+        let ds = rich_state(revision, 5, ir.clone());
+        w.save(&ds, dir.path()).expect("re-save");
+        assert_eq!(load(dir.path()), ds, "revision {revision}: persisted verbatim");
+    }
+
+    // The fast path must not have become an unconditional accept: a genuinely
+    // different, undecodable IR still substitutes.
+    w.save(&rich_state(22, 9, schema2_ir_bytes()), dir.path()).expect("save bad");
+    let got = load(dir.path());
+    assert_eq!(got.policy_version, 5, "different bytes must be decoded, not waved through");
+    assert_eq!(got.policy_ir, ir);
+}
+
+// --- (e) the warning dedupe ------------------------------------------------
+
+/// `warned_version()` exposes the once-per-distinct-bad-version dedupe. The
+/// CRITICAL line itself goes to `eprintln!`, which an in-process test cannot
+/// capture; this accessor is the observable proxy for "would a line have
+/// been emitted".
+///
+/// Peer churn under a broken controller is the driver: every
+/// `EndpointObserved` delta is another `State` event, so without the dedupe
+/// a single bad policy version would emit one CRITICAL per event for as long
+/// as the controller stayed broken.
+#[test]
+fn the_warning_is_deduplicated_per_distinct_bad_version() {
+    let dir = TempDir::new().unwrap();
+    let mut w = FailStaticWriter::default();
+    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("save good");
+    assert_eq!(w.warned_version(), None, "a clean save has nothing to warn about");
+
+    // First bad save at version 9: warned.
+    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path()).expect("bad v9");
+    assert_eq!(w.warned_version(), Some(9));
+
+    // Repeats at the SAME bad version: still 9, i.e. no new line.
+    for revision in 13..=16 {
+        w.save(&rich_state(revision, 9, schema2_ir_bytes()), dir.path()).expect("bad v9 again");
+        assert_eq!(
+            w.warned_version(),
+            Some(9),
+            "revision {revision}: churn at the same bad version must not re-warn"
+        );
+    }
+
+    // A DIFFERENT bad version is a new fact and moves the marker.
+    let mut other_bad = good_ir(10);
+    other_bad.schema = 2;
+    w.save(&rich_state(17, 10, other_bad.to_canonical_json().into_bytes()), dir.path())
+        .expect("bad v10");
+    assert_eq!(w.warned_version(), Some(10), "a new bad version must warn again");
+}
+
+/// Reset on a clean save, via the DECODE path: the controller is fixed, a
+/// readable policy lands, and the marker clears — so if it breaks again
+/// later at the same version, that is a new incident and warns again.
+#[test]
+fn a_clean_save_via_the_decode_path_resets_the_warning() {
+    let dir = TempDir::new().unwrap();
+    let mut w = FailStaticWriter::default();
+    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("good v5");
+    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path()).expect("bad v9");
+    assert_eq!(w.warned_version(), Some(9));
+
+    // New, decodable bytes → decode path.
+    w.save(&rich_state(13, 6, good_ir_bytes(6)), dir.path()).expect("good v6");
+    assert_eq!(w.warned_version(), None, "recovery clears the marker");
+
+    // Same bad version returns: a fresh incident, warned again.
+    w.save(&rich_state(14, 9, schema2_ir_bytes()), dir.path()).expect("bad v9 again");
+    assert_eq!(w.warned_version(), Some(9));
+}
+
+/// Reset on a clean save via the MEMCMP path specifically — the newer of the
+/// two clean paths, and the one that runs in steady state. A gateway that
+/// recovers because the controller re-sends the policy it already had (a
+/// reconnect snapshot, not a new policy) takes this branch, and it must
+/// clear the marker just like the decode path does. Missing the reset here
+/// would silently suppress the next genuine CRITICAL.
+#[test]
+fn a_clean_save_via_the_memcmp_path_resets_the_warning() {
+    let dir = TempDir::new().unwrap();
+    let mut w = FailStaticWriter::default();
+    let ir = good_ir_bytes(5);
+    w.save(&rich_state(11, 5, ir.clone()), dir.path()).expect("good v5");
+    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path()).expect("bad v9");
+    assert_eq!(w.warned_version(), Some(9));
+
+    // The SAME policy bytes arrive again — the memcmp branch, no decode.
+    w.save(&rich_state(13, 5, ir.clone()), dir.path()).expect("re-send of v5");
+    assert_eq!(
+        w.warned_version(),
+        None,
+        "the memcmp fast path is a clean save too and must reset the marker; otherwise a \
+         later genuine CRITICAL at the same version would be swallowed"
+    );
+
+    // Proof that it would now warn again rather than staying silent.
+    w.save(&rich_state(14, 9, schema2_ir_bytes()), dir.path()).expect("bad v9 again");
+    assert_eq!(w.warned_version(), Some(9));
+}
+
+// --- repeated bad saves ----------------------------------------------------
+
+/// Output correctness under sustained churn, alongside the dedupe above:
+/// each pass must carry the fresh device half through with the same
+/// substituted policy.
 #[test]
 fn repeated_saves_under_a_broken_controller_stay_correct() {
     let dir = TempDir::new().unwrap();
