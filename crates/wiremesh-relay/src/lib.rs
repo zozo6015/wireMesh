@@ -9,7 +9,10 @@
 //     `registration_key(my_identity, peer_identity)` — an 8-byte id nobody
 //     but the cert holder can register under. It replies with a 1-byte ack
 //     once the entry is in its registry.
-//   - Datagrams sent to the relay: `[8B dest_key][payload]`.
+//   - Datagrams sent to the relay: `[8B dest_key][payload]`. `dest_key` is
+//     PINNED: the only value the relay will forward is
+//     `registration_key(peer_identity, my_identity)` for the pair THIS
+//     connection registered. Anything else is dropped (see `serve`).
 //   - Datagrams the relay forwards to the destination: `[8B src_key][payload]`.
 //
 // SECURITY (Cycle 4c): the registration id used to be an opaque, self-asserted
@@ -19,6 +22,15 @@
 // key whose `my_identity` half equals its own cert-embedded `gw-<id>`, and a
 // slot already held by a DIFFERENT cert is never blind-overwritten. See
 // `serve`, `identity_from_client_cert`, and `registration_key`.
+//
+// SECURITY (item 3a): that bound the RECEIVE side only — the send side still
+// forwarded to any `dest` on the wire, so any enrolled gateway could inject
+// into any pair's slot. `serve` now pins `dest` to the sending connection's
+// own registered pair. Two related holes closed with it: the key is now 8 RAW
+// digest bytes rather than 4 hex-expanded ones (a 32-bit space is
+// brute-forceable to a chosen pair's slot, because `peer_identity` is NOT
+// cert-bound), and a same-owner registration for a DIFFERENT pair is rejected
+// instead of silently replacing the incumbent (`register_decision`).
 use anyhow::{anyhow, bail, Context, Result};
 use quinn::{
     crypto::rustls::{QuicClientConfig, QuicServerConfig},
@@ -47,6 +59,63 @@ const RELAY_SERVER_NAME: &str = "relay";
 /// misbehaving/hostile peer from streaming an unbounded registration.
 const MAX_REGISTRATION_BYTES: usize = 1024;
 
+/// Minimum spacing between repeated log lines of ONE kind from ONE connection
+/// in `serve`'s datagram loop (see [`DatagramDropLog`]). Every event is
+/// counted, but at most one line per kind per connection per interval is
+/// emitted, and it carries the running count.
+///
+/// This is a hard requirement, not tidiness: every branch in that loop runs
+/// once per received datagram, and an attacker holding any valid gateway cert
+/// controls how fast datagrams arrive. An unbounded `eprintln!` on any of
+/// those branches lets it amplify a few bytes of work into unbounded stderr
+/// I/O on the relay — a cheaper DoS than the one dest-pinning closes.
+const DATAGRAM_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Per-connection, per-branch rate limiter for `serve`'s datagram loop.
+///
+/// Deliberately ONE INSTANCE PER BRANCH rather than one shared limiter for
+/// the whole loop. A shared limiter is simpler, but the branches have
+/// different audiences and one can drown out another: a cross-pair injector
+/// sending at line rate would hold the shared token permanently and suppress
+/// the `unknown dest` line — which is exactly the line an operator greps for
+/// during the [`registration_key`] lockstep upgrade, when a version-skewed
+/// pair's only symptom is that it never rendezvouses. Each kind is therefore
+/// guaranteed to surface within one interval no matter how loud the others
+/// are; three counters and three `Instant`s per connection is nothing.
+struct DatagramDropLog {
+    /// Total events of this kind on this connection, including suppressed
+    /// ones — reported in every emitted line so a suppressed burst is still
+    /// visible as a number.
+    count: u64,
+    last_logged: Option<std::time::Instant>,
+}
+
+impl DatagramDropLog {
+    fn new() -> DatagramDropLog {
+        DatagramDropLog { count: 0, last_logged: None }
+    }
+
+    /// Records one event. Returns `Some(total_so_far)` when a line is due
+    /// (first event, or [`DATAGRAM_LOG_INTERVAL`] since the last emitted
+    /// one), `None` when it must be suppressed. Counting happens either way.
+    fn record(&mut self) -> Option<u64> {
+        self.count += 1;
+        let now = std::time::Instant::now();
+        let due = match self.last_logged {
+            None => true,
+            Some(t) => now.duration_since(t) >= DATAGRAM_LOG_INTERVAL,
+        };
+        if due {
+            self.last_logged = Some(now);
+            Some(self.count)
+        } else {
+            None
+        }
+    }
+}
+
+pub mod enroll;
+
 /// Deterministic 8-byte relay-registry id for the ordered
 /// `(my_identity, peer_identity)` pair. This is the ONE derivation shared by
 /// both sides: the relay keys its registry with `registration_key(my, peer)`
@@ -55,13 +124,41 @@ const MAX_REGISTRATION_BYTES: usize = 1024;
 /// registered under — so the two ends rendezvous.
 ///
 /// The identity strings are length-prefixed before hashing so that
-/// `("gwa","b")` and `("gw","ab")` can never collide by concatenation. Only
-/// the first 4 SHA-256 bytes are used, hex-encoded to 8 ASCII bytes to fit the
-/// relay's fixed 8-byte key/datagram-header width — a 32-bit id space,
-/// collision-safe at v1's ≤50-segment scale (a wider raw `[u8;8]` id is a
-/// documented fast-follow, unchanged from the previous `relay_pair_id`).
-pub mod enroll;
-
+/// `("gwa","b")` and `("gw","ab")` can never collide by concatenation.
+///
+/// # Width: the first 8 RAW digest bytes (item 3a)
+///
+/// This used to take only the first **4** digest bytes and hex-expand them
+/// into the 8 header bytes — 8 ASCII characters carrying **32 bits**. The
+/// header width never changed; the entropy in it was simply thrown away. Two
+/// consequences, one of which is a security bug:
+///
+///   * *Accidental* collisions were a probabilistic, self-healing
+///     mutual-exclusion fault between two pairs registered on the SAME relay
+///     process at the same time (~0.07% at v1's ≤50-segment scale) — plus a
+///     silent same-owner variant, see [`register_decision`]. That is the part
+///     the old comment here called "collision-safe at v1's ≤50-segment
+///     scale", and for accidents at that scale it was true.
+///   * *Adversarial* collisions were cheap, and the scale argument says
+///     nothing about them. `peer_identity` is NOT cert-bound (only
+///     `my_identity` is — see `serve`), so the holder of ANY valid gateway
+///     cert can pick peer strings freely and brute-force a P with
+///     `registration_key("gw-C", P) == registration_key("gw-A", "gw-B")`. At
+///     32 bits that is a ~4.3e9-single-block-SHA-256 target preimage —
+///     minutes on a laptop — after which gw-C occupies gw-A's slot: gw-A's
+///     own registration is rejected for as long as gw-C holds it, and gw-B's
+///     datagrams for that slot are delivered to gw-C. WireGuard's E2E
+///     encryption still holds, so it is targeted DoS plus interception of a
+///     chosen pair's relay leg, not a confidentiality break. At 64 bits the
+///     same preimage search is ~1.8e19 hashes.
+///
+/// **This is a LOCKSTEP change.** The relay recomputes the key itself from
+/// the authenticated cert (`serve`) and each gateway computes its own dest in
+/// [`Client::finish_connect`]; all three must agree byte-for-byte or a pair
+/// silently never rendezvouses (`unknown dest` on the relay, nothing at all
+/// on the gateway). A relay and a gateway on different sides of this change
+/// cannot bridge. Nothing else on the wire moves — same 8-byte header, same
+/// framing, same MTU — so the upgrade is coordinated but not staged.
 pub fn registration_key(my_identity: &str, peer_identity: &str) -> [u8; 8] {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -70,15 +167,25 @@ pub fn registration_key(my_identity: &str, peer_identity: &str) -> [u8; 8] {
     hasher.update(peer_identity.as_bytes());
     let digest = hasher.finalize();
     let mut out = [0u8; 8];
-    for (i, b) in digest[..4].iter().enumerate() {
-        let hex = [HEX[(b >> 4) as usize], HEX[(b & 0x0f) as usize]];
-        out[i * 2] = hex[0];
-        out[i * 2 + 1] = hex[1];
-    }
+    out.copy_from_slice(&digest[..8]);
     out
 }
 
-const HEX: [u8; 16] = *b"0123456789abcdef";
+/// Renders a registration key for a log line. The key used to be 8 ASCII hex
+/// characters, so the logs printed it with `String::from_utf8_lossy`; it is
+/// now 8 RAW digest bytes, which lossy-decode to replacement-character
+/// mojibake. Hex-encode explicitly so operator-facing lines (and the
+/// `unknown dest` / cross-pair-drop diagnostics an operator greps for) stay
+/// readable and greppable.
+fn key_hex(key: &[u8; 8]) -> String {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    let mut s = String::with_capacity(16);
+    for b in key {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
+}
 
 /// Encodes a registration payload: `[2B my_len BE][my_identity][peer_identity]`.
 fn encode_registration(my_identity: &str, peer_identity: &str) -> Vec<u8> {
@@ -427,15 +534,78 @@ impl Client {
     }
 }
 
-/// One registry slot: the live connection plus the cert-bound identity that
-/// owns it. `owner` is what makes duplicate registrations safe — a second
-/// registration for the same key is only allowed to REPLACE the slot when it
-/// comes from the SAME cert identity (a reconnect), never a different one (an
-/// eviction/redirection attempt).
+/// One registry slot: the live connection plus the (owner, peer) pair that
+/// occupies it. `owner` is the cert-bound identity — it is what makes
+/// duplicate registrations safe, since a second registration for the same key
+/// may only REPLACE the slot when it comes from the SAME cert identity.
+///
+/// `peer` is recorded for exactly one reason: without it the relay cannot
+/// tell a same-owner RECONNECT (same pair, must replace) from a same-owner
+/// KEY COLLISION (a different pair that hashed onto this slot, must be
+/// rejected — replacing it would silently cross-wire two of one gateway's
+/// legs, because the receiving gateway discards the forwarded src header).
+/// See [`register_decision`], which is the whole rule as a pure function.
 #[derive(Clone)]
 struct RegEntry {
     conn: Connection,
     owner: String,
+    peer: String,
+}
+
+/// What [`register_decision`] says to do with an incoming registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegisterDecision {
+    /// The slot is free. Insert.
+    Accept,
+    /// Same owner, same peer: an honest reconnect after a stale/half-open
+    /// connection taking its own slot back. Insert over the incumbent.
+    /// (`remove_if_owner` is what stops the stale connection's later teardown
+    /// from evicting this replacement.)
+    ReplaceOwnSlot,
+    /// The slot is held by a DIFFERENT cert identity. Reject — this is the
+    /// eviction/redirection attempt `tests/impersonation.rs` pins.
+    RejectOwnedByOther,
+    /// Same owner, DIFFERENT peer: two of this gateway's own pairs hashed
+    /// onto one slot. Reject rather than replace.
+    RejectKeyCollision,
+}
+
+/// The relay's duplicate-registration rule, extracted as a pure function so
+/// the full 2x2 (same/different owner × same/different peer) is decidable and
+/// testable without a real key collision and without a relay process — the
+/// repo's `mint_action` / `relay_identity_persisted` pattern.
+///
+/// `existing` is the incumbent slot's `(owner, peer)`, or `None` if the key is
+/// free. `cert_identity` is the CERT-bound identity of the registering
+/// connection (never the self-asserted one); `peer_identity` is the peer half
+/// it registered.
+///
+/// Ownership is checked FIRST and unconditionally: a different owner is
+/// rejected whatever the peer half says, because the peer half is
+/// attacker-chosen (it is not cert-bound) and must never be able to upgrade a
+/// rejection into a replace.
+///
+/// The `RejectKeyCollision` arm is the one that used to fall through to a
+/// silent `reg.insert`: the old check compared only `existing.owner`, so a
+/// same-owner different-pair collision replaced the incumbent with no log and
+/// no error, and the first pair's datagrams then landed on the second pair's
+/// local socket (the gateway's downlink drops the src header, so boringtun
+/// roams the endpoint onto the wrong leg). With the widened
+/// [`registration_key`] that arm should now be unreachable in practice; it is
+/// kept — and fails CLOSED — because "should be unreachable" is not a
+/// guarantee, and a silent cross-wire is a far worse outcome than a rejected
+/// registration the gateway retries.
+pub fn register_decision(
+    existing: Option<(&str, &str)>,
+    cert_identity: &str,
+    peer_identity: &str,
+) -> RegisterDecision {
+    match existing {
+        None => RegisterDecision::Accept,
+        Some((owner, _)) if owner != cert_identity => RegisterDecision::RejectOwnedByOther,
+        Some((_, peer)) if peer == peer_identity => RegisterDecision::ReplaceOwnSlot,
+        Some(_) => RegisterDecision::RejectKeyCollision,
+    }
 }
 
 /// In-memory registry mapping a registration key to its owning connection.
@@ -578,23 +748,47 @@ pub async fn serve(endpoint: Endpoint) {
             let key = registration_key(&my_identity, &peer_identity);
 
             // SECURITY: never blind-overwrite a slot owned by a DIFFERENT cert
-            // (that was the eviction/redirection DoS). A same-owner reconnect
-            // is fine — it replaces its own slot.
+            // (that was the eviction/redirection DoS), and never silently
+            // replace a same-owner slot that belongs to a DIFFERENT pair (that
+            // was the silent cross-wire). The whole rule is
+            // `register_decision`; this block only executes it.
             {
                 let mut reg = registry.lock().await;
-                if let Some(existing) = reg.get(&key) {
-                    if existing.owner != cert_identity {
+                let decision = register_decision(
+                    reg.get(&key).map(|e| (e.owner.as_str(), e.peer.as_str())),
+                    &cert_identity,
+                    &peer_identity,
+                );
+                match decision {
+                    RegisterDecision::RejectOwnedByOther => {
+                        let owner = reg.get(&key).map(|e| e.owner.clone()).unwrap_or_default();
                         eprintln!(
-                            "relay: rejecting registration for key {:?}: already held by {:?}, \
+                            "relay: rejecting registration for key {}: already held by {:?}, \
                              refusing overwrite by {:?}",
-                            String::from_utf8_lossy(&key),
-                            existing.owner,
+                            key_hex(&key),
+                            owner,
                             cert_identity
                         );
                         drop(reg);
                         conn.close(3u32.into(), b"registration id in use");
                         return;
                     }
+                    RegisterDecision::RejectKeyCollision => {
+                        let held_peer = reg.get(&key).map(|e| e.peer.clone()).unwrap_or_default();
+                        eprintln!(
+                            "relay: rejecting registration for key {}: {:?} already holds this \
+                             slot for peer {:?}, refusing to replace it with a DIFFERENT pair \
+                             (peer {:?}) — this is a registration-key COLLISION, not a reconnect",
+                            key_hex(&key),
+                            cert_identity,
+                            held_peer,
+                            peer_identity
+                        );
+                        drop(reg);
+                        conn.close(4u32.into(), b"registration id collision");
+                        return;
+                    }
+                    RegisterDecision::Accept | RegisterDecision::ReplaceOwnSlot => {}
                 }
                 // Insert *before* acking: the client blocks on the ack before
                 // it does anything else, so this ordering guarantees a
@@ -604,6 +798,7 @@ pub async fn serve(endpoint: Endpoint) {
                     RegEntry {
                         conn: conn.clone(),
                         owner: cert_identity.clone(),
+                        peer: peer_identity.clone(),
                     },
                 );
             }
@@ -614,27 +809,106 @@ pub async fn serve(endpoint: Endpoint) {
                 return;
             }
             eprintln!(
-                "relay: registered key={:?} owner={cert_identity:?} peer={peer_identity:?} from {}",
-                String::from_utf8_lossy(&key),
+                "relay: registered key={} owner={cert_identity:?} peer={peer_identity:?} from {}",
+                key_hex(&key),
                 conn.remote_address()
             );
+
+            // SECURITY (item 3a): the ONE destination this connection is
+            // allowed to address. Registration binds the RECEIVE side to the
+            // client certificate (`my_identity == cert_identity` above), but
+            // until now the SEND side was unbound: `serve` forwarded to
+            // whatever `dest` was on the wire, so any enrolled, non-revoked
+            // gateway could enumerate the trivially-guessable `gw-<rowid>`
+            // identities, compute another pair's key and inject into its relay
+            // slot. WireGuard E2E means that is a routing/DoS problem rather
+            // than a confidentiality one, but it was live on every deployed
+            // fabric.
+            //
+            // This connection registered the pair (my_identity,
+            // peer_identity), so the only slot it has any business addressing
+            // is its peer's half — byte-for-byte what `Client::finish_connect`
+            // computes as its own `dest_key`. Computed once, outside the loop:
+            // the per-datagram cost is an 8-byte compare.
+            let allowed_dest = registration_key(&peer_identity, &my_identity);
+
+            // Rate-limiting state, one limiter per log-emitting branch of the
+            // loop below. EVERY branch there is per-datagram and therefore
+            // attacker-paced, so none of them may log unconditionally — see
+            // [`DatagramDropLog`] for why the limiters are per-branch and not
+            // shared. (`unknown dest` is reachable by the same actor that
+            // dest-pinning stops: register `(gw-C, P)` for a peer `P` that
+            // never connects, then flood your OWN legal dest — the pin passes
+            // and the registry lookup misses on every datagram.)
+            let mut runt_log = DatagramDropLog::new();
+            let mut cross_pair_log = DatagramDropLog::new();
+            let mut unknown_dest_log = DatagramDropLog::new();
+            let mut forward_failed_log = DatagramDropLog::new();
 
             loop {
                 let dgram = match conn.read_datagram().await {
                     Ok(dgram) => dgram,
                     Err(e) => {
-                        eprintln!(
-                            "relay: connection for key {:?} closed: {e}",
-                            String::from_utf8_lossy(&key)
-                        );
+                        eprintln!("relay: connection for key {} closed: {e}", key_hex(&key));
                         break;
                     }
                 };
                 if dgram.len() < 8 {
+                    // A datagram too short to even carry the dest header.
+                    // This was the loop's one SILENT drop — no amplification
+                    // risk (it logged nothing at all), but no diagnostic
+                    // either. Counted and bounded like the rest so the loop
+                    // has exactly one shape: every drop is counted, every log
+                    // is rate-limited.
+                    if let Some(n) = runt_log.record() {
+                        eprintln!(
+                            "relay: dropping runt datagram ({} bytes, need >= 8 for the dest \
+                             header) from {:?} on key {} ({n} so far on this connection)",
+                            dgram.len(),
+                            cert_identity,
+                            key_hex(&key)
+                        );
+                    }
                     continue;
                 }
                 let mut dest = [0u8; 8];
                 dest.copy_from_slice(&dgram[..8]);
+
+                if dest != allowed_dest {
+                    // DROP, do not close. Closing the offender's connection is
+                    // tempting (it is fail-closed, and it cannot hurt the
+                    // victim — whose slot and connection must both survive)
+                    // but it is the worse choice on both axes:
+                    //   * Against an attacker it buys nothing. The injector
+                    //     holds a valid cert, so it just reconnects — and a
+                    //     QUIC handshake plus registration costs the RELAY far
+                    //     more than the 8-byte compare that dropped the
+                    //     datagram, so close-on-violation is an amplification
+                    //     the attacker would choose deliberately.
+                    //   * Against a bug it is actively harmful. A gateway
+                    //     whose key derivation diverges from ours (the lockstep
+                    //     upgrade on `registration_key`, or a future wire
+                    //     revision) addresses a dest we compute differently;
+                    //     dropping leaves that as a static, greppable "this
+                    //     pair never rendezvouses" failure, whereas closing
+                    //     turns it into a reconnect storm across the fleet.
+                    // The log below is the alerting seam: sustained cross-pair
+                    // dests from one connection is the signature of the
+                    // injection attempt, not of a misconfiguration.
+                    if let Some(n) = cross_pair_log.record() {
+                        eprintln!(
+                            "relay: DROPPING datagram from {:?} (key {}) addressed to {} — \
+                             outside its own registered pair (peer {:?}, only legal dest {}); \
+                             {n} violation(s) on this connection so far",
+                            cert_identity,
+                            key_hex(&key),
+                            key_hex(&dest),
+                            peer_identity,
+                            key_hex(&allowed_dest)
+                        );
+                    }
+                    continue;
+                }
 
                 let peer = registry.lock().await.get(&dest).map(|e| e.conn.clone());
                 if let Some(peer) = peer {
@@ -642,10 +916,32 @@ pub async fn serve(endpoint: Endpoint) {
                     fwd.extend_from_slice(&key); // src key header
                     fwd.extend_from_slice(&dgram[8..]);
                     if let Err(e) = peer.send_datagram(fwd.into()) {
-                        eprintln!("relay: forward to {:?} failed: {e}", String::from_utf8_lossy(&dest));
+                        // Forwarding failure is per-datagram too, and it is
+                        // not necessarily rare: a peer whose datagram queue is
+                        // full or whose connection is closing errors on every
+                        // send until it drains or dies.
+                        if let Some(n) = forward_failed_log.record() {
+                            eprintln!(
+                                "relay: forward to {} failed: {e} ({n} failure(s) on this \
+                                 connection so far)",
+                                key_hex(&dest)
+                            );
+                        }
                     }
                 } else {
-                    eprintln!("relay: unknown dest {:?}", String::from_utf8_lossy(&dest));
+                    // The peer half of this pair is not (or no longer)
+                    // registered. Benign and expected while the far side is
+                    // still connecting or has just left the relay — and it is
+                    // THE line to grep for during a `registration_key`
+                    // lockstep upgrade, which is why this limiter is its own
+                    // and cannot be starved by a noisy cross-pair injector.
+                    if let Some(n) = unknown_dest_log.record() {
+                        eprintln!(
+                            "relay: unknown dest {} ({n} datagram(s) undeliverable on this \
+                             connection so far)",
+                            key_hex(&dest)
+                        );
+                    }
                 }
             }
 
@@ -1382,10 +1678,16 @@ mod registration_tests {
             registration_key("gw-1", "gw-2"),
             registration_key("gw-1", "gw-2")
         );
-        // Always 8 ASCII hex bytes.
+        // Always 8 bytes wide. This assertion used to also require every byte
+        // to be an ASCII hex digit — a characterisation of the 4-byte digest
+        // prefix hex-expanded into the header, i.e. of the 32-bit width bug
+        // item 3a removes. The header is now the first 8 RAW digest bytes, so
+        // "all ASCII hex" is exactly what must NO LONGER hold; the replacement
+        // property (no byte position confined to a 16-value alphabet, and no
+        // collision findable in a 400k budget) is pinned in
+        // `tests/pair_id_width.rs`.
         let k = registration_key("gw-123456789", "gw-987654321");
         assert_eq!(k.len(), 8);
-        assert!(k.iter().all(|b| b.is_ascii_hexdigit()));
     }
 
     /// The rendezvous invariant the whole relay path depends on: the key A
@@ -1416,5 +1718,197 @@ mod registration_tests {
         // Empty identities.
         assert!(decode_registration(&encode_registration("", "gw-1")).is_err());
         assert!(decode_registration(&encode_registration("gw-1", "")).is_err());
+    }
+}
+
+/// [`DatagramDropLog`] — the per-connection, per-branch rate limiter every
+/// branch of `serve`'s datagram loop logs through.
+///
+/// This is a DoS mitigation, not tidiness: each branch runs once per received
+/// datagram and an attacker holding any valid gateway cert controls the
+/// arrival rate, so an unbounded `eprintln!` on any of them amplifies a few
+/// bytes of work into unbounded stderr I/O. If the limiting silently stops
+/// working the only symptom is an operator's disk — which is exactly the kind
+/// of regression that needs a test rather than a review.
+///
+/// `dest_pinning.rs` exercises only the cross-pair branch; the runt,
+/// `unknown dest` and forward-failure branches have no behavioural coverage,
+/// and none of them can observe the *limiting* itself from outside the
+/// process anyway. Hence unit tests, in-crate because the type is private.
+///
+/// # How the interval boundary is reached without sleeping
+///
+/// `record` reads `Instant::now()` internally, so the elapse boundary is not
+/// reachable through the public behaviour of the type in under
+/// [`DATAGRAM_LOG_INTERVAL`] (10s). It IS reachable from in-crate tests by
+/// backdating the private `last_logged` stamp, which is what
+/// [`set_last_logged_ago`] does — no sleeping, no injectable clock, and no
+/// change to the type. The cost is that these tests are coupled to the
+/// field's representation: a future rewrite of `DatagramDropLog`'s internals
+/// must update `set_last_logged_ago` with them. That is a deliberate trade —
+/// the alternative was leaving the whole re-arm contract unpinned.
+///
+/// The one hairline this cannot resolve is `>=` versus `>` at exactly the
+/// interval: real time advances between backdating and the `Instant::now()`
+/// inside `record`, so the elapsed span is always a few nanos PAST the
+/// interval. Distinguishing those two would need a frozen clock, and the
+/// difference is not operationally meaningful.
+#[cfg(test)]
+mod datagram_drop_log_tests {
+    use super::{DatagramDropLog, DATAGRAM_LOG_INTERVAL};
+    use std::time::{Duration, Instant};
+
+    /// Rewinds a limiter's last-emitted stamp to `ago` in the past, so the
+    /// next `record()` sees that much time as having elapsed.
+    fn set_last_logged_ago(log: &mut DatagramDropLog, ago: Duration) {
+        let t = Instant::now().checked_sub(ago).expect(
+            "cannot rewind the monotonic clock by the test interval — the clock origin is \
+             less than the interval in the past (a machine/container booted seconds ago). \
+             This is a test-environment limitation, not a failure of the limiter.",
+        );
+        log.last_logged = Some(t);
+    }
+
+    #[test]
+    fn the_first_event_on_a_fresh_limiter_always_emits() {
+        // The worst possible failure mode is a SILENT first drop: the
+        // diagnostic never appears at all and the operator has no signal that
+        // anything is being dropped. A fresh limiter must always let the
+        // first event through.
+        let mut log = DatagramDropLog::new();
+        assert_eq!(
+            log.record(),
+            Some(1),
+            "the first event on a fresh limiter must emit, carrying a total of 1"
+        );
+    }
+
+    #[test]
+    fn subsequent_events_within_the_interval_are_suppressed() {
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1), "first event emits");
+        for i in 2..=1000u64 {
+            assert_eq!(
+                log.record(),
+                None,
+                "event {i} arrived within the interval and must be suppressed — this is the \
+                 whole DoS mitigation; emitting here means per-datagram logging is unbounded"
+            );
+        }
+    }
+
+    #[test]
+    fn suppressed_events_are_still_counted_and_surface_in_the_next_emitted_line() {
+        // Counting ALWAYS happens, even when the line is suppressed, so an
+        // eventually-emitted line reports every event rather than only the
+        // logged ones — a suppressed burst stays visible as a number.
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1));
+        for _ in 0..499 {
+            assert_eq!(log.record(), None);
+        }
+
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(
+            log.record(),
+            Some(501),
+            "the next emitted line must carry the total of ALL 501 events, not just the 2 that \
+             were logged — otherwise a suppressed burst is invisible"
+        );
+    }
+
+    #[test]
+    fn a_line_becomes_due_again_once_the_interval_has_elapsed() {
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1));
+        assert_eq!(log.record(), None, "still inside the interval");
+
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(
+            log.record(),
+            Some(3),
+            "once the interval has elapsed the next event must emit again — a limiter that \
+             latches shut after its first line loses the diagnostic entirely"
+        );
+
+        // And emitting must RE-ARM the limiter: if the emit path failed to
+        // refresh `last_logged`, every subsequent event would emit forever
+        // after, which is the unbounded-logging DoS the type exists to stop.
+        assert_eq!(
+            log.record(),
+            None,
+            "emitting must reset the interval, not leave the limiter permanently open"
+        );
+    }
+
+    #[test]
+    fn an_event_well_inside_the_interval_stays_suppressed() {
+        // Brackets the boundary from below: half an interval is not enough.
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1));
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL / 2);
+        assert_eq!(
+            log.record(),
+            None,
+            "half the interval has elapsed — the line is not due yet"
+        );
+    }
+
+    #[test]
+    fn the_running_total_is_cumulative_across_emitted_lines() {
+        // The count is the connection's lifetime total for this branch, not a
+        // per-interval tally: it must never reset when a line is emitted.
+        let mut log = DatagramDropLog::new();
+        assert_eq!(log.record(), Some(1));
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(log.record(), Some(2));
+        set_last_logged_ago(&mut log, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(
+            log.record(),
+            Some(3),
+            "the total must accumulate over the connection's life, not restart each interval"
+        );
+    }
+
+    #[test]
+    fn each_limiter_is_independent_so_a_loud_branch_cannot_silence_a_quiet_one() {
+        // The stated reason there are FOUR limiters in `serve` rather than
+        // one: a cross-pair injector sending at line rate would hold a shared
+        // token permanently and suppress the `unknown dest` line — the exact
+        // line an operator greps for during a `registration_key` lockstep
+        // upgrade, when a version-skewed pair's only symptom is that it never
+        // rendezvouses. Each kind must surface within one interval no matter
+        // how loud the others are.
+        let mut loud = DatagramDropLog::new();
+        let mut quiet = DatagramDropLog::new();
+
+        assert_eq!(loud.record(), Some(1));
+        for _ in 0..10_000 {
+            let _ = loud.record();
+        }
+
+        assert_eq!(
+            quiet.record(),
+            Some(1),
+            "a quiet branch's FIRST event must emit even after another branch has recorded \
+             10,000 — the limiters must not share state"
+        );
+
+        // Their totals are independent too.
+        set_last_logged_ago(&mut loud, DATAGRAM_LOG_INTERVAL);
+        set_last_logged_ago(&mut quiet, DATAGRAM_LOG_INTERVAL);
+        assert_eq!(loud.record(), Some(10_002), "loud branch's own running total");
+        assert_eq!(quiet.record(), Some(2), "quiet branch's own running total");
+    }
+
+    #[test]
+    fn the_log_interval_is_the_documented_ten_seconds() {
+        // Deliberately a restatement of the constant. It exists because the
+        // interval is a production tuning value that a later test-author
+        // might be tempted to shorten in order to test the elapse boundary by
+        // sleeping. Backdating (see this module's doc comment) is how that
+        // boundary is reached instead; this assertion makes the shortcut fail
+        // loudly if anyone takes it.
+        assert_eq!(DATAGRAM_LOG_INTERVAL, Duration::from_secs(10));
     }
 }
