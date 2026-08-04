@@ -31,13 +31,13 @@ controller in under 5.
 | Gateways | `5` = FI (segment `aether`, 10.0.0.0/24) · `6` = px (`206.83.146.32`) · `9` = gw-home (segment `home`, 10.0.125.0/24) |
 | Segments | `aether`, `aether-dev`, `aws`, `home` |
 | Ports | 9400 enroll (TCP/TLS) · 9500 sync (TCP/mTLS) · 9600 observe (UDP) · 9443 admin (**loopback only, always**) |
-| State to move | `/var/lib/wiremesh` — CA key/cert **and** the SQLite DB |
+| State to move | `ca.pem` + `ca.key` + `controller.db` + `secrets/` — from the k8s PVC (mounted at `/var/lib/wiremesh`) into the package's `/var/lib/wiremesh-controller` on the new host |
 | Current controller | k8s Deployment `wiremesh-controller` in ns `wiremesh` on zolab |
 | Version to install | v0.4.0 (must be ≥ the gateways' version) |
 
 > **The CA is the crown jewel.** Every gateway's identity chains to it and every
 > enrollment token is pinned to its fingerprint. If the CA does not survive the move,
-> all three gateways must re-enroll from scratch. Treat `/var/lib/wiremesh` as the
+> all three gateways must re-enroll from scratch. Treat the controller's data dir as the
 > single artifact whose integrity decides success.
 
 ---
@@ -59,8 +59,10 @@ kubectl -n wiremesh exec deploy/wiremesh-controller -c admin-exec -- \
 kubectl -n wiremesh get pods,svc
 
 # 1.4 — Capture the CA fingerprint. It MUST be identical after the move.
-#      (Any gateway's on-disk CA bundle works; FI's is easiest.)
-openssl x509 -in /var/lib/wiremesh/ca.pem -noout -fingerprint -sha256
+#      Use the enrollment CA bundle a gateway/relay host already trusts —
+#      /etc/wiremesh/ca.pem (the gateway's own state dir holds identity.json,
+#      not a bare ca.pem). FI's copy is easiest.
+openssl x509 -in /etc/wiremesh/ca.pem -noout -fingerprint -sha256
 ```
 
 Record the fingerprint from 1.4. It is the migration's correctness check.
@@ -126,14 +128,18 @@ dpkg -i wiremesh-controller_0.4.0_amd64.deb
 # 4.2 — Do NOT start it yet. Seed the state first.
 systemctl stop wiremesh-controller 2>/dev/null || true
 
-# 4.3 — Restore the cold snapshot into the data dir.
-install -d -o wiremesh -g wiremesh -m 0700 /var/lib/wiremesh
-tar -C /var/lib/wiremesh -xf wiremesh-controller-state-cold.tar
-chown -R wiremesh:wiremesh /var/lib/wiremesh
-find /var/lib/wiremesh -type f -exec chmod 0600 {} \;
+# 4.3 — Restore the cold snapshot into the CONTROLLER'S OWN data dir.
+#       /var/lib/wiremesh-controller — NOT /var/lib/wiremesh, which belongs to
+#       the gateway on this host (see field note 2 below). The unit's
+#       StateDirectory= would create this at first start; we create it early
+#       because the state has to be seeded before that first start.
+install -d -o wiremesh -g wiremesh -m 0700 /var/lib/wiremesh-controller
+tar -C /var/lib/wiremesh-controller -xf wiremesh-controller-state-cold.tar
+chown -R wiremesh:wiremesh /var/lib/wiremesh-controller
+find /var/lib/wiremesh-controller -type f -exec chmod 0600 {} \;
 
 # 4.4 — CRITICAL: the CA fingerprint must match step 1.4 exactly.
-openssl x509 -in /var/lib/wiremesh/ca.pem -noout -fingerprint -sha256
+openssl x509 -in /var/lib/wiremesh-controller/ca.pem -noout -fingerprint -sha256
 ```
 
 **If the fingerprint differs, stop.** Something restored the wrong data or the controller
@@ -142,7 +148,7 @@ generated a fresh CA. Do not proceed — re-check the tarball.
 ```bash
 # 4.5 — Configure. The shipped template already sets what we need.
 cat /etc/wiremesh/controller.env
-#   WIREMESH_DATA_DIR=/var/lib/wiremesh
+#   WIREMESH_DATA_DIR=/var/lib/wiremesh-controller   <- must match step 4.3
 #   WIREMESH_BIND_IP=0.0.0.0      <- required so remote gateways can reach it
 # Admin TCP stays loopback-only regardless of BIND_IP — by design, do not try to change it.
 
@@ -307,7 +313,7 @@ Option A is recommended unless you actively want CR-driven fabric management.
 
 - **Update the deployment docs** (`docs/operator.md`, the exposure README) — the Envoy
   passthrough + observe LB story no longer applies to this fabric.
-- **Backups.** `/var/lib/wiremesh` on FI now holds the CA and the whole fabric DB.
+- **Backups.** `/var/lib/wiremesh-controller` on FI now holds the CA and the whole fabric DB.
   Schedule a periodic encrypted copy off-host; the k8s PVC previously provided this
   implicitly. Do not skip this.
 - **Consider a static endpoint override for gateways** (feature gap found 2026-08-01):
@@ -342,18 +348,36 @@ Executed against `px` (`206.83.146.32`) instead of FI. Deviations and findings:
    `WiremeshController` CR. Scale the **operator** to 0 first, then the controller.
    (Runbook step 3 updated accordingly.)
 
-2. **PACKAGING BUG — `wiremesh-controller`'s postinst chowns `/var/lib/wiremesh` to
-   `wiremesh:wiremesh`.** On a host that already runs `wiremesh-gateway` (whose identity
-   lives in that directory as root-owned files), installing the controller package takes
-   the directory away from the gateway and the gateway dies on its next restart with
-   `reading identity.json ... Permission denied`. Recovery is
-   `chown root:root /var/lib/wiremesh`. The postinst should only touch the directory it
-   owns, or the packages should use distinct default data dirs. **Filed as a follow-up.**
+2. **PACKAGING BUG (found here, since FIXED) — `wiremesh-controller`'s postinst chowned
+   `/var/lib/wiremesh` to `wiremesh:wiremesh` and chmod'd it 0700.** On a host that also
+   runs `wiremesh-gateway` (whose `identity.json` lives in that directory as root-owned
+   files) that steals the directory, and the gateway dies on its next restart with
+   `reading identity.json ... Permission denied`. It really is denied despite the gateway
+   running as root: its unit's `CapabilityBoundingSet` omits `CAP_DAC_OVERRIDE`. Field
+   recovery at the time was `chown root:root /var/lib/wiremesh`.
 
-3. **Use a separate data dir when co-locating.** `WIREMESH_DATA_DIR=/var/lib/wiremesh-controller`
-   keeps control-plane state away from the gateway's identity. The systemd unit's
-   `ReadWritePaths=` and `WorkingDirectory=` must be updated to match, or
-   `ProtectSystem=strict` blocks the writes.
+   **The fix, shipped:** the controller now has its own state dir, exactly as the relay
+   does. `wiremesh-controller.service` declares `StateDirectory=wiremesh-controller` +
+   `StateDirectoryMode=0700` (systemd creates and owns it before start) with
+   `WorkingDirectory=`/`ReadWritePaths=` pointed at `/var/lib/wiremesh-controller`, the
+   shipped `controller.env` defaults `WIREMESH_DATA_DIR` there, and the postinst no
+   longer creates or chowns `/var/lib/wiremesh` at all. `/var/lib/wiremesh` is the
+   **gateway's** directory, full stop.
+
+3. **Upgrades migrate themselves — with guards.** The controller postinst moves
+   `controller.db`, `ca.pem`, `ca.key` and `secrets/` (only those — never the whole
+   directory, so a co-located gateway's `identity.json` / `wg_private.key` /
+   `state.json` / `epoch_keys.json` are untouched) into `/var/lib/wiremesh-controller`
+   and rewrites `WIREMESH_DATA_DIR`. It does this **only** when the target is absent or
+   empty, the source really holds controller state, and `controller.env` still carries
+   the packaged default with no systemd drop-in overriding it. If any guard fails it
+   prints what to do by hand and exits 0 — a migration must never fail a package
+   install. Note the reason for the drop-in guard: a controller started against an
+   emptied data dir silently mints a **new CA**, which would invalidate every enrolled
+   gateway.
+
+   If you deliberately keep the old path, set `WIREMESH_DATA_DIR` back explicitly **and**
+   add a matching `ReadWritePaths=` drop-in, or `ProtectSystem=strict` blocks the writes.
 
 4. **`fabricctl` is a separate package** — install `wiremesh-fabricctl` on the controller
    host to administer the fabric over the UDS.

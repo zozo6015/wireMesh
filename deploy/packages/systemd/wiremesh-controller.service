@@ -12,19 +12,35 @@ EnvironmentFile=/etc/wiremesh/controller.env
 ExecStart=/usr/bin/wiremesh-controller
 Restart=on-failure
 RestartSec=5
-WorkingDirectory=/var/lib/wiremesh
+# Dedicated controller state dir (ops finding 2026-08-01, px migration —
+# docs/runbooks/controller-migration-to-fi.md §"Field notes", item 2): the
+# controller must NOT share /var/lib/wiremesh with the gateway. That directory
+# is the gateway's root-owned 0700 state dir; the controller package used to
+# chown it to wiremesh:wiremesh, and because the gateway unit's
+# CapabilityBoundingSet has no CAP_DAC_OVERRIDE, the (root) gateway then died
+# on "reading identity.json ... Permission denied". StateDirectory= makes
+# systemd create /var/lib/wiremesh-controller owned by this service's
+# User/Group before start (fixing up ownership on mismatch) and grants write
+# access despite ProtectSystem=strict — same precedent as the relay unit.
+# Operators who deliberately kept the old path must also override
+# WIREMESH_DATA_DIR in /etc/wiremesh/controller.env AND add that path here.
+StateDirectory=wiremesh-controller
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/wiremesh-controller
 # The controller binds its admin UDS at /run/wiremesh/controller.sock (the
 # WIREMESH_SOCKET_PATH default). RuntimeDirectory creates + owns /run/wiremesh
 # writable BEFORE start — required because ProtectSystem=strict makes /run
-# read-only otherwise, which would fail the socket bind.
+# read-only otherwise, which would fail the socket bind. This stays
+# /run/wiremesh (not /run/wiremesh-controller): it is the documented admin
+# socket path fabricctl dials by default, and nothing else contends for it.
 RuntimeDirectory=wiremesh
 RuntimeDirectoryMode=0700
-# Hardening (control plane holds the CA + DB under /var/lib/wiremesh).
+# Hardening (control plane holds the CA + DB under /var/lib/wiremesh-controller).
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/var/lib/wiremesh
+ReadWritePaths=/var/lib/wiremesh-controller
 
 [Install]
 WantedBy=multi-user.target

@@ -59,6 +59,19 @@ conntrack procps`. After editing the config:
 sudo systemctl enable --now wiremesh-controller
 ```
 
+**The controller's data dir is `/var/lib/wiremesh-controller`** (`WIREMESH_DATA_DIR`
+in `/etc/wiremesh/controller.env`), holding the fabric CA (`ca.pem`/`ca.key`),
+the SQLite DB (`controller.db`) and `secrets/`. Like the relay, it gets its own
+dir rather than sharing the gateway's `/var/lib/wiremesh` — the controller runs
+as the `wiremesh` user, the gateway's identity there is root-owned 0700, and
+whichever of the two claims the directory locks the other out. The unit's
+`StateDirectory=wiremesh-controller` creates it owned `wiremesh:wiremesh` mode
+0700 at first start; nothing needs to pre-create it. Upgrading from a release
+that defaulted to `/var/lib/wiremesh`? The package moves the controller's own
+files across (and only those) and repoints `WIREMESH_DATA_DIR` — it tells you
+on the console either way, so read the install output. **Back this directory
+up:** losing `ca.key` means re-enrolling every gateway.
+
 The **gateway** and **relay** must be **enrolled once before first start** (each
 needs a token minted by the controller/operator). Replace the UPPERCASE
 placeholders with your values (they are written this way so the commands are

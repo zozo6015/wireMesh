@@ -26,7 +26,17 @@ contents:
   - src: deploy/packages/env/controller.env
     dst: /etc/wiremesh/controller.env
     type: "config|noreplace"
+# No /var/lib/... entry here on purpose: the controller's state dir
+# (/var/lib/wiremesh-controller) is created and owned by systemd's
+# StateDirectory= in the unit, so the package never has to — and must never
+# claim, chown, or remove the gateway's /var/lib/wiremesh on a shared host.
 scripts:
+  # Controller-specific postinstall: shared user/group + /etc/wiremesh only,
+  # plus a guarded one-time migration of control-plane state (controller.db,
+  # ca.pem, ca.key, secrets/) out of the legacy shared /var/lib/wiremesh into
+  # /var/lib/wiremesh-controller — idempotent, and it moves only the
+  # controller's own entries so a co-located gateway's identity stays put
+  # (px migration finding 2026-08-01).
   postinstall: deploy/packages/scripts/postinstall-server.sh
   preremove: deploy/packages/scripts/preremove-controller.sh
   postremove: deploy/packages/scripts/postremove.sh

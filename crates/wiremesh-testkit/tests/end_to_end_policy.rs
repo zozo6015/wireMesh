@@ -59,6 +59,12 @@
 //! Run (privileged Linux dev container only — see `CLAUDE.md`'s "Host is
 //! macOS" execution rule): `./dev.sh run "cargo test -p wiremesh-testkit \
 //! --features netns --test end_to_end_policy -- --test-threads=1 --nocapture"`.
+// Compiles to an empty test binary unless `netns` is on: this file needs the
+// privileged netns lab plus `wiremesh_policy`/`wiremesh_enforcer`, all of
+// which only exist behind that feature, so without this gate a plain
+// `cargo build -p wiremesh-testkit` fails to resolve them. Same pattern as
+// `tests/netem.rs`.
+#![cfg(feature = "netns")]
 
 use std::io::Write;
 use std::net::SocketAddr;
