@@ -353,8 +353,23 @@ Executed against `px` (`206.83.146.32`) instead of FI. Deviations and findings:
    runs `wiremesh-gateway` (whose `identity.json` lives in that directory as root-owned
    files) that steals the directory, and the gateway dies on its next restart with
    `reading identity.json ... Permission denied`. It really is denied despite the gateway
-   running as root: its unit's `CapabilityBoundingSet` omits `CAP_DAC_OVERRIDE`. Field
-   recovery at the time was `chown root:root /var/lib/wiremesh`.
+   running as root: its unit's `CapabilityBoundingSet` omits `CAP_DAC_OVERRIDE`.
+
+   **If your host was already hit, installing the fix is not enough on its own.** The new
+   package stops doing the chown, but nothing un-does it: `/var/lib/wiremesh` stays
+   `wiremesh`-owned and the gateway keeps crash-looping (`postinstall-gateway.sh` chmods
+   but never chowns). Run the recovery by hand:
+
+   ```bash
+   chown root:root /var/lib/wiremesh     # gateway's dir; controller no longer uses it
+   systemctl restart wiremesh-gateway
+   ```
+
+   The controller postinstall detects this exact state (dir owned by `wiremesh`, still
+   holding `identity.json`) and prints that command — but it does not run it, because a
+   host with a **legacy relay** identity in the same directory needs it `wiremesh`-owned
+   instead. There is no ownership that satisfies both: migrate the relay to
+   `/var/lib/wiremesh-relay` first, then chown to root.
 
    **The fix, shipped:** the controller now has its own state dir, exactly as the relay
    does. `wiremesh-controller.service` declares `StateDirectory=wiremesh-controller` +
@@ -364,17 +379,40 @@ Executed against `px` (`206.83.146.32`) instead of FI. Deviations and findings:
    longer creates or chowns `/var/lib/wiremesh` at all. `/var/lib/wiremesh` is the
    **gateway's** directory, full stop.
 
-3. **Upgrades migrate themselves — with guards.** The controller postinst moves
+3. **Upgrades migrate themselves — with guards.** The controller postinst relocates
    `controller.db`, `ca.pem`, `ca.key` and `secrets/` (only those — never the whole
    directory, so a co-located gateway's `identity.json` / `wg_private.key` /
-   `state.json` / `epoch_keys.json` are untouched) into `/var/lib/wiremesh-controller`
-   and rewrites `WIREMESH_DATA_DIR`. It does this **only** when the target is absent or
-   empty, the source really holds controller state, and `controller.env` still carries
-   the packaged default with no systemd drop-in overriding it. If any guard fails it
-   prints what to do by hand and exits 0 — a migration must never fail a package
-   install. Note the reason for the drop-in guard: a controller started against an
-   emptied data dir silently mints a **new CA**, which would invalidate every enrolled
-   gateway.
+   `state.json` / `epoch_keys.json` are untouched) into `/var/lib/wiremesh-controller`.
+
+   The order is **copy to a staging dir → verify → single atomic rename into place →
+   repoint the config → delete the originals**, and it stops at the first failure. That
+   ordering is the whole safety argument: a controller that boots on a data dir holding
+   *neither* `ca.pem` nor `ca.key` mints a **brand-new CA** and silently invalidates
+   every enrolled gateway, so the data dir must never be observable half-populated.
+   (The half-CA case — exactly one of the two present — is already fail-closed in
+   `wiremesh-trust`'s `load_or_create_ca`, which refuses to regenerate.) Every failure
+   path leaves the originals in place and exits 0: a migration must never fail a
+   package install.
+
+   `ca.pem` is **copied, not moved**. It is the one file in that directory the
+   controller does not own exclusively — a legacy relay's identity is
+   `ca.pem` + `relay.pem` + `relay.key` in the same place, and `postinstall-relay.sh`'s
+   own migration requires all three to still be there.
+
+   The guards: the target must be absent or empty, the source must really hold
+   controller state, `WIREMESH_DATA_DIR` must resolve to either the legacy or the
+   packaged path (not an operator's own), no systemd `Environment=` drop-in may override
+   it, and the effective unit must still declare `StateDirectory=wiremesh-controller` —
+   a `systemctl edit --full` copy of the old unit would otherwise leave the new dir
+   read-only under `ProtectSystem=strict`.
+
+   One asymmetry worth knowing when reading install output: **`.deb` and `.rpm` arrive
+   here differently.** deb has no conffile "noreplace" mechanism (nfpm maps both
+   `config` and `config|noreplace` to a plain conffile), so dpkg silently installs the
+   new `controller.env` during unpack — by the time the postinst runs it already says
+   `/var/lib/wiremesh-controller` and no rewrite is needed. rpm's `%config(noreplace)`
+   keeps your file, so the postinst rewrites the line and verifies it before deleting
+   the originals.
 
    If you deliberately keep the old path, set `WIREMESH_DATA_DIR` back explicitly **and**
    add a matching `ReadWritePaths=` drop-in, or `ProtectSystem=strict` blocks the writes.

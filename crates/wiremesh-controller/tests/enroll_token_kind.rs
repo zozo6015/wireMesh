@@ -17,6 +17,20 @@
 //! this file neither was pinned by a negative test — flagged in review as
 //! "no negative test pins the new controller rebind-kind rejection".
 //!
+//! **Both directions, at both boundaries.** Each boundary gets its
+//! rejections AND its acceptance:
+//!
+//! | | rejects | accepts |
+//! |---|---|---|
+//! | gateway | `relay` | `gateway` (`tests/enroll.rs`), `rebind` (test 4 here) |
+//! | relay | `gateway`, `rebind` | `relay` (test 5 here) |
+//!
+//! The positives are not redundant: a negative-only file stays green under
+//! a filter that has been narrowed too far (`kind = 'gateway'`) or that
+//! rejects everything (`AND 1=0`) — both of which are "fixes" someone could
+//! reach for when a rejection test fails. Each positive is the mutation
+//! guard for its own boundary's filter.
+//!
 //! **Layer.** These tests drive the real `Enrollment.Enroll` gRPC surface
 //! via `wiremesh_testkit::TestController`, not `Db` directly. The filter
 //! itself lives in `Db`, but `Db` is not a public API of this crate's test
@@ -45,9 +59,27 @@
 //! assertions about raw rows, not about a `Db` accessor anyone needs in
 //! production).
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use rusqlite::Connection;
 use wiremesh_proto::v1::{CreateSegmentRequest, EnrollRequest, MintTokenRequest};
+
+/// Opens a read-side connection onto the controller's LIVE `controller.db`.
+///
+/// The controller process holds its own writer connection to this same file
+/// the whole time, so a default-configured second connection (SQLite's
+/// `busy_timeout` defaults to 0) would return `SQLITE_BUSY` immediately if a
+/// write happened to be in flight, and every reader below panics on error.
+/// Nothing in these tests writes while a footprint is being read, so the
+/// window is theoretical — but a 5s busy timeout costs nothing and removes
+/// the whole flake class rather than relying on that staying true.
+fn open_db(db_path: &Path) -> Connection {
+    let conn = Connection::open(db_path)
+        .unwrap_or_else(|e| panic!("opening {} for inspection: {e}", db_path.display()));
+    conn.busy_timeout(Duration::from_secs(5))
+        .expect("setting busy_timeout on the inspection connection");
+    conn
+}
 
 /// Everything a *successful* enrollment of either kind would leave behind,
 /// read in one shot so a rejection can be asserted against a single
@@ -78,7 +110,7 @@ impl Footprint {
 }
 
 fn read_footprint(db_path: &Path) -> Footprint {
-    let conn = Connection::open(db_path).expect("opening controller.db for footprint inspection");
+    let conn = open_db(db_path);
     let count = |sql: &str| -> i64 {
         conn.query_row(sql, [], |row| row.get(0))
             .unwrap_or_else(|e| panic!("counting rows for {sql:?}: {e}"))
@@ -104,7 +136,7 @@ async fn footprint(h: &wiremesh_testkit::TestController) -> Footprint {
 
 /// Every `gateway` row as `(id, status)`, ordered by id.
 fn gateway_statuses(db_path: &Path) -> Vec<(i64, String)> {
-    let conn = Connection::open(db_path).expect("opening controller.db for gateway inspection");
+    let conn = open_db(db_path);
     let mut stmt = conn
         .prepare("SELECT id, status FROM gateway ORDER BY id")
         .expect("preparing gateway SELECT");
@@ -117,7 +149,7 @@ fn gateway_statuses(db_path: &Path) -> Vec<(i64, String)> {
 /// Every `certificate` row as `(serial, revoked_at)` — `revoked_at` is
 /// `None` while the cert is still live.
 fn certificate_revocations(db_path: &Path) -> Vec<(String, Option<String>)> {
-    let conn = Connection::open(db_path).expect("opening controller.db for certificate inspection");
+    let conn = open_db(db_path);
     let mut stmt = conn
         .prepare("SELECT serial, revoked_at FROM certificate ORDER BY serial")
         .expect("preparing certificate SELECT");
@@ -125,6 +157,32 @@ fn certificate_revocations(db_path: &Path) -> Vec<(String, Option<String>)> {
         .expect("querying certificate rows")
         .collect::<rusqlite::Result<Vec<_>>>()
         .expect("collecting certificate rows")
+}
+
+/// Every `relay` row as `(id, endpoint, status)`, ordered by id.
+fn relay_rows(db_path: &Path) -> Vec<(i64, String, String)> {
+    let conn = open_db(db_path);
+    let mut stmt = conn
+        .prepare("SELECT id, endpoint, status FROM relay ORDER BY id")
+        .expect("preparing relay SELECT");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("querying relay rows")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collecting relay rows")
+}
+
+/// Every `certificate` row as `(subject_kind, subject_id)`, ordered by
+/// serial — what the recorded leaf is bound TO, as opposed to
+/// [`certificate_revocations`]'s "is it still live".
+fn certificate_subjects(db_path: &Path) -> Vec<(String, i64)> {
+    let conn = open_db(db_path);
+    let mut stmt = conn
+        .prepare("SELECT subject_kind, subject_id FROM certificate ORDER BY serial")
+        .expect("preparing certificate-subject SELECT");
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("querying certificate subjects")
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .expect("collecting certificate subjects")
 }
 
 /// The same `wiremesh://host/#tok_<secret>@sha256:<fp>` URL with its secret
@@ -174,14 +232,16 @@ fn assert_indistinguishable(wrong_kind: &tonic::Status, wrong_secret: &tonic::St
 /// GATEWAY boundary, negative: a `relay`-kind token must not be redeemable
 /// as a gateway.
 ///
-/// The token here is deliberately minted with `bound_cidrs` matching the
-/// segment's CIDR exactly — i.e. EVERY other gateway-path check (bound-cidr
-/// scope, segment resolution, one-gateway-per-segment occupancy) would pass.
-/// The `AND kind IN ('gateway', 'rebind')` filter is therefore the ONLY
-/// thing standing between this token and a successful gateway enrollment,
-/// which is what makes this test genuinely red if that filter is ever
-/// broadened (rather than tripping some later check and passing for the
-/// wrong reason).
+/// Every OTHER input on the gateway path is deliberately arranged to be
+/// valid: the segment exists, the token is minted with `bound_cidrs` exactly
+/// equal to the CIDRs declared at enroll time, and no gateway occupies that
+/// segment yet. Those later checks are never actually reached here — the
+/// token SELECT's `AND kind IN ('gateway', 'rebind')` short-circuits first,
+/// which is precisely the point: because nothing else about this request is
+/// wrong, the kind filter is provably the only thing producing the
+/// rejection. Set up any other way (e.g. mismatched `bound_cidrs`), the test
+/// would still go green off `BoundCidrMismatch` even after someone broadened
+/// the filter — passing for the wrong reason.
 #[tokio::test]
 async fn relay_token_rejected_at_gateway_enrollment_boundary() {
     let h = wiremesh_testkit::TestController::start().await;
@@ -383,6 +443,79 @@ async fn rebind_token_rejected_at_relay_enrollment_boundary() {
         Footprint::NOTHING,
         "a rejected rebind-token-as-relay attempt must leave NOTHING behind — no relay \
          row, no certificate row, and the token must remain unspent"
+    );
+}
+
+/// RELAY boundary, POSITIVE: a genuine `relay`-kind token IS accepted here,
+/// and produces the relay identity the two negatives above exist to guard.
+///
+/// Counterweight to tests 2 and 3, exactly as test 4 is to test 1. Without
+/// it, both relay negatives stay green under a filter that rejects
+/// EVERYTHING — replace `Db::enroll_relay`'s `AND kind = 'relay'` with
+/// `AND 1=0` and nothing in this file notices, even though relay enrollment
+/// is now entirely broken. (`tests/relay_enroll.rs` would catch it, but a
+/// reader of this file has no way to know that, and this file's header
+/// claims to pin BOTH boundaries.)
+///
+/// Reuses `wiremesh_testkit::enroll_relay` — the helper the relay suite
+/// already uses to mint a relay token, generate a CSR, and redeem it over
+/// the endpoint-routed path — rather than open-coding a fourth copy of that
+/// sequence. It `.expect()`s internally, so a rejected enrollment surfaces
+/// as a panic inside the helper, which is the failure this test wants.
+#[tokio::test]
+async fn relay_token_accepted_at_relay_enrollment_boundary() {
+    let h = wiremesh_testkit::TestController::start().await;
+
+    let endpoint = "203.0.113.9:51820";
+    let (cert_pem, ca_bundle_pem, relay_id) = wiremesh_testkit::enroll_relay(&h, endpoint).await;
+
+    assert!(
+        cert_pem.contains("BEGIN CERTIFICATE"),
+        "a relay-kind token must come back with a CA-signed leaf, got: {cert_pem}"
+    );
+    assert!(
+        ca_bundle_pem.contains("BEGIN CERTIFICATE"),
+        "a relay enrollment must come back with the CA trust bundle, got: {ca_bundle_pem}"
+    );
+    assert!(
+        relay_id > 0,
+        "the controller must assign a real relay row id, got {relay_id}"
+    );
+
+    // The exact mirror image of the negatives' `Footprint::NOTHING`: this
+    // time the relay row, the recorded leaf, and the SPENT single-use token
+    // must all be there — and still no gateway row, since the relay path
+    // never touches segment/gateway state.
+    assert_eq!(
+        footprint(&h).await,
+        Footprint {
+            gateways: 0,
+            relays: 1,
+            certificates: 1,
+            spent_tokens: 1,
+        },
+        "a successful relay enrollment must create exactly one relay row and one \
+         certificate row, spend its single-use token, and create no gateway row"
+    );
+
+    let db_path: PathBuf = h.data_dir().join("controller.db");
+    let (relays, certs) = tokio::task::spawn_blocking({
+        let db_path = db_path.clone();
+        move || (relay_rows(&db_path), certificate_subjects(&db_path))
+    })
+    .await
+    .expect("blocking relay-row inspection task panicked");
+
+    assert_eq!(
+        relays,
+        vec![(relay_id, endpoint.to_string(), "active".to_string())],
+        "the relay row must carry the endpoint declared at enrollment and be active"
+    );
+    assert_eq!(
+        certs,
+        vec![("relay".to_string(), relay_id)],
+        "the recorded leaf must be bound to the new relay (subject_kind 'relay', \
+         subject_id {relay_id}) — a relay token must never mint a gateway-subject cert"
     );
 }
 

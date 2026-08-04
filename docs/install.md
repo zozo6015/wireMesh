@@ -66,11 +66,25 @@ dir rather than sharing the gateway's `/var/lib/wiremesh` — the controller run
 as the `wiremesh` user, the gateway's identity there is root-owned 0700, and
 whichever of the two claims the directory locks the other out. The unit's
 `StateDirectory=wiremesh-controller` creates it owned `wiremesh:wiremesh` mode
-0700 at first start; nothing needs to pre-create it. Upgrading from a release
-that defaulted to `/var/lib/wiremesh`? The package moves the controller's own
-files across (and only those) and repoints `WIREMESH_DATA_DIR` — it tells you
-on the console either way, so read the install output. **Back this directory
-up:** losing `ca.key` means re-enrolling every gateway.
+0700 at first start; nothing needs to pre-create it. **Back this directory up:**
+losing `ca.key` means re-enrolling every gateway.
+
+Upgrading from a release that defaulted to `/var/lib/wiremesh`? The package
+copies the controller's own files across (and only those — a co-located
+gateway's or relay's files stay put), verifies them, repoints
+`WIREMESH_DATA_DIR`, and only then removes the originals. It prints what it did
+or why it declined, so **read the install output**. Two follow-ups it cannot do
+for you:
+
+- If an earlier controller package already chowned `/var/lib/wiremesh` to
+  `wiremesh` on a host that also runs a **gateway**, the gateway is still locked
+  out of its own `identity.json` and crash-loops. Give the directory back:
+  `sudo chown root:root /var/lib/wiremesh && sudo systemctl restart wiremesh-gateway`.
+  (The postinstall detects and prints this; it does not run it, because a
+  co-located *legacy relay* needs that directory `wiremesh`-owned instead —
+  migrate the relay to `/var/lib/wiremesh-relay` first if both apply.)
+- Restart the controller (`sudo systemctl restart wiremesh-controller`) so it
+  picks up the new path.
 
 The **gateway** and **relay** must be **enrolled once before first start** (each
 needs a token minted by the controller/operator). Replace the UPPERCASE

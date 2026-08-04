@@ -24,6 +24,9 @@ RestartSec=5
 # access despite ProtectSystem=strict — same precedent as the relay unit.
 # Operators who deliberately kept the old path must also override
 # WIREMESH_DATA_DIR in /etc/wiremesh/controller.env AND add that path here.
+# (StateDirectoryMode applies when systemd CREATES the directory; on an
+# existing one systemd fixes ownership but not mode, so the package's
+# migration path chmods 0700 itself.)
 StateDirectory=wiremesh-controller
 StateDirectoryMode=0700
 WorkingDirectory=/var/lib/wiremesh-controller
@@ -40,6 +43,10 @@ NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true
+# Strictly redundant — StateDirectory= already grants write access to this
+# exact path (the relay unit omits it for that reason). Kept because it states
+# the one writable location explicitly, so a reader auditing this unit against
+# ProtectSystem=strict does not have to know that implication.
 ReadWritePaths=/var/lib/wiremesh-controller
 
 [Install]
