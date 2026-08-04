@@ -172,7 +172,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
 use wiremesh_gateway::policy_apply::{
-    spawn_policy_apply_worker, PolicyApplyHandle, PolicyApplyTarget,
+    needs_policy_write, spawn_policy_apply_worker, PolicyApplyHandle, PolicyApplyTarget,
 };
 use wiremesh_gateway::state::DesiredState;
 
@@ -248,30 +248,6 @@ impl FakeEntry {
     /// per-entry behaviour gets.
     fn fresh() -> FakeEntry {
         FakeEntry { applied_version: None, ready_at: None }
-    }
-}
-
-/// The three-way write predicate, mirroring `main.rs`'s `needs_policy_write`.
-/// `ready_at` and `install` MUST agree on it — the trait's contract is that
-/// the deadline covers exactly the entries the install will write, and a
-/// disagreement shows up as a spurious deferral.
-///
-/// The only interesting arm is AHEAD. An enforcer whose applied version is
-/// past `version` got there in one of two ways, needing opposite answers:
-///
-///  - `ds_is_newest == false` — our snapshot is stale and a rotation insert
-///    already applied a newer one to that entry. Writing ours DOWNGRADES a
-///    traffic-carrying tun. Skip.
-///  - `ds_is_newest == true` — the controller genuinely rolled back (a DB
-///    restore, a repoint at a different controller). Ours really is desired
-///    and the datapath is ahead of it. Write, or the gateway never
-///    converges.
-fn needs_write(e: &FakeEntry, version: u64, ds_is_newest: bool) -> bool {
-    match e.applied_version {
-        None => true,
-        Some(av) if av < version => true,
-        Some(av) if av > version => ds_is_newest,
-        Some(_) => false, // already exactly this version
     }
 }
 
@@ -411,9 +387,10 @@ impl FakeTarget {
 }
 
 impl PolicyApplyTarget for FakeTarget {
-    /// Mirrors the real adapter: the max deadline over only those entries
-    /// the install would actually WRITE, per the shared [`needs_write`]
-    /// predicate — so `ready_at` and `install` agree on the entry set.
+    /// The max deadline over only those entries the install would actually
+    /// WRITE. Calls the REAL [`needs_policy_write`] rather than restating
+    /// it: a fake that reimplements the decision can drift from the adapter,
+    /// and a drift there is invisible to every test in this file.
     fn ready_at(&self, ds: &DesiredState, ds_is_newest: bool) -> Option<Instant> {
         let version = ds.policy_version;
 
@@ -434,7 +411,7 @@ impl PolicyApplyTarget for FakeTarget {
             let entries = self.entries.lock().unwrap();
             entries
                 .iter()
-                .filter(|e| needs_write(e, version, ds_is_newest))
+                .filter(|e| needs_policy_write(e.applied_version, version, ds_is_newest))
                 .filter_map(|e| e.ready_at)
                 .max()
         };
@@ -481,18 +458,26 @@ impl PolicyApplyTarget for FakeTarget {
             self.fail_next.store(remaining - 1, Ordering::SeqCst);
         }
 
-        // Mirrors the real adapter's under-the-lock re-check: an entry still
-        // inside its own grace is LEFT ALONE and the whole install reports
-        // `Err`, so the worker's retry re-reads the deadline and completes
-        // it once the grace elapses. Writing it here would be exactly the
-        // overwrite of a still-readable outer-array slot the grace exists to
-        // prevent.
+        // The under-the-lock re-check: an entry still inside its own grace is
+        // LEFT ALONE and the whole install reports `Err`, so the worker's
+        // retry re-reads the deadline and completes it once the grace
+        // elapses.
+        //
+        // SCOPE OF WHAT THIS PROVES. The write predicate above is the real
+        // `needs_policy_write`, so tests exercising it exercise production
+        // code. The rest of this method is FIXTURE — the deadline comparison,
+        // the write, and the decision to report a deferral as `Err` are
+        // modelled here to satisfy the trait's documented contract, not
+        // shared with the adapter. A test that turns green because of one of
+        // those lines proves the WORKER handles that shape correctly; it
+        // says nothing about whether `main.rs` produces it. The adapter's own
+        // copy needs review, or a unit test inside `main.rs`.
         let mut deferred = 0usize;
         if !forced_fail {
             let mut entries = self.entries.lock().unwrap();
             let now = Instant::now();
             for e in entries.iter_mut() {
-                if !needs_write(e, version, ds_is_newest) {
+                if !needs_policy_write(e.applied_version, version, ds_is_newest) {
                     continue; // nothing would be written; nothing to gate on
                 }
                 if e.ready_at.is_some_and(|t| t > now) {
@@ -613,6 +598,140 @@ async fn next_failed_attempt_at(sig: &mut Signals, version: u64) {
 /// time to hide.
 async fn settle_counters() {
     tokio::time::sleep(COUNTER_SETTLE).await;
+}
+
+// --- the write predicate (pure truth table) -------------------------------
+
+/// `needs_policy_write` carries the security-relevant half of this item, and
+/// every behavioural test in this file routes through it — including the
+/// fake, which CALLS it rather than restating it. So it gets a pure,
+/// exhaustive pin of its own: no worker, no timing, no fixture.
+///
+/// The four arms, each named so a regression points at the case rather than
+/// at a row index. The AHEAD arms are asserted directly under BOTH flag
+/// values rather than being inferred from the others, because they are the
+/// whole reason the parameter exists.
+#[test]
+fn needs_policy_write_truth_table() {
+    // Never applied: unconditional write. A fresh enforcer has nothing to
+    // protect and nothing to downgrade, so the flag is irrelevant.
+    for newest in [false, true] {
+        assert!(
+            needs_policy_write(None, 7, newest),
+            "an enforcer that has never applied a policy must always be written \
+             (ds_is_newest={newest})"
+        );
+    }
+
+    // Behind: unconditional write. This is the ordinary case — a tun that
+    // has not caught up must catch up whether or not our snapshot is the
+    // newest one.
+    for newest in [false, true] {
+        assert!(
+            needs_policy_write(Some(6), 7, newest),
+            "an enforcer behind the target must be written (ds_is_newest={newest})"
+        );
+    }
+
+    // Equal: never written. `apply_if_changed` would short-circuit anyway;
+    // the point of skipping here is that such an entry's reap grace must not
+    // gate an install that will not touch it.
+    for newest in [false, true] {
+        assert!(
+            !needs_policy_write(Some(7), 7, newest),
+            "an enforcer already on the target version must be skipped \
+             (ds_is_newest={newest})"
+        );
+    }
+
+    // AHEAD + our snapshot is NOT the newest: SKIP. This is the F1 nft
+    // downgrade protection and the reason `ds_is_newest` exists. A rotation
+    // insert applied a newer snapshot to that enforcer before putting it in
+    // the map; writing our older policy over it downgrades a tun that is
+    // carrying traffic. On eBPF the fresh entry's pending reap would defer
+    // it anyway, but on nftables `apply_ready_at` is permanently `None`,
+    // nothing defers, and the downgrade lands.
+    assert!(
+        !needs_policy_write(Some(8), 7, false),
+        "an enforcer AHEAD of a STALE snapshot must NOT be written — that is a live \
+         downgrade of a rotation tun, unmasked on the nftables backend"
+    );
+
+    // AHEAD + our snapshot IS the newest: WRITE. The controller genuinely
+    // rolled back (DB restore, or a repoint at a different controller), so
+    // the older version really is desired and the datapath is what is wrong.
+    assert!(
+        needs_policy_write(Some(8), 7, true),
+        "an enforcer AHEAD of the NEWEST snapshot must be written — otherwise a \
+         rolled-back controller never converges and the gateway stays pinned to an \
+         abandoned policy"
+    );
+}
+
+/// Boundaries. Two of these three are reachable in production and one is
+/// purely defensive; the comments say which, so nobody reads the last as a
+/// real scenario.
+#[test]
+fn needs_policy_write_boundaries() {
+    // ADJACENT VERSIONS — reachable, and the exact shape of the bug the
+    // strictly-less-than comparison exists to prevent: a rotation insert
+    // leaves an entry on `v` while the worker still carries `v-1`. An
+    // equality test (`applied != target`) would return true here and write
+    // the OLDER policy. This is also where an off-by-one (`<=` for `<`,
+    // `>=` for `>`) at either boundary shows up.
+    assert!(needs_policy_write(Some(41), 42, false), "one behind is behind");
+    assert!(!needs_policy_write(Some(42), 42, false), "exactly equal is not behind");
+    assert!(!needs_policy_write(Some(43), 42, false), "one ahead of a stale snapshot: skip");
+    assert!(needs_policy_write(Some(43), 42, true), "one ahead of the newest: rollback write");
+
+    // TARGET 0 — reachable: a boot snapshot carrying no policy yet has
+    // `policy_version: 0`, and `apply_if_changed` installs an empty IR at
+    // that version. Also the case an implementation doing subtraction
+    // instead of comparison (`target - av`) would underflow on.
+    assert!(needs_policy_write(None, 0, false), "never-applied at version 0 must be written");
+    assert!(!needs_policy_write(Some(0), 0, true), "already at version 0: skip");
+    assert!(!needs_policy_write(Some(1), 0, false), "ahead of a stale version-0 snapshot: skip");
+    assert!(needs_policy_write(Some(1), 0, true), "ahead of the newest version-0 snapshot: write");
+
+    // u64::MAX — NOT reachable (the controller's version counter is
+    // `MAX(version) + 1` in SQLite and `set_applied_version` rejects
+    // anything past the INTEGER range). Kept as one cheap line because a
+    // saturating or wrapping arithmetic implementation would misbehave at
+    // the extreme while looking correct everywhere else.
+    assert!(needs_policy_write(Some(0), u64::MAX, false), "0 is behind the maximum");
+    assert!(!needs_policy_write(Some(u64::MAX), u64::MAX, false), "the maximum equals itself");
+    assert!(!needs_policy_write(Some(u64::MAX), 0, false), "the maximum is ahead of 0: skip");
+}
+
+/// Exhaustive sweep of a small domain, as a guard against a mis-ordered or
+/// unreachable `match` arm that the hand-picked cases above could miss.
+///
+/// The expectation is written with `Ordering` rather than the named cases,
+/// which is a RESTATEMENT of the same rule, not an independent derivation —
+/// its value here is coverage of every combination, not a second opinion on
+/// what the rule should be. The named tests above are the actual pins.
+#[test]
+fn needs_policy_write_sweep_matches_the_ordering_rule() {
+    use std::cmp::Ordering;
+    for applied in [None, Some(0u64), Some(1), Some(2), Some(3), Some(4)] {
+        for target in 0u64..=4 {
+            for newest in [false, true] {
+                let expected = match applied {
+                    None => true,
+                    Some(av) => match av.cmp(&target) {
+                        Ordering::Less => true,
+                        Ordering::Equal => false,
+                        Ordering::Greater => newest,
+                    },
+                };
+                assert_eq!(
+                    needs_policy_write(applied, target, newest),
+                    expected,
+                    "applied={applied:?} target={target} ds_is_newest={newest}"
+                );
+            }
+        }
+    }
 }
 
 // --- baseline -------------------------------------------------------------
