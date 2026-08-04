@@ -116,6 +116,21 @@ pub fn render_peer_stats(peers: &[(String, PeerStats)]) -> String {
     s
 }
 
+/// Render the policy-apply failure counter (Backlog item 1). Sourced from
+/// `crate::policy_apply::PolicyApplyHandle::failures`: installs that returned
+/// `Err` and were retried instead of killing the process, which is precisely
+/// the class of event that used to be invisible because it was fatal.
+///
+/// Always emitted, including at 0 — an absent series is indistinguishable
+/// from a dead exporter, and "policy applies are failing" is an alert an
+/// operator must be able to write against an always-present series.
+pub fn render_policy_apply_failures(total: u64) -> String {
+    let mut s = String::new();
+    s.push_str("# TYPE wiremesh_gateway_policy_apply_failures_total counter\n");
+    s.push_str(&format!("wiremesh_gateway_policy_apply_failures_total {total}\n"));
+    s
+}
+
 /// Wrap a Prometheus text body in a minimal HTTP/1.1 response.
 fn http_response(body: &str) -> String {
     format!(
@@ -128,15 +143,17 @@ fn http_response(body: &str) -> String {
 /// Serve one Prometheus scrape per accepted TCP connection on `listener`,
 /// forever (until `listener` errors). `fetch` is called once per connection
 /// to obtain `(backend_kind, applied_policy_version, counters, peer_states,
-/// transition_counts, peer_stats)`, which is rendered via [`render`] +
-/// [`render_path_state`] + [`render_path_transitions`] +
-/// [`render_peer_stats`] and written back verbatim (any HTTP request line
-/// the client sent is drained and ignored — this is a scrape-only stub
-/// server, not a general HTTP server). `peer_stats` is the sixth element
-/// (mesh-convergence fix T5), threaded through the fetch tuple — rather
-/// than rendered by a caller elsewhere — so the per-peer gauges provably
-/// reach the real scrape body (the same wiring failure mode the path-state
-/// gauges once had).
+/// transition_counts, peer_stats, policy_apply_failures)`, which is rendered
+/// via [`render`] + [`render_path_state`] + [`render_path_transitions`] +
+/// [`render_peer_stats`] + [`render_policy_apply_failures`] and written back
+/// verbatim (any HTTP request line the client sent is drained and ignored —
+/// this is a scrape-only stub server, not a general HTTP server).
+///
+/// `peer_stats` (sixth, mesh-convergence fix T5) and
+/// `policy_apply_failures` (seventh, Backlog item 1) ride the fetch tuple —
+/// rather than being rendered by a caller elsewhere — so they provably reach
+/// the real scrape body. That is the same wiring failure mode the path-state
+/// gauges once had: rendered, unit-tested, and never actually served.
 pub async fn serve_metrics<F, Fut>(listener: TcpListener, fetch: F) -> anyhow::Result<()>
 where
     F: Fn() -> Fut + Clone + Send + 'static,
@@ -148,6 +165,7 @@ where
                 Vec<(String, PathState)>,
                 Vec<((PathState, PathState), u64)>,
                 Vec<(String, PeerStats)>,
+                u64,
             )>,
         > + Send
         + 'static,
@@ -161,11 +179,20 @@ where
             let mut buf = [0u8; 512];
             let _ = stream.read(&mut buf).await;
             let body = match fetch().await {
-                Ok((kind, version, counters, peer_states, transitions, peer_stats)) => {
+                Ok((
+                    kind,
+                    version,
+                    counters,
+                    peer_states,
+                    transitions,
+                    peer_stats,
+                    policy_apply_failures,
+                )) => {
                     let mut body = render(&kind, version, &counters);
                     body.push_str(&render_path_state(&peer_states));
                     body.push_str(&render_path_transitions(&transitions));
                     body.push_str(&render_peer_stats(&peer_stats));
+                    body.push_str(&render_policy_apply_failures(policy_apply_failures));
                     body
                 }
                 Err(e) => format!("# error collecting counters: {e:#}\n"),
@@ -237,6 +264,8 @@ mod tests {
             // Mechanical +1 tuple element (fix T5); the per-peer-gauge
             // scrape assertions live in `tests/peer_metrics.rs`.
             let peer_stats: Vec<(String, PeerStats)> = vec![];
+            // Likewise mechanical (Backlog item 1); the apply-failure
+            // scrape assertion lives in `tests/policy_apply_liveness.rs`.
             Ok::<_, anyhow::Error>((
                 "ebpf".to_string(),
                 9u64,
@@ -244,6 +273,7 @@ mod tests {
                 peer_states,
                 transitions,
                 peer_stats,
+                0u64,
             ))
         }));
 

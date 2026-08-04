@@ -131,6 +131,9 @@ async fn t5_serve_metrics_scrape_includes_per_peer_gauges() {
                 PeerStats { rx_bytes: 0, tx_bytes: 0, last_handshake_age_secs: None },
             ),
         ];
+        // Trailing `0u64`: mechanical +1 tuple element (Backlog item 1's
+        // policy-apply failure counter). Its own scrape assertion lives in
+        // `tests/policy_apply_liveness.rs`; nothing here changes.
         Ok::<_, anyhow::Error>((
             "ebpf".to_string(),
             9u64,
@@ -138,6 +141,7 @@ async fn t5_serve_metrics_scrape_includes_per_peer_gauges() {
             peer_states,
             transitions,
             peer_stats,
+            0u64,
         ))
     }));
 

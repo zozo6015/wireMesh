@@ -75,8 +75,12 @@ Bet-3 mTLS QUIC-datagram bridge and filling 4b's inert `Relayed` seam): the
 revocation denylist), controller relay enrollment (`Enroll --kind relay`) +
 advertisement (`RelaysChanged` deltas) + a health/eviction pipeline (≤15s), a
 `RelayInfo`/`RelayHealth` proto surface, and the gateway `RelayTransport`
-(local UDP ↔ QUIC) wired into the path state machine with a **rekey-free**
-endpoint switch to the relay socket. The netns done-bar
+(local UDP ↔ QUIC) wired into the path state machine with a **scoped
+single-peer** endpoint switch to the relay socket (`uapi::set_one_peer` =
+remove + re-add, so the peer restarts with no noise session and the caller
+nudges it — 4c's original "rekey-free" described WireGuard protocol
+behaviour, but the later session-continuity fix rewrote both this and the
+punch path to force a rehandshake). The netns done-bar
 (`crates/wiremesh-gateway/tests/relay_matrix.rs`) proves a **symmetric-NAT
 pair whose direct punch fails flows real WG traffic over the relay** (`path =
 relayed`, relay-local endpoints, never `direct`) — reliably green; relay

@@ -674,13 +674,17 @@ pub fn flip_under_traffic_zero_loss(kind: BackendKind) -> anyhow::Result<()> {
     let (lab, a, b) = wg_lab("aeth13");
     join_netns(&b.name).context("join b's netns before probing wg0 in-process")?;
 
-    // (Review finding) With the default `reap_grace` (10s) each non-first
-    // `apply()` below would block ~10s waiting out the prior flip's reap
-    // grace -- 20 flips would take ~190s, running long after the ~3.5s
-    // sender/1.5s receiver-idle-timeout traffic window has already closed,
-    // defeating the "concurrent with live traffic" point of this scenario.
-    // Shrink it so all 20 flips genuinely complete while traffic is still
-    // flowing.
+    // (Review finding, revised by Backlog item 1) The reap grace is the
+    // minimum spacing between generation flips: overwriting an outer-array
+    // slot sooner can pull the maps out from under packets still reading
+    // them, which is precisely the deficit this scenario measures. With the
+    // default 10s, 20 correctly-spaced flips would take ~190s and run long
+    // after the ~3.5s sender / 1.5s receiver-idle traffic window has closed,
+    // defeating the "concurrent with live traffic" point. Shrink it so all
+    // 20 flips genuinely complete while traffic is still flowing.
+    //
+    // The grace is now HONORED BY THIS CALLER (see the flip loop below)
+    // rather than slept out inside `apply()`.
     let cfg = EnforcerConfig { reap_grace: Duration::from_millis(50), ..EnforcerConfig::default() };
     let mut enforcer = wiremesh_enforcer::probe_with(kind, "wg0", cfg)
         .with_context(|| format!("flip_under_traffic_zero_loss({kind:?}): probe_with"))?;
@@ -708,14 +712,26 @@ policy:
     std::thread::sleep(Duration::from_millis(150));
     let sender = spawn_udp_sender(&a, "10.10.0.2", 7600, 350, 0.01); // ~3.5s total
 
-    // 20 flips of the SAME allow policy, back-to-back, concurrent with the
-    // live traffic. eBPF's apply() may internally block out the remainder
-    // of a prior flip's reap grace before returning (design §6) -- shrunk to
-    // 50ms above so that wait, summed over 20 flips, stays well inside the
-    // traffic window instead of the design's 10s default; no explicit sleep
-    // needed either way; nft's apply() has no such grace (one atomic `nft
-    // -f -` transaction) and returns immediately.
+    // 20 flips of the SAME allow policy, concurrent with the live traffic.
+    //
+    // The explicit wait is REQUIRED (Backlog item 1): `apply()` used to sleep
+    // out the remainder of the prior flip's reap grace itself, which
+    // incidentally spaced this loop out; it no longer does, so 20 flips would
+    // otherwise land within milliseconds of each other and genuinely violate
+    // the grace under live traffic -- a real deficit, not a flaky assertion.
+    // Honoring `apply_ready_at()` is exactly what the production caller
+    // (`wiremesh_gateway::policy_apply`) does, just synchronously here. The
+    // nft backend publishes no deadline (one atomic `nft -f -` transaction,
+    // nothing to protect), so this is a no-op on that backend and the loop
+    // stays back-to-back there, as before. Cost on eBPF: 20 x the 50ms grace
+    // configured above = ~1s, well inside the traffic window.
     for i in 0..20 {
+        if let Some(t) = enforcer.apply_ready_at() {
+            let now = std::time::Instant::now();
+            if t > now {
+                std::thread::sleep(t - now);
+            }
+        }
         enforcer
             .apply(&ir)
             .with_context(|| format!("flip_under_traffic_zero_loss({kind:?}): flip #{i}"))?;

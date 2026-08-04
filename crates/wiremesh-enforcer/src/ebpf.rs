@@ -96,14 +96,15 @@ const PINNED_MAPS: [&str; 12] = [
 /// detach; it does not need an explicit unattach/unload step.
 pub struct EbpfEnforcer {
     ebpf: Ebpf,
-    #[allow(dead_code)] // every field is now consumed (Task 9: `flow_max`/
+    // Most of this is consumed in `new` below from the LOCAL `cfg`
+    // parameter, strictly before this struct exists (Task 9: `flow_max`/
     // `tcp_idle_s`/`udp_idle_s`/`icmp_idle_s`/`rate_cap_per_src`; Task 10:
-    // `log_per_rule`/`log_aggregate`), but all of that consumption happens
-    // in `new` below, from the LOCAL `cfg` parameter, strictly BEFORE this
-    // struct is ever constructed -- `self.cfg` itself is never read again
-    // afterwards. Kept (with the allow) so a later task can read the
-    // effective config back off a live `EbpfEnforcer` without another
-    // `probe`/`new` signature change.
+    // `log_per_rule`/`log_aggregate`) — it was retained purely so a later
+    // task could read the effective config back off a live `EbpfEnforcer`
+    // without another `probe`/`new` signature change. Backlog item 1 is
+    // that task: `apply_ready_at` reads `cfg.reap_grace` on every call,
+    // since the grace is now published to the caller rather than slept out
+    // internally.
     cfg: EnforcerConfig,
     /// Task 8 map-in-map generation bookkeeping (idx→`rule_id` mapping for
     /// `counters()`, and the pending-reap grace-period tracker for
@@ -316,9 +317,21 @@ impl Enforcer for EbpfEnforcer {
     fn apply(&mut self, ir: &PolicyIR) -> Result<()> {
         let flat = flatten(ir)?;
         // Pre-flight, BEFORE apply_generation does any kernel work (trie
-        // building, reap-grace waiting): see `check_lpm_capacity`'s doc.
+        // building, map creation): see `check_lpm_capacity`'s doc.
         check_lpm_capacity(&flat)?;
-        apply_generation(&mut self.ebpf, &flat, &mut self.gen, self.cfg.reap_grace)
+        apply_generation(&mut self.ebpf, &flat, &mut self.gen)
+    }
+
+    /// `flip instant + reap_grace` while a generation reap is pending;
+    /// `None` before the first `apply` (neither outer-array slot has ever
+    /// been written by us, so there is nothing to protect and a boot-time
+    /// apply must never be made to wait). Every flip republishes this off
+    /// ITS OWN `flipped_at`, so a caller honoring it is serialized at
+    /// exactly one grace per generation and can never have a stale,
+    /// already-satisfied deadline authorize overwriting a slot vacated
+    /// moments ago.
+    fn apply_ready_at(&self) -> Option<Instant> {
+        self.gen.pending_reap.as_ref().map(|p| p.flipped_at + self.cfg.reap_grace)
     }
 
     /// Real (Task 8, fixed post-review): reads the 258-entry `COUNTERS`
@@ -822,26 +835,26 @@ fn prune_retired_counters(gen: &mut GenerationState, new_idx_to_rule_id: &[Strin
 /// fixed-capacity A/B `Array<Rule>` pair — see this file's module doc and
 /// the Task 8 brief).
 ///
-/// Reap-on-next-apply (brief: "reap-on-next-apply + minimum 10s since flip
-/// is the implementation: if the next apply comes sooner, it waits out the
-/// remainder"): `target` (`1 - active_now`) is always exactly the slot the
-/// PREVIOUS `apply()` flipped away from (our two slots strictly alternate
-/// under our own sole control, so there's only ever one "pending reap" at a
-/// time) — before overwriting it with the new generation's fresh maps, wait
-/// out whatever remains of `reap_grace` (design default 10s, via
-/// [`crate::EnforcerConfig::reap_grace`]) since that flip. In production use
-/// (`apply()` calls spaced more than `reap_grace` apart) this is a no-op;
-/// back-to-back rapid re-applies (exercised deliberately by
-/// `tests/generations.rs`'s `atomic_generation_flip_under_continuous_udp_traffic_has_zero_deficit`,
-/// which shrinks `reap_grace` so its flips genuinely land inside its traffic
-/// window) serialize on this wait instead of ever installing/flipping to a
-/// still-possibly-in-use generation's slot.
-fn apply_generation(
-    ebpf: &mut Ebpf,
-    flat: &[FlatRule],
-    gen: &mut GenerationState,
-    reap_grace: Duration,
-) -> Result<()> {
+/// Reap-on-next-apply: `target` (`1 - active_now`) is always exactly the
+/// slot the PREVIOUS `apply()` flipped away from (our two slots strictly
+/// alternate under our own sole control, so there's only ever one "pending
+/// reap" at a time), and overwriting it with the new generation's fresh maps
+/// is only safe once `reap_grace` has elapsed since that flip.
+///
+/// **This function no longer WAITS for that (Backlog item 1).** It used to
+/// `std::thread::sleep` out the remainder of the grace right here. In the
+/// gateway that thread is a tokio runtime thread inside the Sync loop
+/// (`main.rs`'s `apply_state` → `GatewayEnforcer::apply_if_changed` → here),
+/// so a single policy epoch parked the loop for up to 10s — delaying
+/// `PunchDirective` servicing past the Cycle-4b go-skew budget, starving the
+/// metrics scrape behind the enforcer-map lock, and costing N × 10s with
+/// several live epochs during a rotation overlap. The grace did not
+/// disappear, it MOVED: [`EbpfEnforcer::apply_ready_at`] publishes
+/// `flipped_at + reap_grace` and the caller waits it out asynchronously
+/// (`wiremesh_gateway::policy_apply`). Test callers that flip back-to-back
+/// must now honor it themselves — see `wiremesh-testkit`'s
+/// `flip_under_traffic_zero_loss`.
+fn apply_generation(ebpf: &mut Ebpf, flat: &[FlatRule], gen: &mut GenerationState) -> Result<()> {
     let active_now: u32 = {
         let a: Array<&MapData, u32> = Array::try_from(ebpf.map("ACTIVE").context("ACTIVE")?)?;
         a.get(&0, 0)?
@@ -849,14 +862,14 @@ fn apply_generation(
     let target = 1 - active_now;
 
     if let Some(pending) = &gen.pending_reap {
+        // Deliberately NO wait here (Backlog item 1) — see this function's
+        // doc comment. The remaining invariant this block still guards is
+        // the alternation `apply_ready_at`'s single-`PendingReap` model
+        // depends on.
         debug_assert_eq!(
             pending.slot, target,
             "outer-array slots must strictly alternate under apply()'s own sole control"
         );
-        let elapsed = pending.flipped_at.elapsed();
-        if elapsed < reap_grace {
-            std::thread::sleep(reap_grace - elapsed);
-        }
     }
 
     let (rules, idx_to_rule_id) = build_rules(flat);
