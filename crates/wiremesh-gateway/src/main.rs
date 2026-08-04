@@ -18,6 +18,7 @@ use wiremesh_gateway::metrics;
 use wiremesh_gateway::path::{
     directive_should_punch, transition_crosses_settled_boundary, Path, PathAction, PathState,
 };
+use wiremesh_gateway::policy_apply::needs_policy_write;
 use wiremesh_gateway::punch_backoff::{PunchBackoff, PunchDecision};
 use wiremesh_gateway::relay::{RelayDeathReason, RelayTransport};
 use wiremesh_gateway::rotation::{Rotation, RotationAction, RotationPhase};
@@ -71,54 +72,11 @@ struct EnforcerApplyTarget {
     report_notify: Arc<tokio::sync::Notify>,
 }
 
-/// Does installing `ds` need to WRITE this enforcer?
-///
-/// Strictly-less-than, not `!=` (review finding). A rotation insert
-/// (`maybe_start_role_a`/`maybe_start_role_b`) applies the CURRENT snapshot
-/// to its new enforcer inline and only then puts it in the map, so a worker
-/// still carrying the previous version can find an entry that is already
-/// AHEAD of it. Under an equality test `Some(v) != Some(v-1)` is true and
-/// the entry gets rewritten with the OLDER policy — a real downgrade of a
-/// rotation overlap tun that is carrying traffic. It self-heals in about one
-/// install round trip (the newer version is already in the mailbox), and on
-/// eBPF it is masked entirely because that fresh entry always has a pending
-/// reap and gets deferred, but on the nftables backend `apply_ready_at` is
-/// permanently `None`, nothing defers it, and the downgrade lands.
-///
-/// An enforcer AHEAD of `ds` is the ambiguous case, and `ds_is_newest`
-/// resolves it. Both readings are reachable and they need opposite answers:
-///
-/// - `ds_is_newest == false` — our snapshot is STALE. A newer state was
-///   published and a rotation insert already applied it to this entry.
-///   Skip: writing our older policy would downgrade a traffic-carrying
-///   rotation tun. (On eBPF that entry is additionally inside its post-flip
-///   grace and would be deferred anyway; on nftables `apply_ready_at` is
-///   permanently `None`, nothing defers, and the downgrade would land — the
-///   reason this filter exists at all.) The newer state is already in the
-///   mailbox, so it lands on the worker's next iteration.
-/// - `ds_is_newest == true` — the CONTROLLER rolled back. Its version
-///   counter is normally monotone (`MAX(version) + 1`,
-///   `controller/src/db.rs`'s `candidate_version`), but a DB restore from
-///   backup — a documented step in this project's own controller-migration
-///   runbook — or repointing the gateway at a different controller makes
-///   `ds` genuinely older than what is installed. Write it: `ds` IS the
-///   desired state, and skipping would leave the gateway pinned to a policy
-///   the operator has abandoned until the controller climbed back past it.
-///
-/// The rollback write is NOT a bypass: it goes through exactly the same
-/// per-entry reap-deadline re-check as every other write in `install`.
-fn needs_policy_write(e: &GatewayEnforcer, ds: &DesiredState, ds_is_newest: bool) -> bool {
-    match e.applied_version() {
-        None => true,
-        Some(av) if av < ds.policy_version => true,
-        Some(av) if av > ds.policy_version => ds_is_newest,
-        Some(_) => false, // already exactly this version
-    }
-}
-
 impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
     /// The furthest-out deadline across the enforcers this install would
-    /// actually WRITE (see [`needs_policy_write`]) — an entry that will not
+    /// actually WRITE (see [`wiremesh_gateway::policy_apply::needs_policy_write`],
+    /// the single shared predicate this and `install` must agree on) — an
+    /// entry that will not
     /// be touched has a grace that protects nothing. Without that filter, a
     /// rotation overlap's brand-new enforcer (first apply = a full fresh
     /// grace) would delay a policy TIGHTENING to the boot tun that is
@@ -131,7 +89,7 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
     fn ready_at(&self, ds: &DesiredState, ds_is_newest: bool) -> Option<Instant> {
         let map = self.enforcers.blocking_lock();
         map.values()
-            .filter(|e| needs_policy_write(e, ds, ds_is_newest))
+            .filter(|e| needs_policy_write(e.applied_version(), ds.policy_version, ds_is_newest))
             .filter_map(|e| e.apply_ready_at())
             .max()
     }
@@ -191,7 +149,8 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
             let mut map = self.enforcers.blocking_lock();
             let now = Instant::now();
             for (epoch, enforcer) in map.iter_mut() {
-                if !needs_policy_write(enforcer, ds, ds_is_newest) {
+                if !needs_policy_write(enforcer.applied_version(), ds.policy_version, ds_is_newest)
+                {
                     continue; // nothing would be written; nothing to gate on
                 }
                 if let Some(left) =

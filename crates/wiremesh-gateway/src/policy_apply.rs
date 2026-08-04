@@ -113,6 +113,65 @@ pub trait PolicyApplyTarget: Send + Sync + 'static {
     fn install(&self, ds: &DesiredState, ds_is_newest: bool) -> anyhow::Result<()>;
 }
 
+/// Does installing policy version `target` need to WRITE an enforcer whose
+/// currently-live version is `applied_version` (`None` = never applied)?
+///
+/// Pure, and public, deliberately. This one predicate carries the
+/// security-relevant half of the whole item, and both
+/// [`PolicyApplyTarget::ready_at`] and [`PolicyApplyTarget::install`] MUST
+/// agree on it — `ready_at` waits out the grace of exactly the entries
+/// `install` will write, so a disagreement either delays a write needlessly
+/// or discovers a grace under the lock that should have been waited out up
+/// front. It lives here rather than in the adapter so its truth table is
+/// exhaustively testable with no timing, and so implementations (including
+/// test fakes) can CALL it instead of mirroring it — a fake that
+/// reimplements this can drift from the adapter, and a drift here is
+/// invisible to every test.
+///
+/// Strictly-less-than, not `!=` (review finding). A rotation insert
+/// (`maybe_start_role_a`/`maybe_start_role_b`) applies the CURRENT snapshot
+/// to its new enforcer inline and only then puts it in the map, so a worker
+/// still carrying the previous version can find an entry that is already
+/// AHEAD of it. Under an equality test `Some(v) != Some(v-1)` is true and
+/// the entry gets rewritten with the OLDER policy — a real downgrade of a
+/// rotation overlap tun that is carrying traffic. It self-heals in about one
+/// install round trip (the newer version is already in the mailbox), and on
+/// eBPF it is masked entirely because that fresh entry always has a pending
+/// reap and gets deferred, but on the nftables backend `apply_ready_at` is
+/// permanently `None`, nothing defers it, and the downgrade lands.
+///
+/// An enforcer AHEAD of `target` is the ambiguous case, and `ds_is_newest`
+/// resolves it. Both readings are reachable and they need opposite answers:
+///
+/// - `ds_is_newest == false` — our snapshot is STALE. A newer state was
+///   published and a rotation insert already applied it to this entry.
+///   Skip: writing our older policy would downgrade a traffic-carrying
+///   rotation tun. (On eBPF that entry is additionally inside its post-flip
+///   grace and would be deferred anyway; on nftables `apply_ready_at` is
+///   permanently `None`, nothing defers, and the downgrade would land — the
+///   reason this filter exists at all.) The newer state is already in the
+///   mailbox, so it lands on the worker's next iteration.
+/// - `ds_is_newest == true` — the CONTROLLER rolled back. Its version
+///   counter is normally monotone (`MAX(version) + 1`,
+///   `controller/src/db.rs`'s `candidate_version`), but a DB restore from
+///   backup — a documented step in this project's own controller-migration
+///   runbook — or repointing the gateway at a different controller makes
+///   the desired state genuinely older than what is installed. Write it: it
+///   IS the desired state, and skipping would leave the gateway pinned to a
+///   policy the operator has abandoned until the controller climbed back
+///   past it.
+///
+/// The rollback write is NOT a bypass: it goes through exactly the same
+/// per-entry reap-deadline re-check as every other write in `install`.
+pub fn needs_policy_write(applied_version: Option<u64>, target: u64, ds_is_newest: bool) -> bool {
+    match applied_version {
+        None => true,
+        Some(av) if av < target => true,
+        Some(av) if av > target => ds_is_newest,
+        Some(_) => false, // already exactly this version
+    }
+}
+
 /// Latest-wins mailbox handle. Cheap to clone: the Sync loop publishes
 /// through it, the metrics scrape reads [`PolicyApplyHandle::failures`].
 #[derive(Clone)]
