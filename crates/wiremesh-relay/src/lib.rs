@@ -59,13 +59,60 @@ const RELAY_SERVER_NAME: &str = "relay";
 /// misbehaving/hostile peer from streaming an unbounded registration.
 const MAX_REGISTRATION_BYTES: usize = 1024;
 
-/// Minimum spacing between "dropped a cross-pair datagram" log lines from one
-/// connection (see `serve`'s datagram loop). Every violating datagram is
-/// counted, but at most one line per connection per interval is emitted, and
-/// it carries the running count — an injector sends at line rate, so a
-/// per-datagram log would let it amplify a cheap 8-byte compare into unbounded
-/// stderr I/O on the relay.
-const CROSS_PAIR_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// Minimum spacing between repeated log lines of ONE kind from ONE connection
+/// in `serve`'s datagram loop (see [`DatagramDropLog`]). Every event is
+/// counted, but at most one line per kind per connection per interval is
+/// emitted, and it carries the running count.
+///
+/// This is a hard requirement, not tidiness: every branch in that loop runs
+/// once per received datagram, and an attacker holding any valid gateway cert
+/// controls how fast datagrams arrive. An unbounded `eprintln!` on any of
+/// those branches lets it amplify a few bytes of work into unbounded stderr
+/// I/O on the relay — a cheaper DoS than the one dest-pinning closes.
+const DATAGRAM_LOG_INTERVAL: Duration = Duration::from_secs(10);
+
+/// Per-connection, per-branch rate limiter for `serve`'s datagram loop.
+///
+/// Deliberately ONE INSTANCE PER BRANCH rather than one shared limiter for
+/// the whole loop. A shared limiter is simpler, but the branches have
+/// different audiences and one can drown out another: a cross-pair injector
+/// sending at line rate would hold the shared token permanently and suppress
+/// the `unknown dest` line — which is exactly the line an operator greps for
+/// during the [`registration_key`] lockstep upgrade, when a version-skewed
+/// pair's only symptom is that it never rendezvouses. Each kind is therefore
+/// guaranteed to surface within one interval no matter how loud the others
+/// are; three counters and three `Instant`s per connection is nothing.
+struct DatagramDropLog {
+    /// Total events of this kind on this connection, including suppressed
+    /// ones — reported in every emitted line so a suppressed burst is still
+    /// visible as a number.
+    count: u64,
+    last_logged: Option<std::time::Instant>,
+}
+
+impl DatagramDropLog {
+    fn new() -> DatagramDropLog {
+        DatagramDropLog { count: 0, last_logged: None }
+    }
+
+    /// Records one event. Returns `Some(total_so_far)` when a line is due
+    /// (first event, or [`DATAGRAM_LOG_INTERVAL`] since the last emitted
+    /// one), `None` when it must be suppressed. Counting happens either way.
+    fn record(&mut self) -> Option<u64> {
+        self.count += 1;
+        let now = std::time::Instant::now();
+        let due = match self.last_logged {
+            None => true,
+            Some(t) => now.duration_since(t) >= DATAGRAM_LOG_INTERVAL,
+        };
+        if due {
+            self.last_logged = Some(now);
+            Some(self.count)
+        } else {
+            None
+        }
+    }
+}
 
 pub mod enroll;
 
@@ -785,13 +832,18 @@ pub async fn serve(endpoint: Endpoint) {
             // the per-datagram cost is an 8-byte compare.
             let allowed_dest = registration_key(&peer_identity, &my_identity);
 
-            // Rate-limiting state for the cross-pair drop log. A rejected
-            // datagram is dropped silently-but-countably rather than logged
-            // per packet: an injector sends at line rate, and an unbounded
-            // eprintln! per datagram would turn a cheap drop into a
-            // log-amplification DoS against the relay itself.
-            let mut violations: u64 = 0;
-            let mut last_violation_log: Option<std::time::Instant> = None;
+            // Rate-limiting state, one limiter per log-emitting branch of the
+            // loop below. EVERY branch there is per-datagram and therefore
+            // attacker-paced, so none of them may log unconditionally — see
+            // [`DatagramDropLog`] for why the limiters are per-branch and not
+            // shared. (`unknown dest` is reachable by the same actor that
+            // dest-pinning stops: register `(gw-C, P)` for a peer `P` that
+            // never connects, then flood your OWN legal dest — the pin passes
+            // and the registry lookup misses on every datagram.)
+            let mut runt_log = DatagramDropLog::new();
+            let mut cross_pair_log = DatagramDropLog::new();
+            let mut unknown_dest_log = DatagramDropLog::new();
+            let mut forward_failed_log = DatagramDropLog::new();
 
             loop {
                 let dgram = match conn.read_datagram().await {
@@ -802,6 +854,21 @@ pub async fn serve(endpoint: Endpoint) {
                     }
                 };
                 if dgram.len() < 8 {
+                    // A datagram too short to even carry the dest header.
+                    // This was the loop's one SILENT drop — no amplification
+                    // risk (it logged nothing at all), but no diagnostic
+                    // either. Counted and bounded like the rest so the loop
+                    // has exactly one shape: every drop is counted, every log
+                    // is rate-limited.
+                    if let Some(n) = runt_log.record() {
+                        eprintln!(
+                            "relay: dropping runt datagram ({} bytes, need >= 8 for the dest \
+                             header) from {:?} on key {} ({n} so far on this connection)",
+                            dgram.len(),
+                            cert_identity,
+                            key_hex(&key)
+                        );
+                    }
                     continue;
                 }
                 let mut dest = [0u8; 8];
@@ -828,24 +895,17 @@ pub async fn serve(endpoint: Endpoint) {
                     // The log below is the alerting seam: sustained cross-pair
                     // dests from one connection is the signature of the
                     // injection attempt, not of a misconfiguration.
-                    violations += 1;
-                    let now = std::time::Instant::now();
-                    let due = match last_violation_log {
-                        None => true,
-                        Some(t) => now.duration_since(t) >= CROSS_PAIR_LOG_INTERVAL,
-                    };
-                    if due {
+                    if let Some(n) = cross_pair_log.record() {
                         eprintln!(
                             "relay: DROPPING datagram from {:?} (key {}) addressed to {} — \
                              outside its own registered pair (peer {:?}, only legal dest {}); \
-                             {violations} violation(s) on this connection so far",
+                             {n} violation(s) on this connection so far",
                             cert_identity,
                             key_hex(&key),
                             key_hex(&dest),
                             peer_identity,
                             key_hex(&allowed_dest)
                         );
-                        last_violation_log = Some(now);
                     }
                     continue;
                 }
@@ -856,10 +916,32 @@ pub async fn serve(endpoint: Endpoint) {
                     fwd.extend_from_slice(&key); // src key header
                     fwd.extend_from_slice(&dgram[8..]);
                     if let Err(e) = peer.send_datagram(fwd.into()) {
-                        eprintln!("relay: forward to {} failed: {e}", key_hex(&dest));
+                        // Forwarding failure is per-datagram too, and it is
+                        // not necessarily rare: a peer whose datagram queue is
+                        // full or whose connection is closing errors on every
+                        // send until it drains or dies.
+                        if let Some(n) = forward_failed_log.record() {
+                            eprintln!(
+                                "relay: forward to {} failed: {e} ({n} failure(s) on this \
+                                 connection so far)",
+                                key_hex(&dest)
+                            );
+                        }
                     }
                 } else {
-                    eprintln!("relay: unknown dest {}", key_hex(&dest));
+                    // The peer half of this pair is not (or no longer)
+                    // registered. Benign and expected while the far side is
+                    // still connecting or has just left the relay — and it is
+                    // THE line to grep for during a `registration_key`
+                    // lockstep upgrade, which is why this limiter is its own
+                    // and cannot be starved by a noisy cross-pair injector.
+                    if let Some(n) = unknown_dest_log.record() {
+                        eprintln!(
+                            "relay: unknown dest {} ({n} datagram(s) undeliverable on this \
+                             connection so far)",
+                            key_hex(&dest)
+                        );
+                    }
                 }
             }
 
