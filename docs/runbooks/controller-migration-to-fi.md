@@ -361,15 +361,32 @@ Executed against `px` (`206.83.146.32`) instead of FI. Deviations and findings:
    but never chowns). Run the recovery by hand:
 
    ```bash
-   chown root:root /var/lib/wiremesh     # gateway's dir; controller no longer uses it
+   # Check what else lives here BEFORE the chown — it locks the `wiremesh` user out:
+   ls /var/lib/wiremesh
+   #   ca.key present    -> a PINNED CONTROLLER still uses this directory. This chown
+   #                        takes its own CA/DB away from it and it will refuse to
+   #                        start. Move its state out first: docs/install.md,
+   #                        "Moving the controller to its own directory".
+   #   relay.pem present -> a LEGACY RELAY (User=wiremesh) still uses this directory.
+   #                        Migrate it to /var/lib/wiremesh-relay first.
+   chown root:root /var/lib/wiremesh     # gateway's dir. NOT -R — see below.
    systemctl restart wiremesh-gateway
    ```
 
+   **The chown is deliberately not recursive, and must stay that way.** The bug it undoes
+   was itself non-recursive (`chown wiremesh:wiremesh /var/lib/wiremesh`, no `-R`): only
+   the directory's own ownership ever changed, the gateway's files inside were never
+   touched, and the gateway was blocked on *traversing* the directory, not on the files.
+   Restoring the directory alone is therefore the exact inverse and is sufficient.
+   `chown -R` would go further than the bug did and rewrite files that are `wiremesh`-owned
+   for perfectly good reasons — a legacy relay's `relay.key`, or a pinned controller's
+   `ca.key`/`controller.db`/`secrets/` — breaking those services to fix the gateway.
+
    The controller postinstall detects this exact state (dir owned by `wiremesh`, still
    holding `identity.json`) and prints that command — but it does not run it, because a
-   host with a **legacy relay** identity in the same directory needs it `wiremesh`-owned
-   instead. There is no ownership that satisfies both: migrate the relay to
-   `/var/lib/wiremesh-relay` first, then chown to root.
+   host with a **legacy relay** identity, or a **pinned controller**, in the same directory
+   needs it `wiremesh`-owned instead. There is no ownership that satisfies all three;
+   only someone who knows what runs on the host can choose.
 
    **The fix, shipped:** *new* controller installs get their own state dir, exactly as
    the relay does. `wiremesh-controller.service` declares
@@ -379,10 +396,20 @@ Executed against `px` (`206.83.146.32`) instead of FI. Deviations and findings:
    fresh install `/var/lib/wiremesh` is the **gateway's** directory, full stop.
 
 3. **Upgrades do NOT move anything — existing hosts get PINNED.** If
-   `/var/lib/wiremesh` already holds control-plane state (`controller.db` or `ca.key`),
-   the postinst writes `WIREMESH_DATA_DIR=/var/lib/wiremesh` into `controller.env` and
-   leaves every byte where it is. Only a host with no controller state anywhere gets the
-   new `/var/lib/wiremesh-controller` default.
+   `/var/lib/wiremesh` already holds control-plane state, the postinst writes
+   `WIREMESH_DATA_DIR=/var/lib/wiremesh` into `controller.env` and leaves every byte
+   where it is. Only a host with no controller state anywhere gets the new
+   `/var/lib/wiremesh-controller` default.
+
+   The marker for "a real controller lives here" is **`ca.key`, and only `ca.key`**.
+   `controller.db` is deliberately NOT accepted: the controller used to open and fully
+   migrate its DB before the CA guard could refuse, so one boot against the wrong
+   directory left a complete, empty schema behind — and treating that as occupancy made
+   the mis-started directory look permanently in use, silently disabling the pin from
+   then on with no message at all. (`ca.pem` is no good either: a legacy relay identity
+   is `ca.pem` + `relay.pem` + `relay.key` in this same shared directory, so it
+   false-positives on a relay-only host.) `ca.key` is written by neither the gateway nor
+   the relay, and no controller can run without it.
 
    An automatic migration was designed, implemented and reviewed here, and then
    **dropped on purpose**. Two things killed it, and they are worth recording because

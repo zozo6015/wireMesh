@@ -38,6 +38,15 @@ OLD_DIR=/var/lib/wiremesh
 NEW_DIR=/var/lib/wiremesh-controller
 CONTROLLER_ENV=/etc/wiremesh/controller.env
 
+# What env_file_data_dir reports when the EnvironmentFile DOES set
+# WIREMESH_DATA_DIR but in a form this script will not interpret. It is a
+# distinct third answer on purpose: "set to something we do not understand"
+# must not collapse into "not set", because those two lead to opposite
+# actions (leave alone and warn, versus write a pin). An operator who
+# literally used this string as a path would land in the leave-alone branch,
+# which is the safe one, so the collision costs nothing.
+UNPARSABLE='<unparsable WIREMESH_DATA_DIR>'
+
 say()  { echo "WireMesh controller: $*"; }
 warn() { echo "WireMesh controller: WARNING $*" >&2; }
 
@@ -110,12 +119,70 @@ strip_slash() {
 }
 
 # The LAST WIREMESH_DATA_DIR= value in the EnvironmentFile (systemd keeps the
-# last assignment when a variable is set more than once), quotes stripped.
-# Empty when the file is absent or never sets it.
+# last assignment when a variable is set more than once), surrounding quotes
+# stripped. THREE possible answers, and the caller depends on all three being
+# distinguishable:
+#   - empty      the file is absent, or never sets the variable. Safe to pin:
+#                appending an assignment takes nothing away.
+#   - a path     understood; the caller compares it against OLD_DIR/NEW_DIR.
+#   - $UNPARSABLE  set, but in a form this script will not interpret. NEVER
+#                pinned — only warned about.
+#
+# That third answer is the whole point of rewriting this. The previous version
+# did the entire job in one regex and, on any value containing whitespace,
+# simply failed to match and returned EMPTY. `WIREMESH_DATA_DIR="/var/lib/wm
+# dir"` is balanced, quoted and perfectly valid to systemd, but empty means
+# "not set", so the caller appended its own assignment — systemd honours the
+# last one — and silently moved a working controller onto a different data
+# directory. Verified against the old regex: balanced double quotes with a
+# space, balanced single quotes with a space, and an unquoted value with a
+# space all returned empty.
 env_file_data_dir() {
   [ -f "$CONTROLLER_ENV" ] || return 0
-  sed -n -E "s/^[[:space:]]*WIREMESH_DATA_DIR=[\"']?([^\"'[:space:]]*)[\"']?[[:space:]]*\$/\\1/p" \
-      "$CONTROLLER_ENV" | tail -n 1
+
+  # Everything to the right of the last `WIREMESH_DATA_DIR=`, verbatim apart
+  # from trailing whitespace (which systemd ignores). This sed deliberately
+  # does NOT try to understand the value: interpreting it in the pattern is
+  # what made "malformed" and "absent" indistinguishable. The shell below can
+  # tell the cases apart; a regex that either matches or does not, cannot.
+  raw=$(sed -n -E -e "/^[[:space:]]*WIREMESH_DATA_DIR=/!d" \
+                  -e "s/^[[:space:]]*WIREMESH_DATA_DIR=//" \
+                  -e "s/[[:space:]]+\$//" -e p \
+                  "$CONTROLLER_ENV" | tail -n 1)
+
+  case "$raw" in
+    '')
+      # Not set, or set to nothing. Same thing here.
+      ;;
+    '"'*'"' | "'"*"'")
+      # Balanced surrounding quotes: strip exactly those two characters and
+      # keep everything between them, INTERNAL SPACES INCLUDED. A further
+      # quote inside means the outer pair is not the simple wrapper it looks
+      # like (shell-style concatenation, an escaped quote, ...) — hands off.
+      inner=${raw#?}
+      inner=${inner%?}
+      case "$inner" in
+        *'"'* | *"'"*) printf '%s' "$UNPARSABLE" ;;
+        *)             printf '%s' "$inner" ;;
+      esac
+      ;;
+    *'"'* | *"'"*)
+      # A quote that is not a balanced surrounding pair — unbalanced, or
+      # mid-value. Note what the OLD regex did with `WIREMESH_DATA_DIR="/x/y`:
+      # it stripped the opening quote and returned `/x/y`, i.e. it invented a
+      # plausible path out of a malformed line.
+      printf '%s' "$UNPARSABLE"
+      ;;
+    *[[:space:]]*)
+      # Unquoted, with whitespace in it. systemd takes the rest of the line;
+      # we will not second-guess that, and above all must not truncate at the
+      # space and then act on the fragment.
+      printf '%s' "$UNPARSABLE"
+      ;;
+    *)
+      printf '%s' "$raw"
+      ;;
+  esac
 }
 
 # Any `Environment=WIREMESH_DATA_DIR=` a drop-in sets — reported to the
@@ -234,6 +301,17 @@ elif has_controller_state "$OLD_DIR"; then
       # own state.
       pin_to_old_dir
       ;;
+    "$UNPARSABLE")
+      # Set, but not in a form this script will rewrite. Deliberately falls
+      # through to doing NOTHING: the alternatives are to guess at the value
+      # (which is how a truncated path gets acted on) or to append an
+      # overriding assignment (which silently repoints a controller whose
+      # config was fine). Warn and let a human read the line.
+      warn "there is control-plane state in $OLD_DIR, and $CONTROLLER_ENV does set" \
+           "WIREMESH_DATA_DIR — but in a form this script will not rewrite (an unbalanced" \
+           "quote, or an unquoted value containing whitespace). NOTHING was changed. Read" \
+           "that line yourself and make sure it names the directory the state is in."
+      ;;
     *)
       # A path we do not manage. Warned, not noted: if it is wrong the
       # controller either refuses to start (CA guard) or starts on the wrong
@@ -258,6 +336,11 @@ elif has_controller_state "$OLD_DIR"; then
     if [ -z "$effective" ]; then
       effective=$OLD_DIR
       effective_src="the controller's compiled-in default"
+    elif [ "$effective" = "$UNPARSABLE" ]; then
+      # Do not put the sentinel in an operator-facing sentence as if it were a
+      # path. Whatever systemd makes of that line is the effective value, and
+      # the branch above has already said so at length.
+      effective="whatever systemd reads from that line"
     fi
     if [ "$(strip_slash "$dropin_dir")" = "$(strip_slash "$effective")" ]; then
       say "note: a systemd drop-in also sets Environment=WIREMESH_DATA_DIR=$dropin_dir." \

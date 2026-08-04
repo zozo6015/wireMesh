@@ -103,9 +103,18 @@ crash-loops. It needs the directory back:
 # this chown locks the `wiremesh` user out of that directory, and a
 # controller that can no longer read its own CA refuses to start.
 sudo ls /var/lib/wiremesh
-sudo chown root:root /var/lib/wiremesh
+sudo chown root:root /var/lib/wiremesh   # NOT -R — deliberate, see below
 sudo systemctl restart wiremesh-gateway
 ```
+
+**Do not add `-R`.** The bug being undone was itself non-recursive (`chown
+wiremesh:wiremesh /var/lib/wiremesh`, no `-R`), so only the directory's own
+ownership ever changed and the gateway's files inside were never touched — the
+gateway was locked out of *traversing* the directory, not out of the files, and
+restoring the directory alone is the exact inverse. A recursive chown would go
+further than the bug did and rewrite files that are `wiremesh`-owned for good
+reasons — a legacy relay's `relay.key`, or a pinned controller's
+`ca.key`/`controller.db`/`secrets/` — breaking those to fix the gateway.
 
 The postinstall detects this and prints the command but will not run it, because
 a co-located controller (now pinned there) or a legacy relay needs that same
@@ -160,7 +169,17 @@ sudo install -d -o wiremesh -g wiremesh -m 0700 /var/lib/wiremesh-controller
 #    "Directory not empty", a previous boot already created a secrets/ in the
 #    new dir: merge it by hand (`sudo cp -a /var/lib/wiremesh/secrets/. \
 #    /var/lib/wiremesh-controller/secrets/`) rather than forcing the move.
-sudo mv /var/lib/wiremesh/controller.db /var/lib/wiremesh-controller/
+#
+#    controller.db is moved WITH ITS SIDECARS. A cleanly stopped controller
+#    leaves controller.db alone, but one that crashed or was SIGKILLed leaves a
+#    hot journal next to it (controller.db-journal, or -wal/-shm if the journal
+#    mode was ever changed). Those are part of the database, not scratch files:
+#    move the .db without them and SQLite opens a file whose last transaction
+#    can neither be completed nor rolled back. The glob is a no-op when the
+#    shutdown was clean — which is the normal case here, since step 0 stopped
+#    the service, but "something already went wrong" is exactly why people run
+#    this procedure.
+sudo sh -c 'mv /var/lib/wiremesh/controller.db* /var/lib/wiremesh-controller/'
 sudo mv /var/lib/wiremesh/ca.key        /var/lib/wiremesh-controller/
 sudo mv /var/lib/wiremesh/secrets       /var/lib/wiremesh-controller/
 
