@@ -69,6 +69,25 @@ impl Interceptor for BearerCredential {
 
 /// A real controller, booted in-process against a temporary data directory,
 /// for integration tests to drive.
+/// The directory a harness-booted controller points its CA re-mint guard at:
+/// a path inside the harness's own tempdir that is never created.
+///
+/// The guard exists to stop a controller minting a replacement CA when one
+/// already sits at `/var/lib/wiremesh` (see
+/// `wiremesh_controller::Config::legacy_data_dir`). That absolute path is
+/// right in production and poison in a test: on any machine that really has
+/// `/var/lib/wiremesh/ca.key` — a controller host, or a developer's laptop —
+/// every harness boot into a tempdir would refuse to start. Pointing the
+/// probe at a guaranteed-absent path makes the harness hermetic: the guard
+/// still runs, and still resolves the same way on every machine.
+///
+/// A test that wants to exercise the guard itself should build its own
+/// `Config` (or use `EmbeddedTrust::open_with_legacy_dir` directly) rather
+/// than reaching for this.
+fn hermetic_legacy_dir(data_dir: &Path) -> PathBuf {
+    data_dir.join("no-legacy-ca-here")
+}
+
 pub struct TestController {
     // FIELD ORDER matters, but as of Task 13 the ordering between `running`
     // and `_data_dir` is enforced EXPLICITLY in `impl Drop` below (not just
@@ -232,6 +251,7 @@ impl TestController {
             bind_ip,
             rotation_interval,
             rotation_sweep_interval,
+            legacy_data_dir: Some(hermetic_legacy_dir(data_dir.path())),
         };
 
         let server_runtime = tokio::runtime::Builder::new_multi_thread()
@@ -302,6 +322,9 @@ impl TestController {
             // comment.
             rotation_interval: self.rotation_interval,
             rotation_sweep_interval: self.rotation_sweep_interval,
+            // Same sentinel as the initial boot — a restart must not suddenly
+            // start probing the host's real /var/lib/wiremesh.
+            legacy_data_dir: Some(hermetic_legacy_dir(self._data_dir.path())),
         };
 
         // (Task 13) Reuse the SAME `server_runtime` across a restart (rather

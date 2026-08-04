@@ -10,16 +10,39 @@
 // builds a trust anchor from the CA cert, and asks webpki to verify the
 // leaf's signature and validity against that anchor.
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustls_pki_types::{CertificateDer, TrustAnchor, UnixTime};
 use wiremesh_trust::{CertProfile, CertificateIssuer, EmbeddedTrust, SecretStore};
 
+/// Opens a provider rooted at `dir` with the CA re-mint guard's legacy probe
+/// pointed at a path inside `dir` that is never created.
+///
+/// Every test in this file starts from an EMPTY tempdir, so every one of them
+/// takes `load_or_create_ca`'s mint branch — and that branch probes for a
+/// pre-existing CA before minting. `EmbeddedTrust::open` aims that probe at
+/// the absolute production path, which makes the outcome depend on the MACHINE
+/// running the suite: on any host that really has `/var/lib/wiremesh/ca.key`
+/// (a controller host, or a developer's box) the guard fires and every test
+/// here panics on `.unwrap()`, for a reason that has nothing to do with the
+/// code under test. Green in the dev container is not evidence of anything;
+/// the container simply has no such directory.
+///
+/// `open_with_legacy_dir` with a guaranteed-absent sentinel keeps the guard
+/// running and makes it resolve identically everywhere. The guard's own
+/// behavior is covered by `tests/ca_legacy_guard.rs`, which injects both
+/// directories for the same reason.
+fn open_hermetic(dir: &Path) -> EmbeddedTrust {
+    EmbeddedTrust::open_with_legacy_dir(dir, &dir.join("__no_such_legacy_dir__"))
+        .expect("opening the embedded CA into a temp dir must succeed")
+}
+
 #[tokio::test]
 async fn embedded_ca_signs_a_csr_that_chains_to_the_bundle() {
     let dir = tempfile::tempdir().unwrap();
-    let trust = EmbeddedTrust::open(dir.path()).unwrap();
+    let trust = open_hermetic(dir.path());
 
     // A gateway generates its own keypair + CSR (rcgen) — the trust provider
     // never sees the gateway's private key, only the CSR PEM.
@@ -140,7 +163,7 @@ fn profile(cn: &str) -> CertProfile {
 #[tokio::test]
 async fn secret_store_roundtrip() {
     let dir = tempfile::tempdir().unwrap();
-    let trust = EmbeddedTrust::open(dir.path()).unwrap();
+    let trust = open_hermetic(dir.path());
 
     let value = b"super-secret-wireguard-key".to_vec();
     let version = trust.put("gw1.wgkey", value.clone()).await.unwrap();
@@ -162,7 +185,7 @@ async fn secret_store_roundtrip() {
 #[tokio::test]
 async fn secret_store_versions_increase_monotonically() {
     let dir = tempfile::tempdir().unwrap();
-    let trust = EmbeddedTrust::open(dir.path()).unwrap();
+    let trust = open_hermetic(dir.path());
 
     let v1 = trust.put("gw1.token", b"v-one".to_vec()).await.unwrap();
     let v2 = trust.put("gw1.token", b"v-two".to_vec()).await.unwrap();
@@ -200,7 +223,7 @@ fn secret_store_concurrent_puts_to_distinct_dotted_keys_do_not_collide() {
     use std::sync::Barrier;
 
     let dir = tempfile::tempdir().unwrap();
-    let trust = Arc::new(EmbeddedTrust::open(dir.path()).unwrap());
+    let trust = Arc::new(open_hermetic(dir.path()));
     let verify_rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -275,7 +298,7 @@ async fn ca_reload_across_restart_keeps_trust_anchor() {
     let ca_key_path = dir.path().join("ca.key");
 
     let leaf1 = {
-        let trust = EmbeddedTrust::open(dir.path()).unwrap();
+        let trust = open_hermetic(dir.path());
         let issued = trust.sign(&gateway_csr("gw-aws"), profile("gw-aws")).await.unwrap();
         issued.cert_pem
         // trust dropped here — simulates process exit.
@@ -284,7 +307,7 @@ async fn ca_reload_across_restart_keeps_trust_anchor() {
     let ca_key_before = std::fs::read(&ca_key_path).unwrap();
 
     // Restart: same data dir.
-    let trust2 = EmbeddedTrust::open(dir.path()).unwrap();
+    let trust2 = open_hermetic(dir.path());
 
     // On-disk CA material must be byte-identical — no new CA minted, no
     // rewrite of the existing files.

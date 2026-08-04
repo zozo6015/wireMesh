@@ -164,12 +164,27 @@ impl EmbeddedTrust {
     /// Idempotent: calling this again against the same `data_dir` reuses
     /// the existing CA rather than minting a new one.
     pub fn open(data_dir: &Path) -> Result<Self> {
+        Self::open_with_legacy_dir(data_dir, Path::new(LEGACY_SHARED_DATA_DIR))
+    }
+
+    /// Same as [`EmbeddedTrust::open`], with the directory that the re-mint
+    /// guard probes for a pre-existing CA injected rather than hardcoded.
+    ///
+    /// Exists purely so that guard is testable: it keys on an absolute
+    /// production path ([`LEGACY_SHARED_DATA_DIR`]), and a test must be able
+    /// to point it at a temp dir instead of depending on — or worse, being
+    /// silently disabled by — whatever happens to exist at that path on the
+    /// machine running the suite. Injection rather than a `cfg(test)` switch
+    /// or an env var: integration tests link this crate built WITHOUT
+    /// `cfg(test)`, and a process-global override would race under the
+    /// parallel test harness.
+    pub fn open_with_legacy_dir(data_dir: &Path, legacy_dir: &Path) -> Result<Self> {
         fs::create_dir_all(data_dir)
             .with_context(|| format!("creating data dir {}", data_dir.display()))?;
         fs::create_dir_all(data_dir.join("secrets"))
             .with_context(|| format!("creating secrets dir under {}", data_dir.display()))?;
 
-        let (ca_cert, ca_key, ca_cert_pem) = load_or_create_ca(data_dir)?;
+        let (ca_cert, ca_key, ca_cert_pem) = load_or_create_ca(data_dir, legacy_dir)?;
 
         Ok(Self {
             data_dir: data_dir.to_path_buf(),
@@ -378,11 +393,25 @@ fn decode_versioned(bytes: &[u8]) -> Result<Versioned> {
     })
 }
 
+/// The pre-split shared state directory that the controller, the relay
+/// certdir default, the container image and the operator PVC all used.
+///
+/// [`load_or_create_ca`] probes it before minting so a packaging or
+/// configuration mistake cannot silently rotate the fabric's trust anchor.
+pub const LEGACY_SHARED_DATA_DIR: &str = "/var/lib/wiremesh";
+
 /// Loads the CA from `data_dir` if both `ca.pem` and `ca.key` already exist,
 /// otherwise mints a fresh self-signed CA and persists it. Returns the
 /// in-memory issuer `Certificate` (usable for `signed_by`), the `KeyPair`,
 /// and the exact PEM bytes on disk (the value `trust_bundle()` must return).
-fn load_or_create_ca(data_dir: &Path) -> Result<(rcgen::Certificate, KeyPair, String)> {
+///
+/// `legacy_dir` is the directory checked for a pre-existing CA before
+/// minting — [`LEGACY_SHARED_DATA_DIR`] in production, a temp dir under test
+/// (see [`EmbeddedTrust::open_with_legacy_dir`]).
+fn load_or_create_ca(
+    data_dir: &Path,
+    legacy_dir: &Path,
+) -> Result<(rcgen::Certificate, KeyPair, String)> {
     let ca_key_path = data_dir.join("ca.key");
     let ca_pem_path = data_dir.join("ca.pem");
 
@@ -424,6 +453,129 @@ fn load_or_create_ca(data_dir: &Path) -> Result<(rcgen::Certificate, KeyPair, St
             .context("reconstructing CA certificate from stored params")?;
         ensure_private_mode(&ca_key_path)?;
         return Ok((ca_cert, ca_key, cert_pem));
+    }
+
+    // ---- Everything below this line is the MINT path, and only the mint
+    // path. The two branches above are exhaustive over "a CA exists here":
+    // unequal existence bailed, both-exist loaded and returned. So the
+    // invariant `!key_exists && !cert_exists` holds from here on by control
+    // flow, not by a condition anyone has to remember to re-state.
+    //
+    // That placement is the point, and it is load-bearing: an earlier
+    // revision put this probe ABOVE the load branch, where it ran
+    // unconditionally, and it bailed on every host that had already been
+    // split (own CA present, legacy ca.key still lying around) — turning the
+    // guard into the very outage it exists to prevent, and emitting a "no CA
+    // in {data_dir}" message that was plainly false. Keep the probe here.
+    debug_assert!(
+        !key_exists && !cert_exists,
+        "the legacy-CA probe must be reachable only when data_dir has no CA of its own"
+    );
+
+    // "No CA here" is genuinely ambiguous: it is the normal first boot of a
+    // NEW fabric, and it is also exactly what a controller sees when a
+    // package upgrade, a unit override or a typo points WIREMESH_DATA_DIR
+    // somewhere the state is not. `data_dir` alone cannot tell them apart,
+    // and guessing "new fabric" the second way mints a fresh trust anchor and
+    // invalidates every enrolled gateway and relay — the outage class that
+    // turned one bad `chown` in a postinstall into a fabric-wide incident.
+    // Probing the one path WireMesh has historically used disambiguates it.
+    // Keyed on `ca.key`, NOT `ca.pem`: a legacy relay identity is ca.pem +
+    // relay.pem + relay.key in that same shared directory, so ca.pem alone
+    // would false-positive on a relay-only host.
+    //
+    // The `data_dir != legacy_dir` clause is UNREACHABLE as a decision: we
+    // have just proved `data_dir/ca.key` does not exist, so when the two
+    // paths denote the same directory the legacy probe IS that same check and
+    // cannot succeed. NO TEST CAN DISCRIMINATE IT — forcing the clause to
+    // `true` leaves the whole suite green, which has been verified
+    // empirically, so do not assume the k8s/Docker fresh-PVC shape (where
+    // `data_dir` IS the legacy path and an empty volume must still mint) is
+    // protected by this clause; it is protected by that unreachability. The
+    // clause is kept as cheap insurance for the day the two probes diverge —
+    // point the legacy side at `controller.db` instead, say, and it becomes
+    // live and load-bearing — and as documentation of the intent. Plain
+    // `Path` comparison is component-wise, so trailing slashes and `.`
+    // components already match; deliberately not `canonicalize`, which fails
+    // on a non-existent directory (the common case) for no benefit here.
+    //
+    // The probe is a `metadata` call, NOT `Path::exists()`. `exists()` is
+    // `metadata().is_ok()`, so it answers "no CA here" to EVERY error — most
+    // importantly `EACCES`, which is what a `User=wiremesh` controller gets
+    // for anything inside a root-owned 0700 `/var/lib/wiremesh`. That turned
+    // the guard silently off in precisely the situation it was written for:
+    // an operator who runs the `chown root:root /var/lib/wiremesh` from
+    // docs/install.md while control-plane state is still in there locks the
+    // controller out of its own CA, and a guard that reads "locked out" as
+    // "absent" would then mint a replacement and invalidate the fabric. A
+    // controller that CANNOT TELL must refuse; only a definite `NotFound` is
+    // permission to mint.
+    if data_dir != legacy_dir {
+        let legacy_key = legacy_dir.join("ca.key");
+        // Stat the directory first, so the overwhelmingly common "this host
+        // never had a shared dir" case is a clean, silent `NotFound` and the
+        // stricter file-level probe below only ever runs against a directory
+        // that actually exists.
+        let legacy_dir_present = match fs::metadata(legacy_dir) {
+            Ok(md) => md.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => bail!(
+                "cannot determine whether a CA exists at {}: {} while reading {}. Refusing to \
+                 generate a CA in {} without knowing: if that directory holds a WireMesh CA, \
+                 minting here would silently rotate the trust anchor and invalidate every \
+                 enrolled certificate. Make {} readable to this process, or point \
+                 WIREMESH_DATA_DIR at the data dir that already holds the CA.",
+                legacy_dir.display(),
+                e,
+                legacy_dir.display(),
+                data_dir.display(),
+                legacy_dir.display()
+            ),
+        };
+
+        let legacy_key_present = if legacy_dir_present {
+            match fs::metadata(&legacy_key) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => bail!(
+                    "cannot determine whether a CA exists at {}: {}. Refusing to generate a CA \
+                     in {} without knowing: if {} exists, minting here would silently rotate \
+                     the trust anchor and invalidate every enrolled certificate.\n\
+                     If {} is a CO-LOCATED GATEWAY's state directory and holds no controller \
+                     CA, grant this process search access to it — `sudo chmod o+x {}` is \
+                     enough, and leaks nothing: the directory still cannot be listed and its \
+                     0600 files still cannot be read.\n\
+                     If it does hold your control-plane state, point WIREMESH_DATA_DIR at it \
+                     instead of {}.",
+                    legacy_key.display(),
+                    e,
+                    data_dir.display(),
+                    legacy_key.display(),
+                    legacy_dir.display(),
+                    legacy_dir.display(),
+                    data_dir.display()
+                ),
+            }
+        } else {
+            false
+        };
+
+        if legacy_key_present {
+            bail!(
+                "no CA in {}, but an existing WireMesh CA is present at {}. Refusing to \
+                 regenerate the CA, which would silently rotate the trust anchor and \
+                 invalidate all enrolled certificates. Either set WIREMESH_DATA_DIR to {}; \
+                 or — with the controller STOPPED — move ca.pem, ca.key, controller.db and \
+                 secrets/ into {} and start it again; or, if that old fabric is retired and \
+                 every gateway and relay will be re-enrolled, delete {} to allow a new CA \
+                 to be generated here.",
+                data_dir.display(),
+                legacy_key.display(),
+                legacy_dir.display(),
+                data_dir.display(),
+                legacy_key.display()
+            );
+        }
     }
 
     let mut ca_params = CertificateParams::new(Vec::<String>::new())

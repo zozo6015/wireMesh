@@ -10,6 +10,7 @@
 // Idioms (CSR generation, `verify_chains`) are duplicated from
 // `tests/embedded.rs` rather than shared, per the brief — duplication in a
 // test file is acceptable here.
+use std::path::Path;
 use std::time::Duration;
 
 use rustls_pki_types::{CertificateDer, TrustAnchor, UnixTime};
@@ -140,8 +141,24 @@ async fn run_conformance<C: CertificateIssuer + SecretStore>(p: &C) {
 #[tokio::test]
 async fn embedded_default_passes_conformance() {
     let dir = tempfile::tempdir().unwrap();
-    let p = EmbeddedTrust::open(dir.path()).unwrap();
+    let p = open_hermetic(dir.path());
     run_conformance(&p).await;
+}
+
+/// Opens a provider rooted at an EMPTY `dir`, with the CA re-mint guard's
+/// legacy probe pointed at a path inside `dir` that is never created.
+///
+/// The empty dir means `load_or_create_ca` takes its mint branch, which probes
+/// for a pre-existing CA first. `EmbeddedTrust::open` aims that probe at the
+/// absolute production path, so this test would refuse to boot — and fail —
+/// on any machine that really has `/var/lib/wiremesh/ca.key`, which a real
+/// controller host does. Injecting a guaranteed-absent sentinel keeps the
+/// guard running and makes it resolve the same way on every machine; the
+/// guard's own behavior is covered by `tests/ca_legacy_guard.rs`.
+/// Duplicated from `tests/embedded.rs`, per this file's duplication note.
+fn open_hermetic(dir: &Path) -> EmbeddedTrust {
+    EmbeddedTrust::open_with_legacy_dir(dir, &dir.join("__no_such_legacy_dir__"))
+        .expect("opening the embedded CA into a temp dir must succeed")
 }
 
 // ---------------------------------------------------------------------------
