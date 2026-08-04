@@ -171,6 +171,25 @@ pub struct Config {
     /// ([`Config::default_rotation_sweep_interval`]); shrunk by tests the
     /// same way as `rotation_interval`.
     pub rotation_sweep_interval: std::time::Duration,
+    /// Directory the CA re-mint guard probes for a pre-existing WireMesh CA
+    /// before it is allowed to mint one into `data_dir` (see
+    /// [`wiremesh_trust::EmbeddedTrust::open_with_legacy_dir`] and
+    /// [`serve`]).
+    ///
+    /// `None` — the only value any production deployment should use — means
+    /// [`wiremesh_trust::LEGACY_SHARED_DATA_DIR`] (`/var/lib/wiremesh`).
+    /// Deliberately NOT wired to an environment variable in `main.rs`: an
+    /// operator-settable override would be a one-line bypass of the guard,
+    /// and the guard's entire job is to stop a misconfiguration from
+    /// rotating the fabric's trust anchor.
+    ///
+    /// It exists so the guard is TESTABLE. It keys on an absolute production
+    /// path, so a controller booted into a tempdir on a machine that happens
+    /// to have `/var/lib/wiremesh/ca.key` — a real controller host, or a
+    /// developer's own box — refuses to start and fails the suite for a
+    /// reason that has nothing to do with the code under test. Every test
+    /// that boots [`serve`] should point this at a directory it owns.
+    pub legacy_data_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -459,7 +478,17 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     // the residue the packaging looks at to decide whether a directory is
     // already in use, so one mis-start used to permanently disable the
     // postinstall's data-dir pin.
-    let trust = EmbeddedTrust::open(&config.data_dir).context("opening embedded CA/trust")?;
+    //
+    // `open_with_legacy_dir`, not `open`: `open` hardcodes the absolute
+    // production path, which would make every test that boots a controller
+    // into a tempdir depend on whether the HOST running the suite has a
+    // `/var/lib/wiremesh/ca.key` (see `Config::legacy_data_dir`).
+    let legacy_data_dir = config
+        .legacy_data_dir
+        .clone()
+        .unwrap_or_else(|| PathBuf::from(wiremesh_trust::LEGACY_SHARED_DATA_DIR));
+    let trust = EmbeddedTrust::open_with_legacy_dir(&config.data_dir, &legacy_data_dir)
+        .context("opening embedded CA/trust")?;
 
     let db_path = config.data_dir.join("controller.db");
     let db = Db::open(&db_path).with_context(|| format!("opening db at {}", db_path.display()))?;

@@ -15,13 +15,19 @@ overrides:
   deb:
     depends:
       - passwd          # groupadd/useradd (postinstall-server.sh)
-      # NOT listing coreutils/findutils: both are Essential on Debian, and
-      # Policy 3.5 says not to depend on Essential packages.
+      # NOT listing coreutils/findutils/sed: all three are Essential on
+      # Debian, and Policy 3.5 says not to depend on Essential packages.
   rpm:
     depends:
       - shadow-utils    # groupadd/useradd (postinstall-server.sh)
       - coreutils       # stat (postinstall-server.sh ownership probe)
       - findutils       # xargs (postinstall-server.sh drop-in probe)
+      # sed does the data-dir pin itself, and also the read-back that decides
+      # whether the pin landed. Without it the append branch still writes a
+      # correct assignment (printf is a shell builtin and systemd honours the
+      # last one), but the read-back returns empty and the script reports a
+      # failure that did not happen.
+      - sed             # WIREMESH_DATA_DIR pin (postinstall-server.sh)
 contents:
   - src: dist/linux-${ARCH}/wiremesh-controller
     dst: /usr/bin/wiremesh-controller

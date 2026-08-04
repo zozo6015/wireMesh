@@ -95,6 +95,20 @@ has_controller_state() {
   [ -f "$1/ca.key" ]
 }
 
+# Drop ONE trailing slash, so an operator who wrote
+# `WIREMESH_DATA_DIR=/var/lib/wiremesh/` compares equal to the same path
+# without it — systemd and the controller both treat those as one directory,
+# and without this the value fell through to the "your own layout" branch and
+# got a warning it did not deserve. Not a path canonicaliser: no symlink, no
+# `..`, no repeated-slash handling — just the one form people actually type.
+# A bare `/` is left alone (`?*/` needs at least one character before the
+# slash), since stripping it would produce the empty string.
+strip_slash() {
+  s=$1
+  case "$s" in ?*/) s=${s%/} ;; esac
+  printf '%s' "$s"
+}
+
 # The LAST WIREMESH_DATA_DIR= value in the EnvironmentFile (systemd keeps the
 # last assignment when a variable is set more than once), quotes stripped.
 # Empty when the file is absent or never sets it.
@@ -132,6 +146,27 @@ systemd_env_data_dir() {
     sed -n -E "s/^WIREMESH_DATA_DIR=(.*)\$/\\1/p" | tail -n 1
 }
 
+# Any EnvironmentFile= the unit reads OTHER than the one this package ships.
+#
+# The note above says the EnvironmentFile beats `Environment=`, which is true
+# but not the whole story: a drop-in `EnvironmentFile=` is simply another
+# EnvironmentFile, applied after the packaged unit's, and a LATER one
+# overrides an earlier one. So this — unlike a drop-in `Environment=` — really
+# can beat the pin. It is reported, not acted on, and it is not treated as an
+# emergency: in every shape where the pin matters the legacy ca.key exists, so
+# a controller sent to the wrong directory hits the CA re-mint guard and
+# refuses to start rather than doing damage. Naming it here just turns a
+# confusing refusal into an obvious one.
+#
+# `systemctl show` prints one path per line, each suffixed with
+# ` (ignore_errors=yes|no)`; the sed strips that back to the bare path.
+systemd_extra_env_files() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl show --value -p EnvironmentFiles wiremesh-controller 2>/dev/null |
+    sed -n -E "s/^(.+) \\(ignore_errors=(yes|no)\\)\$/\\1/p" |
+    grep -vxF "$CONTROLLER_ENV" || true
+}
+
 # Write WIREMESH_DATA_DIR=$OLD_DIR into the EnvironmentFile, replacing every
 # existing assignment (there may be more than one; systemd honours the last,
 # so all of them have to go) or appending one if the setting was deleted
@@ -167,11 +202,24 @@ pin_to_old_dir() {
   fi
 }
 
-if has_controller_state "$OLD_DIR" && ! has_controller_state "$NEW_DIR"; then
+if has_controller_state "$OLD_DIR" && has_controller_state "$NEW_DIR"; then
+  # Two CAs on one host. Nothing here can pick between them — and if they are
+  # different CAs, whichever one WIREMESH_DATA_DIR names decides which fabric
+  # this controller serves and silently strands the other's gateways and
+  # relays on an untrusted anchor. Rare, and no longer reachable by accident
+  # (a refused boot leaves no residue, and ca.key is only ever written by a
+  # controller that really did mint or receive one), but silence here would
+  # be a silent trust-anchor selection, so say so.
+  warn "control-plane state (ca.key) exists in BOTH $OLD_DIR and $NEW_DIR. Nothing was" \
+       "changed. WIREMESH_DATA_DIR=$(env_file_data_dir) decides which of the two this" \
+       "controller serves; if the CAs differ, every gateway and relay enrolled against the" \
+       "other one will fail mTLS. Confirm the value names the fabric you want, and remove" \
+       "or archive the directory you are not using."
+elif has_controller_state "$OLD_DIR"; then
   # The EnvironmentFile is authoritative (see systemd_env_data_dir), so this
-  # decision is made from it ALONE. A drop-in cannot change the outcome and is
-  # only reported afterwards.
-  case "$(env_file_data_dir)" in
+  # decision is made from it ALONE. A drop-in `Environment=` cannot change the
+  # outcome and is only reported afterwards.
+  case "$(strip_slash "$(env_file_data_dir)")" in
     "$OLD_DIR")
       # Already correct. Something made this file locally modified — an
       # operator edit, or a previous run of the pin below — so rpm kept it
@@ -201,17 +249,36 @@ if has_controller_state "$OLD_DIR" && ! has_controller_state "$NEW_DIR"; then
   # does, and if it disagrees they should know it is inert.
   dropin_dir=$(systemd_env_data_dir)
   if [ -n "$dropin_dir" ]; then
+    # Name the value's real SOURCE. If the pin failed to write, the file sets
+    # nothing and the effective value is the binary's compiled-in default —
+    # saying "from $CONTROLLER_ENV" there would send the operator to a file
+    # that does not contain it.
     effective=$(env_file_data_dir)
-    [ -n "$effective" ] || effective=$OLD_DIR
-    if [ "$dropin_dir" = "$effective" ]; then
+    effective_src=$CONTROLLER_ENV
+    if [ -z "$effective" ]; then
+      effective=$OLD_DIR
+      effective_src="the controller's compiled-in default"
+    fi
+    if [ "$(strip_slash "$dropin_dir")" = "$(strip_slash "$effective")" ]; then
       say "note: a systemd drop-in also sets Environment=WIREMESH_DATA_DIR=$dropin_dir." \
-          "It agrees with $CONTROLLER_ENV, which takes precedence regardless."
+          "It agrees with the effective value ($effective, from $effective_src), which takes" \
+          "precedence regardless."
     else
       warn "a systemd drop-in sets Environment=WIREMESH_DATA_DIR=$dropin_dir, but" \
            "EnvironmentFile= overrides Environment= in systemd, so the effective value is" \
-           "$effective (from $CONTROLLER_ENV). The drop-in has NO effect — delete it, or move" \
+           "$effective (from $effective_src). The drop-in has NO effect — delete it, or move" \
            "the setting into $CONTROLLER_ENV, so the two stop disagreeing."
     fi
+  fi
+
+  # An unmanaged EnvironmentFile=, unlike a drop-in Environment=, CAN beat the
+  # pin — see systemd_extra_env_files.
+  extra_env_files=$(systemd_extra_env_files)
+  if [ -n "$extra_env_files" ]; then
+    warn "the wiremesh-controller unit also reads EnvironmentFile(s) this package does not" \
+         "manage: $(printf '%s' "$extra_env_files" | tr '\n' ' ') — a later EnvironmentFile=" \
+         "overrides an earlier one, so a WIREMESH_DATA_DIR set there wins over the one in" \
+         "$CONTROLLER_ENV. Check them before starting the controller."
   fi
 fi
 

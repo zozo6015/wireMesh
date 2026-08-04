@@ -498,9 +498,69 @@ fn load_or_create_ca(
     // `Path` comparison is component-wise, so trailing slashes and `.`
     // components already match; deliberately not `canonicalize`, which fails
     // on a non-existent directory (the common case) for no benefit here.
+    //
+    // The probe is a `metadata` call, NOT `Path::exists()`. `exists()` is
+    // `metadata().is_ok()`, so it answers "no CA here" to EVERY error — most
+    // importantly `EACCES`, which is what a `User=wiremesh` controller gets
+    // for anything inside a root-owned 0700 `/var/lib/wiremesh`. That turned
+    // the guard silently off in precisely the situation it was written for:
+    // an operator who runs the `chown root:root /var/lib/wiremesh` from
+    // docs/install.md while control-plane state is still in there locks the
+    // controller out of its own CA, and a guard that reads "locked out" as
+    // "absent" would then mint a replacement and invalidate the fabric. A
+    // controller that CANNOT TELL must refuse; only a definite `NotFound` is
+    // permission to mint.
     if data_dir != legacy_dir {
         let legacy_key = legacy_dir.join("ca.key");
-        if legacy_key.exists() {
+        // Stat the directory first, so the overwhelmingly common "this host
+        // never had a shared dir" case is a clean, silent `NotFound` and the
+        // stricter file-level probe below only ever runs against a directory
+        // that actually exists.
+        let legacy_dir_present = match fs::metadata(legacy_dir) {
+            Ok(md) => md.is_dir(),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+            Err(e) => bail!(
+                "cannot determine whether a CA exists at {}: {} while reading {}. Refusing to \
+                 generate a CA in {} without knowing: if that directory holds a WireMesh CA, \
+                 minting here would silently rotate the trust anchor and invalidate every \
+                 enrolled certificate. Make {} readable to this process, or point \
+                 WIREMESH_DATA_DIR at the data dir that already holds the CA.",
+                legacy_dir.display(),
+                e,
+                legacy_dir.display(),
+                data_dir.display(),
+                legacy_dir.display()
+            ),
+        };
+
+        let legacy_key_present = if legacy_dir_present {
+            match fs::metadata(&legacy_key) {
+                Ok(_) => true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => bail!(
+                    "cannot determine whether a CA exists at {}: {}. Refusing to generate a CA \
+                     in {} without knowing: if {} exists, minting here would silently rotate \
+                     the trust anchor and invalidate every enrolled certificate.\n\
+                     If {} is a CO-LOCATED GATEWAY's state directory and holds no controller \
+                     CA, grant this process search access to it — `sudo chmod o+x {}` is \
+                     enough, and leaks nothing: the directory still cannot be listed and its \
+                     0600 files still cannot be read.\n\
+                     If it does hold your control-plane state, point WIREMESH_DATA_DIR at it \
+                     instead of {}.",
+                    legacy_key.display(),
+                    e,
+                    data_dir.display(),
+                    legacy_key.display(),
+                    legacy_dir.display(),
+                    legacy_dir.display(),
+                    data_dir.display()
+                ),
+            }
+        } else {
+            false
+        };
+
+        if legacy_key_present {
             bail!(
                 "no CA in {}, but an existing WireMesh CA is present at {}. Refusing to \
                  regenerate the CA, which would silently rotate the trust anchor and \

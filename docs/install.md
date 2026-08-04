@@ -97,6 +97,12 @@ already chowned `/var/lib/wiremesh` to `wiremesh` on a host that also runs a
 crash-loops. It needs the directory back:
 
 ```sh
+# STOP: run this ONLY if no controller or relay state remains in
+# /var/lib/wiremesh. `ls /var/lib/wiremesh` must show NO ca.key and NO
+# relay.pem. If either is there, do the migration procedure below FIRST —
+# this chown locks the `wiremesh` user out of that directory, and a
+# controller that can no longer read its own CA refuses to start.
+sudo ls /var/lib/wiremesh
 sudo chown root:root /var/lib/wiremesh
 sudo systemctl restart wiremesh-gateway
 ```
@@ -142,7 +148,7 @@ sudo install -d -m 0700 /root/wiremesh-backup
 sudo tar -C /var/lib/wiremesh -czf /root/wiremesh-backup/state.tar.gz .
 sudo chmod 0600 /root/wiremesh-backup/state.tar.gz
 
-# 2. Record the CA fingerprint NOW; step 5 has to compare against it.
+# 2. Record the CA fingerprint NOW; step 6 has to compare against it.
 sudo openssl x509 -in /var/lib/wiremesh/ca.pem -noout -fingerprint -sha256
 
 sudo install -d -o wiremesh -g wiremesh -m 0700 /var/lib/wiremesh-controller
@@ -150,7 +156,10 @@ sudo install -d -o wiremesh -g wiremesh -m 0700 /var/lib/wiremesh-controller
 # 3. Move only the controller's own entries. Leave the gateway's identity.json,
 #    wg_private.key, state.json and epoch_keys.json exactly where they are.
 #    `secrets/` does not exist on every install — if mv reports it missing,
-#    that is harmless, the controller recreates it.
+#    that is harmless, the controller recreates it. If instead mv reports
+#    "Directory not empty", a previous boot already created a secrets/ in the
+#    new dir: merge it by hand (`sudo cp -a /var/lib/wiremesh/secrets/. \
+#    /var/lib/wiremesh-controller/secrets/`) rather than forcing the move.
 sudo mv /var/lib/wiremesh/controller.db /var/lib/wiremesh-controller/
 sudo mv /var/lib/wiremesh/ca.key        /var/lib/wiremesh-controller/
 sudo mv /var/lib/wiremesh/secrets       /var/lib/wiremesh-controller/
@@ -163,11 +172,23 @@ sudo chown -R wiremesh:wiremesh /var/lib/wiremesh-controller
 
 # If /etc/wiremesh/controller.env is a symlink into a config-management tree,
 # edit the target instead — `sed -i` replaces the symlink with a regular file.
-sudo sed -i 's#^WIREMESH_DATA_DIR=.*#WIREMESH_DATA_DIR=/var/lib/wiremesh-controller#' \
+# The leading [[:space:]]* matters: an indented assignment is still live to
+# systemd, and a pattern anchored straight at WIREMESH_ would skip it.
+sudo sed -i -E 's#^([[:space:]]*)WIREMESH_DATA_DIR=.*#\1WIREMESH_DATA_DIR=/var/lib/wiremesh-controller#' \
   /etc/wiremesh/controller.env
+grep -n WIREMESH_DATA_DIR /etc/wiremesh/controller.env   # confirm it took
 sudo systemctl start wiremesh-controller
 
-# 5. The fingerprint MUST equal the one recorded in step 2.
+# 5. Confirm it is actually UP. `systemctl start` on a Type=simple unit returns
+#    0 even if the process dies a moment later, so check, and read the log on
+#    any doubt — a CA-guard refusal is printed there.
+systemctl is-active wiremesh-controller
+sudo journalctl -u wiremesh-controller -n 20 --no-pager
+
+# 6. The fingerprint MUST equal the one recorded in step 2. (cp -p guarantees
+#    the FILE matches; what this really confirms is that the controller came
+#    up on the moved state rather than minting a replacement CA — so read it
+#    together with step 5, not instead of it.)
 sudo openssl x509 -in /var/lib/wiremesh-controller/ca.pem -noout -fingerprint -sha256
 ```
 

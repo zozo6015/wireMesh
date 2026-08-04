@@ -76,6 +76,9 @@ async fn main() -> Result<()> {
         bind_ip,
         rotation_interval: Config::default_rotation_interval(),
         rotation_sweep_interval: Config::default_rotation_sweep_interval(),
+        // Production always probes the real `/var/lib/wiremesh`. Deliberately
+        // not env-configurable — see `Config::legacy_data_dir`.
+        legacy_data_dir: None,
     };
 
     let running = serve(config).await?;
