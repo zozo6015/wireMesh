@@ -9,6 +9,7 @@ pub mod metrics;
 pub mod netif;
 pub mod observe;
 pub mod path;
+pub mod policy_apply;
 pub mod punch;
 pub mod punch_backoff;
 pub mod relay;

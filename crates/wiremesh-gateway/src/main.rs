@@ -51,6 +51,62 @@ const MSS: u16 = 1240;
 const ROTATION_KEEPALIVE: u16 = 3;
 const OBSERVE_PERIOD: Duration = Duration::from_secs(20);
 
+/// How long the policy-apply worker waits before re-attempting an install
+/// that returned `Err`. Long enough that a persistently unconsumable policy
+/// IR cannot turn into a hot loop of failing kernel work (and a log flood),
+/// short enough that a transient failure costs a scrape interval rather than
+/// a maintenance window. Retries re-read the mailbox, so an operator pushing
+/// a corrected policy is picked up on the next attempt regardless.
+const POLICY_APPLY_RETRY: Duration = Duration::from_secs(5);
+
+/// The real [`wiremesh_gateway::policy_apply::PolicyApplyTarget`]: the live
+/// per-epoch enforcer map, plus the two things that must only move once an
+/// install has ACTUALLY landed in the datapath (the `applied_version` gauge
+/// and a nudge to re-report it).
+struct EnforcerApplyTarget {
+    enforcers: Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
+    applied_version: Arc<AtomicU64>,
+    report_notify: Arc<tokio::sync::Notify>,
+}
+
+impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
+    /// The furthest-out deadline across every live epoch: applying is only
+    /// safe once EVERY enforcer that will be written has cleared its grace.
+    /// The guard is dropped on return by construction (the signature hands
+    /// back a plain `Option<Instant>`), which is what keeps the map
+    /// available to the metrics scrape, retire, Role-B collapse and
+    /// rotation-insert paths for the whole of the worker's wait.
+    fn ready_at(&self) -> Option<Instant> {
+        let map = self.enforcers.blocking_lock();
+        map.values().filter_map(|e| e.apply_ready_at()).max()
+    }
+
+    /// Apply the current policy IR to EVERY live enforcer (boot tun + every
+    /// rotation tun), not just the active one — a policy TIGHTENING during
+    /// or after a rotation overlap must reach the tun actually carrying
+    /// traffic. `apply_if_changed` is idempotent per policy version, so this
+    /// is cheap for entries already on `ds.policy_version` and, crucially,
+    /// makes a RETRY after a partial failure re-apply only what is missing.
+    ///
+    /// `applied_version` is stored only after every entry succeeded, so the
+    /// gauge (and the report derived from it) never claims a version the
+    /// datapath does not have.
+    fn install(&self, ds: &DesiredState) -> anyhow::Result<()> {
+        {
+            let mut map = self.enforcers.blocking_lock();
+            for e in map.values_mut() {
+                e.apply_if_changed(ds)?;
+            }
+        }
+        self.applied_version.store(ds.policy_version, Ordering::Relaxed);
+        // Tell the Sync loop to re-report: it already sent its report for
+        // this snapshot while the install was still pending, carrying the
+        // PREVIOUS applied version. Debounced on the loop side.
+        self.report_notify.notify_one();
+        Ok(())
+    }
+}
+
 /// How long the endpoint-driven punch waits for ONE candidate's WG handshake to
 /// land before advancing to the next (`punch::CandidateTrial`'s per-candidate
 /// window). Chosen ≥ boringtun 0.6.0's ~5s handshake-retry cadence (spike
@@ -285,7 +341,38 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
 
     // Last-applied policy version, shared with the metrics task below (it
     // does not hold the enforcer lock just to report this gauge).
+    //
+    // Written by exactly ONE place now (Backlog item 1):
+    // `EnforcerApplyTarget::install`, after a successful install. It keeps
+    // meaning "the version actually live in the datapath" — storing it when a
+    // snapshot is merely accepted into the worker's mailbox would make both
+    // this gauge and the controller's roster `applied_version` lag signal
+    // lie by up to a full reap grace.
     let applied_version = Arc::new(AtomicU64::new(0));
+
+    // Signals the Sync loop to send a fresh (debounced) report. Created here
+    // rather than inline in `PathCtx` below because the policy-apply worker
+    // — which runs the install asynchronously and so learns the new
+    // `applied_version` AFTER the Sync loop has already reported — needs to
+    // poke it, and the worker is spawned before `ctx` exists. Without this,
+    // an install completing during a quiet period would leave the
+    // controller's roster stuck on the previous version until the next
+    // unrelated event.
+    let path_report_notify = Arc::new(tokio::sync::Notify::new());
+
+    // The policy-apply worker (Backlog item 1). From here on the ONLY way
+    // policy reaches the enforcers on the steady-state path is
+    // `policy_apply.publish(..)` — a non-async, infallible hand-off, so the
+    // Sync loop can neither stall on a reap grace nor die on a bad IR. See
+    // `wiremesh_gateway::policy_apply` for the full why.
+    let policy_apply = wiremesh_gateway::policy_apply::spawn_policy_apply_worker(
+        Arc::new(EnforcerApplyTarget {
+            enforcers: enforcers.clone(),
+            applied_version: applied_version.clone(),
+            report_notify: path_report_notify.clone(),
+        }),
+        POLICY_APPLY_RETRY,
+    );
 
     // The single shared "active tun" descriptor (ifname + priv key + port +
     // change-guard), seeded to `wg0`'s values. Shared by every site that
@@ -329,8 +416,13 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     let mut applied: Option<DesiredState> = DesiredState::load(&cfg.state_dir)?;
     if let Some(ds) = &applied {
         eprintln!("wiremesh-gateway: fail-static boot from state.json rev {}", ds.revision);
-        apply_state(&enforcers, None, ds, &active, &wg0_pins, &live_endpoints).await?;
-        applied_version.store(ds.policy_version, Ordering::Relaxed);
+        apply_state(None, ds, &active, &wg0_pins, &live_endpoints).await?;
+        // The enforcer half goes through the worker here too, so boot and
+        // steady state share one install path. No reap is pending at boot
+        // (nothing has flipped yet), so the backend publishes no deadline and
+        // the install runs immediately; `applied_version` is stored by the
+        // worker once it has.
+        policy_apply.publish(ds.clone());
     }
 
     // Observation loop (background). Binds the WG listen port with
@@ -390,7 +482,10 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
         endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
         wg0_pins: wg0_pins.clone(),
-        path_report_notify: Arc::new(tokio::sync::Notify::new()),
+        // Shared with the policy-apply worker (created above), which pokes it
+        // after a successful install so the loop re-reports the freshly
+        // advanced `applied_version`.
+        path_report_notify: path_report_notify.clone(),
         peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
         live_endpoints: live_endpoints.clone(),
         punch_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -409,11 +504,13 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         let enforcers = enforcers.clone();
         let applied_version = applied_version.clone();
         let ctx = ctx.clone();
+        let policy_apply_metrics = policy_apply.clone();
         tokio::spawn(async move {
             let fetch = move || {
                 let enforcers = enforcers.clone();
                 let applied_version = applied_version.clone();
                 let ctx = ctx.clone();
+                let policy_apply = policy_apply_metrics.clone();
                 async move {
                     // Aggregate deny counters across ALL live enforcers (boot
                     // tun + any rotation tun) so a post-rotation deny on the new
@@ -479,6 +576,11 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         peer_states,
                         transitions,
                         peer_stats,
+                        // Backlog item 1: apply failures are no longer fatal,
+                        // so they need a series an operator can alert on —
+                        // and it has to ride the fetch tuple to actually
+                        // reach the body.
+                        policy_apply.failures(),
                     ))
                 }
             };
@@ -588,13 +690,24 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     // pair's punches, the case-4 finding). Failures are
                     // logged and dropped — the next State apply sends the
                     // same snapshot anyway.
+                    //
+                    // (Backlog item 1) The policy-apply worker also signals
+                    // here after a successful install, so a version that
+                    // landed during a quiet period still reaches the
+                    // controller's roster rather than waiting for an
+                    // unrelated event.
                     if prompt_report_pending
                         && last_prompt_report
                             .map_or(true, |t| t.elapsed() >= PROMPT_REPORT_DEBOUNCE)
                     {
                         prompt_report_pending = false;
                         last_prompt_report = Some(Instant::now());
-                        let version = applied.as_ref().map(|d| d.policy_version).unwrap_or(0);
+                        // The INSTALLED version (the worker's atomic), not
+                        // the newest snapshot's: with the install
+                        // asynchronous, `applied.policy_version` is what we
+                        // have accepted, which is not yet what the datapath
+                        // enforces.
+                        let version = applied_version.load(Ordering::Relaxed);
                         if let Err(e) = send_paths_snapshot_report(
                             &mut client,
                             &ctx,
@@ -645,7 +758,6 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // waiting for that session to go live.
                             maybe_collapse_role_b(&rot, &ds);
                             apply_state(
-                                &enforcers,
                                 applied.as_ref(),
                                 &ds,
                                 &rot.active,
@@ -657,6 +769,16 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 &live_endpoints,
                             )
                             .await?;
+                            // (Backlog item 1) The enforcer half of the apply,
+                            // handed to the worker instead of run here. No
+                            // `.await` and no `?`: this loop must not park on
+                            // a reap grace (it is the same loop that services
+                            // `PunchDirective`, whose go-skew budget is
+                            // milliseconds) and must not exit the process
+                            // because one policy IR was unconsumable. Placed
+                            // immediately after the device apply so the
+                            // ordering device → policy → routes is unchanged.
+                            policy_apply.publish(ds.clone());
                             ds.save(&cfg.state_dir)?;
                             // (Key-rotation Role B) If desired state now shows a
                             // peer that is rotating (a real-keyed `pending`
@@ -689,12 +811,25 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                                 &mut client,
                                 &ctx,
                                 cfg.wg_listen_port,
-                                ds.policy_version,
+                                // (Backlog item 1) The INSTALLED version, not
+                                // `ds.policy_version`: the worker may still be
+                                // waiting out a reap grace, and reporting a
+                                // version the datapath does not yet enforce
+                                // would make the controller's roster-lag
+                                // signal lie. The worker signals
+                                // `path_report_notify` once the install lands,
+                                // so the roster converges within a debounce
+                                // window rather than at the next event.
+                                applied_version.load(Ordering::Relaxed),
                             )
                             .await;
                             prompt_report_pending = false;
                             last_prompt_report = Some(Instant::now());
-                            applied_version.store(ds.policy_version, Ordering::Relaxed);
+                            // NB: `applied_version` is deliberately NOT stored
+                            // here anymore — see its declaration. `applied`
+                            // still tracks the newest ACCEPTED snapshot, which
+                            // is what the route diff and the rotation handlers
+                            // need (both are applied synchronously above).
                             applied = Some(ds);
                         }
                         Ok(Some(sync::SyncEvent::Punch(d))) => {
@@ -2903,16 +3038,24 @@ fn device_header(encoded: &str) -> &str {
     }
 }
 
-/// Apply one desired state to the data plane (tunnel peers, enforcer, routes).
+/// Apply one desired state to the data plane (tunnel peers, routes).
 ///
 /// The WG device peers, the change-guard, and the peer-segment routes ALL
 /// follow the ACTIVE tun (`active`): boot's `wg0` in steady state, and after a
 /// Role-A cutover the new epoch's `wg0e<N>` — which is what lets the old epoch's
 /// `wg0` be torn down afterward without this ever trying to `uapi::apply` to a
-/// Device that no longer exists. The current policy IR is applied to EVERY live
-/// enforcer (see below), not just the active tun's.
+/// Device that no longer exists.
+///
+/// **The enforcer half is NOT here (Backlog item 1).** It used to be, and it
+/// is what made this function — awaited inline by the Sync loop — park a
+/// runtime thread for up to a reap grace per epoch while holding the
+/// enforcer-map lock. It now goes through
+/// `wiremesh_gateway::policy_apply`'s worker; every caller of this function
+/// pairs it with a `policy_apply.publish(..)`. What stayed is deliberate:
+/// the UAPI device apply and the route diff are fast AND must stay ordered
+/// with peer events, so deferring them would trade a stall for a
+/// correctness problem.
 async fn apply_state(
-    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
     prev: Option<&DesiredState>,
     ds: &DesiredState,
     active: &Arc<std::sync::Mutex<ActiveTunInfo>>,
@@ -3019,17 +3162,6 @@ async fn apply_state(
         // must not take an incremental path that would drop the header change.
         _ => {
             apply_device_if_changed(&ifname, &dev, active).await?;
-        }
-    }
-    // Apply the current policy IR to EVERY live enforcer (boot tun + every
-    // rotation tun), not just the active one — a policy TIGHTENING during/after
-    // a rotation overlap must reach the tun actually carrying traffic (Role A's
-    // new tun; Role B's overlap tun). `apply_if_changed` is idempotent per
-    // policy_version, so applying to all entries each time is cheap and correct.
-    {
-        let mut map = enforcers.lock().await;
-        for e in map.values_mut() {
-            e.apply_if_changed(ds)?;
         }
     }
     let empty = DesiredState::default();

@@ -48,16 +48,21 @@ pub struct EnforcerConfig {
     pub log_per_rule: u32,
     pub log_aggregate: u32,
     /// (Review finding) The eBPF backend's "reap-on-next-apply + minimum
-    /// N since flip" wait (design §6's "grace period: 10s after flip, then
+    /// N since flip" grace (design §6's "grace period: 10s after flip, then
     /// the old generation's maps are deleted" — see `ebpf::apply_generation`)
-    /// as an injectable duration, defaulting to the design's 10s. Exists so
-    /// tests that deliberately flip generations back-to-back (e.g.
-    /// `tests/generations.rs`'s
-    /// `atomic_generation_flip_under_continuous_udp_traffic_has_zero_deficit`,
-    /// `wiremesh-testkit`'s `flip_under_traffic_zero_loss`) can shrink it to
-    /// a few milliseconds so all their flips genuinely land inside a short
-    /// traffic window, instead of each non-first `apply()` blocking ~10s.
-    /// Production callers get the real 10s via `Default`.
+    /// as an injectable duration, defaulting to the design's 10s.
+    ///
+    /// **Backlog item 1 inverted what this knob buys a test.** It used to
+    /// shrink an internal `std::thread::sleep` inside `apply()`; `apply()`
+    /// no longer waits at all, and this value is now the offset
+    /// [`Enforcer::apply_ready_at`] publishes past each flip. So it is what
+    /// makes a test's OWN inter-flip spacing a sufficient honoring of the
+    /// grace: `tests/generations.rs`'s
+    /// `atomic_generation_flip_under_continuous_udp_traffic_has_zero_deficit`
+    /// sleeps 175ms between flips, which only clears the grace because this
+    /// is shrunk to 50ms; `wiremesh-testkit`'s `flip_under_traffic_zero_loss`
+    /// waits out `apply_ready_at()` explicitly. Production callers get the
+    /// real 10s via `Default`.
     pub reap_grace: std::time::Duration,
 }
 
@@ -92,7 +97,32 @@ pub trait Enforcer: Send {
     /// Installs `ir` as the live rule set. Atomic: in-flight packets must
     /// never observe a half-applied policy (design §6's atomic generation
     /// flip — Task 8's map-in-map generations in the eBPF backend, `ebpf.rs`).
+    ///
+    /// **Does not wait out the previous flip's reap grace** (Backlog item 1):
+    /// honoring [`Enforcer::apply_ready_at`] before calling this is the
+    /// CALLER's job now. Calling `apply` early is still unsafe for the same
+    /// reason it always was — it overwrites an outer-array slot in-flight
+    /// packets may still be reading — the enforcement of that rule simply
+    /// moved out of a thread-parking `sleep` and into a published deadline.
     fn apply(&mut self, ir: &PolicyIR) -> anyhow::Result<()>;
+    /// The earliest instant at which the next [`Enforcer::apply`] may proceed
+    /// without overwriting state that in-flight packets may still be reading.
+    /// `None` means "no constraint"; a `Some(t)` already in the past is a
+    /// SATISFIED constraint, not a request to wait.
+    ///
+    /// Cheap and non-blocking by contract: it never sleeps and never does
+    /// kernel work. Its whole purpose is to let an async caller
+    /// `sleep_until` the deadline WITHOUT occupying a thread — which is why
+    /// it hands back a plain `Option<Instant>` rather than any kind of
+    /// guard: an adapter that reads this across a live enforcer map is
+    /// structurally unable to hold that map's lock across the wait (see
+    /// `wiremesh_gateway::policy_apply::PolicyApplyTarget::ready_at`).
+    ///
+    /// The eBPF backend publishes `flip instant + reap_grace` while a
+    /// generation reap is pending (design §6's 10s grace); the nftables
+    /// backend always returns `None` — one atomic `nft -f -` transaction
+    /// replaces the whole ruleset, so there is no vacated slot to protect.
+    fn apply_ready_at(&self) -> Option<std::time::Instant>;
     /// Reads current per-rule and default-deny counters.
     fn counters(&mut self) -> anyhow::Result<Counters>;
     /// Forces re-evaluation of already-live flows against the current rule
