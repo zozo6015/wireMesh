@@ -55,3 +55,18 @@ runs) before touching anything.
   measurement window is the lever, not the tolerance.
 - Check whether the drops cluster at the cutover instant or are spread — the former is a
   real property of the handover, the latter is scheduling noise.
+
+## Second sighting, 2026-08-04 (same day, later)
+
+`key_rotation.rs` failed **once in four runs** during item-2 verification — three of
+those runs were under an unrelated sabotage (`send_epoch_ack`'s `local_endpoints`
+reverted), and the failure did not reproduce in the two subsequent sabotaged runs, so it
+was correctly called a flake rather than a detection. The specific test name was not
+captured.
+
+`direct_rotation_is_zero_drop` lives in `key_rotation.rs`, and this profile — one failure
+in four, non-reproducing, in a full-suite run — matches the distribution recorded above.
+Treat it as the same flake unless a captured failure says otherwise.
+
+Running total for full-suite runs at clean HEAD: gap 2, 3, 2, plus this uncaptured
+failure and the earlier gap-4 failure under sabotage. The margin remains one packet.
