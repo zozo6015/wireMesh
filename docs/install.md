@@ -79,6 +79,18 @@ that is a deliberate design decision, not an omission (see the runbook
 `docs/runbooks/controller-migration-to-fi.md`, field note 3). Read the install
 output; it says which directory it settled on.
 
+Pinning edits `/etc/wiremesh/controller.env`, which both package managers then
+regard as locally modified. Two consequences to expect on later upgrades:
+
+- **deb** will prompt (`Configuration file '/etc/wiremesh/controller.env' …
+  Modified (by you or by a script) since installation`) whenever a release
+  changes that file. Keeping your version is the safe answer; diff it if you
+  want new settings.
+- **rpm** will *not* prompt. It writes `/etc/wiremesh/controller.env.rpmnew` and
+  leaves yours alone — so newly shipped settings **silently stop arriving**.
+  **Check for `*.rpmnew` in `/etc/wiremesh/` after every upgrade** and merge by
+  hand.
+
 One thing the package cannot do for you: if an earlier controller release
 already chowned `/var/lib/wiremesh` to `wiremesh` on a host that also runs a
 **gateway**, that gateway is still locked out of its own `identity.json` and
@@ -98,30 +110,81 @@ directory readable by the `wiremesh` user. No single ownership serves all three
 
 Only needed if a controller and a gateway share `/var/lib/wiremesh` and you want
 them separated. Do it with the controller **stopped** — this is precisely the
-work an unattended package script must not attempt:
+work an unattended package script must not attempt.
+
+First check you are not on a host with a frozen unit:
 
 ```sh
+systemctl cat wiremesh-controller | head -1
+```
+
+If that shows `/etc/systemd/system/wiremesh-controller.service` (someone ran
+`systemctl edit --full`), **stop here**. That frozen copy predates this layout:
+it has no `StateDirectory=wiremesh-controller`, so `ProtectSystem=strict` will
+make the new directory read-only and the controller will crash-loop on opening
+its database. Run `sudo systemctl revert wiremesh-controller` to go back to the
+packaged unit, or add `StateDirectory=wiremesh-controller` and
+`ReadWritePaths=/var/lib/wiremesh-controller` to your override first.
+
+Every command below uses absolute paths on purpose — do **not** `cd` into
+`/var/lib/wiremesh` first. It is mode 0700, so an unprivileged `cd` fails while
+the `sudo` commands after it would still run, quietly relocating the wrong
+files (or none) and then repointing the config anyway.
+
+```sh
+# 0. Stop FIRST, then back up: the tarball below copies a SQLite database, and
+#    a copy taken from under a running controller can be torn.
 sudo systemctl stop wiremesh-controller
+
+# 1. Back up the crown jewels. Keep the tarball root-only — it contains ca.key,
+#    and root's umask would otherwise make it world-readable.
+sudo install -d -m 0700 /root/wiremesh-backup
+sudo tar -C /var/lib/wiremesh -czf /root/wiremesh-backup/state.tar.gz .
+sudo chmod 0600 /root/wiremesh-backup/state.tar.gz
+
+# 2. Record the CA fingerprint NOW; step 5 has to compare against it.
+sudo openssl x509 -in /var/lib/wiremesh/ca.pem -noout -fingerprint -sha256
+
 sudo install -d -o wiremesh -g wiremesh -m 0700 /var/lib/wiremesh-controller
-# Move only the controller's own entries. Leave the gateway's identity.json,
-# wg_private.key, state.json and epoch_keys.json exactly where they are.
-cd /var/lib/wiremesh
-sudo mv controller.db ca.key secrets /var/lib/wiremesh-controller/
-# ca.pem is COPIED, not moved: a legacy relay identity in this directory is
-# ca.pem + relay.pem + relay.key, and removing it would break that relay.
-sudo cp -p ca.pem /var/lib/wiremesh-controller/
+
+# 3. Move only the controller's own entries. Leave the gateway's identity.json,
+#    wg_private.key, state.json and epoch_keys.json exactly where they are.
+#    `secrets/` does not exist on every install — if mv reports it missing,
+#    that is harmless, the controller recreates it.
+sudo mv /var/lib/wiremesh/controller.db /var/lib/wiremesh-controller/
+sudo mv /var/lib/wiremesh/ca.key        /var/lib/wiremesh-controller/
+sudo mv /var/lib/wiremesh/secrets       /var/lib/wiremesh-controller/
+
+# 4. ca.pem is COPIED, not moved: a legacy relay identity in this directory is
+#    ca.pem + relay.pem + relay.key, and removing it would break that relay.
+sudo cp -p /var/lib/wiremesh/ca.pem /var/lib/wiremesh-controller/
+
 sudo chown -R wiremesh:wiremesh /var/lib/wiremesh-controller
+
+# If /etc/wiremesh/controller.env is a symlink into a config-management tree,
+# edit the target instead — `sed -i` replaces the symlink with a regular file.
 sudo sed -i 's#^WIREMESH_DATA_DIR=.*#WIREMESH_DATA_DIR=/var/lib/wiremesh-controller#' \
   /etc/wiremesh/controller.env
 sudo systemctl start wiremesh-controller
-# Verify the CA fingerprint is UNCHANGED before trusting the move:
-openssl x509 -in /var/lib/wiremesh-controller/ca.pem -noout -fingerprint -sha256
+
+# 5. The fingerprint MUST equal the one recorded in step 2.
+sudo openssl x509 -in /var/lib/wiremesh-controller/ca.pem -noout -fingerprint -sha256
+```
+
+With the controller's state out of the way, you can finally give the shared
+directory back to the gateway — the step the earlier bad `chown` made necessary
+(skip the `chown` if a **relay** identity is still in there; migrate it to
+`/var/lib/wiremesh-relay` first):
+
+```sh
+sudo chown root:root /var/lib/wiremesh
+sudo systemctl restart wiremesh-gateway
 ```
 
 If the controller ever starts against a data dir with no CA in it while one
 still exists at `/var/lib/wiremesh`, it **refuses to start** rather than
 generating a fresh CA (which would invalidate every enrolled gateway and relay).
-The error names both directories; point `WIREMESH_DATA_DIR` at the right one.
+The error names both directories and tells you how to resolve it.
 
 The **gateway** and **relay** must be **enrolled once before first start** (each
 needs a token minted by the controller/operator). Replace the UPPERCASE

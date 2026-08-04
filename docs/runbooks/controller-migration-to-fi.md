@@ -388,14 +388,16 @@ Executed against `px` (`206.83.146.32`) instead of FI. Deviations and findings:
    **dropped on purpose**. Two things killed it, and they are worth recording because
    they will re-surface if anyone proposes it again:
 
-   - **The config moves before the script runs.** deb has no conffile "noreplace"
-     mechanism (nfpm maps both `config` and `config|noreplace` to a plain conffile), so
-     dpkg silently installs the new `controller.env` during *unpack*. By `postinst`
-     time it already reads `/var/lib/wiremesh-controller`. Every abort path in a
-     migration therefore ends with the config pointing at a directory the data is not
-     in — and a controller starting on an empty data dir used to mint a **brand-new CA**
-     and invalidate the entire fabric. (rpm's `%config(noreplace)` behaves the other
-     way, which is its own trap: the two formats need opposite handling.)
+   - **The config moves before the script runs — on both formats.** deb has no conffile
+     "noreplace" mechanism at all (nfpm maps both `config` and `config|noreplace` to a
+     plain conffile), so dpkg silently installs the new `controller.env` during *unpack*.
+     rpm's `%config(noreplace)` sounds like the opposite but is not: it only protects a
+     file whose checksum differs from the one the previous package shipped, so an
+     **unmodified** config is replaced there too (observed directly, v0.3.0 → v0.4.0 on
+     rockylinux:9). By the time either scriptlet runs, the config already reads
+     `/var/lib/wiremesh-controller`. Every abort path in a migration therefore ends with
+     the config pointing at a directory the data is not in — and a controller starting
+     on an empty data dir used to mint a **brand-new CA** and invalidate the fabric.
    - **The DB is live.** `preremove-controller.sh` only stops the service on
      *removal*, so an upgrade copies a running controller's SQLite DB (default
      rollback-journal, no WAL) and then deletes the originals. POSIX keeps the unlinked
@@ -409,10 +411,13 @@ Executed against `px` (`206.83.146.32`) instead of FI. Deviations and findings:
    `docs/install.md`. A human with the controller stopped has none of these problems.
 
    Defence in depth, since a pinned config can still be wrong by other means:
-   `wiremesh-trust`'s `load_or_create_ca` now **refuses to mint** a CA in an empty data
-   dir when it finds one at `/var/lib/wiremesh`, naming both paths and the
-   `WIREMESH_DATA_DIR` knob. (Its existing half-CA refusal — exactly one of
-   `ca.pem`/`ca.key` present — is unchanged and still checked first.)
+   `wiremesh-trust`'s `load_or_create_ca` now **refuses to mint** a CA when the data dir
+   has no CA *of its own* but one exists at `/var/lib/wiremesh`, naming both paths and
+   the `WIREMESH_DATA_DIR` knob. A data dir that already holds its own `ca.pem` +
+   `ca.key` loads normally and never consults the legacy path — a host that has already
+   been split keeps booting even with a stale `ca.key` left behind in the shared
+   directory. (The existing half-CA refusal — exactly one of `ca.pem`/`ca.key` present —
+   is unchanged and still checked first.)
 
    The unit serves both layouts: `StateDirectory=wiremesh-controller` for fresh
    installs, plus `ReadWritePaths=-/var/lib/wiremesh` so a pinned install can still

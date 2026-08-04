@@ -450,11 +450,21 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     std::fs::create_dir_all(&config.data_dir)
         .with_context(|| format!("creating data dir {}", config.data_dir.display()))?;
 
+    // Trust FIRST, deliberately: `EmbeddedTrust::open` carries the guard that
+    // refuses to mint a replacement CA when this data dir has none but the
+    // legacy one does (see `wiremesh_trust::load_or_create_ca`), and a guard
+    // is only worth having if it runs before anything else writes here.
+    // `Db::open` runs migrations, so opening it first left a complete, empty
+    // schema in the wrong directory on every refused boot — which is exactly
+    // the residue the packaging looks at to decide whether a directory is
+    // already in use, so one mis-start used to permanently disable the
+    // postinstall's data-dir pin.
+    let trust = EmbeddedTrust::open(&config.data_dir).context("opening embedded CA/trust")?;
+
     let db_path = config.data_dir.join("controller.db");
     let db = Db::open(&db_path).with_context(|| format!("opening db at {}", db_path.display()))?;
     let db_handle = DbHandle::new(db);
 
-    let trust = EmbeddedTrust::open(&config.data_dir).context("opening embedded CA/trust")?;
     let ca_fingerprint = ca_root_fingerprint_hex(&trust).await?;
     let ca_bundle_pem = trust.trust_bundle().await.context("reading CA trust bundle")?;
 

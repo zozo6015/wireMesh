@@ -15,9 +15,13 @@ overrides:
   deb:
     depends:
       - passwd          # groupadd/useradd (postinstall-server.sh)
+      # NOT listing coreutils/findutils: both are Essential on Debian, and
+      # Policy 3.5 says not to depend on Essential packages.
   rpm:
     depends:
       - shadow-utils    # groupadd/useradd (postinstall-server.sh)
+      - coreutils       # stat (postinstall-server.sh ownership probe)
+      - findutils       # xargs (postinstall-server.sh drop-in probe)
 contents:
   - src: dist/linux-${ARCH}/wiremesh-controller
     dst: /usr/bin/wiremesh-controller
@@ -38,10 +42,15 @@ scripts:
   # back to it. It never moves, copies or deletes state (see the script header
   # for why an automatic migration was designed, reviewed, and then dropped).
   #
-  # The pin exists because of a deb/rpm asymmetry: `config|noreplace` below is
-  # honoured on rpm (%config(noreplace)) but is a plain conffile on deb — dpkg
-  # silently replaces an unmodified controller.env during unpack, BEFORE
-  # postinst runs, so on deb the env would otherwise point at an empty new dir.
+  # The pin exists because BOTH formats replace an UNMODIFIED controller.env on
+  # upgrade, before the scripts run: deb has no conffile "noreplace" mechanism
+  # (nfpm maps `config` and `config|noreplace` to the same plain conffile), and
+  # rpm's %config(noreplace) only protects a file the user actually changed.
+  # Without the pin, an upgraded host would come up pointing at an empty new
+  # data dir. Note the pin makes the file "locally modified" for both package
+  # managers thereafter — dpkg will prompt on future changes to it, rpm will
+  # write .rpmnew and stop delivering them silently (documented in
+  # controller.env and docs/install.md).
   postinstall: deploy/packages/scripts/postinstall-server.sh
   preremove: deploy/packages/scripts/preremove-controller.sh
   postremove: deploy/packages/scripts/postremove.sh
