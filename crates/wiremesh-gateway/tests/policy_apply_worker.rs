@@ -145,7 +145,9 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
-use wiremesh_gateway::policy_apply::{spawn_policy_apply_worker, PolicyApplyTarget};
+use wiremesh_gateway::policy_apply::{
+    spawn_policy_apply_worker, PolicyApplyHandle, PolicyApplyTarget,
+};
 use wiremesh_gateway::state::DesiredState;
 
 /// Short enough that the failure tests finish quickly, long enough that a
@@ -163,6 +165,17 @@ const RESPONSIVE_WITHIN: Duration = Duration::from_millis(250);
 /// place of the production 10s, so the suite stays fast while keeping the
 /// same shape.
 const SLOW: Duration = Duration::from_millis(800);
+
+/// Bounded wait for a WORKER-side counter to catch up with a TARGET-side
+/// signal — see [`await_failures`]. Deliberately generous next to the ~0.1s
+/// these tests actually take: it is only ever paid in full when the property
+/// is genuinely broken, and a tight budget here would trade a real race for
+/// a flaky one.
+const COUNTER_VISIBILITY_BUDGET: Duration = Duration::from_secs(2);
+
+/// Settle window for the mirror-image "this counter must NOT move"
+/// assertions — see [`settle_counters`].
+const COUNTER_SETTLE: Duration = Duration::from_millis(100);
 
 fn ds(version: u64) -> DesiredState {
     DesiredState { revision: version, policy_version: version, ..Default::default() }
@@ -323,6 +336,57 @@ async fn assert_quiet<T: std::fmt::Debug>(rx: &mut UnboundedReceiver<T>, d: Dura
     }
 }
 
+/// **Sound observation barrier for WORKER-side state.** Waits until the
+/// worker's failure counter has reached `want`, or fails on a bounded
+/// deadline. Returns the first observed value at or above `want`, so a
+/// caller can still pin an EXACT count on top of it.
+///
+/// ## Why this exists (do not "simplify" it back into a direct read)
+///
+/// Every `install_done` signal in this file is emitted by the FAKE TARGET,
+/// from inside `install()`, BEFORE it returns. The worker can only record
+/// the outcome after its `spawn_blocking(install).await` resolves — one
+/// scheduling hop later. On the current-thread runtime these tests use, the
+/// test task reliably wins that race, so
+/// `recv(done_rx); assert!(handle.failures() >= n)` asserts one hop too
+/// early and is unsatisfiable by ANY correct worker. That is a defect in the
+/// harness's observation barrier, not in the product.
+///
+/// This does not weaken the property. "Every failed attempt is counted" is
+/// still asserted in full: a worker that drops a failure, or never counts at
+/// all, sits below `want` until the deadline and fails loudly with the count
+/// it got stuck on. All that changed is that the counter is given a bounded
+/// moment to become observable, instead of being read before it possibly
+/// could be.
+async fn await_failures(handle: &PolicyApplyHandle, want: u64) -> u64 {
+    let deadline = Instant::now() + COUNTER_VISIBILITY_BUDGET;
+    loop {
+        let seen = handle.failures();
+        if seen >= want {
+            return seen;
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "the worker counted only {seen} apply failure(s) within \
+                 {COUNTER_VISIBILITY_BUDGET:?} of {want} being observed at the enforcer \
+                 — every failed attempt must be counted (this counter is the source of \
+                 `wiremesh_gateway_policy_apply_failures_total`)"
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// The mirror image of [`await_failures`], for assertions of the form "this
+/// counter must NOT have moved". The same one-hop gap applies in reverse: an
+/// increment the worker makes WRONGLY would land after a naive read, so the
+/// read would pass by luck. Settling first is strictly STRONGER than reading
+/// immediately — it gives a miscounting worker time to be caught rather than
+/// time to hide.
+async fn settle_counters() {
+    tokio::time::sleep(COUNTER_SETTLE).await;
+}
+
 // --- baseline -------------------------------------------------------------
 
 /// Smoke: with no reap constraint, a published state is installed promptly
@@ -337,6 +401,10 @@ async fn a_published_state_is_installed() {
     let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the install").await;
     assert_eq!((v, ok), (7, true));
     assert_eq!(target.installed_versions(), vec![7]);
+    // `failures()` is WORKER-side while the signal above is TARGET-side, so a
+    // worker that wrongly counted this SUCCESS as a failure would increment
+    // one scheduling hop after a naive read — see `settle_counters`.
+    settle_counters().await;
     assert_eq!(handle.failures(), 0, "a successful install must not count as a failure");
 }
 
@@ -644,11 +712,17 @@ async fn install_failures_are_counted_and_retried_and_never_kill_the_worker() {
     assert_eq!(b, (1, false), "attempt 2 retries the SAME desired state and fails");
     assert_eq!(c, (1, true), "attempt 3 retries again and succeeds");
 
+    // WORKER-side read behind a TARGET-side signal — barrier per
+    // `await_failures`. This particular read happens to be safe today only
+    // because the worker must record attempt N's failure before it can start
+    // attempt N+1; that is an internal ordering assumption about the
+    // implementation, not part of the contract, so it gets the same sound
+    // barrier as everywhere else rather than passing by luck.
+    let seen = await_failures(&handle, 2).await;
     assert_eq!(
-        handle.failures(),
-        2,
-        "both failures must be counted (this counter is the source of \
-         `wiremesh_gateway_policy_apply_failures_total`)"
+        seen, 2,
+        "both failures must be counted, and ONLY those two (this counter is the source \
+         of `wiremesh_gateway_policy_apply_failures_total`)"
     );
     assert_quiet(&mut sig.done_rx, Duration::from_millis(300), "installs").await;
 
@@ -656,6 +730,7 @@ async fn install_failures_are_counted_and_retried_and_never_kill_the_worker() {
     handle.publish(ds(2));
     let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the next install").await;
     assert_eq!((v, ok), (2, true), "the worker must keep serving after a failure");
+    settle_counters().await;
     assert_eq!(handle.failures(), 2, "a success must not change the failure count");
 }
 
@@ -676,7 +751,14 @@ async fn a_permanently_failing_state_does_not_wedge_the_worker() {
             recv_within(&mut sig.done_rx, Duration::from_secs(5), "a retry of the bad state").await;
         assert_eq!((v, ok), (1, false), "attempt {attempt} must keep retrying the bad state");
     }
-    assert!(handle.failures() >= 3, "every failed attempt is counted");
+    // WORKER-side read behind a TARGET-side signal — barrier per
+    // `await_failures`. This is the exact race that made the assertion
+    // unsatisfiable when it read `failures()` in the same breath as the third
+    // failure signal: the counter is incremented one scheduling hop after
+    // `install()` has already signalled, and the test task wins that race
+    // every time on a current-thread runtime. The property is unchanged —
+    // all three failed attempts must be counted.
+    await_failures(&handle, 3).await;
 
     // Operator pushes a corrected policy. It is published while the backend
     // is STILL failing, so the first thing to prove is that the retry loop
