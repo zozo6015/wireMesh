@@ -67,18 +67,34 @@ struct EnforcerApplyTarget {
     enforcers: Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
     applied_version: Arc<AtomicU64>,
     report_notify: Arc<tokio::sync::Notify>,
+    /// Set by the first successful install. While it is still false the
+    /// datapath has NO policy at all — every live enforcer is attached and
+    /// default-denying — so a failure is a total blackhole, not the
+    /// "keeps the last good policy" degradation the steady-state retry line
+    /// describes. It gets its own escalated log so a fail-static boot on an
+    /// un-appliable persisted policy cannot hide behind the retry chatter.
+    ever_installed: AtomicBool,
 }
 
 impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
-    /// The furthest-out deadline across every live epoch: applying is only
-    /// safe once EVERY enforcer that will be written has cleared its grace.
+    /// The furthest-out deadline across the enforcers this install would
+    /// actually WRITE — entries already on `ds.policy_version` are skipped,
+    /// because `apply_if_changed` will not touch them and their grace
+    /// therefore protects nothing. Without that filter, a rotation
+    /// overlap's brand-new enforcer (first apply = a full fresh grace)
+    /// would delay a policy TIGHTENING to the boot tun that is already
+    /// clear to take it.
+    ///
     /// The guard is dropped on return by construction (the signature hands
     /// back a plain `Option<Instant>`), which is what keeps the map
     /// available to the metrics scrape, retire, Role-B collapse and
     /// rotation-insert paths for the whole of the worker's wait.
-    fn ready_at(&self) -> Option<Instant> {
+    fn ready_at(&self, ds: &DesiredState) -> Option<Instant> {
         let map = self.enforcers.blocking_lock();
-        map.values().filter_map(|e| e.apply_ready_at()).max()
+        map.values()
+            .filter(|e| e.applied_version() != Some(ds.policy_version))
+            .filter_map(|e| e.apply_ready_at())
+            .max()
     }
 
     /// Apply the current policy IR to EVERY live enforcer (boot tun + every
@@ -88,17 +104,65 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
     /// is cheap for entries already on `ds.policy_version` and, crucially,
     /// makes a RETRY after a partial failure re-apply only what is missing.
     ///
+    /// **Each entry's deadline is re-checked HERE, under the lock.** The
+    /// reading `ready_at` took was made before the lock was dropped, and
+    /// `maybe_start_role_a`/`maybe_start_role_b` can insert a brand-new
+    /// enforcer — one that flipped moments ago — in between. Today that is
+    /// benign only because those handlers apply the same snapshot we hold,
+    /// so `apply_if_changed` short-circuits; nothing states or enforces
+    /// that, and it is exactly the overwrite the grace exists to prevent.
+    /// An entry still inside its grace is left alone and the whole install
+    /// reports `Err`, so the worker's retry re-reads the deadline and
+    /// completes it once the grace elapses.
+    ///
     /// `applied_version` is stored only after every entry succeeded, so the
     /// gauge (and the report derived from it) never claims a version the
     /// datapath does not have.
     fn install(&self, ds: &DesiredState) -> anyhow::Result<()> {
+        let mut deferred: Vec<u32> = Vec::new();
+        let mut failure: Option<anyhow::Error> = None;
         {
             let mut map = self.enforcers.blocking_lock();
-            for e in map.values_mut() {
-                e.apply_if_changed(ds)?;
+            let now = Instant::now();
+            for (epoch, enforcer) in map.iter_mut() {
+                if enforcer.applied_version() == Some(ds.policy_version) {
+                    continue; // nothing would be written; nothing to gate on
+                }
+                if enforcer.apply_ready_at().is_some_and(|t| t > now) {
+                    deferred.push(*epoch);
+                    continue;
+                }
+                if let Err(err) = enforcer.apply_if_changed(ds) {
+                    failure = Some(err.context(format!("applying policy to epoch {epoch}")));
+                    break;
+                }
             }
         }
+        if let Some(e) = failure {
+            if !self.ever_installed.load(Ordering::Relaxed) {
+                eprintln!(
+                    "wiremesh-gateway: CRITICAL: NO policy has ever been installed on this \
+                     process and policy version {} cannot be applied — every live tun is \
+                     attached and default-denying, so ALL fabric traffic is being dropped. \
+                     This is a blackhole, not fail-static. Push an installable policy from \
+                     the controller.",
+                    ds.policy_version
+                );
+            }
+            return Err(e);
+        }
+        if !deferred.is_empty() {
+            // Not a policy error — a race with a rotation insert. Reported
+            // as `Err` purely so the worker retries; the counter ticking is
+            // acceptable and honest ("this apply did not fully land").
+            anyhow::bail!(
+                "epoch(s) {deferred:?} were inserted after the apply deadline was read and are \
+                 still inside their reap grace; deferring policy version {} for them",
+                ds.policy_version
+            );
+        }
         self.applied_version.store(ds.policy_version, Ordering::Relaxed);
+        self.ever_installed.store(true, Ordering::Relaxed);
         // Tell the Sync loop to re-report: it already sent its report for
         // this snapshot while the install was still pending, carrying the
         // PREVIOUS applied version. Debounced on the loop side.
@@ -370,6 +434,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
             enforcers: enforcers.clone(),
             applied_version: applied_version.clone(),
             report_notify: path_report_notify.clone(),
+            ever_installed: AtomicBool::new(false),
         }),
         POLICY_APPLY_RETRY,
     );
@@ -775,9 +840,23 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // a reap grace (it is the same loop that services
                             // `PunchDirective`, whose go-skew budget is
                             // milliseconds) and must not exit the process
-                            // because one policy IR was unconsumable. Placed
-                            // immediately after the device apply so the
-                            // ordering device → policy → routes is unchanged.
+                            // because one policy IR was unconsumable.
+                            //
+                            // The ordering genuinely CHANGED and that is
+                            // safe. It used to be device → policy → routes
+                            // (the enforcer apply sat inside `apply_state`,
+                            // between the UAPI write and the route diff); it
+                            // is now device → routes → policy, with the
+                            // policy landing asynchronously up to a reap
+                            // grace later. So a newly enrolled peer's segment
+                            // CIDRs are routed at the tun before the policy
+                            // governing them reaches the datapath — which is
+                            // fail-CLOSED, because the policy still live in
+                            // the datapath is the previous version, which has
+                            // no rule for that new segment and default-denies
+                            // it. The window can only ever deny traffic the
+                            // new policy would allow, never allow traffic it
+                            // would deny.
                             policy_apply.publish(ds.clone());
                             ds.save(&cfg.state_dir)?;
                             // (Key-rotation Role B) If desired state now shows a

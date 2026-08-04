@@ -63,21 +63,35 @@
 //! /// `Arc<tokio::sync::Mutex<HashMap<u32, GatewayEnforcer>>>`; tests
 //! /// implement it with a fake.
 //! pub trait PolicyApplyTarget: Send + Sync + 'static {
-//!     /// Cheap and NON-BLOCKING: the latest instant at which every live
-//!     /// enforcer will accept the next apply — `max` over each entry's
-//!     /// `GatewayEnforcer::apply_ready_at()` (which forwards
-//!     /// `Enforcer::apply_ready_at`). `None` = no constraint.
+//!     /// The latest instant at which every enforcer that installing `ds`
+//!     /// would actually WRITE will accept that write — `max` over the
+//!     /// `GatewayEnforcer::apply_ready_at()` of THOSE entries only.
+//!     /// `None` = no constraint.
+//!     ///
+//!     /// `ds` is a parameter because the install is version-gated per
+//!     /// enforcer: an entry already on `ds.policy_version` will not be
+//!     /// touched, so its grace protects nothing and must not gate. Without
+//!     /// the filter, a rotation overlap's freshly-created enforcer (first
+//!     /// apply = a full fresh grace) would delay a security-relevant
+//!     /// policy TIGHTENING to a boot tun already clear to take it.
 //!     ///
 //!     /// The real adapter takes the enforcer-map lock, reads the deadlines,
 //!     /// and DROPS the lock before returning — returning a plain
 //!     /// `Option<Instant>` (not a guard) is what structurally forbids
 //!     /// holding the map lock across the worker's wait.
-//!     fn ready_at(&self) -> Option<std::time::Instant>;
+//!     fn ready_at(&self, ds: &DesiredState) -> Option<std::time::Instant>;
 //!
 //!     /// Perform the (now fast) install: re-lock the enforcer map and
 //!     /// `apply_if_changed(ds)` every live entry. BLOCKING by contract —
 //!     /// the worker always calls it inside `tokio::task::spawn_blocking`,
 //!     /// so the real adapter uses `Mutex::blocking_lock()`.
+//!     ///
+//!     /// The reading `ready_at` returned was taken before the lock was
+//!     /// dropped and re-taken, so a rotation insert can have added an
+//!     /// enforcer in between whose grace was never consulted. An
+//!     /// implementation must re-check each entry's own deadline UNDER THE
+//!     /// LOCK and defer (returning `Err`, so the worker retries) rather
+//!     /// than write it.
 //!     fn install(&self, ds: &DesiredState) -> anyhow::Result<()>;
 //! }
 //!
@@ -177,6 +191,12 @@ const COUNTER_VISIBILITY_BUDGET: Duration = Duration::from_secs(2);
 /// assertions — see [`settle_counters`].
 const COUNTER_SETTLE: Duration = Duration::from_millis(100);
 
+/// A deadline far enough out that any test which accidentally waits on it
+/// fails by TIMING OUT rather than by running slowly — used by the
+/// version-filter tests, where the whole point is that this deadline must
+/// never be waited on at all.
+const FAR_DEADLINE: Duration = Duration::from_secs(10);
+
 fn ds(version: u64) -> DesiredState {
     DesiredState { revision: version, policy_version: version, ..Default::default() }
 }
@@ -187,14 +207,47 @@ struct Install {
     version: u64,
     started_at: Instant,
     ok: bool,
+    /// `true` when the attempt failed because at least one entry was still
+    /// inside its own reap grace at install time (the rotation-insert race),
+    /// as opposed to a test-forced backend rejection. Diagnostic only — the
+    /// pinned properties are the worker-side ones.
+    deferred: bool,
+}
+
+/// One live enforcer, as the fake models it: exactly the two fields the real
+/// adapter's version filter and under-the-lock deadline re-check consult
+/// (`GatewayEnforcer::applied_version()` / `::apply_ready_at()`).
+///
+/// The fake models a SET of these rather than one flat deadline so that the
+/// `ds` parameter on `ready_at` is genuinely exercised — with a single
+/// unconstrained entry the filter would be satisfied by accident and the
+/// version-threading tests below would prove nothing.
+#[derive(Debug, Clone, Copy)]
+struct FakeEntry {
+    applied_version: Option<u64>,
+    ready_at: Option<Instant>,
+}
+
+impl FakeEntry {
+    /// A fresh, unconstrained enforcer: nothing applied yet, no pending reap.
+    /// The default single-entry map every test that does not care about
+    /// per-entry behaviour gets.
+    fn fresh() -> FakeEntry {
+        FakeEntry { applied_version: None, ready_at: None }
+    }
 }
 
 /// In-test stand-in for the live enforcer map. Records every `install`,
 /// signals every `ready_at`/install-start/install-finish so tests can
 /// synchronize on the worker's progress instead of sleeping and hoping, and
-/// can be told to stall or fail.
+/// can be told to stall, fail, or panic.
 struct FakeTarget {
-    ready_at: Mutex<Option<Instant>>,
+    /// The modelled enforcer map. Starts as one [`FakeEntry::fresh`].
+    entries: Mutex<Vec<FakeEntry>>,
+    /// Every `ds.policy_version` handed to `ready_at`, in call order — lets
+    /// a test pin that the deadline was read for the state actually being
+    /// installed, not a stale or default one.
+    ready_at_versions: Mutex<Vec<u64>>,
     installs: Mutex<Vec<Install>>,
     /// Signalled once per `ready_at()` call — the observation point that
     /// tells a test "the worker has picked the state up and is about to
@@ -213,6 +266,16 @@ struct FakeTarget {
     /// Number of upcoming installs that must return `Err`. `u64::MAX` = fail
     /// until told otherwise.
     fail_next: AtomicU64,
+    /// Number of upcoming `ready_at` calls that must PANIC. `u64::MAX` =
+    /// panic until told otherwise. Models the safety-critical degradation
+    /// path: the worker must treat an unreadable deadline as a failed
+    /// attempt, never as "no deadline, apply now".
+    panic_ready_at: AtomicU64,
+    /// One-shot rotation-insert race: an entry appended at the END of the
+    /// next `ready_at` call, i.e. AFTER the worker has already taken its
+    /// deadline reading, exactly as `maybe_start_role_a`/`maybe_start_role_b`
+    /// can insert a brand-new enforcer between the read and the install.
+    insert_after_next_ready_at: Mutex<Option<FakeEntry>>,
 }
 
 impl FakeTarget {
@@ -221,7 +284,8 @@ impl FakeTarget {
         let (install_started, started_rx) = unbounded_channel();
         let (install_done, done_rx) = unbounded_channel();
         let t = Arc::new(FakeTarget {
-            ready_at: Mutex::new(None),
+            entries: Mutex::new(vec![FakeEntry::fresh()]),
+            ready_at_versions: Mutex::new(Vec::new()),
             installs: Mutex::new(Vec::new()),
             ready_calls,
             install_started,
@@ -229,12 +293,46 @@ impl FakeTarget {
             block_for: Mutex::new(None),
             gate: Mutex::new(None),
             fail_next: AtomicU64::new(0),
+            panic_ready_at: AtomicU64::new(0),
+            insert_after_next_ready_at: Mutex::new(None),
         });
         (t, Signals { ready_rx, started_rx, done_rx })
     }
 
+    /// Convenience for the single-entry tests: set the one default
+    /// enforcer's pending-reap deadline.
     fn set_ready_at(&self, t: Option<Instant>) {
-        *self.ready_at.lock().unwrap() = t;
+        let mut entries = self.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1, "set_ready_at is the single-entry convenience");
+        entries[0].ready_at = t;
+    }
+
+    /// Replace the modelled enforcer map wholesale (multi-entry tests).
+    fn set_entries(&self, entries: Vec<FakeEntry>) {
+        *self.entries.lock().unwrap() = entries;
+    }
+
+    fn entries(&self) -> Vec<FakeEntry> {
+        self.entries.lock().unwrap().clone()
+    }
+
+    /// Arm the rotation-insert race: `entry` becomes visible only after the
+    /// worker's NEXT deadline read has already returned.
+    fn insert_after_next_ready_at(&self, entry: FakeEntry) {
+        *self.insert_after_next_ready_at.lock().unwrap() = Some(entry);
+    }
+
+    fn panic_ready_at(&self, n: u64) {
+        self.panic_ready_at.store(n, Ordering::SeqCst);
+    }
+
+    fn stop_panicking(&self) {
+        self.panic_ready_at.store(0, Ordering::SeqCst);
+    }
+
+    /// Every `ds.policy_version` the worker asked a deadline for, in order.
+    fn ready_at_versions(&self) -> Vec<u64> {
+        self.ready_at_versions.lock().unwrap().clone()
     }
 
     fn set_block_for(&self, d: Duration) {
@@ -270,12 +368,48 @@ impl FakeTarget {
 }
 
 impl PolicyApplyTarget for FakeTarget {
-    fn ready_at(&self) -> Option<Instant> {
-        let t = *self.ready_at.lock().unwrap();
+    /// Mirrors the real adapter: the max deadline over only those entries
+    /// the install would actually WRITE — entries already on
+    /// `ds.policy_version` are filtered out, because `apply_if_changed`
+    /// would not touch them.
+    fn ready_at(&self, ds: &DesiredState) -> Option<Instant> {
+        let version = ds.policy_version;
+
+        // No mutex guard may be alive when this panics: a poisoned fixture
+        // mutex would turn every LATER `.lock().unwrap()` into a second,
+        // unrelated panic and the test would fail for the wrong reason.
+        let panics = self.panic_ready_at.load(Ordering::SeqCst);
+        if panics > 0 {
+            if panics != u64::MAX {
+                self.panic_ready_at.store(panics - 1, Ordering::SeqCst);
+            }
+            self.ready_at_versions.lock().unwrap().push(version);
+            let _ = self.ready_calls.send(());
+            panic!("fake ready_at panic (policy version {version})");
+        }
+
+        let deadline = {
+            let entries = self.entries.lock().unwrap();
+            entries
+                .iter()
+                .filter(|e| e.applied_version != Some(version))
+                .filter_map(|e| e.ready_at)
+                .max()
+        };
+
+        // The rotation-insert race: the new entry lands only NOW, after the
+        // reading above was taken — so `install` is the first place its
+        // grace can possibly be seen.
+        let late = self.insert_after_next_ready_at.lock().unwrap().take();
+        if let Some(entry) = late {
+            self.entries.lock().unwrap().push(entry);
+        }
+
+        self.ready_at_versions.lock().unwrap().push(version);
         // Send AFTER reading, so a test woken by this signal is guaranteed
         // the worker has already taken the value it will wait on.
         let _ = self.ready_calls.send(());
-        t
+        deadline
     }
 
     fn install(&self, ds: &DesiredState) -> anyhow::Result<()> {
@@ -296,19 +430,53 @@ impl PolicyApplyTarget for FakeTarget {
             let _ = rx.recv();
         }
 
+        // A test-forced backend rejection short-circuits before any entry is
+        // written — a failing `apply_if_changed` leaves the real enforcer's
+        // `applied_version` untouched too.
         let remaining = self.fail_next.load(Ordering::SeqCst);
-        let ok = remaining == 0;
-        if !ok && remaining != u64::MAX {
+        let forced_fail = remaining != 0;
+        if forced_fail && remaining != u64::MAX {
             self.fail_next.store(remaining - 1, Ordering::SeqCst);
         }
 
-        self.installs.lock().unwrap().push(Install { version, started_at, ok });
+        // Mirrors the real adapter's under-the-lock re-check: an entry still
+        // inside its own grace is LEFT ALONE and the whole install reports
+        // `Err`, so the worker's retry re-reads the deadline and completes
+        // it once the grace elapses. Writing it here would be exactly the
+        // overwrite of a still-readable outer-array slot the grace exists to
+        // prevent.
+        let mut deferred = 0usize;
+        if !forced_fail {
+            let mut entries = self.entries.lock().unwrap();
+            let now = Instant::now();
+            for e in entries.iter_mut() {
+                if e.applied_version == Some(version) {
+                    continue; // nothing would be written; nothing to gate on
+                }
+                if e.ready_at.is_some_and(|t| t > now) {
+                    deferred += 1;
+                    continue;
+                }
+                e.applied_version = Some(version);
+            }
+        }
+
+        let ok = !forced_fail && deferred == 0;
+        self.installs
+            .lock()
+            .unwrap()
+            .push(Install { version, started_at, ok, deferred: deferred > 0 });
         let _ = self.install_done.send((version, ok));
 
         if ok {
             Ok(())
-        } else {
+        } else if forced_fail {
             Err(anyhow::anyhow!("fake install failure for policy version {version}"))
+        } else {
+            Err(anyhow::anyhow!(
+                "{deferred} entr(ies) were still inside their reap grace; deferring policy \
+                 version {version} for them"
+            ))
         }
     }
 }
@@ -374,6 +542,21 @@ async fn await_failures(handle: &PolicyApplyHandle, want: u64) -> u64 {
             );
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// Drains install signals until a FAILED attempt at `version` is seen.
+/// Used where the desired state changes mid-wedge: the worker may still be
+/// mid-attempt on the previous version when the newer one is published, so
+/// "the next signal" is not reliably the one under test.
+async fn next_failed_attempt_at(sig: &mut Signals, version: u64) {
+    loop {
+        let (v, ok) =
+            recv_within(&mut sig.done_rx, Duration::from_secs(10), "an install attempt").await;
+        assert!(!ok, "the backend is still failing, so no attempt may succeed yet");
+        if v == version {
+            return;
+        }
     }
 }
 
@@ -560,6 +743,201 @@ async fn a_satisfied_deadline_does_not_delay_the_install() {
         "a deadline in the past must not delay the install; it waited {:?}",
         started.saturating_duration_since(published_at)
     );
+}
+
+// --- per-entry deadline semantics (review findings 4+5) -------------------
+
+/// **Review finding 4.** The deadline must be read for the enforcers the
+/// install would actually WRITE. An entry already on `ds.policy_version`
+/// will not be touched by `apply_if_changed`, so its pending reap protects
+/// nothing and must not gate anything.
+///
+/// The concrete outage this prevents: during a rotation overlap a
+/// freshly-created enforcer has just done its first apply and is therefore
+/// sitting on a full 10s grace. If its deadline gated the whole install, a
+/// security-relevant policy TIGHTENING would be held off the boot tun — which
+/// is already on a different version and perfectly clear to take it — for a
+/// grace period.
+///
+/// Sabotage that must turn this red: hand `ready_at` anything other than the
+/// state about to be installed (a `DesiredState::default()`, a stale clone),
+/// or drop the `ds` argument and go back to max-over-everything — entry
+/// `already_on_v2` stops being filtered and the install waits
+/// `FAR_DEADLINE`, blowing the 3s budget.
+#[tokio::test]
+async fn an_entry_already_on_the_target_version_does_not_gate_the_install() {
+    let (target, mut sig) = FakeTarget::new();
+    let far = Instant::now() + FAR_DEADLINE;
+    target.set_entries(vec![
+        // The rotation newcomer: just flipped, a full grace pending — but it
+        // is ALREADY on the version we are about to install.
+        FakeEntry { applied_version: Some(2), ready_at: Some(far) },
+        // The boot tun: nothing applied yet, no pending reap. This is the
+        // one the install must reach, promptly.
+        FakeEntry::fresh(),
+    ]);
+    let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
+
+    let published_at = Instant::now();
+    handle.publish(ds(2));
+
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(3), "the install").await;
+    assert_eq!((v, ok), (2, true));
+    let waited = target.installs()[0].started_at.saturating_duration_since(published_at);
+    assert!(
+        waited < RESPONSIVE_WITHIN,
+        "the install waited {waited:?} on a deadline belonging to an enforcer that was \
+         already on policy version 2 — that entry would not have been written, so its \
+         reap grace must not gate a tightening bound for the other tun"
+    );
+    assert_eq!(
+        target.ready_at_versions(),
+        vec![2],
+        "the deadline must be read for the state actually being installed"
+    );
+    assert_eq!(
+        target.entries()[1].applied_version,
+        Some(2),
+        "the entry that WAS behind must have been written"
+    );
+}
+
+/// The same property across the supersession path — where a stale `ds` is
+/// genuinely easy to leak, because the version filter makes the deadline
+/// DIFFERENT for the two states.
+///
+/// The fixture inverts which entry gates: `gates_v2_only` is already on v1,
+/// so it is filtered while v1 is the target and becomes gating the moment v2
+/// is adopted. A worker that adopts v2 and installs it using the deadline it
+/// computed for v1 therefore writes `gates_v2_only` while it is still inside
+/// its grace — the adapter's under-the-lock re-check catches that and defers,
+/// so the sabotage shows up as a spurious deferral (a counted failure and a
+/// second install attempt) rather than as a silent overwrite.
+///
+/// Sabotage that must turn this red: install the newly adopted state without
+/// looping back to re-read its deadline, or re-read it while still passing
+/// the superseded `ds` — `failures()` becomes 1 and `installs` has two
+/// entries instead of one.
+#[tokio::test]
+async fn re_adopting_a_newer_state_re_reads_the_deadline_for_that_newer_state() {
+    let (target, mut sig) = FakeTarget::new();
+    let t0 = Instant::now();
+    let gates_v1 = t0 + Duration::from_millis(200);
+    let gates_v2 = t0 + Duration::from_millis(500);
+    target.set_entries(vec![
+        // Nothing applied yet: gates BOTH states, and its short deadline is
+        // what the worker parks on for v1.
+        FakeEntry { applied_version: None, ready_at: Some(gates_v1) },
+        // Already on v1, so filtered out while v1 is the target — and NOT
+        // filtered once v2 is adopted, at which point its later deadline
+        // becomes the binding one.
+        FakeEntry { applied_version: Some(1), ready_at: Some(gates_v2) },
+    ]);
+    let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
+
+    handle.publish(ds(1));
+    recv_within(&mut sig.ready_rx, Duration::from_secs(5), "the deadline query for v1").await;
+
+    // Supersede during the (200ms) wait.
+    handle.publish(ds(2));
+
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the install").await;
+    assert_eq!((v, ok), (2, true), "the superseding state is the one installed");
+
+    let started = target.installs()[0].started_at;
+    assert!(
+        started >= gates_v2,
+        "the install ran {:?} before the deadline that applies to v2 — it reused the \
+         deadline computed for v1, under which that enforcer was filtered out",
+        gates_v2.saturating_duration_since(started)
+    );
+    assert_eq!(
+        target.ready_at_versions(),
+        vec![1, 2],
+        "exactly one deadline read per adopted state, each for that state's own version"
+    );
+    assert_eq!(target.installs().len(), 1, "one clean install, no deferral round trip");
+    settle_counters().await;
+    assert_eq!(
+        handle.failures(),
+        0,
+        "re-reading the deadline for the adopted state is what avoids writing an \
+         enforcer inside its grace; a spurious deferral here means the worker carried \
+         the superseded state's deadline forward"
+    );
+}
+
+/// **Review finding 5.** An entry inserted between the deadline read and the
+/// install — a rotation standing up a new tun — has a grace the worker never
+/// consulted. It must be DEFERRED, not written: the install reports `Err`,
+/// the worker counts it and retries, and the retry re-reads the deadline,
+/// waits the newly-discovered grace out, and lands the state.
+///
+/// Before the fix this was benign only because the rotation handlers happen
+/// to apply the same snapshot, so `apply_if_changed` short-circuited. Nothing
+/// stated or enforced that; this pins the enforced version.
+///
+/// The discriminator is the failure COUNT, not just eventual success. A
+/// worker that re-reads the deadline defers exactly ONCE, then waits and
+/// succeeds. A worker that blindly re-attempted on the retry timer would
+/// keep hammering the target — with a 600ms grace and 50ms backoff doubling
+/// (50/100/200/400) that is four deferrals before one happens to land after
+/// the grace, and it would land by luck rather than by waiting.
+#[tokio::test]
+async fn an_entry_inserted_after_the_deadline_read_is_deferred_then_landed_by_the_retry() {
+    let (target, mut sig) = FakeTarget::new();
+    let grace = Duration::from_millis(600);
+    let late_deadline = Instant::now() + grace;
+    // Arrives only after the worker has taken its (unconstrained) reading.
+    target.insert_after_next_ready_at(FakeEntry {
+        applied_version: None,
+        ready_at: Some(late_deadline),
+    });
+    let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
+
+    handle.publish(ds(1));
+
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the first attempt").await;
+    assert_eq!(
+        (v, ok),
+        (1, false),
+        "the attempt must FAIL rather than write an enforcer whose grace was never read"
+    );
+    assert!(
+        target.installs()[0].deferred,
+        "sanity: the first attempt must have failed by DEFERRAL (the race), not by a \
+         forced backend rejection"
+    );
+
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the retry").await;
+    assert_eq!((v, ok), (1, true), "the retry must land the state once the grace elapses");
+
+    let landed_at = target.installs()[1].started_at;
+    assert!(
+        landed_at >= late_deadline,
+        "the retry wrote the late entry {:?} BEFORE its grace expired — the deferral \
+         must be resolved by waiting the grace out, not by retrying until one attempt \
+         happens to slip past it",
+        late_deadline.saturating_duration_since(landed_at)
+    );
+    for (i, e) in target.entries().iter().enumerate() {
+        assert_eq!(
+            e.applied_version,
+            Some(1),
+            "entry {i} must be on the target version once the state has landed"
+        );
+    }
+
+    let failures = await_failures(&handle, 1).await;
+    settle_counters().await;
+    assert_eq!(
+        handle.failures(),
+        1,
+        "exactly ONE deferral: the retry must re-read the deadline and wait it out. \
+         More than one means the worker is blind-retrying on its backoff timer and \
+         landing the state by luck (first observation was {failures})"
+    );
+    assert_quiet(&mut sig.done_rx, Duration::from_millis(300), "installs").await;
 }
 
 // --- (D) the Sync loop keeps running while an apply is in flight ----------
@@ -779,6 +1157,128 @@ async fn a_permanently_failing_state_does_not_wedge_the_worker() {
     target.stop_failing();
     loop {
         let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "an install").await;
+        if ok {
+            assert_eq!(v, 2, "the corrected policy is what gets installed");
+            break;
+        }
+    }
+    assert_eq!(
+        target.ok_versions(),
+        vec![2],
+        "the wedged state must never have been installed — only the corrected one"
+    );
+}
+
+/// **Review finding 6 — the safety-critical degradation path.** A deadline
+/// query that cannot be completed must be treated as a FAILED ATTEMPT, never
+/// as "no deadline, apply now".
+///
+/// This is the one path in the whole design that could deliberately violate
+/// the reap grace: applying without a deadline reading overwrites outer-array
+/// slots that in-flight packets may still be reading. "The datapath keeps the
+/// last good policy" is the strictly safer degradation and is what every
+/// other failure here does.
+///
+/// The "no install happened" assertion is a stable invariant, not a race:
+/// `ready_at` panics for the whole first phase, so an install is unreachable
+/// by construction for as long as it does.
+///
+/// NOTE for whoever reads the output: this test deliberately panics inside
+/// `spawn_blocking`, so a PASSING run still prints `thread '...' panicked at
+/// ... fake ready_at panic` several times. That is the fixture working.
+///
+/// Sabotage that must turn this red: treat a failed deadline query as `None`
+/// and fall through to the install — `installs` stops being empty. Or drop
+/// the counter increment on that arm — `await_failures` times out.
+#[tokio::test]
+async fn an_unreadable_deadline_is_a_counted_retry_and_never_an_ungated_apply() {
+    let (target, mut sig) = FakeTarget::new();
+    target.panic_ready_at(u64::MAX);
+    let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
+
+    handle.publish(ds(1));
+
+    // Counted: the only observable here is the counter — a failed deadline
+    // query produces no install signal at all, which is the point.
+    await_failures(&handle, 3).await;
+    settle_counters().await;
+    assert!(
+        target.installs().is_empty(),
+        "a deadline query that failed must NOT degrade into applying with no reap-grace \
+         reading — that is the one path that can knowingly overwrite maps in-flight \
+         packets are still reading. Installs seen: {:?}",
+        target.installs()
+    );
+    assert!(
+        target.ready_at_versions().len() >= 3,
+        "sanity: the worker must keep re-asking for the deadline, not give up on it"
+    );
+
+    // Retried: once the query works again the state lands, with no further
+    // intervention.
+    target.stop_panicking();
+    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the recovered install").await;
+    assert_eq!(
+        (v, ok),
+        (1, true),
+        "the state must land once its deadline is readable again — a transient query \
+         failure must not wedge the datapath on the last good policy forever"
+    );
+}
+
+/// **Retry backoff, and its reset on adoption.** Consecutive failures double
+/// the pause (to `RETRY_BACKOFF_MAX`) so an un-appliable policy cannot flood
+/// the log, but a CORRECTED policy must not inherit the wedged one's
+/// punishment — that is the operator recovery path, and making them wait out
+/// a grown backoff would be a self-inflicted outage extension.
+///
+/// The measurement is the gap between the FIRST and SECOND attempt at the
+/// corrected state. The first attempt's own latency is not measured: the
+/// worker is asleep in the grown pause when the new state is published and
+/// only adopts it on waking, which is expected and unchanged by the reset.
+///
+/// Arithmetic at `RETRY_AFTER` = 50ms — attempts at 0/50/150/350/750ms, so
+/// after the fifth failure the pause has grown to 800ms and the next
+/// doubling is 1600ms. With the reset the measured gap is ~50ms; without it,
+/// ~1600ms. The 400ms threshold sits 8x above the former and 4x below the
+/// latter.
+///
+/// Sabotage that must turn this red: drop `backoff = retry_after` from the
+/// re-adoption arm.
+#[tokio::test]
+async fn adopting_a_corrected_policy_resets_the_retry_backoff() {
+    let (target, mut sig) = FakeTarget::new();
+    target.fail_next(u64::MAX);
+    let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
+
+    handle.publish(ds(1));
+    for attempt in 1..=5 {
+        let (v, ok) =
+            recv_within(&mut sig.done_rx, Duration::from_secs(10), "a wedged attempt").await;
+        assert_eq!((v, ok), (1, false), "wedged attempt {attempt} must fail");
+    }
+
+    // The corrected policy. Kept un-appliable for now, so the retry cadence
+    // stays observable rather than ending at the first success.
+    handle.publish(ds(2));
+
+    next_failed_attempt_at(&mut sig, 2).await;
+    let first_v2_attempt = Instant::now();
+    next_failed_attempt_at(&mut sig, 2).await;
+    let gap = first_v2_attempt.elapsed();
+
+    assert!(
+        gap < Duration::from_millis(400),
+        "the corrected policy's second attempt came {gap:?} after its first — it \
+         inherited the wedged state's grown backoff instead of getting a fresh \
+         {RETRY_AFTER:?} cadence. A corrected policy is the operator's recovery path; \
+         it must not be made to serve the previous policy's sentence."
+    );
+
+    // And it still lands once it can.
+    target.stop_failing();
+    loop {
+        let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(10), "an install").await;
         if ok {
             assert_eq!(v, 2, "the corrected policy is what gets installed");
             break;

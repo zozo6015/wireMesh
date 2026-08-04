@@ -846,9 +846,12 @@ policy:
          across v1/v2 despite shifting from idx0 to idx1"
     );
 
-    // apply() may internally block out the remainder of v1's post-flip reap
-    // grace (>=10s total since v1's flip) before returning -- acceptable
-    // per the coordinator's note; no explicit sleep needed here.
+    // (Backlog item 1) apply() no longer blocks out the remainder of v1's
+    // post-flip reap grace; it publishes the deadline via apply_ready_at()
+    // and returns. No caller-side wait is added here on purpose: this test
+    // has NOTHING in flight across the flip (it asserts on counters, sends
+    // no traffic between v1 and v2), so nothing can be reading the slot v1
+    // vacated, and 10s of dead time would buy the suite nothing.
     enforcer.apply(&v2).expect(
         "v2 (the same 2 rules plus 1 new rule inserted before A, 3 total -- no padding needed, \
          small policies apply fast) must apply",
@@ -1003,9 +1006,11 @@ policy:
          across v1/v2 despite shifting from idx1 to idx0"
     );
 
-    // apply() may internally block out the remainder of v1's post-flip reap
-    // grace (>=10s total since v1's flip) before returning -- acceptable,
-    // no explicit sleep needed here.
+    // (Backlog item 1) apply() no longer blocks out the remainder of v1's
+    // post-flip reap grace; it publishes the deadline via apply_ready_at()
+    // and returns. As in the sibling counter test above, no caller-side wait
+    // is added: nothing is in flight across this flip, so there is no slot
+    // reader to protect.
     enforcer.apply(&v2).expect(
         "v2 (B only, A removed -- no padding needed, small policies apply fast) must apply",
     );

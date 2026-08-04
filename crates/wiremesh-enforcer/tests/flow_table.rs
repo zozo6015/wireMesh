@@ -87,16 +87,20 @@ fn tiny_cfg() -> EnforcerConfig {
 }
 
 /// Same as [`tiny_cfg`] but with a much larger `udp_idle_s` (60s, the
-/// design's real default) instead of 2s. (c) needs a SECOND `apply()` call,
-/// which internally blocks ~10s on the reap grace (`ebpf.rs`'s
-/// `REAP_GRACE`) -- with `tiny_cfg`'s 2s idle window, that ~10s gap alone
-/// would (once Task 9 correctly wires idle eviction) age the established
-/// flow out on idle grounds ALONE, before flush_flows() is ever called --
-/// confounding (c)'s actual subject (apply() must not itself disturb
-/// `FLOWS`; only an explicit flush does) with (a)/(b)'s idle-timeout
-/// mechanism. A large idle window here keeps (c) about apply()/flush
-/// specifically, immune to Task 9's idle-eviction feature landing correctly
-/// alongside it.
+/// design's real default) instead of 2s, so (c) stays about apply()/flush
+/// specifically and can never be confounded by (a)/(b)'s idle-timeout
+/// mechanism: with `tiny_cfg`'s 2s window, ANY delay between establishing
+/// the flow and probing it after the second `apply()` risks aging the entry
+/// out on idle grounds alone, before `flush_flows()` is ever called, which
+/// would silently turn (c) into an idle-timeout test.
+///
+/// (Backlog item 1 rewrote this rationale. It used to name a specific
+/// delay: the ~10s `apply()` itself blocked on the reap grace before
+/// returning. `apply()` no longer sleeps -- it publishes the deadline via
+/// `apply_ready_at()` -- so (c)'s second apply now returns immediately and
+/// its establish→probe gap is well under a second. That makes the confound
+/// far less likely, NOT impossible, so the large window stays: it is cheap
+/// insurance, and (c)'s subject has not changed.)
 fn flush_test_cfg() -> EnforcerConfig {
     EnforcerConfig { flow_max: 64, rate_cap_per_src: 8, ..EnforcerConfig::default() }
 }
@@ -357,7 +361,13 @@ policy:
     );
 
     // v2: udp/9600's allow rule is REMOVED entirely (empty policy). This is
-    // the SECOND apply() -- internally waits out the reap grace (~10s).
+    // the SECOND apply(); since Backlog item 1 it returns immediately rather
+    // than sleeping out v1's ~10s reap grace, so probe2 below runs a
+    // fraction of a second after the flow was established rather than ~10s
+    // later. No caller-side wait is added here on purpose: unlike (e), this
+    // test has nothing in flight across the flip (probe1's exchange has
+    // completed and probe2 has not started), and adding 10s of dead time
+    // would only make the suite slower.
     let v2 = empty_ir(2);
     enforcer
         .apply(&v2)
@@ -516,14 +526,22 @@ for s in socks:
 /// times out.
 ///
 /// Timing (single long-lived client process, no cross-process signaling):
-/// the client sleeps a fixed 10.5s after r1 (comfortably past the ~10s reap
-/// grace `apply()`'s second call blocks on internally) before attempting
-/// r2, then a further fixed 2.5s before attempting r3 -- the coordinating
-/// Rust thread mirrors this with its own sleeps so `apply(&v2)` returns and
-/// `flush_flows()` is called strictly between the client's r2 and r3
-/// attempts. Same technique `tests/generations.rs`'s
+/// the client sleeps a fixed 10.5s after r1 before attempting r2, then a
+/// further fixed 2.5s before attempting r3 -- the coordinating Rust thread
+/// mirrors this with its own waits so `flush_flows()` is called strictly
+/// between the client's r2 and r3 attempts. Same technique
+/// `tests/generations.rs`'s
 /// `old_generation_reap_does_not_break_in_flight_allowed_flow_and_new_gen_matches`
 /// already uses for its own reap-grace synchronization.
+///
+/// **The 10.5s is the ~10s reap grace, and the Rust side must now wait it
+/// out EXPLICITLY** (Backlog item 1). It used to be implicit: `apply(&v2)`
+/// is the second apply, and `apply()` slept out the remainder of v1's grace
+/// internally before returning, which is what put the flush after r2 -- the
+/// margin was only ~0.7s. `apply()` no longer sleeps (it publishes the
+/// deadline via `apply_ready_at()`), so the coordinator honors it before
+/// `apply(&v2)`; drop that wait and the flush moves ~8.8s earlier, lands
+/// BEFORE r2, and both the R2 and R3 assertions fail.
 ///
 /// **Empirically GREEN today, not RED** (same finding as (c), verified as
 /// part of this task's RED-verification step): the flush/apply-independence
@@ -563,6 +581,22 @@ policy:
     let client = spawn_flow_persistence_client(&a, "10.10.0.2", 9500);
     std::thread::sleep(Duration::from_millis(300)); // let r1 land under v1
 
+    // Backlog item 1: this is the SECOND apply(), so it overwrites the
+    // outer-array slot v1's flip vacated -- honor v1's reap grace BEFORE it,
+    // as every caller must now that `apply()` no longer sleeps it out
+    // internally. Doing it here (not after) is both the contract-correct
+    // placement and what reproduces this test's original coordinator
+    // timeline exactly: the wait lands at ~v1_flip+10s, i.e. where
+    // `apply(&v2)` used to RETURN, so `flush_flows()` below stays strictly
+    // between the client's r2 (~t+10.6s) and r3 (~t+13.1s) attempts. Without
+    // it the flush would jump ~8.8s earlier, to BEFORE r2, and r2 would be
+    // denied -- see this test's doc comment.
+    if let Some(t) = enforcer.apply_ready_at() {
+        let now = std::time::Instant::now();
+        if t > now {
+            std::thread::sleep(t - now);
+        }
+    }
     let v2 = empty_ir(2);
     enforcer
         .apply(&v2)
@@ -629,9 +663,10 @@ except Exception:
 /// Connects to `dst_addr:port` and performs THREE request/ack round trips
 /// on the SAME socket, with fixed sleeps between them (see this test's doc
 /// comment for the timing rationale): r1 immediately, r2 after a 10.5s
-/// sleep (spans the coordinator's v2 `apply()`, which blocks ~10s
-/// internally on the reap grace), r3 after a further 2.5s sleep (spans the
-/// coordinator's `flush_flows()` call). Prints exactly one `R1=`/`R2=`/`R3=`
+/// sleep (spans the coordinator's explicit `apply_ready_at()` wait for v1's
+/// ~10s reap grace plus its v2 `apply()`), r3 after a further 2.5s sleep
+/// (spans the coordinator's `flush_flows()` call). Prints exactly one
+/// `R1=`/`R2=`/`R3=`
 /// line per stage (`OK`/`FAIL` for r1/r2, `DENIED`/`PASSED` for r3) and
 /// always exits 0, so the whole story is in stdout regardless of where a
 /// stage fails.

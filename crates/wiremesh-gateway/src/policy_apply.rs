@@ -37,26 +37,49 @@ use tokio::sync::watch;
 
 use crate::state::DesiredState;
 
+/// Ceiling on the retry backoff. A permanently un-appliable policy (an
+/// unconsumable IR, an empty-CIDR segment the nft backend rejects) would
+/// otherwise emit a log line every `retry_after` forever — 12/min at the
+/// production 5s, ~17k/day. The alertable signal is
+/// `wiremesh_gateway_policy_apply_failures_total`, which keeps counting at
+/// full rate; the log only has to stay diagnosable.
+pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
+
 /// Everything the worker needs from the live enforcer map. `main.rs`
 /// implements it with a thin adapter over
 /// `Arc<tokio::sync::Mutex<HashMap<u32, GatewayEnforcer>>>`; tests implement
 /// it with a fake.
 pub trait PolicyApplyTarget: Send + Sync + 'static {
-    /// The latest instant at which EVERY live enforcer will accept the next
-    /// apply — the `max` over each entry's `GatewayEnforcer::apply_ready_at()`.
-    /// `None` = no constraint; a `Some` in the past is already satisfied.
+    /// The latest instant at which every enforcer that installing `ds` would
+    /// actually WRITE will accept that write — the `max` over the
+    /// `GatewayEnforcer::apply_ready_at()` of those entries only. `None` = no
+    /// constraint; a `Some` in the past is already satisfied.
+    ///
+    /// **`ds` is a parameter, not an oversight.** The install is version-
+    /// gated per enforcer, so an entry already on `ds.policy_version` will
+    /// not be touched and its deadline must not gate anything. Without this,
+    /// a rotation overlap's freshly-created enforcer (whose first apply just
+    /// armed a full grace) would delay a security-relevant TIGHTENING to a
+    /// boot tun that is already clear to take it.
     ///
     /// Returning a plain `Option<Instant>` (rather than any kind of guard)
     /// is the load-bearing part of this seam: the real adapter takes the
     /// enforcer-map lock, reads the deadlines and drops the lock before
     /// returning, and the signature makes holding that lock across the
     /// worker's wait structurally impossible.
-    fn ready_at(&self) -> Option<Instant>;
+    fn ready_at(&self, ds: &DesiredState) -> Option<Instant>;
 
     /// Perform the (now fast) install: re-lock the enforcer map and
     /// `apply_if_changed(ds)` every live entry. BLOCKING by contract — the
     /// worker always calls it inside `tokio::task::spawn_blocking`, so the
     /// real adapter is free to use `Mutex::blocking_lock()`.
+    ///
+    /// The deadline [`PolicyApplyTarget::ready_at`] published was read
+    /// BEFORE the lock was dropped and re-taken, so the set of enforcers can
+    /// have grown in between (a rotation insert). An implementation must
+    /// therefore re-check each entry's own deadline under the lock and
+    /// refuse — with an `Err`, so the worker's retry picks it up — rather
+    /// than write an entry whose grace it never consulted.
     fn install(&self, ds: &DesiredState) -> anyhow::Result<()>;
 }
 
@@ -91,10 +114,13 @@ impl PolicyApplyHandle {
 /// mailbox handle. The task exits once the last [`PolicyApplyHandle`] is
 /// dropped.
 ///
-/// `retry_after` is the pause between attempts at a state whose install
-/// failed. Failures are logged and counted, never propagated: a policy the
-/// backend cannot consume must degrade to "the datapath keeps the last good
-/// policy and the gateway keeps running", not to a dead process.
+/// `retry_after` is the pause before the FIRST re-attempt at a state whose
+/// install failed; consecutive failures double it up to
+/// [`RETRY_BACKOFF_MAX`]. Failures are logged and counted, never propagated:
+/// a policy the backend cannot consume must degrade to "the datapath keeps
+/// the last good policy and the gateway keeps running", not to a dead
+/// process — and not to a log flood either, which is why the backoff exists
+/// (the counter, not the log line, is the alertable signal).
 pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
     target: Arc<T>,
     retry_after: Duration,
@@ -117,9 +143,13 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
             let Some(mut ds) = rx.borrow_and_update().clone() else {
                 continue;
             };
+            // Per-episode, so a state that lands first try never inherits a
+            // previous state's punishment.
+            let mut backoff = retry_after;
 
             loop {
-                // (2) Read the deadline and let go of whatever it touched.
+                // (2) Read the deadline for THIS desired state and let go of
+                // whatever it touched.
                 //
                 // On the blocking pool because the real adapter reaches the
                 // deadlines through a `tokio::sync::Mutex` and there is no
@@ -132,19 +162,33 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                 // moves the lock ACQUISITION off the runtime thread.
                 let deadline = {
                     let target = target.clone();
-                    match tokio::task::spawn_blocking(move || target.ready_at()).await {
+                    let probe = ds.clone();
+                    match tokio::task::spawn_blocking(move || target.ready_at(&probe)).await {
                         Ok(d) => d,
-                        // A panicking `ready_at` must not take the worker
-                        // (or the gateway) with it. Treating it as "no
-                        // deadline known" is the honest degradation: the
-                        // alternative, refusing to apply policy at all, is
-                        // strictly worse than one early generation flip.
+                        // EXPLICIT CHOICE: a `ready_at` that panics is
+                        // treated as a failed attempt, NOT as "no deadline,
+                        // apply now". Applying without a deadline reading is
+                        // the one thing in this whole design that can
+                        // deliberately violate the reap grace — overwriting
+                        // maps in-flight packets may still be reading — and
+                        // "the datapath keeps the last good policy" is the
+                        // strictly safer degradation, consistent with every
+                        // other failure here. It also cannot wedge in
+                        // practice: both backends' `apply_ready_at` is a
+                        // total `Option::map`/`None`, so the realistic cause
+                        // is runtime shutdown, where the task is going away
+                        // anyway.
                         Err(e) => {
+                            failures.fetch_add(1, Ordering::Relaxed);
                             eprintln!(
-                                "wiremesh-gateway: policy-apply deadline query failed: {e}; \
-                                 applying without waiting out a reap grace"
+                                "wiremesh-gateway: policy-apply deadline query failed (policy \
+                                 version {}): {e}; NOT applying without a reap-grace reading, \
+                                 retrying in {backoff:?}",
+                                ds.policy_version
                             );
-                            None
+                            tokio::time::sleep(backoff).await;
+                            backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
+                            continue;
                         }
                     }
                 };
@@ -159,14 +203,33 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                 // (4) Re-read the mailbox: a state published DURING the wait
                 // supersedes the one we were waiting for. This is what keeps
                 // a burst of epochs at ONE grace period instead of N.
+                //
+                // No starvation bound, deliberately. Re-adopting loops back
+                // to (2), and the deadline it re-reads can only move forward
+                // when WE flip a generation — which cannot happen while we
+                // are still waiting to install. So every iteration after the
+                // first has an already-satisfied deadline and costs one
+                // `spawn_blocking` round trip; starving the install would
+                // require a publisher that beats that loop forever, which a
+                // Watch stream (one message per controller reconcile) cannot
+                // do. Force-installing after N supersessions would trade
+                // this impossibility for the certainty of installing a state
+                // we already know is stale.
                 match rx.has_changed() {
                     Ok(true) => {
-                        if let Some(newer) = rx.borrow_and_update().clone() {
-                            ds = newer;
-                            // Re-run the deadline query for the state we
-                            // actually intend to install rather than reusing
-                            // a reading taken for a superseded one.
-                            continue;
+                        match rx.borrow_and_update().clone() {
+                            Some(newer) => {
+                                ds = newer;
+                                // A fresh state deserves a fresh first
+                                // attempt, not the previous one's backoff.
+                                backoff = retry_after;
+                                continue;
+                            }
+                            // Unreachable today (`publish` only ever sends
+                            // `Some`), but falling through here would install
+                            // the state we just learned was superseded. Wait
+                            // for the next real publish instead.
+                            None => break,
                         }
                     }
                     Ok(false) => {}
@@ -196,7 +259,7 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                         failures.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "wiremesh-gateway: policy apply failed (policy version {}): {e:#}; \
-                             retrying in {retry_after:?} — datapath keeps the last good policy",
+                             retrying in {backoff:?} — datapath keeps the last good policy",
                             ds.policy_version
                         );
                     }
@@ -204,12 +267,13 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
                         failures.fetch_add(1, Ordering::Relaxed);
                         eprintln!(
                             "wiremesh-gateway: policy apply task panicked (policy version {}): \
-                             {e}; retrying in {retry_after:?}",
+                             {e}; retrying in {backoff:?}",
                             ds.policy_version
                         );
                     }
                 }
-                tokio::time::sleep(retry_after).await;
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(RETRY_BACKOFF_MAX);
             }
         }
     });
