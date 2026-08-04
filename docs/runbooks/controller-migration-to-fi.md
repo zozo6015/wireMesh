@@ -371,51 +371,53 @@ Executed against `px` (`206.83.146.32`) instead of FI. Deviations and findings:
    instead. There is no ownership that satisfies both: migrate the relay to
    `/var/lib/wiremesh-relay` first, then chown to root.
 
-   **The fix, shipped:** the controller now has its own state dir, exactly as the relay
-   does. `wiremesh-controller.service` declares `StateDirectory=wiremesh-controller` +
-   `StateDirectoryMode=0700` (systemd creates and owns it before start) with
-   `WorkingDirectory=`/`ReadWritePaths=` pointed at `/var/lib/wiremesh-controller`, the
-   shipped `controller.env` defaults `WIREMESH_DATA_DIR` there, and the postinst no
-   longer creates or chowns `/var/lib/wiremesh` at all. `/var/lib/wiremesh` is the
-   **gateway's** directory, full stop.
+   **The fix, shipped:** *new* controller installs get their own state dir, exactly as
+   the relay does. `wiremesh-controller.service` declares
+   `StateDirectory=wiremesh-controller` + `StateDirectoryMode=0700` (systemd creates and
+   owns it before start), the shipped `controller.env` defaults `WIREMESH_DATA_DIR`
+   there, and the postinst no longer creates or chowns `/var/lib/wiremesh` at all. On a
+   fresh install `/var/lib/wiremesh` is the **gateway's** directory, full stop.
 
-3. **Upgrades migrate themselves — with guards.** The controller postinst relocates
-   `controller.db`, `ca.pem`, `ca.key` and `secrets/` (only those — never the whole
-   directory, so a co-located gateway's `identity.json` / `wg_private.key` /
-   `state.json` / `epoch_keys.json` are untouched) into `/var/lib/wiremesh-controller`.
+3. **Upgrades do NOT move anything — existing hosts get PINNED.** If
+   `/var/lib/wiremesh` already holds control-plane state (`controller.db` or `ca.key`),
+   the postinst writes `WIREMESH_DATA_DIR=/var/lib/wiremesh` into `controller.env` and
+   leaves every byte where it is. Only a host with no controller state anywhere gets the
+   new `/var/lib/wiremesh-controller` default.
 
-   The order is **copy to a staging dir → verify → single atomic rename into place →
-   repoint the config → delete the originals**, and it stops at the first failure. That
-   ordering is the whole safety argument: a controller that boots on a data dir holding
-   *neither* `ca.pem` nor `ca.key` mints a **brand-new CA** and silently invalidates
-   every enrolled gateway, so the data dir must never be observable half-populated.
-   (The half-CA case — exactly one of the two present — is already fail-closed in
-   `wiremesh-trust`'s `load_or_create_ca`, which refuses to regenerate.) Every failure
-   path leaves the originals in place and exits 0: a migration must never fail a
-   package install.
+   An automatic migration was designed, implemented and reviewed here, and then
+   **dropped on purpose**. Two things killed it, and they are worth recording because
+   they will re-surface if anyone proposes it again:
 
-   `ca.pem` is **copied, not moved**. It is the one file in that directory the
-   controller does not own exclusively — a legacy relay's identity is
-   `ca.pem` + `relay.pem` + `relay.key` in the same place, and `postinstall-relay.sh`'s
-   own migration requires all three to still be there.
+   - **The config moves before the script runs.** deb has no conffile "noreplace"
+     mechanism (nfpm maps both `config` and `config|noreplace` to a plain conffile), so
+     dpkg silently installs the new `controller.env` during *unpack*. By `postinst`
+     time it already reads `/var/lib/wiremesh-controller`. Every abort path in a
+     migration therefore ends with the config pointing at a directory the data is not
+     in — and a controller starting on an empty data dir used to mint a **brand-new CA**
+     and invalidate the entire fabric. (rpm's `%config(noreplace)` behaves the other
+     way, which is its own trap: the two formats need opposite handling.)
+   - **The DB is live.** `preremove-controller.sh` only stops the service on
+     *removal*, so an upgrade copies a running controller's SQLite DB (default
+     rollback-journal, no WAL) and then deletes the originals. POSIX keeps the unlinked
+     inode alive for the running process, so every enrollment and policy change until
+     the operator's manual restart lands in an unreachable file.
 
-   The guards: the target must be absent or empty, the source must really hold
-   controller state, `WIREMESH_DATA_DIR` must resolve to either the legacy or the
-   packaged path (not an operator's own), no systemd `Environment=` drop-in may override
-   it, and the effective unit must still declare `StateDirectory=wiremesh-controller` —
-   a `systemctl edit --full` copy of the old unit would otherwise leave the new dir
-   read-only under `ProtectSystem=strict`.
+   Pinning has neither failure mode, because nothing ever moves: there is no window in
+   which the config and the data can disagree.
 
-   One asymmetry worth knowing when reading install output: **`.deb` and `.rpm` arrive
-   here differently.** deb has no conffile "noreplace" mechanism (nfpm maps both
-   `config` and `config|noreplace` to a plain conffile), so dpkg silently installs the
-   new `controller.env` during unpack — by the time the postinst runs it already says
-   `/var/lib/wiremesh-controller` and no rewrite is needed. rpm's `%config(noreplace)`
-   keeps your file, so the postinst rewrites the line and verifies it before deleting
-   the originals.
+   **Splitting a co-located host is therefore a manual, service-down procedure** — see
+   `docs/install.md`. A human with the controller stopped has none of these problems.
 
-   If you deliberately keep the old path, set `WIREMESH_DATA_DIR` back explicitly **and**
-   add a matching `ReadWritePaths=` drop-in, or `ProtectSystem=strict` blocks the writes.
+   Defence in depth, since a pinned config can still be wrong by other means:
+   `wiremesh-trust`'s `load_or_create_ca` now **refuses to mint** a CA in an empty data
+   dir when it finds one at `/var/lib/wiremesh`, naming both paths and the
+   `WIREMESH_DATA_DIR` knob. (Its existing half-CA refusal — exactly one of
+   `ca.pem`/`ca.key` present — is unchanged and still checked first.)
+
+   The unit serves both layouts: `StateDirectory=wiremesh-controller` for fresh
+   installs, plus `ReadWritePaths=-/var/lib/wiremesh` so a pinned install can still
+   write under `ProtectSystem=strict` (the leading `-` means "ignore if absent", which
+   is the normal case on a fresh host).
 
 4. **`fabricctl` is a separate package** — install `wiremesh-fabricctl` on the controller
    host to administer the fabric over the UDS.

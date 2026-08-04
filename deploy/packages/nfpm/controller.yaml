@@ -31,20 +31,17 @@ contents:
 # StateDirectory= in the unit, so the package never has to — and must never
 # claim, chown, or remove the gateway's /var/lib/wiremesh on a shared host.
 scripts:
-  # Controller-specific postinstall: shared user/group + /etc/wiremesh only,
-  # plus a guarded one-time migration of control-plane state (controller.db,
-  # ca.pem, ca.key, secrets/) out of the legacy shared /var/lib/wiremesh into
-  # /var/lib/wiremesh-controller — copy, verify, atomic rename, repoint the
-  # config, THEN delete the originals, so the data dir is never observable
-  # half-populated (an empty one makes the controller mint a new CA). Only the
-  # controller's own entries move, and ca.pem is copied rather than moved
-  # because a legacy relay identity in the same dir needs it (px migration
-  # finding 2026-08-01; "Relay Finding A"). Idempotent and never fails install.
+  # Controller-specific postinstall: shared user/group + /etc/wiremesh, and one
+  # decision — which data dir this host uses. Fresh installs get the new
+  # /var/lib/wiremesh-controller default; a host that already has control-plane
+  # state in the legacy shared /var/lib/wiremesh gets WIREMESH_DATA_DIR PINNED
+  # back to it. It never moves, copies or deletes state (see the script header
+  # for why an automatic migration was designed, reviewed, and then dropped).
   #
-  # NOTE the deb/rpm asymmetry this has to cope with: `config|noreplace` below
-  # is honoured on rpm (%config(noreplace)) but is a plain conffile on deb —
-  # dpkg silently replaces an unmodified controller.env during unpack, BEFORE
-  # postinst runs, so on deb the env already points at the new dir.
+  # The pin exists because of a deb/rpm asymmetry: `config|noreplace` below is
+  # honoured on rpm (%config(noreplace)) but is a plain conffile on deb — dpkg
+  # silently replaces an unmodified controller.env during unpack, BEFORE
+  # postinst runs, so on deb the env would otherwise point at an empty new dir.
   postinstall: deploy/packages/scripts/postinstall-server.sh
   preremove: deploy/packages/scripts/preremove-controller.sh
   postremove: deploy/packages/scripts/postremove.sh
