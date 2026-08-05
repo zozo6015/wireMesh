@@ -187,6 +187,92 @@ fn decide_role_b(peer: &PeerState, overlapped: Option<u32>) -> RoleBDecision {
     }
 }
 
+// --- Route ownership: which device ONE peer's CIDRs belong on --------------
+
+/// The device a single peer's segment CIDRs belong on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteOwner {
+    /// This gateway's OWN active tun — `wg0` in steady state, `wg0e<N>` after a
+    /// Role-A cutover has moved the active epoch.
+    ActiveTun,
+    /// The transient Role-B overlap Device this gateway holds toward the peer.
+    OverlapTun,
+}
+
+/// The Role-B overlap held toward ONE peer, reduced to the two facts route
+/// ownership turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverlapClaim {
+    /// This gateway's OWN active epoch at the moment the overlap Device was
+    /// brought up — i.e. the epoch whose private key that Device runs, because
+    /// `maybe_start_role_b` builds every overlap on the CURRENT active key.
+    pub built_at_own_epoch: u32,
+    /// The overlap's session toward the peer's pending key has been observed
+    /// rx-corroborated live, so it is a usable path (the Role-B cutover has
+    /// run, or is running at this very moment).
+    pub cut_over: bool,
+}
+
+/// Derive which device ONE peer's CIDRs belong on, from this gateway's own
+/// active epoch plus whatever Role-B overlap it holds toward that peer.
+///
+/// # Why this is derived rather than written
+///
+/// Three paths used to program a peer's routes, each writing the device it
+/// individually believed in:
+///
+///  - the **Role-A cutover** flips every peer's CIDRs onto our new-epoch tun;
+///  - the **Role-B cutover** flips the rotating peer's CIDRs onto the overlap
+///    Device we built toward it;
+///  - the **Role-B collapse** flips them back off that overlap.
+///
+/// In a ONE-SIDED rotation only ever one of the two cutovers runs, so their
+/// ordering could not matter and each was individually correct. In-step
+/// rotation — which is what the controller's single global timer produces by
+/// default — runs BOTH on the same gateway toward the SAME peer, and whichever
+/// finished last won. Observed symmetrically on both gateways: Role A flipped
+/// the peer onto `wg0e1`, then Role B's (by then moot) cutover clobbered it
+/// back onto `wg0o0`, and the settled fabric had no connectivity
+/// (`docs/research/in-step-rotation-cutover-arbitration.md`).
+///
+/// So ownership is decided ONCE, here, and all three paths execute the answer.
+///
+/// # The rule, and why the epoch comparison is the discriminator
+///
+/// An overlap Device toward peer P runs OUR key for the epoch that was active
+/// when it was stood up, and pairs with P's own new-epoch tun — whose peer
+/// entry for us carries whatever key P's roster advertises as our ACTIVE one.
+/// The moment our own rotation completes, P's roster advertises our NEW epoch,
+/// P re-applies, and the overlap's session is dead by construction. An overlap
+/// built on an epoch we have already rotated off can therefore never be a
+/// peer's settled home — regardless of which cutover ran last.
+///
+/// That is exactly [`OverlapClaim::built_at_own_epoch`] `==`
+/// `own_active_epoch`. It also carries F8 ("Role B has no active-tun
+/// awareness"): the collapse path can no longer flip routes onto the BASE tun
+/// while the active tun has moved out from under it, because it does not name
+/// a device at all — it drops its claim and re-derives.
+///
+/// # Make-before-break is preserved by the CALLERS, not weakened here
+///
+/// This function says where routes belong, never when to move them. Each
+/// caller still proves the device it is about to name is live first: Role A
+/// only cuts over on an rx-corroborated session on the new tun, Role B only on
+/// one over the overlap, and the collapse only drops its claim after the
+/// ACTIVE tun is proven live toward the peer's new key. Ownership changing is
+/// always the consequence of a corroboration, never of a clock.
+pub fn route_owner(own_active_epoch: u32, overlap: Option<OverlapClaim>) -> RouteOwner {
+    match overlap {
+        // The overlap is a proven-live path AND still runs the key our peer's
+        // roster advertises for us: it is where this peer's traffic belongs.
+        Some(o) if o.cut_over && o.built_at_own_epoch == own_active_epoch => RouteOwner::OverlapTun,
+        // Everything else — no overlap, an overlap not yet proven live, or an
+        // overlap stranded on an epoch we have rotated off (the in-step case)
+        // — belongs on our own active tun.
+        _ => RouteOwner::ActiveTun,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
