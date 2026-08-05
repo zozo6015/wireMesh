@@ -20,7 +20,14 @@ attached, and traffic flows across the overlap. Observed peak on both sides in o
 **But the settled state after both rotations complete has no connectivity.** The case fails
 at its post-rotation ICMP check, not at the T3 assertion.
 
-## Mechanism
+> **Read the rest of this note as historical evidence, not as the current failure.**
+> `a5e9fb6` fixed the arbitration: routes now land on `wg0e1 (ActiveTun)` on both gateways,
+> where the dumps below show `wg0o0`. The case still fails, but for a *different and
+> unrelated* reason — the post-cutover endpoint dials the peer's base port while the peer
+> listens on an offset port. See
+> [`rotation-endpoint-and-port-model-is-broken.md`](rotation-endpoint-and-port-model-is-broken.md).
+
+## Mechanism (as observed BEFORE `a5e9fb6` — historical)
 
 Both gateways end with the peer route on the **Role-B overlap** device rather than on their
 own new-epoch tun:
@@ -53,9 +60,11 @@ sides overlap, traffic flows during the window, then the peer route is stranded 
 that is about to be torn down". Both are fabric-wide outages on the first timer fire. The
 in-step scenario needs this fixed too before the timer can be trusted.
 
-The mitigations from the plan verification still apply and are unchanged: jitter does not
-help (this is ordering between two cutovers, not simultaneity of their starts), and
-`rotation_interval` is hardcoded, so a controller restart remains the only zero-code lever.
+The mitigations from the plan verification still apply in part: jitter does not help (this
+is ordering between two cutovers, not simultaneity of their starts). **The "`rotation_interval`
+is hardcoded, so a controller restart is the only zero-code lever" claim is obsolete as of
+v0.7.0** — `WIREMESH_ROTATION_INTERVAL=off` now disables the timer outright, and it is set
+on the live controller.
 
 ## What to look at
 
