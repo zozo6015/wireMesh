@@ -2,7 +2,7 @@
 
 **A self-hosted, cloud-agnostic, zero-trust L3/L4 network fabric written in Rust.**
 
-WireMesh connects network *segments* — VPCs, VNets, VLANs, bare-metal subnets — rather than individual devices, using **one gateway per segment**. There are no agents on your workloads: connectivity is a route change. The data plane is WireGuard; policy is **default-deny** with explicit L4 allow rules, distributed in real time from a central controller and enforced in-kernel via eBPF (with an nftables fallback).
+WireMesh connects network *segments* — VPCs, VNets, VLANs, bare-metal subnets — using **one gateway per segment**, rather than requiring an agent on every device. (A single-host **client peer** is additionally in scope for hosts that must join the fabric directly.) There are no agents on your workloads: connectivity is a route change. The data plane is WireGuard; policy is **default-deny** with explicit L4 allow rules, distributed in real time from a central controller and enforced in-kernel via eBPF (with an nftables fallback).
 
 Think *"AWS Transit Gateway + Twingate, but open-source, self-hosted, and cloud-agnostic."*
 
@@ -14,7 +14,7 @@ Think *"AWS Transit Gateway + Twingate, but open-source, self-hosted, and cloud-
 
 ## Why
 
-- **Segment-level, not device-level.** Join whole networks in minutes instead of installing an agent on every host. Connectivity is a route change; workloads are untouched.
+- **Segment-level first.** Join whole networks in minutes instead of installing an agent on every host. A single-host **client peer** is additionally in scope for workstations that need to reach the fabric directly. Connectivity is a route change; workloads are untouched.
 - **Zero-trust by default.** 100% of inter-segment traffic is denied unless an explicit L4 allow rule (src/dst CIDR, port range, protocol) exists. Policy is code, changes are audited, and denied flows are counted.
 - **Fail-static, not fail-open.** If the controller is unreachable, existing tunnels and the last-applied policy keep working indefinitely — a control-plane outage is never a network outage.
 - **Cloud-agnostic & self-hosted.** Run the controller anywhere (VPS, Kubernetes, a managed platform); connect AWS, GCP, Azure, Proxmox, bare metal, homelab — you decide where everything lives.
@@ -26,7 +26,7 @@ Think *"AWS Transit Gateway + Twingate, but open-source, self-hosted, and cloud-
 |---|---|
 | Time-to-connected (two segments, cold start, from the docs) | **< 30 minutes** |
 | Policy propagation (controller → all gateways) | **< 5 s** p99 |
-| Zero-trust posture | **default-deny**; no inter-segment flow without an explicit allow |
+| Zero-trust posture | **default-deny** between segments; no inter-segment flow without an explicit allow. Traffic *to a client peer* is not yet enforced — see PRD G-4a |
 | Control-plane outage tolerance | **fail-static** — data plane survives indefinitely |
 | Platforms | Linux x86-64 + arm64; AWS / GCP / Azure / Proxmox / bare metal / Kubernetes (node-network mode) |
 

@@ -11,7 +11,9 @@ The project ships binaries and docs, never hosted infrastructure.
    engineering design**; its §1 decision record and §11 amendments supersede the PRD
    where they conflict (eBPF-first enforcement, per-gateway key epochs, single-tenant
    controller, no SaaS).
-2. `docs/PRD.md` — product requirements (v0.1, pending v0.2 fold-in of spec §11).
+2. `docs/PRD.md` — product requirements (Draft v0.4, pending v0.5 fold-in of spec §11 —
+   which now includes §11.8, the 2026-08-05 client-peer amendment: PRD Non-Goals item 1,
+   G-4a enforcement carve-out, X-7 client scope limits).
 3. `docs/superpowers/plans/2026-07-15-phase0-spike.md` — current implementation plan
    (Phase 0: 5 de-risk bets, 15 tasks).
 

@@ -10,6 +10,15 @@ PR #15 → ghcr.io/zozo6015/wiremesh-*).
   `fabricctl` binary **and a Windows `.msi` installer** (WiX, fabricctl + a PATH
   entry; Authenticode-unsigned until an owner code-signing cert is provisioned —
   same skip-with-notice guard as the other signing jobs).
+> **AMENDED 2026-08-05 (owner decision).** macOS is no longer admin-only. A
+> **single-host client peer** is in scope (PRD Non-Goals item 1 amendment; design §11.8),
+> so macOS gains a **per-device connectivity** role alongside its admin/control-plane
+> components — the artifact list below grows a `wiremesh-client` column when that ships.
+> **The gateway stays Linux-only and that is unchanged**: the client needs no enforcer of
+> its own (PRD G-4a), so it does not require the `pf` backend that the gateway exclusion
+> exists to avoid. Do not read "macOS = fabricctl + controller + relay" below as evidence
+> that macOS cannot carry data-plane connectivity; it means macOS cannot host a *gateway*.
+
 - **Component scope: macOS = fabricctl + controller + relay; Windows = fabricctl
   ONLY.** Discovered during the build (2026-07-23): the controller and relay use
   Unix-only APIs unconditionally — a `tokio::net::UnixListener` admin socket and
@@ -67,7 +76,18 @@ portable components.
   `wiremesh-<version>.pkg` (choosable payloads) or per-component; default = one `.pkg`
   installing `fabricctl` + optional controller/relay payloads. (fabricctl is the point.)
 
-### Mac connectivity model (owner decision 2026-07-22 — keep the segment model)
+### Mac connectivity model (owner decision 2026-07-22 — ~~keep the segment model~~)
+
+> **SUPERSEDED IN PART, 2026-08-05 (owner decision).** The paragraph below is kept for the
+> record but **no longer states current scope.** A **single-host client peer** is now in
+> scope (PRD Non-Goals item 1 amendment; engineering design §11.8), so "a Mac does not run
+> WireMesh to join the mesh" and "no … per-device client in v1" are both reversed. What
+> **stands unchanged** is the *reason it gives for the gateway*: macOS has no eBPF, so no
+> macOS **gateway** — the client is a different component that needs no enforcer of its
+> own (PRD G-4a), which is exactly why it does not reopen that question. The paragraph's
+> guess at the shape was also close: a `utun` + userspace-WG data plane is roughly what
+> phase 3 would build, though phases 1–2 need far less.
+
 The macOS artifacts are **operator/admin tooling ONLY** (chiefly `fabricctl`; controller/
 relay for local dev). They are **NOT a data-plane client** — a Mac does not run WireMesh
 to join the mesh. Per WireMesh's core tenets ("one gateway per segment", "no agents on

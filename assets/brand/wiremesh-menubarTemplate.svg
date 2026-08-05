@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="WireMesh connected">
+  <title>WireMesh — connected</title>
+  <!-- macOS TEMPLATE image: pure black + alpha only. The system tints this for
+       light/dark menu bars and inverts it while the menu is open, so it must
+       contain no colour of its own. Export as *Template.png @1x/@2x. -->
+  <g fill="none" stroke="#000000" stroke-width="2.2" stroke-linecap="round">
+    <line x1="12" y1="5" x2="5.5" y2="17.5"/>
+    <line x1="12" y1="5" x2="18.5" y2="17.5"/>
+    <line x1="5.5" y1="17.5" x2="18.5" y2="17.5"/>
+  </g>
+  <g fill="#000000">
+    <circle cx="12" cy="5" r="3.1"/>
+    <circle cx="5.5" cy="17.5" r="3.1"/>
+    <circle cx="18.5" cy="17.5" r="3.1"/>
+  </g>
+</svg>
