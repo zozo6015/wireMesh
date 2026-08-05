@@ -7,7 +7,7 @@
 
 The gateway is Linux-only, in two ratified places:
 
-- `docs/PRD.md:47`, non-goals: *"Windows/BSD gateway hosts (v1) — Linux-only gateways.
+- `docs/PRD.md` **Non-Goals item 5**: *"Windows/BSD gateway hosts (v1) — Linux-only gateways.
   Workloads behind gateways can be any OS since they're untouched."*
 - `docs/superpowers/specs/2026-07-22-release-distribution-design.md` §0:
   *"Component scope: macOS = fabricctl + controller + relay"* … *"The gateway stays
@@ -15,7 +15,7 @@ The gateway is Linux-only, in two ratified places:
   the component table (§ table, line 60), and the reason stated at lines 53-54: it loads
   eBPF (tc/BPF), creates a tun, and programs nftables/routes.
 
-`docs/PRD.md:118` (X-1) lists the supported gateway platforms — AWS, GCP, Azure, Proxmox,
+`docs/PRD.md` requirement **X-1** lists the supported gateway platforms — AWS, GCP, Azure, Proxmox,
 generic Linux VPS/bare metal, Kubernetes, local Linux workstation/PC. No macOS entry.
 
 **The technical reason is sound and is not in question.** A macOS gateway would need a
@@ -60,7 +60,7 @@ The obvious correction — "then ship a macOS gateway" — does not deliver what
 promised, and this is the load-bearing point of this note.
 
 **A gateway fronting a network requires that network to route to it. That is inherent to
-"no agents on workloads" (`PRD.md:36`), not to Linux.** Put the gateway on a Mac and:
+"no agents on workloads" (`PRD.md`, Guiding Principle 2), not to Linux.** Put the gateway on a Mac and:
 
 - the LAN still needs the same static routes, in both directions;
 - the Mac becomes the same single point of failure the k8s node was;
@@ -96,16 +96,16 @@ macOS *client*.
 > This is an owner decision, not a detail — see the client scoping note.
 
 **This IS a reversal of a ratified decision, and the first draft was wrong to say
-otherwise.** `docs/PRD.md:43` lists as an explicit v1 non-goal: *"Device/user-level access
+otherwise.** `docs/PRD.md` **Non-Goals item 1** lists as an explicit v1 non-goal: *"Device/user-level access
 (v1) — no per-laptop, per-user client. This is segment-to-segment routing… conflating the
-two would bloat v1."* The macOS *gateway* exclusion (§47) and the *client* exclusion (§43)
+two would bloat v1."* The macOS *gateway* exclusion (Non-Goals item 5) and the *client* exclusion (item 1)
 are two separate ratified decisions, and a client component reopens the second one. It
 needs a spec amendment in the engineering design's §11, not just a scoping note.
 
 ## What should change in the record
 
 1. **Annotate the macOS-gateway exclusion** in the release-distribution spec and `PRD.md`
-   §47 to state that it was traded against a Kubernetes HA story that does not exist as
+   Non-Goals item 5 to state that it was traded against a Kubernetes HA story that does not exist as
    built — and that the remedy is the client component, not a macOS gateway.
 2. **Remove or correct any claim that Kubernetes gives the gateway HA.** It does not
    today, and on an autoscaled cluster it is actively fragile. See the HA design gap.

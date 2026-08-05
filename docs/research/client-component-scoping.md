@@ -14,7 +14,7 @@ like any VPN client. It does not front a network and does not forward.
 
 ## This reopens a ratified non-goal
 
-`docs/PRD.md:43`: *"Device/user-level access (v1) — no per-laptop, per-user client. This is
+`docs/PRD.md` **Non-Goals item 1**: *"Device/user-level access (v1) — no per-laptop, per-user client. This is
 segment-to-segment routing… conflating the two would bloat v1."*
 
 That exclusion has a technical shadow, and findings 1–3 below **are** that shadow. Whatever
@@ -88,10 +88,22 @@ Three independent mechanisms combine:
   **there is no per-peer address column.** Two peers in one segment would advertise
   identical `allowed_ips`, a cryptokey-routing collision on every gateway.
 
-So each client is a segment. Twenty laptops is twenty segments, twenty extra WireGuard
-peers on every gateway, and — the binding constraint — **20 × N_segments × 2 policy
-blocks** against `MAX_RULES = 256` flattened rules (`flatten.rs:50`). With four segments
-that is 160 rules for twenty clients, before any port range expands a rule into several.
+So each client is a segment. Twenty laptops is twenty segments and twenty extra WireGuard
+peers on every gateway. The binding constraint is `MAX_RULES = 256` (`flatten.rs:50`),
+checked **after port explosion** (`flatten.rs:147`), and the arithmetic is:
+
+> `flat_rules ≈ clients × segments_reached × Σ over the block's rules of max(ports.len(), 1)`
+
+Only the `client → segment` direction is worth writing (see finding 1 — a reverse block is
+never enforced), so it is one block per pair, not two. A minimal block of three portless
+rules (tcp / udp / icmp) flattens to 3. Twenty clients each reaching four segments is then
+`20 × 4 × 3 = 240` — already at the ceiling before a single rule names a port list, and
+each named port is its own flat rule.
+
+Ten clients reaching four segments with modest port lists lands in the same place. **A
+dozen is the honest number**, and it is the count of `client × segment` *reachability
+pairs* that matters, not the client count alone — one client permitted everywhere costs as
+much as several tightly scoped ones.
 
 **The "client is just another gateway" model does not survive past roughly a dozen
 clients.** Fine for the actual requirement (one Mac). Not a foundation.
@@ -132,16 +144,35 @@ and no new daemon.**
    segment, mints a gateway-kind token, prints a ready wg-quick config.
 3. **A ~50-line client binary** — generate a WG keypair, call `wiremesh_enroll::enroll()`
    with `cidrs=["100.64.0.7/32"]` and `endpoint=""`, discard the cert, emit the config.
-4. **Policy blocks** for `X ↔ <segments>`, both directions.
+4. **Policy blocks for `X → <segments>` only — one direction.** A reverse
+   `<segment> → X` block compiles and distributes fine but **is never enforced** (finding
+   1), so writing one would imply a protection that does not exist. Replies to
+   client-initiated flows pass regardless, because tun egress never drops.
 
 On macOS this drives the **official WireGuard app**, which already provides the menu-bar
 toggle. No custom UI, no Network Extension entitlement, no notarization.
 
-**What Phase 1 does not get** (all of §1 above, plus): no revocation propagation to the
-client; no rotation participation, so it sits on epoch 0 and every gateway rotation breaks
-it until reconfigured by hand; no relay fallback or punch, so it must reach a gateway with
-a routable endpoint; permanent `applied_version = 0` in the roster, which the pending
-roster-lag alerting would fire on forever; and no automatic learning of new gateways.
+### What Phase 1 clients inherit, whether wanted or not
+
+Phase 1 mints a **gateway-kind** token, so the client is a `gateway` row — and there is no
+`role` column yet to distinguish it. It is therefore swept into everything a gateway is
+swept into:
+
+- **Key rotation.** `initiate_due_rotations` reads `active_gateway_ids()` with no exclusion
+  of any kind (`db.rs:1786-1793`). This is **latent, not live**, only because rotation is
+  currently disabled fabric-wide (`WIREMESH_ROTATION_INTERVAL=off`). **Re-enabling rotation
+  before the `role` column lands would break every Phase 1 client** — a static peer cannot
+  follow a rotation, and one that never connects burns an abort cycle per interval.
+  Phase 2's rotation exclusion is therefore a hard prerequisite for re-enabling rotation,
+  not an optional tidy-up.
+- **The punch broker**, which filters only on differing segment (`broker.rs:630-641`).
+  Harmless for a laptop dialling a gateway with a routable endpoint, but it is mesh traffic
+  nobody asked for.
+
+**Also not included:** no revocation propagation to the client; no relay fallback, so it
+must reach a gateway with a routable endpoint; permanent `applied_version = 0` in the
+roster, which the pending roster-lag alerting would fire on forever; and no automatic
+learning of newly enrolled gateways.
 
 ## Phase 2 — a real client peer (medium)
 
