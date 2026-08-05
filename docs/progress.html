@@ -254,7 +254,7 @@
     <p class="eyebrow">WireMesh &middot; Build Progress</p>
     <h1>Zero-trust network fabric &mdash; cycle-by-cycle build tracker</h1>
     <p class="lede">Open-source (Apache-2.0), self-hosted, cloud-agnostic L3/L4 network fabric in Rust: WireGuard data plane, default-deny eBPF policy, one gateway per segment, no agents on workloads. The engineering design ships as four plan cycles; this page tracks what's done, in flight, and next.</p>
-    <p class="stamp">Last updated <b>2026-07-31</b> &middot; Phase 0 + Cycle 2/3/4 + key-rotation + ghcr images + K8s operator all merged &middot; <b>multi-site fabric LIVE</b> (zolab k3s + bare-metal FI &amp; px gateways; controller internet-exposed via Envoy Gateway TCP passthrough + source-preserving observe UDP LB) &middot; releases through <b>v0.3.4</b> &mdash; DDNS hostname dial + Sync keepalive (v0.1.1), mesh-convergence fixes (v0.1.2), <code>--help</code>/<code>--version</code> (v0.2.0), PVC-backed gateway identity + idempotent enroll (v0.2.1), hands-off emptyDir&rarr;PVC adoption (v0.2.2), endpoint-driven NAT punch ending punch-socket starvation (v0.2.3), relayed-peer ProbeDirect defer-log spam silenced (v0.2.4), path-state-aware punch brokering (v0.3.0), <b>relay-wedge self-heal ending the production sawtooth (v0.3.1)</b>, Cycle-3 hardening &mdash; LPM compile bound + empty-CIDR rejection + iface validation (v0.3.2), Sync keepalive mirrors + <b>durable key retirement</b> (v0.3.3), and audit-actor attribution pin (v0.3.4) &mdash; all 34-asset releases</p>
+    <p class="stamp">Last updated <b>2026-08-06</b> &middot; Phase 0 + Cycle 2/3/4 + key-rotation + ghcr images + K8s operator all merged &middot; <b>multi-site fabric LIVE</b>, control plane on bare-metal <b>px</b> since 2026-08-01 (zolab now runs a gateway only) &middot; releases through <b>v0.7.1</b> &mdash; earlier: DDNS dial + Sync keepalive, mesh-convergence, <code>--help</code>/<code>--version</code>, PVC identity, endpoint-driven punch, path-state-aware brokering, relay-wedge self-heal, Cycle-3 hardening, durable key retirement, audit-actor pin (v0.1.1&ndash;v0.4.0); then the backlog sweep &mdash; policy-apply worker + controller state-dir split + CA re-mint guard + Sync session generation + relay cross-pair injection close (v0.5.0), relay pair-key 32&rarr;64 bits (v0.6.0), <b><code>WIREMESH_ROTATION_INTERVAL</code> with an <code>off</code> escape hatch (v0.7.0)</b>, and four in-step key-rotation fixes (v0.7.1) &mdash; all 34-asset releases</p>
   </header>
 
   <div class="metrics">
@@ -265,8 +265,8 @@
     </div>
     <div class="metric">
       <p class="k">Post-cycle merges</p>
-      <div class="v">2<small> PRs</small></div>
-      <p class="sub">#14 key-rotation &middot; #15 ghcr container images (4 images)</p>
+      <div class="v">9<small> PRs</small></div>
+      <p class="sub">#14 key-rotation &middot; #15 ghcr images &middot; #43&ndash;#46 backlog sweep &middot; #47 rotation off-switch &middot; #48 client scoping &middot; #49 in-step rotation</p>
     </div>
     <div class="metric">
       <p class="k">Phase 0 bets</p>
@@ -275,8 +275,8 @@
     </div>
     <div class="metric">
       <p class="k">Latest release</p>
-      <div class="v" style="font-size:19px;">v0.3.4</div>
-      <p class="sub">34 assets &middot; five releases in one day (v0.3.1&ndash;v0.3.4) &middot; <b>relay wedge self-heals in production</b>: both zolab peers <code>direct</code>, journal quiet</p>
+      <div class="v" style="font-size:19px;">v0.7.1</div>
+      <p class="sub">34 assets &middot; <b>automatic key rotation is DISABLED fabric-wide</b> and must stay so &mdash; v0.7.0 shipped the switch and defused an outage scheduled for 2026-08-31; v0.7.1 fixed four of the six bugs behind it</p>
     </div>
   </div>
 
@@ -428,6 +428,22 @@
     <div class="risks">
       <div class="risk-item">
         <span class="chip top">Top risk</span>
+        <div class="rt"><b>Key rotation is broken and deliberately switched off.</b><span class="rd">The controller rotates <em>every</em> active gateway on one 30-day timer, so the fabric rotates <b>in step</b> &mdash; a scenario nothing had ever tested. A done-bar written 2026-08-05 found <b>six bugs</b>; four are fixed (v0.7.1). Two remain: after a cutover the active tun dials the peer's <b>base</b> port while the peer listens on an <b>offset</b> port, and <b>the second rotation of any gateway cannot complete at all</b> (two incompatible port models; no test had ever rotated twice). <code>WIREMESH_ROTATION_INTERVAL=off</code> is set on the live controller, which defused an outage due <b>2026-08-31</b>. <b>Do not re-enable the timer</b> until one authoritative port model exists, endpoints are read from boringtun rather than recomputed, and a rotate-twice test is green. Keys do not rotate on a schedule meanwhile &mdash; a real posture cost, not a neutral pause.</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip sec">Known gap</span>
+        <div class="rt"><b>The rotation wedge &mdash; three ways in.</b><span class="rd"><code>on_directive</code> is honoured only from <code>Idle</code>, and the only path back is a completed retire. Anything parking the phase off-<code>Idle</code> makes the gateway silently ignore every later directive <em>and</em> never scrub the old private key. Most reachable: <code>handle_rotate</code> advances the phase and <em>then</em> does fallible work, so one lost name race is enough. A bare reset is not the fix &mdash; it must unwind partial setup or it trades one wedge for another. Latent only because the timer is off.</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip sec">Scope change</span>
+        <div class="rt"><b>Single-host client peer taken into scope (PRD Non-Goals item 1 amended).</b><span class="rd">The "a workstation joins the fabric" requirement had been assigned by implication to a Kubernetes gateway deployment that cannot carry it &mdash; identity in an RWO node-local PVC means no HA, and worse on an autoscaled cluster. New <b>G-4a</b> records the cost: enforcement is ingress-on-tun only, so <code>segment&rarr;client</code> and <code>client&rarr;client</code> are <b>unenforced</b>. Egress-side enforcement is the named bar for production-grade. New <b>X-7</b> lists what a phase-1 client does <em>not</em> satisfy (C-9, G-7, G-3, C-4, X-2, X-6).</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip note">Tracked fix</span>
+        <div class="rt"><b>Gateway routes carry no <code>src</code>.</b><span class="rd">Fabric routes install as <code>&lt;cidr&gt; dev wg0 scope link</code> with no preferred source, so traffic <em>originated on a gateway host</em> picks an address in no segment and is dropped by the far side's default-deny. Workloads behind the gateway are fine. This produced three false "the data plane is down" diagnoses in one session. Until fixed, anything run on a gateway needs an explicit source (<code>ping -I</code>, <code>curl --interface</code>).</span></div>
+      </div>
+      <div class="risk-item">
+        <span class="chip sec">Carried</span>
         <div class="rt"><b>G-2 throughput gate &mdash; cloud run pending.</b><span class="rd">The &ge;1 Gbps target on a 4-vCPU cloud VM cannot run in the local container. Cycle 4a's real <code>wiremesh-gateway</code> throughput smoke test reproduced the same order-of-magnitude cap (~6.9 Mbit/s) as the Phase-0 spike binary, reinforcing the container as the likely shared cause. Bench procedure is built (<code>crates/wiremesh-gateway/bench.md</code>): run parallel <code>-P 4</code> streams plus <code>iperf3 -u -b 0</code> (inspect Lost/Total) on real 4-vCPU hardware. Does not block Cycle 4a/4b completion; still open.</span></div>
       </div>
       <div class="risk-item">
@@ -472,6 +488,17 @@
   <section>
     <h2>Session log</h2>
     <div class="log">
+      <div class="entry">
+        <div class="date">2026-08-05<br>&rarr; 08-06</div>
+        <h4>Backlog program &middot; a shipped outage found and defused &middot; PRs #47&ndash;#49, v0.7.0 + v0.7.1</h4>
+        <ul>
+          <li><b>Found a fabric-wide outage already in production, scheduled for 2026-08-31.</b> <code>initiate_due_rotations</code> rotates every active gateway in one tick off a single 30-day timer, so the fabric rotates <b>in step</b>. A done-bar for that scenario did not exist; writing it surfaced <b>six bugs</b>, three of which were only reachable <em>because of</em> the fixes for the other three.</li>
+          <li><b>Defused it on the live fabric.</b> v0.7.0 added <code>WIREMESH_ROTATION_INTERVAL</code> with an <code>off</code> switch; the px controller was upgraded 0.4.0&rarr;0.7.1 and the timer disabled. Verified: banner in the journal, all three gateways back at <code>applied_version=11</code>, relay active, real ICMP across the fabric at 16.8&nbsp;ms.</li>
+          <li><b>Four rotation bugs fixed</b> (v0.7.1): tun/port collision, route arbitration, a retire that watched a stale key so <em>the retired key was never retired</em>, and a regression the first fix introduced. Two remain open with a decided fix shape; the done-bar is committed <code>#[ignore]</code>d as RED-by-design rather than deleted.</li>
+          <li><b>Requirements amended</b> (PR #48): a single-host client peer is in scope, the macOS-gateway exclusion kept but its failed premise recorded, plus G-4a and X-7. A <code>100.64.0.0/10</code> client range was recommended, ratified, and <b>retracted the same day</b> &mdash; the intended first client already runs Twingate inside it.</li>
+          <li><b>Method note.</b> Nearly every defect came from aiming a test or a reviewer at a scenario nobody had aimed at before &mdash; in-step rotation, and "what does <code>off</code> actually guarantee". Neither was new code; both were unexamined defaults. CodeRabbit returned zero findings on the branch where a purpose-briefed reviewer found two silent paths to a running timer.</li>
+        </ul>
+      </div>
       <div class="entry">
         <div class="date">2026-07-27</div>
         <h4>Controller internet-exposed &middot; first off-cluster gateway &middot; PR #28 (DDNS + Sync keepalive) merged</h4>
