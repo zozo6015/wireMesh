@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24" role="img" aria-label="WireMesh">
+  <title>WireMesh</title>
+  <!-- Full mesh of three segments: every node reachable from every other.
+       Edges drawn first so the nodes sit on top of the joins. -->
+  <g fill="none" stroke="#0E9F9C" stroke-width="2.2" stroke-linecap="round">
+    <line x1="12" y1="5" x2="5.5" y2="17.5"/>
+    <line x1="12" y1="5" x2="18.5" y2="17.5"/>
+    <line x1="5.5" y1="17.5" x2="18.5" y2="17.5"/>
+  </g>
+  <g fill="#0E9F9C">
+    <circle cx="12" cy="5" r="3.1"/>
+    <circle cx="5.5" cy="17.5" r="3.1"/>
+    <circle cx="18.5" cy="17.5" r="3.1"/>
+  </g>
+</svg>
