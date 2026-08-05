@@ -39,7 +39,10 @@
 //!   * an interval above the 3650d (10-year) cap is rejected. A timer that
 //!     never fires is a SECOND, silent spelling of "disabled" — reachable
 //!     without `off`, and therefore without the boot banner that is this
-//!     binary's only runtime signal that rotation is off
+//!     binary's only runtime signal that rotation is off. Every route to "too
+//!     large" — a saturating multiply, a count literal too big for `u64`, or a
+//!     value simply over the cap — answers identically, since which one a value
+//!     takes depends only on the unit the operator happened to choose
 //!
 //! And, for the environment resolution `main.rs` delegates to:
 //!
@@ -80,6 +83,19 @@ use wiremesh_controller::{
 fn parsed(s: &str) -> Option<Duration> {
     parse_rotation_interval(s)
         .unwrap_or_else(|e| panic!("parse_rotation_interval({s:?}) must succeed, got error: {e:#}"))
+}
+
+/// The rejection message for `s` with the echoed-back input elided, so
+/// rejections of DIFFERENT inputs can be compared for "is this the same
+/// answer?".
+///
+/// Every rejection quotes the offending value back (`invalid rotation interval
+/// "3651d": …`), which is the one part that legitimately differs between two
+/// inputs. The needle is the QUOTED form, so eliding it cannot accidentally
+/// chew through an unquoted coincidence elsewhere in the message (the accepted-
+/// forms list ends `900s`, which contains `0s`).
+fn rejection_reason(s: &str) -> String {
+    rejected(s).replace(&format!("{s:?}"), "<value>")
 }
 
 /// Parses `s`, asserting failure, and returns the full error chain as the
@@ -176,6 +192,18 @@ fn rejects_zero_duration_and_points_the_operator_at_off() {
              rotation) — a bare 'invalid value' leaves them with no way to discover it. \
              Got: {msg:?}"
         );
+        // Zero is the OPPOSITE failure from "too large", and must keep its own
+        // diagnosis. It cannot saturate — `count == 0` times any multiplier is
+        // still 0, and the zero check runs before the cap check — but "it
+        // cannot happen" is exactly the reasoning worth a test rather than a
+        // comment, now that a saturating multiply sits directly above it. The
+        // cap message is identified by the maximum it quotes.
+        assert!(
+            !msg.contains("3650d"),
+            "parse_rotation_interval({input:?}) is ZERO, not too large: it must get the \
+             hot-loop diagnosis, never the 3650d cap message, which would tell an operator \
+             who typed `0d` to try a SMALLER value. Got: {msg:?}"
+        );
     }
 }
 
@@ -229,21 +257,74 @@ fn rejects_malformed_input() {
     }
 }
 
-/// Oversized values are rejected rather than wrapping, saturating, or
-/// panicking — `30d`-style inputs are multiplied up to seconds, so the
-/// multiplication has to be checked.
+/// Oversized values are rejected rather than wrapping, panicking, or — since
+/// the multiply now saturates — quietly clamping to something that then looks
+/// acceptable. Each one must also carry the CAP message: an operator whose
+/// value was rejected for being too large needs to be told what the maximum is
+/// and that `off` is what they probably wanted, regardless of which internal
+/// route their particular value took to get there.
 #[test]
 fn rejects_overflowing_values() {
     for input in [
-        // Beyond u64 entirely.
+        // The count literal does not fit u64 at all — `parse` fails before any
+        // multiply happens.
         "99999999999999999999999999d",
+        "99999999999999999999999d",
         "184467440737095516150s",
-        // Fits u64 as a count, overflows once multiplied into seconds.
+        // Fits u64 as a count; saturates once multiplied into seconds.
         "18446744073709551615d",
         "18446744073709551615h",
         "18446744073709551615m",
     ] {
-        rejected(input);
+        let msg = rejected(input);
+        assert!(
+            msg.contains("3650d"),
+            "{input:?} is rejected for being too large, so it must get the same help as any \
+             other too-large value — including what the maximum actually is (3650d). \
+             Saturating the multiply is only sound because it lands here. Got: {msg:?}"
+        );
+        assert!(
+            msg.to_lowercase().contains("off"),
+            "{input:?} is an attempt to make rotation effectively not happen; its rejection \
+             must point at `off`. Got: {msg:?}"
+        );
+    }
+}
+
+/// **The invariant the shared message establishes.** All three structurally
+/// different routes to "too large" must produce the SAME answer — not merely
+/// three answers that happen to mention the cap.
+///
+/// Asserting only "each contains `3650d`" would pass just as happily for three
+/// independently-worded messages, which is precisely the asymmetry that was
+/// removed: whether a value overflows the multiply, saturates it, or fails to
+/// parse as a `u64` at all is an implementation detail of the unit the operator
+/// happened to choose, and it must not decide how much help they get.
+#[test]
+fn every_route_to_too_large_gives_the_same_answer() {
+    // Same count, different units — and therefore different internal routes.
+    let routes = [
+        // No multiply overflow possible (`unit_secs == 1`): reaches the cap
+        // check directly. This is the value that used to slip through entirely.
+        "18446744073709551615s",
+        // Saturates the multiply on the way to the cap check.
+        "18446744073709551615d",
+        "18446744073709551615h",
+        // The count literal does not even fit u64: fails at `parse`.
+        "99999999999999999999999d",
+    ];
+
+    let baseline = rejection_reason(routes[0]);
+    for input in &routes[1..] {
+        assert_eq!(
+            rejection_reason(input),
+            baseline,
+            "{input:?} and {:?} are both simply too large, and must be answered identically \
+             (modulo the value echoed back). Getting here via a saturating multiply, an \
+             overflowing one, or a `u64` parse failure is invisible to the operator and must \
+             stay that way.",
+            routes[0]
+        );
     }
 }
 
