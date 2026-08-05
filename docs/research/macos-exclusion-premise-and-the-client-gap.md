@@ -104,13 +104,28 @@ needs a spec amendment in the engineering design's §11, not just a scoping note
 
 ## What should change in the record
 
-1. **Annotate the macOS-gateway exclusion** in the release-distribution spec and `PRD.md`
-   Non-Goals item 5 to state that it was traded against a Kubernetes HA story that does not exist as
-   built — and that the remedy is the client component, not a macOS gateway.
-2. **Remove or correct any claim that Kubernetes gives the gateway HA.** It does not
-   today, and on an autoscaled cluster it is actively fragile. See the HA design gap.
-3. **Assign the "workstation joins the fabric" requirement to the client component**, since
-   it is currently assigned, implicitly, to a Kubernetes deployment that cannot carry it.
+All four were applied on 2026-08-05:
+
+1. **Annotate the macOS-gateway exclusion** in `PRD.md` Non-Goals item 5 to state that it
+   was traded against a Kubernetes HA story that does not exist as built — while keeping
+   the exclusion, which stands on the `pf`-enforcer cost. ✅
+2. **Correct the release-distribution spec's macOS scope.** Its §0 reads
+   *"macOS = fabricctl + controller + relay"*, which is true of *components that exist*
+   but now misleads: with a client in scope, macOS carries **per-device connectivity**, not
+   just admin. Annotated so nobody reads it as "macOS cannot do data plane" — it means
+   macOS cannot host a *gateway*. ✅
+3. **Assign the "workstation joins the fabric" requirement to the client component** and
+   record it in the engineering design's **§11 amendments** (item 8), which is the
+   authority the PRD defers to. Doing it only in `docs/research/` would have left the
+   top-authority document contradicting the decision. ✅
+4. **Amend `PRD.md` G-4.** This one was not in the original list and is the easiest to
+   miss: G-4's acceptance criterion is *"traffic matching no allow rule is dropped and
+   counted"*, which a client destination violates. A new **G-4a** records the carve-out
+   explicitly rather than letting the Non-Goals amendment silently contradict a
+   G-requirement. ✅
+
+No claim that Kubernetes gives the gateway HA was found in the shipped docs — the
+assumption lived in conversation, not in the record, which is precisely why it survived.
 
 ## What is NOT claimed here
 

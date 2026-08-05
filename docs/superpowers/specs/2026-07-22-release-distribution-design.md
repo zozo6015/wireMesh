@@ -10,6 +10,15 @@ PR #15 → ghcr.io/zozo6015/wiremesh-*).
   `fabricctl` binary **and a Windows `.msi` installer** (WiX, fabricctl + a PATH
   entry; Authenticode-unsigned until an owner code-signing cert is provisioned —
   same skip-with-notice guard as the other signing jobs).
+> **AMENDED 2026-08-05 (owner decision).** macOS is no longer admin-only. A
+> **single-host client peer** is in scope (PRD Non-Goals item 1 amendment; design §11.8),
+> so macOS gains a **per-device connectivity** role alongside its admin/control-plane
+> components — the artifact list below grows a `wiremesh-client` column when that ships.
+> **The gateway stays Linux-only and that is unchanged**: the client needs no enforcer of
+> its own (PRD G-4a), so it does not require the `pf` backend that the gateway exclusion
+> exists to avoid. Do not read "macOS = fabricctl + controller + relay" below as evidence
+> that macOS cannot carry data-plane connectivity; it means macOS cannot host a *gateway*.
+
 - **Component scope: macOS = fabricctl + controller + relay; Windows = fabricctl
   ONLY.** Discovered during the build (2026-07-23): the controller and relay use
   Unix-only APIs unconditionally — a `tokio::net::UnixListener` admin socket and
