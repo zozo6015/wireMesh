@@ -85,10 +85,11 @@ WIREMESH_ROTATION_INTERVAL=off    # disable the automatic schedule
 A malformed value (`30dd`, `30D`, `0d`) is a **startup error** — the controller
 refuses to boot rather than quietly falling back to the 30-day default and
 leaving you believing you changed something. Uppercase units are rejected on
-purpose (`M` reads as "months" to too many people); a zero interval is rejected
-because it would rotate in a hot loop — if you meant "never", write `off`. So is
-anything longer than `3650d` (10 years): a timer that never fires is "never"
-without the boot banner below that tells you so — again, write `off`.
+purpose (`M` reads as "months" to too many people). A zero interval is rejected
+because it would rotate in a hot loop. An interval longer than `3650d`
+(10 years) is rejected as well: such a timer would never fire, which stops
+rotation without the boot banner below that tells you rotation is off. If you
+meant "never" in any of these cases, write `off`.
 
 `off` disables the automatic **schedule** only. It does not disable rotation as
 a capability:
