@@ -1,24 +1,268 @@
-//! A set of simultaneous boringtun `Device`s, one per own-epoch
-//! (key-rotation Task 6). Each epoch is a full [`crate::tunnel::Tunnel`] —
-//! the proven per-Device unit is reused verbatim, never re-implemented.
-//! boringtun's UAPI control socket is keyed by the fixed path
-//! `/var/run/wireguard/<ifname>.sock`, so each epoch's `Tunnel` MUST use a
-//! distinct ifname (e.g. `wge0`, `wge1`): distinct ifnames give distinct
-//! sockets, letting multiple Devices coexist in a single network+mount
-//! namespace with no extra juggling.
+//! A set of simultaneous boringtun `Device`s, one per live [`TunnelId`]
+//! (key-rotation Task 6, re-keyed by T3). Each entry is a full
+//! [`crate::tunnel::Tunnel`] — the proven per-Device unit is reused verbatim,
+//! never re-implemented. boringtun's UAPI control socket is keyed by the fixed
+//! path `/var/run/wireguard/<ifname>.sock`, so each Device MUST use a distinct
+//! ifname: distinct ifnames give distinct sockets, letting multiple Devices
+//! coexist in a single network+mount namespace with no extra juggling.
 //!
-//! This module is purely additive: nothing in `main.rs`/`apply_state`
-//! constructs or drives a `TunnelSet` yet. Wiring it into the boot/rotation
-//! path (bringing up epoch n+1's Device, then flipping peer routes from the
-//! old tun to the new one once the new session is live) is Task 8's job.
+//! # Why the key is a [`TunnelId`] and not a bare epoch number (T3)
+//!
+//! Until T3 this map was keyed by `u32` — and that number meant **two
+//! different things**. Role A (this gateway rotating its own key) inserted
+//! under *its own* new epoch; Role B (an overlap Device toward a rotating
+//! PEER) inserted under the *peer's pending* epoch. Both derived the ifname
+//! (`{base}e{n}`) and the listen port (`base + delta`) from that same number,
+//! so all three axes collided the moment the two epoch numbers coincided —
+//! which the controller's `initiate_due_rotations` makes the DEFAULT case, not
+//! an edge case: it walks every active gateway off one global 30-day timer, so
+//! the whole fabric marches N -> N+1 in the same tick. `bring_up` then bailed
+//! on the duplicate and the caller's `?` aborted its whole peer loop: neither
+//! side overlapped, neither acked, neither flipped, and the controller
+//! grace-promoted a dead key anyway. See
+//! `docs/research/key-rotation-plan-verification.md` (headline + F3/F8).
+//!
+//! Jitter is not a mitigation — the defect is one number meaning two things,
+//! so an in-step fabric collides regardless of timing. [`TunnelId`] makes the
+//! two meanings distinct kinds of key, and [`plan_tunnel`] derives the ifname
+//! and the listen port from that id together, so a plan cannot come out
+//! half-de-collided (distinct key, shared port).
+//!
+//! Role A's `{base}e{n}` naming survives unchanged — an own-epoch number was
+//! always unique among our own tuns, so it was never the broken half. It is
+//! the overlap side that moves, into its own `{base}o{slot}` namespace.
 use crate::state::DesiredState;
 use crate::tunnel::Tunnel;
 use crate::uapi::{self, DeviceConfig};
-use std::collections::HashMap;
+use anyhow::Context;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
+
+/// Identity of one live Device in a [`TunnelSet`]. Replaces the bare `u32`
+/// epoch, which conflated our own epochs with peers' pending epochs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TunnelId {
+    /// This gateway's own key epoch (the boot/active tun, or Role A's new one).
+    Own { epoch: u32 },
+    /// A transient Role-B overlap Device toward peer `gateway_id`'s pending
+    /// epoch `epoch`. Runs OUR active key; the epoch is THEIRS.
+    Overlap { gateway_id: u64, epoch: u32 },
+}
+
+/// The three per-Device resources a tun needs, derived together by
+/// [`plan_tunnel`] so they cannot drift apart: map key, interface name, WG
+/// listen port.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TunnelPlan {
+    pub id: TunnelId,
+    pub ifname: String,
+    pub listen_port: u16,
+}
+
+/// Suffix marker for one of THIS gateway's own epochs: `wg0` + `e` + the
+/// epoch number, i.e. `wg0e1` — the pre-T3 convention, kept verbatim. It was
+/// never the broken half: an own-epoch number is unique among our own tuns by
+/// construction.
+const OWN_MARK: char = 'e';
+
+/// Suffix marker for a Role-B overlap: `wg0` + `o` + a slot index, i.e.
+/// `wg0o0`. A DIFFERENT letter from [`OWN_MARK`], which is the whole
+/// de-collision on the name axis — the two kinds of tun now live in literally
+/// disjoint namespaces, so `Own { epoch: 2 }` and `Overlap { .., epoch: 2 }`
+/// cannot produce the same name no matter what the epoch numbers do.
+const OVERLAP_MARK: char = 'o';
+
+/// Upper bound on both the overlap-slot search and the rotation port window
+/// (`base_port + 1 ..= base_port + MAX_ROTATION_TUNS`). A slot is only
+/// occupied while a rotation Device is LIVE, and the live set is at most "our
+/// own new tun + one overlap per rotating peer", so 64 is far beyond any
+/// plausible fan-out for a single gateway while keeping the port range small
+/// enough to stay inside a conventional firewall allowance. Exhausting it is a
+/// hard error, never a silent wrap onto an in-use port.
+const MAX_ROTATION_TUNS: u16 = 64;
+
+/// How long a torn-down rotation tun's ifname AND listen port stay reserved
+/// against re-allocation (F6).
+///
+/// # Why a freed slot cannot be handed straight back
+///
+/// [`plan_ifname`] hands back the LOWEST free overlap slot and [`plan_port`]
+/// the lowest free port, so before this existed a teardown followed by an
+/// allocation returned the very name and port that had just been released. On
+/// the [`crate::rotation::RoleBDecision::Restart`] path those two run
+/// back-to-back with no `.await` between them (`retire_stale_overlap` ->
+/// `plan_tunnel` -> `bring_up`), i.e. microseconds apart, and neither half of
+/// the teardown is synchronous:
+///
+///  - dropping the `Tunnel` stops boringtun's device threads, but the UAPI
+///    socket `/var/run/wireguard/<ifname>.sock` is not necessarily unlinked by
+///    the time the next `Tunnel::up` starts POLLING FOR THAT EXACT PATH to
+///    appear — a stale socket satisfies that wait instantly, and the caller
+///    then talks UAPI to a dead listener;
+///  - `ip link del` is spawned best-effort and the kernel may still be
+///    tearing the tun down (or the command may have failed outright, which is
+///    only logged), so `DeviceHandle::new` on the same name races a device
+///    that still exists.
+///
+/// Five seconds is far longer than either the kernel's link deletion or
+/// boringtun's socket cleanup, and 25x the 200ms rotation tick, so a reused
+/// name/port is always separated from its predecessor by many ticks rather
+/// than by microseconds.
+const QUARANTINE: Duration = Duration::from_secs(5);
+
+/// Hard ceiling on simultaneously-quarantined entries, so the quarantine can
+/// never eat the allocation window that [`MAX_ROTATION_TUNS`] bounds. At half
+/// the window, at least 32 slots and 32 ports are always allocatable no matter
+/// how hard the gateway churns; the OLDEST entry is evicted first, i.e. the one
+/// whose Device has been down longest and is therefore likeliest to be gone.
+/// Expiry does the work in every realistic case (a burst would have to tear
+/// down more than 32 rotation tuns inside [`QUARANTINE`]); this only ensures
+/// the failure mode of an implausible burst is "reuse sooner" rather than
+/// "cannot allocate at all".
+const MAX_QUARANTINE: usize = (MAX_ROTATION_TUNS / 2) as usize;
+
+/// Derive the plan for `id` against everything already reserved (`live`), which
+/// the returned plan must not collide with on ANY of the three axes. Pure: no
+/// I/O, no devices, safe to call anywhere.
+///
+/// `live` is whatever the caller declares reserved. In production that is
+/// [`TunnelSet::plans`], which reports live Devices AND recently torn-down ones
+/// still inside [`QUARANTINE`] — so this allocator never needs to know about
+/// time to stop handing a just-freed ifname/port straight back (F6).
+///
+/// # The scheme (owner decision E)
+///
+/// **Name: disjoint namespaces per kind. Port: allocated from what is free.**
+///
+///  - `Own { epoch: n }` keeps the shipped `{base}e{n}` — an own-epoch number
+///    is already unique among our own tuns, the name stays self-describing in
+///    `ip link`/logs/runbooks, and Role A's field behaviour is unchanged.
+///  - `Overlap { .. }` becomes `{base}o{slot}`, the lowest slot index free in
+///    `live`. The `o`/`e` split is what makes the two kinds structurally
+///    incapable of sharing a name, rather than merely unlikely to.
+///  - The listen port is the lowest value in `base_port + 1 ..=
+///    base_port + MAX_ROTATION_TUNS` that no live plan holds.
+///
+/// The shipped scheme derived ALL THREE axes from a bare epoch number that
+/// meant our own epoch for Role A and the peer's pending epoch for Role B, so
+/// an in-step fabric collided on all three at once. Note that neither half of
+/// the fix could be a pure derivation from the identity:
+///
+///  - **The name could not carry the peer id.** The kernel's `IFNAMSIZ` is 15
+///    bytes + NUL ([`wiremesh_enforcer::validate_iface`]). A `{base}p{gid}e{n}`
+///    form spends 3 + 1 + 3 + 1 + 2 = 10 bytes on the conventional `wg0` for
+///    just a three-digit gateway id and a two-digit epoch — and `gateway_id`
+///    is a `u64` the gateway does not choose. The slot index is bounded by the
+///    number of *simultaneously live* overlaps instead, which is small by
+///    construction: `wg0o0` is 5 bytes and the worst case here is 7.
+///  - **The port could not be derived at all.** It would need an injection
+///    from `(u64, u32)` into the handful of `u16` values near the base port;
+///    no such function exists. Any correct port scheme is an allocator, and an
+///    allocator has to be told what is taken.
+///
+/// That is why `live` is load-bearing rather than decorative: the boot tun is
+/// NOT planned (it is `base_tun` at `base_port` by definition, `main.rs`'s
+/// boot `bring_up`, OD-1), so being told what is up is the only way to honour
+/// F8's "don't collide with the active tun".
+///
+/// Returns `Err` rather than emitting an ifname the kernel or `validate_iface`
+/// would reject (a too-long name otherwise surfaces only as a late, opaque
+/// tc-attach failure, after the Device is half-built), and `Err` rather than
+/// wrapping when the slot or port window is exhausted.
+///
+/// **Plan once, keep the plan.** Re-planning an `id` that is already in `live`
+/// is a caller bug and is reported as one for `Own` (its name is already
+/// taken); callers hold onto the plan they were given
+/// (`RoleA::new_tun`/`RoleB::new_tun`) rather than re-deriving it, which is
+/// also what keeps teardown addressing the Device that was actually brought up.
+pub fn plan_tunnel(
+    id: TunnelId,
+    base_tun: &str,
+    base_port: u16,
+    live: &[TunnelPlan],
+) -> anyhow::Result<TunnelPlan> {
+    let ifname = plan_ifname(id, base_tun, live)?;
+    let listen_port = plan_port(base_port, live).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no free rotation listen port for {id:?}: every port in {}..={} is held by one of \
+             the {} reserved tun(s) (rotation tuns are not being torn down, or too many are in \
+             post-teardown quarantine), or the window overflows u16",
+            base_port.saturating_add(1),
+            base_port.saturating_add(MAX_ROTATION_TUNS),
+            live.len(),
+        )
+    })?;
+    Ok(TunnelPlan { id, ifname, listen_port })
+}
+
+/// The name axis of [`plan_tunnel`]. Every returned name is
+/// `validate_iface`-clean, distinct from `base_tun`, and distinct from every
+/// name in `live`.
+fn plan_ifname(id: TunnelId, base_tun: &str, live: &[TunnelPlan]) -> anyhow::Result<String> {
+    let taken = |name: &str| live.iter().any(|p| p.ifname == name);
+    match id {
+        TunnelId::Own { epoch } => {
+            let ifname = format!("{base_tun}{OWN_MARK}{epoch}");
+            wiremesh_enforcer::validate_iface(&ifname).with_context(|| {
+                format!(
+                    "deriving an own-epoch tun name for epoch {epoch} from base tun \
+                     {base_tun:?} (shorten --tun)"
+                )
+            })?;
+            if taken(&ifname) {
+                anyhow::bail!(
+                    "own-epoch tun name {ifname:?} is already reserved — {id:?} has already been \
+                     planned and brought up (or was torn down so recently that its name is still \
+                     quarantined); keep the original plan rather than re-deriving it"
+                );
+            }
+            Ok(ifname)
+        }
+        TunnelId::Overlap { .. } => {
+            for slot in 0..MAX_ROTATION_TUNS {
+                let ifname = format!("{base_tun}{OVERLAP_MARK}{slot}");
+                // Names only get LONGER as the slot index grows, and an
+                // invalid base is invalid at every slot, so no later slot can
+                // recover from a rejection here.
+                if let Err(e) = wiremesh_enforcer::validate_iface(&ifname) {
+                    return Err(e).with_context(|| {
+                        format!(
+                            "deriving an overlap tun name for {id:?} from base tun {base_tun:?} \
+                             (shorten --tun)"
+                        )
+                    });
+                }
+                if !taken(&ifname) {
+                    return Ok(ifname);
+                }
+            }
+            anyhow::bail!(
+                "all {MAX_ROTATION_TUNS} overlap tun slots on base tun {base_tun:?} are reserved; \
+                 cannot name an overlap for {id:?} (overlap Devices are not being torn down, or \
+                 more than half the window is in post-teardown quarantine)"
+            )
+        }
+    }
+}
+
+/// The port axis of [`plan_tunnel`]: the lowest port above `base_port`, within
+/// the rotation window, that no live plan holds. `None` when the window is
+/// exhausted or overflows `u16`.
+fn plan_port(base_port: u16, live: &[TunnelPlan]) -> Option<u16> {
+    (1..=MAX_ROTATION_TUNS)
+        .filter_map(|off| base_port.checked_add(off))
+        .find(|port| !live.iter().any(|p| p.listen_port == *port))
+}
 
 #[derive(Default)]
 pub struct TunnelSet {
-    tunnels: HashMap<u32, Tunnel>,
+    tunnels: HashMap<TunnelId, Tunnel>,
+    /// Recently torn-down rotation tuns, oldest first, each with the instant it
+    /// was released. [`Self::plans`] reports them alongside the live set so the
+    /// planner treats their ifname and port as taken for [`QUARANTINE`] — see
+    /// that constant for why an immediately-reused name/port is a real defect
+    /// rather than an aesthetic one.
+    quarantine: VecDeque<(TunnelPlan, Instant)>,
 }
 
 impl TunnelSet {
@@ -26,15 +270,19 @@ impl TunnelSet {
         Self::default()
     }
 
-    /// Bring up epoch `epoch`'s Device and insert it into the set. Bails if
-    /// `epoch` is already present — callers must `tear_down` the existing
-    /// entry first rather than silently clobbering a live Device.
+    /// Bring `id`'s Device up and insert it into the set. Bails if `id` is
+    /// already present, or if `ifname`/`listen_port` are already taken by a
+    /// DIFFERENT live entry — callers must `tear_down` the existing entry
+    /// first rather than silently clobbering a live Device. All three axes are
+    /// checked, not just the key: a caller that de-collided the key but reused
+    /// a name or a port would otherwise get an opaque failure from netlink (or
+    /// worse, a second Device quietly fighting the first over a UDP port).
     ///
     /// `Tunnel::up` only creates the boringtun `DeviceHandle` and brings the
     /// tun link up at `mtu` — it never touches UAPI (that's `Tunnel::reconcile`'s
     /// job, driven by a `DesiredState`). A freshly-created Device is otherwise
     /// unconfigured: no private key, and listening on whatever ephemeral port
-    /// the kernel happened to pick. Since a new epoch's identity (private key,
+    /// the kernel happened to pick. Since a new Device's identity (private key,
     /// listen port) is known and fixed at `bring_up` time — independent of any
     /// peer set — apply it immediately via one no-peers UAPI `set`, so the
     /// Device is a real, addressable WG endpoint (`wg show` reports the right
@@ -42,14 +290,26 @@ impl TunnelSet {
     /// `reconcile` populates peers.
     pub fn bring_up(
         &mut self,
-        epoch: u32,
+        id: TunnelId,
         ifname: &str,
         private_key_b64: &str,
         listen_port: u16,
         mtu: u32,
     ) -> anyhow::Result<()> {
-        if self.tunnels.contains_key(&epoch) {
-            anyhow::bail!("epoch {epoch} already has a tunnel up; tear it down first");
+        if self.tunnels.contains_key(&id) {
+            anyhow::bail!("{id:?} already has a tunnel up; tear it down first");
+        }
+        if let Some((other, t)) = self
+            .tunnels
+            .iter()
+            .find(|(_, t)| t.ifname == ifname || t.listen_port == listen_port)
+        {
+            anyhow::bail!(
+                "{id:?} would collide with the live {other:?} ({} on port {}): requested ifname \
+                 {ifname:?} on port {listen_port}",
+                t.ifname,
+                t.listen_port
+            );
         }
         let tunnel = Tunnel::up(ifname, private_key_b64, listen_port, mtu)?;
         uapi::apply(
@@ -60,51 +320,134 @@ impl TunnelSet {
                 peers: vec![],
             },
         )?;
-        self.tunnels.insert(epoch, tunnel);
+        // Whatever this Device now holds is LIVE, so any quarantine reservation
+        // that named the same id, ifname or port is stale and must not keep
+        // being reported as taken on top of the live entry. (A caller reaching
+        // here with a quarantined name did not get it from `plan_tunnel` — the
+        // boot tun, or a test — but the bookkeeping has to stay honest either
+        // way, or `plans()` would report the same resource twice.)
+        self.quarantine
+            .retain(|(p, _)| p.id != id && p.ifname != ifname && p.listen_port != listen_port);
+        self.tunnels.insert(id, tunnel);
         Ok(())
     }
 
-    /// Tear down epoch `epoch`: remove it from the map first — dropping the
-    /// `Tunnel` (and its `DeviceHandle`) stops boringtun's device threads —
-    /// then best-effort `ip link del <ifname>` so the tun interface doesn't
-    /// linger (dropping the handle stops the device but may not delete the
-    /// netlink interface itself). A missing epoch is a no-op success: tearing
-    /// down something that was never up isn't an error for the caller.
-    pub fn tear_down(&mut self, epoch: u32) -> anyhow::Result<()> {
-        let Some(tunnel) = self.tunnels.remove(&epoch) else {
+    /// Drop quarantine entries whose [`QUARANTINE`] window has elapsed, then
+    /// evict oldest-first down to [`MAX_QUARANTINE`].
+    fn prune_quarantine(&mut self) {
+        let now = Instant::now();
+        self.quarantine
+            .retain(|(_, freed)| now.duration_since(*freed) < QUARANTINE);
+        while self.quarantine.len() > MAX_QUARANTINE {
+            self.quarantine.pop_front();
+        }
+    }
+
+    /// Tear `id` down: remove it from the map first — dropping the `Tunnel`
+    /// (and its `DeviceHandle`) stops boringtun's device threads — then
+    /// best-effort `ip link del <ifname>` so the tun interface doesn't linger
+    /// (dropping the handle stops the device but may not delete the netlink
+    /// interface itself). A missing `id` is a no-op success: tearing down
+    /// something that was never up isn't an error for the caller.
+    ///
+    /// The released ifname + port then enter [`QUARANTINE`], so the next
+    /// allocation cannot hand them straight back while the kernel is still
+    /// deleting the link and boringtun is still unlinking the UAPI socket (F6).
+    /// The quarantine is what makes `ip link del`'s best-effort posture
+    /// tolerable: a delete that fails, or that has not finished, no longer
+    /// hands the very next allocation a name that is still occupied.
+    pub fn tear_down(&mut self, id: TunnelId) -> anyhow::Result<()> {
+        let Some(tunnel) = self.tunnels.remove(&id) else {
             return Ok(());
         };
         let ifname = tunnel.ifname.clone();
+        let listen_port = tunnel.listen_port;
         drop(tunnel);
-        let status = std::process::Command::new("ip")
+        match std::process::Command::new("ip")
             .args(["link", "del", &ifname])
-            .status();
-        if let Err(e) = status {
-            eprintln!("wiremesh-gateway: best-effort `ip link del {ifname}` failed to spawn: {e}");
+            .status()
+        {
+            Err(e) => eprintln!(
+                "wiremesh-gateway: best-effort `ip link del {ifname}` failed to spawn: {e} — the \
+                 link may linger; its name and port stay quarantined"
+            ),
+            // A non-zero exit was previously discarded entirely. It is still
+            // not fatal (the interface may already be gone), but it is the
+            // exact condition under which the name is still occupied, so it
+            // must at least be visible.
+            Ok(st) if !st.success() => eprintln!(
+                "wiremesh-gateway: best-effort `ip link del {ifname}` exited {st} — the link may \
+                 linger; its name and port stay quarantined"
+            ),
+            Ok(_) => {}
         }
+        self.quarantine
+            .push_back((TunnelPlan { id, ifname, listen_port }, Instant::now()));
+        self.prune_quarantine();
         Ok(())
     }
 
-    pub fn get(&self, epoch: u32) -> Option<&Tunnel> {
-        self.tunnels.get(&epoch)
+    pub fn get(&self, id: TunnelId) -> Option<&Tunnel> {
+        self.tunnels.get(&id)
     }
 
-    /// Present epochs, sorted ascending.
-    pub fn epochs(&self) -> Vec<u32> {
-        let mut epochs: Vec<u32> = self.tunnels.keys().copied().collect();
-        epochs.sort_unstable();
-        epochs
+    /// Present ids, sorted (`Own` before `Overlap`, then by epoch / peer).
+    pub fn ids(&self) -> Vec<TunnelId> {
+        let mut ids: Vec<TunnelId> = self.tunnels.keys().copied().collect();
+        ids.sort_unstable();
+        ids
     }
 
-    /// Apply the desired peer set to epoch `epoch`'s tun. Bails if the epoch
-    /// is absent. Keepalive is not a parameter — `Tunnel::reconcile` builds
-    /// via `reconcile::device_config`, which emits the always-on
+    /// What is currently RESERVED, in the shape [`plan_tunnel`] consumes — the
+    /// authoritative "don't collide with these" input. Includes the boot tun
+    /// (`base_tun` at `base_port`), which is never itself planned, which is
+    /// exactly why the planner has to be handed this rather than deriving it.
+    /// Sorted so the allocation is deterministic for a given reserved set.
+    ///
+    /// Reserved is deliberately WIDER than live: it is the live Devices PLUS
+    /// every still-quarantined teardown ([`QUARANTINE`], F6). The planner is a
+    /// pure lowest-free-index allocator over exactly this list, so putting the
+    /// quarantine in here — rather than teaching the planner about time — is
+    /// what keeps a just-freed ifname and port out of the very next plan while
+    /// [`plan_tunnel`] stays a pure function of its arguments.
+    ///
+    /// Expired entries are filtered on read rather than pruned, since this
+    /// takes `&self`; `tear_down` prunes for real.
+    pub fn plans(&self) -> Vec<TunnelPlan> {
+        let now = Instant::now();
+        let mut plans: Vec<TunnelPlan> = self
+            .tunnels
+            .iter()
+            .map(|(id, t)| TunnelPlan {
+                id: *id,
+                ifname: t.ifname.clone(),
+                listen_port: t.listen_port,
+            })
+            .chain(
+                self.quarantine
+                    .iter()
+                    .filter(|(_, freed)| now.duration_since(*freed) < QUARANTINE)
+                    .map(|(p, _)| p.clone()),
+            )
+            .collect();
+        // By (id, ifname, port), not id alone: a quarantined entry and a live
+        // one can share an id only transiently, but the order must still be
+        // total or the allocation would not be reproducible.
+        plans.sort_unstable_by(|a, b| {
+            (a.id, &a.ifname, a.listen_port).cmp(&(b.id, &b.ifname, b.listen_port))
+        });
+        plans
+    }
+
+    /// Apply the desired peer set to `id`'s tun. Bails if it is absent.
+    /// Keepalive is not a parameter — `Tunnel::reconcile` builds via
+    /// `reconcile::device_config`, which emits the always-on
     /// `uapi::PERSISTENT_KEEPALIVE_SECS` on every peer (fix T1).
-    pub fn reconcile(&self, epoch: u32, ds: &DesiredState) -> anyhow::Result<()> {
+    pub fn reconcile(&self, id: TunnelId, ds: &DesiredState) -> anyhow::Result<()> {
         let tunnel = self
             .tunnels
-            .get(&epoch)
-            .ok_or_else(|| anyhow::anyhow!("no tunnel up for epoch {epoch}"))?;
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("no tunnel up for {id:?}"))?;
         tunnel.reconcile(ds)
     }
 }
@@ -116,7 +459,7 @@ mod tests {
     #[test]
     fn new_is_empty() {
         let set = TunnelSet::new();
-        assert!(set.epochs().is_empty());
-        assert!(set.get(0).is_none());
+        assert!(set.ids().is_empty());
+        assert!(set.get(TunnelId::Own { epoch: 0 }).is_none());
     }
 }

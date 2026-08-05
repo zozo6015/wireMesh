@@ -47,7 +47,7 @@ pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(60);
 
 /// Everything the worker needs from the live enforcer map. `main.rs`
 /// implements it with a thin adapter over
-/// `Arc<tokio::sync::Mutex<HashMap<u32, GatewayEnforcer>>>`; tests implement
+/// `Arc<tokio::sync::Mutex<HashMap<TunnelId, GatewayEnforcer>>>`; tests implement
 /// it with a fake.
 pub trait PolicyApplyTarget: Send + Sync + 'static {
     /// The latest instant at which every enforcer that installing `ds` would

@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::process::Command;
 use wiremesh_gateway::routes;
-use wiremesh_gateway::tunnelset::TunnelSet;
+use wiremesh_gateway::tunnelset::{TunnelId, TunnelSet};
 use wiremesh_gateway::uapi::base64_pub_from_priv;
 use wiremesh_testkit::netns::{join_netns_and_mountns, Lab};
 
@@ -103,11 +103,16 @@ fn two_epoch_tunnels_coexist_and_tear_down() {
     let (k0_priv, k0_pub) = gen_keypair();
     let (k1_priv, k1_pub) = gen_keypair();
 
+    // (T3) `TunnelSet` is keyed by `TunnelId`, not a bare epoch — these two
+    // are this gateway's OWN epochs 0 and 1, so both are `Own`. Mechanical
+    // update: no assertion below changes meaning.
+    let e0 = TunnelId::Own { epoch: 0 };
+    let e1 = TunnelId::Own { epoch: 1 };
     let mut set = TunnelSet::new();
-    set.bring_up(0, "wge0", &k0_priv, 51820, 1280).unwrap();
-    set.bring_up(1, "wge1", &k1_priv, 51821, 1280).unwrap();
+    set.bring_up(e0, "wge0", &k0_priv, 51820, 1280).unwrap();
+    set.bring_up(e1, "wge1", &k1_priv, 51821, 1280).unwrap();
 
-    assert_eq!(set.epochs(), vec![0, 1]);
+    assert_eq!(set.ids(), vec![e0, e1]);
 
     let show0 = Command::new("wg").args(["show", "wge0"]).output().unwrap();
     assert!(show0.status.success(), "wg show wge0 failed: {}", String::from_utf8_lossy(&show0.stderr));
@@ -138,8 +143,8 @@ fn two_epoch_tunnels_coexist_and_tear_down() {
     routes::add_route("10.30.0.0/24", "wge0").unwrap();
     routes::add_route("10.31.0.0/24", "wge1").unwrap();
 
-    set.tear_down(1).unwrap();
-    assert_eq!(set.epochs(), vec![0]);
+    set.tear_down(e1).unwrap();
+    assert_eq!(set.ids(), vec![e0]);
     assert!(
         !Command::new("ip").args(["link", "show", "wge1"]).status().unwrap().success(),
         "wge1 should no longer exist after tear_down"

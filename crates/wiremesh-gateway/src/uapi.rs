@@ -52,6 +52,26 @@ fn key_b64_to_hex(b64: &str) -> anyhow::Result<String> {
     Ok(raw.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Decode a base64 WireGuard public key into the lowercase-hex form the WG
+/// UAPI keys its per-peer state by ([`get_peer_liveness`]), so a
+/// controller-provided `active_pubkey_b64` can be correlated with the
+/// device's live handshake/rx_bytes state. Returns `None` for malformed
+/// input or a key that isn't exactly 32 bytes.
+///
+/// Lives here (rather than in `main.rs`, where it used to) because
+/// `rotation::role_b_decisions` — library code — has to answer "is this
+/// peer's advertised pending key usable at all?" as a pure decision, and the
+/// binary's copy is invisible to the library. Same decode as
+/// [`key_b64_to_hex`], `Option`-shaped for callers that treat a bad key as a
+/// skip rather than an error.
+pub fn pubkey_b64_to_hex(b64: &str) -> Option<String> {
+    let raw = base64_decode(b64).ok()?;
+    if raw.len() != 32 {
+        return None;
+    }
+    Some(raw.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Validate an `ip:port` endpoint as IPv4 before it reaches the UAPI wire.
 /// v1 is IPv4-only end to end (spec §1 — the controller binds an `Ipv4Addr`;
 /// matches `config.rs`'s IPv6-reject-at-boot policy), so a bracketed

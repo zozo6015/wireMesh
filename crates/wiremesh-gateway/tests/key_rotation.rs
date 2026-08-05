@@ -31,6 +31,8 @@
 //! hide any drop the make-before-break cutover would otherwise cause.
 #![cfg(feature = "netns-tests")]
 
+use std::collections::BTreeSet;
+use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -1789,4 +1791,548 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     pb.kill();
     drop(lab);
     eprintln!("\nDONE-BAR PASSED: a completed rotation survives a crash+restart — the promoted epoch boots (on wg0/base port per OD-1), the retired private key is durably gone, and traffic reconverges.");
+}
+
+// --- in-step (whole-fabric) rotation: T3's done bar --------------------------
+
+/// Every network interface currently present in `ns`, by its LOCAL name.
+/// `ip -br link` prints a veth end as `seg0@if7`; only the part before `@` is
+/// this namespace's name for it. Interface names are the one thing the kernel
+/// itself guarantees unique per namespace, which is what makes counting them a
+/// SCHEME-AGNOSTIC probe: the test never has to know what the implementer
+/// named the rotation tuns, only that two more devices exist than before.
+/// An `ip` failure yields an empty set rather than panicking — this runs
+/// inside a sampling loop where a transient miss must not abort the run (the
+/// assertion is on the PEAK across all samples, so a dropped sample can only
+/// ever make the test harder to pass).
+fn link_names(ns: &Ns) -> BTreeSet<String> {
+    let Ok(out) = ns.exec(&["ip", "-br", "link"]) else {
+        return BTreeSet::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| Some(l.split_whitespace().next()?.split('@').next()?.to_string()))
+        .collect()
+}
+
+/// The same "the rotation has completed" predicate `poll_rotation_complete`
+/// applies — epoch 1 is `active` AND no epoch-0 row is still `active` (either
+/// retired away or demoted to `"retiring"`). Factored out here (rather than
+/// reusing `poll_rotation_complete`, which polls ONE gateway to its own
+/// deadline) because the in-step case has to watch BOTH gateways on a single
+/// sampling loop: sampling the transient overlap devices is only possible
+/// while at least one rotation is still in flight.
+fn rotation_done(states: &[(u32, String, String)]) -> bool {
+    states.iter().any(|(e, _, s)| *e == 1 && s == "active")
+        && !states.iter().any(|(e, _, s)| *e == 0 && s == "active")
+}
+
+/// Scrape `wiremesh_gateway_live_enforcers` from a gateway's Prometheus
+/// endpoint, reachable from the root netns over the underlay bridge (same
+/// route `mesh_milestone.rs`'s `scrape_deny` takes). `None` on any transport
+/// failure or a missing series.
+///
+/// The gauge is the ONLY probe that can see a displaced enforcer. Holding a
+/// `GatewayEnforcer` in the gateway's map is what keeps that tun's tc-BPF
+/// program attached — the eBPF backend's TCX `bpf_link` attach releases on
+/// drop, with no explicit unload (`wiremesh-enforcer/src/ebpf.rs:80-96`, pinned
+/// by its `dropping_enforcer_detaches_and_allows_reprobe_on_same_iface`). So a
+/// `HashMap::insert` that DISPLACES an entry leaves the tun perfectly up, with
+/// routes and traffic, enforcing nothing: **fail-open**, and invisible to every
+/// tun-shaped observation this file makes. A one-second budget (rather than
+/// `scrape_deny`'s two) keeps a stalled endpoint from stretching a 250ms
+/// sampling tick; a timed-out tick just yields `None` and the next tick
+/// re-probes.
+fn scrape_live_enforcers(addr: &str) -> Option<u64> {
+    let sa: std::net::SocketAddr = addr.parse().ok()?;
+    let mut s = std::net::TcpStream::connect_timeout(&sa, Duration::from_secs(1)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(1))).ok()?;
+    s.write_all(b"GET /metrics HTTP/1.0\r\n\r\n").ok()?;
+    let mut buf = String::new();
+    let _ = s.read_to_string(&mut buf);
+    buf.lines()
+        .find_map(|l| l.strip_prefix("wiremesh_gateway_live_enforcers "))
+        .and_then(|v| v.trim().parse().ok())
+}
+
+/// What one gateway's sampling loop accumulates. See [`sample_tick`] for why
+/// `paired_peak` is a single field rather than two independent maxima.
+#[derive(Default)]
+struct RotationObs {
+    /// The FIRST tick at which this gateway satisfied BOTH probes *in the same
+    /// tick*: two more interfaces than its steady-state baseline, and at least
+    /// three live enforcers. This is the only field asserted on.
+    paired_peak: Option<(BTreeSet<String>, u64)>,
+    /// DIAGNOSTICS ONLY — never asserted on. Independent maxima exist so a
+    /// failure can say WHICH axis fell short (no overlap tun at all, versus
+    /// two tuns but a displaced enforcer) instead of just "never paired".
+    /// Asserting on these would be exactly the mistake `paired_peak` avoids.
+    max_extra_links: usize,
+    max_enforcers: u64,
+    last_links: BTreeSet<String>,
+    last_enforcers: Option<u64>,
+}
+
+/// One tick's PAIRED observation of a gateway.
+///
+/// The two probes must be read together and judged together. Read
+/// independently, a gateway that briefly had three interfaces and — at some
+/// other, unrelated instant — briefly had three enforcers would satisfy both
+/// maxima while never once having had a fully-armed overlap. Making
+/// `paired_peak` the conjunction *inside a single call* makes that
+/// impossible to express: the tuple can only be recorded by one invocation
+/// that saw both at once. The two syscalls are still milliseconds apart
+/// (an `ip -br link` exec, then a TCP scrape), which is three orders of
+/// magnitude inside the seconds-long overlap window — but they are never
+/// separately maximised across the run, which is the property that matters.
+fn sample_tick(ns: &Ns, metrics_addr: &str, base: &BTreeSet<String>, obs: &mut RotationObs) {
+    let links = link_names(ns);
+    let enforcers = scrape_live_enforcers(metrics_addr);
+    let extra = links.difference(base).count();
+
+    obs.max_extra_links = obs.max_extra_links.max(extra);
+    if let Some(n) = enforcers {
+        obs.max_enforcers = obs.max_enforcers.max(n);
+        // `>= 3` rather than `== 3`: three is the expected peak (base +
+        // own-new + overlap) and a DISPLACEMENT shows up as 2, which this
+        // catches. A hypothetical fourth entry is caught by the
+        // settles-back-to-1 assertion instead, so there is no need to make
+        // the peak brittle about an exact count.
+        if obs.paired_peak.is_none() && extra >= 2 && n >= 3 {
+            obs.paired_peak = Some((links.clone(), n));
+        }
+    }
+    obs.last_links = links;
+    obs.last_enforcers = enforcers;
+}
+
+/// **T3 DONE BAR — the scenario the shipped outage actually needs.**
+///
+/// **KNOWN FAILING, DELIBERATELY `#[ignore]`d — DO NOT DELETE.** This test is
+/// not flaky, not obsolete, and not superseded: it is a documented red parked
+/// as the done bar for the endpoint/port work described in
+/// `docs/research/rotation-endpoint-and-port-model-is-broken.md`. It fails at
+/// the post-rotation reachability check (`POST-ROTATION FAILED: ICMP wlA ->
+/// wlB ...`) because of bugs 4 and 5 in that document, which are structural
+/// and out of scope for T3. Everything before that point passes and is real
+/// coverage. See "Why this is `#[ignore]`d" at the bottom before touching it.
+///
+/// Every other rotation test in this file rotates ONE gateway, so an
+/// own-epoch tun and a Role-B overlap tun never carry the same epoch number
+/// and the `TunnelSet` collision cannot arise at all. That is not the
+/// production case: `initiate_due_rotations`
+/// (`controller/services/sync.rs:640-688`) walks **every** active gateway off
+/// one global `rotation_interval` with no per-gateway key-age filter, so the
+/// whole fabric marches N -> N+1 in the same tick. Both gateways then hit the
+/// three-axis collision simultaneously — this gateway's own new epoch 1 vs the
+/// overlap toward a peer whose pending epoch is also 1 (see
+/// `docs/research/key-rotation-plan-verification.md`, headline + F3/F8).
+///
+/// # What "in step" means here, and why it is driven explicitly
+///
+/// Both gateways are rotated by back-to-back `Admin.RotateKey` calls on a
+/// single admin client rather than by shrinking the controller's rotation
+/// timer. Three reasons, in order of weight:
+///
+///  1. It is the SAME collision. The hazard is that the two epoch NUMBERS
+///     coincide, which they do for any pair rotating 0 -> 1; the timer only
+///     decides *when*. Nothing about the defect is timer-specific — indeed the
+///     verification's owner-decision D rejects jitter precisely because
+///     staggering does not help.
+///  2. It is deterministic. A timer-driven variant would make the test's
+///     result depend on tick alignment against a 45s mesh-up wait.
+///  3. The timer route is not reachable from here without a new harness seam:
+///     `TestController::start_with_rotation_intervals` binds
+///     `Config::default_bind_ip()`, and this topology needs
+///     `start_on(CTRL_IP)` for a routable underlay address. There is no
+///     constructor taking both.
+///
+/// The two RPCs are issued with no wait between them, so gwA is still holding
+/// its own epoch-1 tun when gwB's epoch-1 pending key reaches it — which is
+/// exactly the window in which the collision fires.
+///
+/// # The assertion that would have been red before the fix
+///
+/// Each gateway must, at some instant during the rotation window, have TWO
+/// MORE network interfaces than it had at steady state: its own new epoch tun
+/// (Role A) *and* an overlap tun toward the rotating peer (Role B). Four
+/// rotation devices across the pair, on top of the two base tuns.
+///
+/// Before the fix, both roles computed the same map key, the same ifname and
+/// the same listen port; `TunnelSet::bring_up` bailed on the duplicate and the
+/// `?` inside `for peer in &ds.peers` aborted the whole Role-B loop, whose
+/// caller only logs. Neither side ever brought an overlap up, so the peak
+/// would have been base + 1, not base + 2, on both gateways.
+///
+/// The probe is deliberately a COUNT of interfaces, not a set of names: the
+/// test asks the kernel "how many devices are up", never "is `wg0e1` up", so
+/// it holds for any de-collision scheme the implementer picks. Port
+/// distinctness is NOT re-probed here — it is already pinned twice, purely in
+/// `tests/tunnel_id_decollision.rs` and against real Devices in
+/// `tests/tunnelset_same_epoch_netns.rs`. Sampling `wg show` at the peak would
+/// add a race to this (serial, flake-sensitive) file for no new information.
+///
+/// # Why this is `#[ignore]`d
+///
+/// Writing this test was the first time anybody exercised an in-step
+/// both-gateways rotation — the shape the controller's default 30-day timer
+/// produces on every fabric. **It found six bugs. Four are fixed on this
+/// branch** (the `TunnelSet` three-axis collision the T3 assertion above
+/// pins, and the arbitration/route defects around it). **Two are not, and
+/// cannot be without structural work**, so the test is committed red rather
+/// than weakened:
+///
+///  - **Bug 4 — the Role-A cutover leaves nothing durable able to address the
+///    active tun.** After cutover the active tun dials the peer's BASE port
+///    while the peer listens for that epoch on an offset port, so no
+///    handshake ever completes. Everything durable in the fabric (observed
+///    candidate, reported locals, punch candidates, `live_endpoints`) is
+///    base-port by construction; only two transient writers ever emit an
+///    offset port and both *guess*. A one-sided rotation survives this only
+///    by accident of the change-guard rendering an identical no-op forever;
+///    in-step rotation forces a real `uapi::apply` and the accident stops
+///    holding.
+///  - **Bug 5 — the SECOND rotation of any gateway cannot complete at all.**
+///    `device_config_at_port` assumes "the peer listens on the port I chose"
+///    while `pending_peer_configs` assumes "base + epoch delta" — two
+///    mutually incompatible models, both invalidated by T3's free-list
+///    `plan_port` allocator. No test in this file has ever rotated twice
+///    (every case goes 0 -> 1 once from a clean tree), which is why this went
+///    unseen.
+///
+/// Both are written up in full — mechanism, direct observation from the
+/// failing run, the decided fix shape (ground-truth endpoint feedback from
+/// boringtun's `get=1`, plus a single port authority so `device_config_pinned`,
+/// `device_config_at_port` and `pending_peer_configs` stop disagreeing), and
+/// why two other candidate fixes were rejected — in
+/// **`docs/research/rotation-endpoint-and-port-model-is-broken.md`**.
+///
+/// ## What still passes, and what does not
+///
+/// Everything up to the post-rotation reachability check is green and is the
+/// coverage this test exists for: the T3 assertion (four rotation devices
+/// across the pair, every one with its enforcer attached — the fail-open
+/// displacement probe) and the traffic-during-overlap assertion (the ICMP
+/// flood loses at most two cutovers' worth of packets). The failure is the
+/// `POST-ROTATION FAILED: ICMP wlA -> wlB no longer passes after BOTH
+/// gateways rotated in step` panic below: bug 4 means neither side's
+/// configured endpoint reaches a device holding the matching key once both
+/// have cut over.
+///
+/// ## Un-ignoring this IS the done bar
+///
+/// Removing the `#[ignore]` and getting this green is the acceptance
+/// criterion for the endpoint/port work. Nothing here may be relaxed to get
+/// there: no widened packet-loss tolerance, no dropped direction in the
+/// both-ways reachability loop, no softened failure message. If a future
+/// change makes it pass, it must pass for the reason in the research doc.
+/// (The doc also calls for a NEW test that rotates twice — bug 5 is invisible
+/// without one, and this test only rotates once per gateway.)
+///
+/// Run it with `--ignored` to see the current red:
+/// `cargo test -p wiremesh-gateway --test key_rotation --features netns-tests \
+///  -- --test-threads=1 --nocapture --ignored`
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "RED by design, NOT obsolete — do not delete. Blocked on bug 4 (post-cutover \
+            endpoint dials the peer's base port while it listens on an offset port) and bug 5 \
+            (the second rotation of any gateway cannot complete: device_config_at_port and \
+            pending_peer_configs use incompatible port models). Both in \
+            docs/research/rotation-endpoint-and-port-model-is-broken.md; un-ignoring this is \
+            the done bar for that work. See this test's doc comment."]
+async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
+    // Topology: IDENTICAL to `direct_rotation_is_zero_drop` — see that test
+    // for the per-step rationale (bridge, netem, veths, identities).
+    setup_bridge();
+    let _root_guard = RootNetGuard;
+
+    let h = TestController::start_on(CTRL_IP.parse().unwrap()).await;
+
+    let diff = h.apply(FABRIC_ICMP).await;
+    assert!(diff.policy_updated, "fabric apply must compile a real policy, got: {diff:?}");
+
+    let (a_priv, a_pub) = wg_keypair();
+    let (b_priv, b_pub) = wg_keypair();
+    let ga = enroll_into(&h, "10.10.1.0/24", &a_pub).await;
+    let gb = enroll_into(&h, "10.10.2.0/24", &b_pub).await;
+
+    let mut lab = Lab::new("gwstep").expect("lab");
+    let gwa = lab.ns("a").expect("gwA netns");
+    let gwb = lab.ns("b").expect("gwB netns");
+    let wla = lab.ns("wa").expect("wlA netns");
+    let wlb = lab.ns("wb").expect("wlB netns");
+
+    attach_underlay(&gwa, "a", "10.9.0.1");
+    attach_underlay(&gwb, "b", "10.9.0.2");
+    apply_netem(&gwa, "und", 20).expect("netem on gwA underlay");
+    apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
+
+    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
+        .expect("seg-a veth");
+    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
+        .expect("seg-b veth");
+    wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
+        .expect("wlA default route");
+    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
+        .expect("wlB default route");
+
+    let sda = tempfile::tempdir().unwrap();
+    let sdb = tempfile::tempdir().unwrap();
+    write_identity(&ga, &a_priv, sda.path());
+    write_identity(&gb, &b_priv, sdb.path());
+    let logdir = tempfile::tempdir().unwrap();
+
+    let sync_addr = h.sync_tcp_addr().to_string();
+    let observe_addr = h.observe_addr().to_string();
+    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
+    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+
+    // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
+    let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
+    if !up {
+        dump_diag("mesh-not-up", &[("gwA", &gwa), ("gwB", &gwb)], &[("gwA", &pa), ("gwB", &pb)]);
+        pa.kill();
+        pb.kill();
+        panic!("SETUP FAILED: workload A -> workload B ICMP (policy-permitted) never passed over the direct tunnel before rotation");
+    }
+    eprintln!("SETUP PASS: direct mesh is up (ICMP crosses wlA -> wlB)");
+
+    // ===== Steady-state interface baseline, per gateway =====
+    // Expected: lo, und, seg0, wg0. Captured rather than hard-coded so the
+    // assertion is "two MORE than steady state", immune to the harness
+    // acquiring another device later.
+    let base_a = link_names(&gwa);
+    let base_b = link_names(&gwb);
+    eprintln!("BASELINE links: gwA={base_a:?} gwB={base_b:?}");
+    assert!(
+        base_a.contains("wg0") && base_b.contains("wg0"),
+        "SETUP FAILED: both gateways must have their base tun wg0 up at steady state; \
+         gwA={base_a:?} gwB={base_b:?}"
+    );
+
+    // Each gateway's Prometheus endpoint, addressed over the underlay bridge
+    // from the root netns (the gateways bind `0.0.0.0:METRICS_PORT`) — the
+    // same route `mesh_milestone.rs` scrapes `10.9.0.2:9099` by.
+    let metrics_a = format!("10.9.0.1:{METRICS_PORT}");
+    let metrics_b = format!("10.9.0.2:{METRICS_PORT}");
+    let base_enf_a = scrape_live_enforcers(&metrics_a);
+    let base_enf_b = scrape_live_enforcers(&metrics_b);
+    eprintln!("BASELINE live_enforcers: gwA={base_enf_a:?} gwB={base_enf_b:?}");
+    assert!(
+        base_enf_a == Some(1) && base_enf_b == Some(1),
+        "SETUP FAILED: at steady state each gateway must report exactly one live enforcer (the \
+         base tun's); got gwA={base_enf_a:?} gwB={base_enf_b:?}. A `None` means the \
+         `wiremesh_gateway_live_enforcers` series never reached the scrape body, which would \
+         make every enforcer assertion below vacuous."
+    );
+
+    // ===== Continuous ICMP flood across the pair, as in case 1 =====
+    let flood = wla
+        .spawn(&["ping", "-i", "0.2", "-q", "10.10.2.2"])
+        .expect("spawn ping flood in wlA netns");
+
+    // ===== Rotate BOTH gateways, back to back on one admin client =====
+    // No await between the two beyond each RPC itself: the pending epochs must
+    // be in flight simultaneously for the collision window to open.
+    let mut admin = h.admin_client().await;
+    admin
+        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .await
+        .expect("Admin.RotateKey for gwA");
+    admin
+        .rotate_key(RotateKeyRequest { gateway_id: gb.id() })
+        .await
+        .expect("Admin.RotateKey for gwB");
+    eprintln!("Admin.RotateKey submitted for BOTH gwA and gwB (in step, epoch 0 -> 1 each)");
+
+    // ===== Sample interfaces AND the enforcer gauge while both rotations run =====
+    // One loop does triple duty: it drives both gateways to completion, and
+    // per tick takes ONE PAIRED reading per gateway (`sample_tick`) of the
+    // interfaces present and the live-enforcer gauge. The transient overlap
+    // devices only exist while the PEER's rotation is in flight, so this is
+    // the only window in which either probe means anything. 250ms cadence
+    // against a window that lasts seconds gives tens of samples.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut obs_a = RotationObs::default();
+    let mut obs_b = RotationObs::default();
+    let (states_a, states_b) = loop {
+        sample_tick(&gwa, &metrics_a, &base_a, &mut obs_a);
+        sample_tick(&gwb, &metrics_b, &base_b, &mut obs_b);
+
+        let sa = h.debug_key_states(ga.id()).await;
+        let sb = h.debug_key_states(gb.id()).await;
+        if (rotation_done(&sa) && rotation_done(&sb)) || Instant::now() >= deadline {
+            break (sa, sb);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    let done_a = rotation_done(&states_a);
+    let done_b = rotation_done(&states_b);
+
+    eprintln!(
+        "SAMPLING SUMMARY: gwA paired_peak={:?} max_extra_links={} max_enforcers={} | \
+         gwB paired_peak={:?} max_extra_links={} max_enforcers={}",
+        obs_a.paired_peak, obs_a.max_extra_links, obs_a.max_enforcers,
+        obs_b.paired_peak, obs_b.max_extra_links, obs_b.max_enforcers,
+    );
+
+    if !done_a || !done_b {
+        dump_diag(
+            "in-step-rotation-timeout",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        let _ = wla.exec(&["pkill", "-INT", "-x", "ping"]);
+        if let Ok(o) = flood.wait_with_output() {
+            eprintln!("--- ping flood output at timeout ---\n{}", String::from_utf8_lossy(&o.stdout));
+        }
+        pa.kill();
+        pb.kill();
+        panic!(
+            "IN-STEP ROTATION TIMEOUT after 120s: gwA done={done_a} gwB done={done_b}. \
+             Last debug_key_states: gwA={states_a:?} gwB={states_b:?}"
+        );
+    }
+    eprintln!("BOTH ROTATIONS COMPLETE: gwA={states_a:?} gwB={states_b:?}");
+
+    // ===== THE T3 ASSERTION: own-epoch tun AND overlap tun, BOTH ARMED =====
+    // At one instant, each gateway must have had two more devices than its
+    // steady-state baseline — Role A's own new epoch tun and Role B's overlap
+    // toward the rotating peer, live at the same time under the same epoch
+    // number — AND at least three live enforcers, so neither of those tuns is
+    // running with its policy hook displaced.
+    //
+    // Before the de-collision fix both roles computed the same ifname/key/port,
+    // `bring_up` bailed on the second, and the `?` inside the peer loop
+    // discarded every remaining peer: the peak would be +1 device, not +2.
+    // With the tuns de-collided but the enforcer map still keyed by a bare
+    // `u32` epoch, the devices would appear but one `HashMap::insert` would
+    // displace the other's enforcer — two extra tuns, only two enforcers, one
+    // of them carrying traffic with nothing attached.
+    for (name, obs, base) in [("gwA", &obs_a, &base_a), ("gwB", &obs_b, &base_b)] {
+        let Some((peak_links, peak_enf)) = &obs.paired_peak else {
+            dump_diag(
+                "in-step-never-fully-armed",
+                &[("gwA", &gwa), ("gwB", &gwb)],
+                &[("gwA", &pa), ("gwB", &pb)],
+            );
+            let _ = wla.exec(&["pkill", "-INT", "-x", "ping"]);
+            pa.kill();
+            pb.kill();
+            panic!(
+                "IN-STEP COLLISION: {name} never had, AT THE SAME INSTANT, both rotation tuns up \
+                 and all three enforcers attached. Best seen independently (diagnostics only, \
+                 never paired): max_extra_links={} (need 2 — one short means the two roles \
+                 collided on the TunnelSet and the second bring_up bailed, the shipped \
+                 fabric-wide outage F3), max_enforcers={} (need 3 — one short with 2 extra links \
+                 means an enforcer was DISPLACED out of the map and its tun is running \
+                 fail-open). Last links={:?}, last gauge={:?}, baseline={base:?}",
+                obs.max_extra_links, obs.max_enforcers, obs.last_links, obs.last_enforcers,
+            );
+        };
+        assert!(
+            peak_links.contains("wg0"),
+            "MAKE-BEFORE-BREAK: {name}'s base tun wg0 must still be up at the paired peak \
+             (links={peak_links:?}, enforcers={peak_enf})"
+        );
+    }
+    eprintln!(
+        "T3 PASS: both gateways stood up their own new-epoch tun AND an overlap toward the \
+         rotating peer at the same epoch number — four rotation devices across the pair, \
+         alongside both base tuns, every one of them with its enforcer still attached."
+    );
+
+    // ===== Traffic kept flowing across BOTH cutovers =====
+    let _ = wla.exec(&["pkill", "-INT", "-x", "ping"]);
+    let flood_out = flood.wait_with_output().expect("wait for ping flood to exit after SIGINT");
+    let flood_stdout = String::from_utf8_lossy(&flood_out.stdout).into_owned();
+    eprintln!("--- ping flood summary ---\n{flood_stdout}");
+    let (transmitted, received) = parse_ping_summary(&flood_stdout);
+    // Same PER-ROTATION tolerance as `direct_rotation_is_zero_drop` (3 packets
+    // = roughly one handshake RTT at `-i 0.2` under 20ms netem), applied twice
+    // because two independent cutovers happen in this window. Deliberately not
+    // a looser bar per cutover.
+    assert!(
+        received + 6 >= transmitted,
+        "IN-STEP TRAFFIC FAILED: the ICMP flood lost more than two cutovers' worth of packets \
+         (transmitted={transmitted}, received={received}, allowed gap=6 = 2 x the single-rotation \
+         allowance)"
+    );
+    eprintln!(
+        "TRAFFIC PASS: transmitted={transmitted} received={received} (gap {} <= 6)",
+        transmitted.saturating_sub(received)
+    );
+
+    // ===== Both directions still work once both rotations have settled =====
+    // Both sides rotated, so both directions are checked: a one-way check
+    // could pass on a pair where only one gateway actually cut over.
+    for (from, dst, label) in [(&wla, "10.10.2.2", "wlA -> wlB"), (&wlb, "10.10.1.2", "wlB -> wlA")] {
+        if !wait_until(Duration::from_secs(20), || ping_ok(from, dst)) {
+            dump_diag(
+                "post-in-step-rotation",
+                &[("gwA", &gwa), ("gwB", &gwb)],
+                &[("gwA", &pa), ("gwB", &pb)],
+            );
+            pa.kill();
+            pb.kill();
+            panic!("POST-ROTATION FAILED: ICMP {label} no longer passes after BOTH gateways rotated in step");
+        }
+        eprintln!("POST-ROTATION PASS: ICMP still crosses {label} on the new epochs");
+    }
+
+    // ===== The gauge must track BACK DOWN to one =====
+    // A peak assertion alone is satisfied by a gauge that only ever rises, and
+    // "rises and never falls" is precisely the leak shape: an overlap Device,
+    // its enforcer entry, its routes and its `wg0_pins` entry surviving the
+    // rotation they belonged to (finding F9 — real, and out of scope for T3,
+    // which is exactly why it needs a guard rather than an assumption).
+    //
+    // Once both rotations have fully settled each gateway must be back to a
+    // single tun and a single enforcer: the Role-B overlap collapsed after the
+    // peer promoted, and the old epoch-0 Device retired.
+    //
+    // Budget: the gateway's own retire fires `RETIRE_GRACE` — `2 *
+    // ROTATION_KEEPALIVE`, i.e. SIX seconds (`main.rs:351`), not the
+    // controller's 30s `RETIRE_GRACE` — after its cutover, gated on every peer
+    // staying rx-corroborated live on the new tun for that whole grace. The
+    // Role-B collapse additionally waits for a live base-tun session toward
+    // the peer's new key. `rotation_survives_gateway_restart_on_new_epoch`
+    // already waits for exactly this teardown on a 30s bound and is
+    // comfortable; 45s adds headroom for the second gateway doing it at the
+    // same time.
+    let settle_deadline = Instant::now() + Duration::from_secs(45);
+    let (settled_a, settled_b) = loop {
+        let a = scrape_live_enforcers(&metrics_a);
+        let b = scrape_live_enforcers(&metrics_b);
+        if (a == Some(1) && b == Some(1)) || Instant::now() >= settle_deadline {
+            break (a, b);
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    if settled_a != Some(1) || settled_b != Some(1) {
+        // Capture the interface sets BEFORE killing the gateways — the tun
+        // devices go away with the processes, so a post-kill sample would
+        // report an empty-looking gateway and hide which state leaked.
+        let links_a = link_names(&gwa);
+        let links_b = link_names(&gwb);
+        dump_diag(
+            "in-step-enforcers-did-not-settle",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "LEAKED ROTATION STATE: 45s after both in-step rotations completed the live-enforcer \
+             gauge has not returned to 1 — gwA={settled_a:?} gwB={settled_b:?} (links: \
+             gwA={links_a:?} gwB={links_b:?}). Above 1 means an overlap or old-epoch enforcer \
+             outlived the rotation it belonged to (the F9 leak shape); below 1, or absent, means \
+             one was displaced or the exporter died."
+        );
+    }
+    eprintln!("SETTLE PASS: both gateways back to exactly one live enforcer after the overlap collapse and the epoch-0 retire");
+
+    pa.kill();
+    pb.kill();
+    drop(lab);
+    eprintln!("\nDONE-BAR PASSED: a whole-fabric in-step rotation — both gateways to epoch 1 at once — stands up every own-epoch and overlap tun without collision, every one of them armed with its own enforcer, traffic survives both cutovers, and all the transient state is reclaimed.");
 }

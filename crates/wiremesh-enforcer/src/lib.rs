@@ -232,7 +232,14 @@ pub fn probe_with(kind: BackendKind, iface: &str, cfg: EnforcerConfig) -> anyhow
 /// reaches) or `.` (hidden/relative path components in pin paths).
 /// Rejection messages always contain `"invalid interface name"` — pinned
 /// by `tests/iface_validation.rs`.
-pub(crate) fn validate_iface(iface: &str) -> anyhow::Result<()> {
+///
+/// **`pub`, not `pub(crate)` (key-rotation T3):** the gateway's
+/// `tunnelset::plan_tunnel` derives rotation-tun names and must refuse to
+/// emit one this function would later reject. Re-implementing the predicate
+/// there would let the two drift, and the drift only surfaces in production
+/// as a late, opaque tc-attach failure long after the Device is half-built —
+/// so the planner calls THIS, the same check the enforcer will apply.
+pub fn validate_iface(iface: &str) -> anyhow::Result<()> {
     let charset_ok = iface
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'));
