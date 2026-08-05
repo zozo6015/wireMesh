@@ -22,8 +22,8 @@ use wiremesh_gateway::policy_apply::needs_policy_write;
 use wiremesh_gateway::punch_backoff::{PunchBackoff, PunchDecision};
 use wiremesh_gateway::relay::{RelayDeathReason, RelayTransport};
 use wiremesh_gateway::rotation::{
-    role_b_decisions, OverlapClaim, RoleBDecision, Rotation, RotationAction, RotationPhase,
-    RouteOwner,
+    role_b_decisions, EpochWatch, OverlapClaim, RoleBDecision, Rotation, RotationAction,
+    RotationPhase, RouteOwner,
 };
 use wiremesh_gateway::state::{DesiredState, FailStaticWriter};
 use wiremesh_gateway::tunnelset::{plan_tunnel, TunnelId, TunnelSet};
@@ -3659,8 +3659,13 @@ struct RoleAPeer {
     /// epoch tun or on a Role-B overlap we hold toward the very same peer —
     /// which needs a `role_b` lookup, which needs the id.
     gateway_id: u64,
-    /// The peer's ACTIVE-key hex: the peer talks to us on `new_tun` with that
-    /// key, and the tick watches `new_tun` for an rx-corroborated session on it.
+    /// The peer's ACTIVE-key hex AS OF THE DIRECTIVE — i.e. exactly what
+    /// `handle_rotate` configured on `new_tun`. It is the watch key until the
+    /// cutover (nothing re-applies to `new_tun` before then) and the fallback
+    /// after it; from the cutover on, the live watch key is re-derived every
+    /// tick from the roster + pins by `rotation::new_epoch_watch_keys`,
+    /// because `apply_state` owns the peer set once `new_tun` is the active
+    /// tun and a peer that rotates too gets rekeyed out from under this value.
     active_hex: String,
     /// The peer's segment CIDRs.
     cidrs: Vec<String>,
@@ -4446,13 +4451,42 @@ async fn run_rotation_ticks(rot: RotationShared) {
         // Role A: our own new epoch's Device.
         let role_a = rot.role_a.lock().unwrap().clone();
         if let Some(a) = role_a {
-            let hexes = a.peers.iter().map(|p| p.active_hex.clone());
-            let live = read_live_peers(&a.new_tun, hexes).await;
-            let any_live =
-                live.as_ref().map_or(false, |l| a.peers.iter().any(|p| l.contains(&p.active_hex)));
-            let all_live =
-                live.as_ref().map_or(false, |l| a.peers.iter().all(|p| l.contains(&p.active_hex)));
             let phase = rot.rotation.lock().unwrap().phase.clone();
+            // WHICH KEY to watch is a judgement over CURRENT roster + pin
+            // state, not the directive-time snapshot it used to be: once we
+            // have cut over, `apply_state` owns the new tun's peer set and a
+            // peer that ALSO rotates has its entry rekeyed out from under a
+            // snapshot watcher — which stalled the retire grace forever and so
+            // never actually retired the old key. See
+            // `rotation::new_epoch_watch_keys`, which derives it from exactly
+            // the inputs `device_config_pinned` writes it from.
+            //
+            // One watch set feeds both arms. Pre-cutover the function returns
+            // the snapshot verbatim, so the `any_live` cutover gate below is
+            // bit-for-bit what it was; only the post-cutover retire arm sees a
+            // refreshed answer.
+            let watch: Vec<(u64, String)> = {
+                let snapshot: Vec<(u64, String)> =
+                    a.peers.iter().map(|p| (p.gateway_id, p.active_hex.clone())).collect();
+                let cut_over = matches!(phase, RotationPhase::CutOver { .. });
+                let ds = rot.desired.lock().unwrap();
+                let pins = rot.wg0_pins.lock().unwrap();
+                rotation::new_epoch_watch_keys(&snapshot, cut_over, ds.as_ref(), &pins)
+                    .into_iter()
+                    .filter_map(|(gid, w)| match w {
+                        EpochWatch::Key(hex) => Some((gid, hex)),
+                        // A peer that left the roster is not on the device and
+                        // cannot need our old epoch — excluded rather than
+                        // watched, so it can't hold the retire hostage.
+                        EpochWatch::Gone => None,
+                    })
+                    .collect()
+            };
+            let live = read_live_peers(&a.new_tun, watch.iter().map(|(_, h)| h.clone())).await;
+            let any_live =
+                live.as_ref().map_or(false, |l| watch.iter().any(|(_, hex)| l.contains(hex)));
+            let all_live =
+                live.as_ref().map_or(false, |l| watch.iter().all(|(_, hex)| l.contains(hex)));
             match phase {
                 RotationPhase::Overlapping { .. } => {
                     if any_live {

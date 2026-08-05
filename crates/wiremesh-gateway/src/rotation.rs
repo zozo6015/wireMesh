@@ -16,7 +16,7 @@
 
 use crate::state::{DesiredState, PeerState};
 use crate::uapi::pubkey_b64_to_hex;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Where a single gateway's own rotation currently stands.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +271,124 @@ pub fn route_owner(own_active_epoch: u32, overlap: Option<OverlapClaim>) -> Rout
         // — belongs on our own active tun.
         _ => RouteOwner::ActiveTun,
     }
+}
+
+// --- Which peer key the new-epoch tun should currently be live on -----------
+
+/// What Role A should watch its new-epoch tun for, per peer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EpochWatch {
+    /// Watch the new-epoch tun for an rx-corroborated session on this pubkey
+    /// hex (lowercase, UAPI wire form).
+    Key(String),
+    /// The peer is gone from the roster. The same apply that dropped it from
+    /// desired state dropped it from the device, so there is nothing to watch —
+    /// and, more to the point, a departed peer cannot still depend on our old
+    /// epoch, so it must not hold the retire grace hostage.
+    Gone,
+}
+
+/// Which peer key this gateway's NEW-EPOCH tun should CURRENTLY show a live
+/// session on, for every peer of an in-flight Role-A rotation.
+///
+/// # The bug this removes
+///
+/// The watch set used to be a snapshot taken once, when the `RotateDirective`
+/// arrived: each peer's active-key hex at that instant. That is correct for
+/// exactly as long as the peer's key does not move — i.e. for a ONE-SIDED
+/// rotation, which is all the suite ever exercised. When the peer rotates too,
+/// its promote unpins `wg0_pins[gid]` and the very same `apply_state` rebuilds
+/// our active tun with the peer's NEW key. The peer's old key is then no longer
+/// configured on the device at all, `read_live_peers` can never report it, and
+/// so `all_live` is false on every subsequent tick: `retire_all_live_since`
+/// resets forever and [`RotationAction::TearDown`] is never signalled.
+///
+/// The consequence is not cosmetic. The old epoch's Device and its enforcer
+/// are never torn down, which means **the retired private key is never
+/// actually retired** — the point of rotating — and one Device plus one
+/// enforcer leak per rotation, permanently, on a long-lived fabric.
+///
+/// This is the third instance in this branch of one bug class: a pass watching
+/// a thing the roster has moved past. The Role-B collapse watching `base_tun`
+/// while `active` had moved was the ifname version (F8); this is the key
+/// version.
+///
+/// # The rule
+///
+/// **Before the cutover** the answer is the snapshot, unconditionally.
+/// `handle_rotate` wrote the new tun's peer set out-of-band and NOTHING
+/// re-applies to it until the cutover flips `active` onto it — so whatever the
+/// roster has done since, the device still holds exactly the keys the snapshot
+/// recorded, and watching anything else would watch a key that is not there.
+///
+/// **After the cutover** the new tun IS the active tun, and `apply_state` owns
+/// its peer set. So the answer is precisely what
+/// [`crate::reconcile::device_config_pinned`] would select — the `wg0_pins`
+/// entry if one exists, else the roster's `active_pubkey_b64` — because that
+/// is, by construction, what was last written to the device. Deriving it from
+/// the same two inputs the writer uses is what keeps the watcher and the
+/// device from drifting again.
+///
+/// A peer absent from the roster is [`EpochWatch::Gone`]. A peer whose
+/// selected key does not decode falls back to the snapshot hex: watching a
+/// stale key merely delays the retire, whereas dropping the peer would let a
+/// roster glitch retire a key a live peer still needs.
+///
+/// # If the peer rotates AGAIN mid-grace
+///
+/// The grace restarts, and that is the intended behaviour rather than a
+/// tolerated one. A second rotation moves the peer's key on the device (unpin
+/// or re-pin -> full `replace_peers`), boringtun rebuilds that peer's session
+/// from scratch, and `rx_bytes` for the new key is 0 until real traffic
+/// arrives — so `all_live` goes false for a tick or two and
+/// `retire_all_live_since` resets. That is make-before-break doing its job:
+/// while a peer's session is being rebuilt is precisely when it might still
+/// fall back on our old key, and retiring the old Device underneath it is the
+/// one thing the grace exists to prevent.
+///
+/// It cannot starve indefinitely. Each reset costs one `RETIRE_GRACE`
+/// (`2 * ROTATION_KEEPALIVE` = 6s), and a reset needs a KEY CHANGE, not merely
+/// traffic — so starvation would require the controller to promote a peer
+/// epoch more often than every 6s. The controller rotates the fabric off one
+/// 30-day timer and its promote SM is bounded by a grace of its own, so the
+/// achievable cadence is many orders of magnitude slower. On a wide fabric
+/// rotating in step the bound is (number of peers x the spread of their
+/// promotes), not unbounded: each peer's key moves once per rotation. Only a
+/// controller emitting sub-6s key churn could starve this, and such a
+/// controller has already broken the fabric by other means.
+pub fn new_epoch_watch_keys(
+    snapshot: &[(u64, String)],
+    cut_over: bool,
+    ds: Option<&DesiredState>,
+    pinned_pubkeys: &HashMap<u64, String>,
+) -> Vec<(u64, EpochWatch)> {
+    snapshot
+        .iter()
+        .map(|(gid, snapshot_hex)| {
+            // Pre-cutover: `handle_rotate` owns the new tun's peer set and
+            // nothing has re-applied to it. The snapshot IS the device.
+            if !cut_over {
+                return (*gid, EpochWatch::Key(snapshot_hex.clone()));
+            }
+            // No cached desired state to re-derive from — keep watching what
+            // we know rather than inventing a verdict.
+            let Some(ds) = ds else {
+                return (*gid, EpochWatch::Key(snapshot_hex.clone()));
+            };
+            let Some(peer) = ds.peers.iter().find(|p| p.gateway_id == *gid) else {
+                return (*gid, EpochWatch::Gone);
+            };
+            // EXACTLY `device_config_pinned`'s selection rule, because that is
+            // the function that wrote this device.
+            let selected = match pinned_pubkeys.get(gid) {
+                Some(pinned) => Some(pinned.as_str()),
+                None => peer.active_pubkey_b64.as_deref(),
+            };
+            let hex =
+                selected.and_then(pubkey_b64_to_hex).unwrap_or_else(|| snapshot_hex.clone());
+            (*gid, EpochWatch::Key(hex))
+        })
+        .collect()
 }
 
 #[cfg(test)]
