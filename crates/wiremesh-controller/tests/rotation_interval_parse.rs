@@ -33,27 +33,41 @@
 //!   * an UPPERCASE unit suffix (`30D`, `15M`) is rejected — owner decision,
 //!     because `M` reads as "months" to plenty of operators — and says so
 //!     specifically, rather than hiding behind the generic "unknown suffix"
-//!     message
+//!     message. That message is claimed ONLY when casing is the sole problem:
+//!     `abcD` and a bare `D` are not miscased units, and telling their author
+//!     to "write `d`" would hand them a second invalid value
+//!   * an interval above the 3650d (10-year) cap is rejected. A timer that
+//!     never fires is a SECOND, silent spelling of "disabled" — reachable
+//!     without `off`, and therefore without the boot banner that is this
+//!     binary's only runtime signal that rotation is off
 //!
 //! And, for the environment resolution `main.rs` delegates to:
 //!
 //! ```ignore
 //! pub const ROTATION_INTERVAL_ENV: &str = "WIREMESH_ROTATION_INTERVAL";
 //! pub fn rotation_interval_from_env(
-//!     lookup: impl FnOnce(&str) -> Option<String>,
+//!     lookup: impl FnOnce(&str) -> std::result::Result<String, std::env::VarError>,
 //! ) -> anyhow::Result<Option<std::time::Duration>>
 //! ```
 //!
-//!   * ABSENT → `Ok(Some(Config::default_rotation_interval()))` — the unchanged
-//!     30-day behaviour every existing deployment takes;
-//!   * PRESENT → whatever the parser makes of it, INCLUDING the error. A
-//!     malformed value must never be swallowed into the default: an operator
-//!     who typed `of` instead of `off` would otherwise believe rotation was
-//!     disabled while a 30-day timer was in fact still armed.
+//! `lookup` mirrors `std::env::var`'s own signature rather than the lossy
+//! `.ok()` form, and that is load-bearing: `Err(VarError::NotUnicode(..))`
+//! means PRESENT-but-not-UTF-8, and collapsing it into "absent" would arm the
+//! 30-day timer, silently, for an operator who believes they wrote `off`.
+//!
+//!   * ABSENT (`Err(VarError::NotPresent)`) →
+//!     `Ok(Some(Config::default_rotation_interval()))` — the unchanged 30-day
+//!     behaviour every existing deployment takes;
+//!   * NOT UTF-8 (`Err(VarError::NotUnicode(..))`) → `Err`, never the default;
+//!   * PRESENT (`Ok(raw)`) → whatever the parser makes of it, INCLUDING the
+//!     error. A malformed value must never be swallowed into the default: an
+//!     operator who typed `of` instead of `off` would otherwise believe
+//!     rotation was disabled while a 30-day timer was in fact still armed.
 //!
 //! These tests do not compile until `parse_rotation_interval` exists — that
 //! compile failure is the expected RED.
 
+use std::env::VarError;
 use std::time::Duration;
 
 use wiremesh_controller::{
@@ -233,6 +247,71 @@ fn rejects_overflowing_values() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The 3650d (10-year) upper bound — the second silent route to a disabled
+// timer, closed.
+// ---------------------------------------------------------------------------
+
+/// The cap in seconds, spelled out here rather than imported: the bound is part
+/// of the operator-facing contract, so the test states it independently instead
+/// of agreeing with whatever the implementation currently computes.
+const MAX_SECS: u64 = 3650 * 24 * 60 * 60;
+
+/// Exactly the cap is ACCEPTED — the bound is inclusive, and it must be
+/// expressible in whichever unit the operator reached for. The bound is applied
+/// to the computed seconds, so the same instant has to be accepted through all
+/// four spellings.
+#[test]
+fn accepts_intervals_up_to_the_ten_year_cap() {
+    for input in ["3650d", "87600h", "5256000m", "315360000s"] {
+        assert_eq!(
+            parsed(input),
+            Some(Duration::from_secs(MAX_SECS)),
+            "{input:?} is exactly the 3650d cap and must be ACCEPTED — the bound is \
+             inclusive, and it must not depend on which unit the operator used to write it"
+        );
+    }
+}
+
+/// One unit above the cap is REJECTED, uniformly across units.
+///
+/// Why a cap exists at all: an interval large enough never to fire is a SECOND
+/// way to disable automatic rotation — one that does not go through `off`, and
+/// therefore never prints the boot banner. That banner is the controller's only
+/// runtime signal that rotation is off (no metrics endpoint), so a silent route
+/// past it defeats the safety mechanism this whole knob was built around.
+/// `18446744073709551615s` was the concrete case: with unit `s` the overflow
+/// check can never trip, and tokio's `Interval` saturates rather than
+/// panicking, so it "worked".
+#[test]
+fn rejects_intervals_above_the_ten_year_cap() {
+    for input in [
+        // One unit past the boundary, in each unit.
+        "3651d",
+        "87601h",
+        "5256001m",
+        "315360001s",
+        // The concrete finding: u64::MAX seconds, which no overflow check can
+        // catch because the multiplier is 1.
+        "18446744073709551615s",
+        // And a merely absurd one an operator might actually type.
+        "100000d",
+    ] {
+        let msg = rejected(input);
+        assert!(
+            msg.contains("3650d"),
+            "the rejection of {input:?} must tell the operator what the maximum actually is \
+             (3650d) — otherwise their only recourse is to guess downwards. Got: {msg:?}"
+        );
+        assert!(
+            msg.to_lowercase().contains("off"),
+            "an over-long interval is an attempt to make rotation not happen, so its \
+             rejection must point at `off` — the one spelling that disables rotation AND \
+             announces it at boot. Got: {msg:?}"
+        );
+    }
+}
+
 /// Requirement 6: the default is unchanged at 30 days. `Config::default_rotation_interval()`
 /// stays a plain `Duration` (the `Option` lives on the `Config` field, where
 /// `None` means "disabled"), and `30d` — the string an operator would write to
@@ -295,6 +374,43 @@ fn unknown_suffix_rejection_does_not_claim_units_are_lowercase() {
     }
 }
 
+/// The lowercase claim must hold only when CASING IS THE SOLE PROBLEM. An
+/// uppercase unit sitting on a broken count (`abcD`) — or standing alone with
+/// no count at all (`D`) — is not a miscased interval, and "write `d`, not `D`"
+/// would hand the operator a second value (`abcd`, `d`) that is *also*
+/// rejected: two restarts to learn one thing. Those must fall through to the
+/// ordinary bad-number / unknown-suffix rejections instead.
+///
+/// This is the shape the sibling test above does not reach: it covers a bad
+/// SUFFIX with a good count, whereas this covers a good-looking suffix with a
+/// bad count.
+#[test]
+fn miscased_suffix_on_a_broken_count_does_not_claim_units_are_lowercase() {
+    // The control: casing IS the sole problem here, so the claim is true and
+    // must still be made. Asserted alongside the negatives so this test fails
+    // if the uppercase branch is deleted outright rather than narrowed.
+    for input in ["30D", "15M", "900S", "12H"] {
+        let msg = rejected(input);
+        assert!(
+            msg.to_lowercase().contains("lowercase"),
+            "parse_rotation_interval({input:?}) is a well-formed count with a MISCASED unit \
+             — casing is the only thing wrong with it, so the rejection must still say units \
+             are lowercase. Got: {msg:?}"
+        );
+    }
+
+    for input in ["abcD", "D", "  D  ", "S", "xM", "-1D", "1.5H", "offD"] {
+        let msg = rejected(input);
+        assert!(
+            !msg.to_lowercase().contains("lowercase"),
+            "parse_rotation_interval({input:?}) is not merely miscased — the part before the \
+             suffix is not a whole number (or is missing entirely), so lowercasing the unit \
+             would leave it just as invalid. Claiming 'units are lowercase' here sends the \
+             operator back for another restart with a value that still fails. Got: {msg:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Environment resolution (`rotation_interval_from_env`).
 // ---------------------------------------------------------------------------
@@ -306,7 +422,7 @@ fn unknown_suffix_rejection_does_not_claim_units_are_lowercase() {
 /// to boot) is acceptable here.
 #[test]
 fn env_absent_yields_the_unchanged_thirty_day_default() {
-    let got = rotation_interval_from_env(|_| None).unwrap_or_else(|e| {
+    let got = rotation_interval_from_env(|_| Err(VarError::NotPresent)).unwrap_or_else(|e| {
         panic!("an ABSENT {ROTATION_INTERVAL_ENV} must not be an error, got: {e:#}")
     });
     assert_eq!(
@@ -330,7 +446,7 @@ fn env_present_and_valid_yields_the_parsed_value() {
         // Whitespace an env file or Kubernetes manifest would pick up.
         ("  15m\n", Duration::from_secs(15 * 60)),
     ] {
-        let got = rotation_interval_from_env(|_| Some(raw.to_string()))
+        let got = rotation_interval_from_env(|_| Ok(raw.to_string()))
             .unwrap_or_else(|e| panic!("{ROTATION_INTERVAL_ENV}={raw:?} must parse, got: {e:#}"));
         assert_eq!(
             got,
@@ -345,7 +461,7 @@ fn env_present_and_valid_yields_the_parsed_value() {
 #[test]
 fn env_present_off_disables_rotation() {
     for raw in ["off", "OFF", "  Off  "] {
-        let got = rotation_interval_from_env(|_| Some(raw.to_string())).unwrap_or_else(|e| {
+        let got = rotation_interval_from_env(|_| Ok(raw.to_string())).unwrap_or_else(|e| {
             panic!("{ROTATION_INTERVAL_ENV}={raw:?} must be accepted, got: {e:#}")
         });
         assert_eq!(
@@ -353,6 +469,55 @@ fn env_present_off_disables_rotation() {
             "{ROTATION_INTERVAL_ENV}={raw:?} must resolve to None — automatic rotation \
              DISABLED"
         );
+    }
+}
+
+/// **The review finding.** A PRESENT variable whose bytes are not UTF-8
+/// (`Err(VarError::NotUnicode(..))`) is a hard error — never the 30-day
+/// default.
+///
+/// `std::env::var(k).ok()`, the obvious closure to pass, collapses this case
+/// into `None`; `None` reads as absent; absent means the default. So a value
+/// the operator did set — plausibly a mis-encoded `off` pasted out of a
+/// terminal or a mangled env file — would have silently ARMED the automatic
+/// rotation timer, with no error and no banner, for someone who believed they
+/// had switched it off. The whole point of `lookup` mirroring `std::env::var`'s
+/// signature is that this third case cannot be dropped on the floor, so the
+/// test asserts the distinction the type now preserves.
+#[test]
+fn env_non_utf8_value_is_a_hard_error_not_the_default() {
+    // `off` with a stray continuation byte on the end — present, non-empty,
+    // and not representable as a `String`.
+    use std::os::unix::ffi::OsStringExt;
+    let not_utf8 = std::ffi::OsString::from_vec(vec![b'o', b'f', b'f', 0x80]);
+
+    match rotation_interval_from_env(|_| Err(VarError::NotUnicode(not_utf8))) {
+        Ok(v) => panic!(
+            "a PRESENT-but-not-UTF-8 {ROTATION_INTERVAL_ENV} must be a startup error, got \
+             Ok({v:?}). {} would be the worst of these: it is indistinguishable from \
+             'absent', so an operator who set the variable and got it mis-encoded would run \
+             a 30-day rotation timer they believe is off.",
+            if v == Some(Config::default_rotation_interval()) {
+                "Falling back to the 30-day default (which is what happened here)"
+            } else {
+                "Falling back to any default"
+            }
+        ),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            assert!(
+                msg.contains(ROTATION_INTERVAL_ENV),
+                "the rejection must name the variable at fault ({ROTATION_INTERVAL_ENV}); \
+                 the operator cannot see the raw bytes and needs to be told which variable \
+                 to re-set. Got: {msg:?}"
+            );
+            assert!(
+                msg.to_lowercase().contains("utf-8"),
+                "the rejection must say the value is not valid UTF-8 — that is the ONLY \
+                 clue the operator has, since the bytes themselves cannot be echoed back \
+                 legibly. Got: {msg:?}"
+            );
+        }
     }
 }
 
@@ -367,7 +532,7 @@ fn env_present_off_disables_rotation() {
 #[test]
 fn env_present_malformed_is_a_startup_error_not_a_silent_default() {
     for raw in ["of", "0", "30", "30dd", "30D", "abc", "", "   ", "-1d", "30w"] {
-        match rotation_interval_from_env(|_| Some(raw.to_string())) {
+        match rotation_interval_from_env(|_| Ok(raw.to_string())) {
             Ok(v) => panic!(
                 "{ROTATION_INTERVAL_ENV}={raw:?} is malformed and MUST be a startup error. \
                  Got Ok({v:?}) — a silent fallback here leaves an operator believing they \
@@ -391,7 +556,7 @@ fn env_present_malformed_is_a_startup_error_not_a_silent_default() {
 /// `rotation_interval_from_env` has added its context.
 #[test]
 fn env_error_preserves_the_underlying_reason() {
-    let e = rotation_interval_from_env(|_| Some("0s".to_string()))
+    let e = rotation_interval_from_env(|_| Ok("0s".to_string()))
         .expect_err("a zero interval must be rejected through the env path too");
     let msg = format!("{e:#}");
     assert!(
@@ -412,7 +577,7 @@ fn env_lookup_is_called_once_with_the_canonical_variable_name() {
     let seen = std::cell::RefCell::new(Vec::new());
     let got = rotation_interval_from_env(|key| {
         seen.borrow_mut().push(key.to_string());
-        None
+        Err(VarError::NotPresent)
     })
     .expect("an absent variable must not be an error");
     assert_eq!(got, Some(Config::default_rotation_interval()));
