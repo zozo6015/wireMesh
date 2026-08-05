@@ -4697,12 +4697,17 @@ async fn run_rotation_ticks(rot: RotationShared) {
                         if watch.is_empty() && !warned_empty_watch {
                             warned_empty_watch = true;
                             eprintln!(
-                                "wiremesh-gateway: Role A — every peer of the rotation to {} has \
-                                 left the watch set (roster no longer lists them, or lists no \
-                                 usable active key); the old epoch {} will NOT be retired while \
-                                 that holds, because an empty watch set corroborates nothing. Its \
-                                 Device and enforcer stay up until a peer reappears or the \
-                                 process restarts",
+                                "wiremesh-gateway: ROTATION WEDGED — every peer of the rotation \
+                                 to {} has left the watch set (roster no longer lists them, or \
+                                 lists no usable active key). The old epoch {} will NOT be \
+                                 retired while that holds, because an empty watch set \
+                                 corroborates nothing. THIS IS NOT ONLY A LEAK: the rotation \
+                                 stays in CutOver, and `Rotation::on_directive` is honored only \
+                                 from Idle, so THIS GATEWAY WILL SILENTLY IGNORE EVERY FURTHER \
+                                 RotateDirective UNTIL THE PROCESS RESTARTS. `service_retire` \
+                                 also never runs, so the old private key is never scrubbed from \
+                                 epoch_keys.json — the security half of the rotation does not \
+                                 happen. Restart the gateway to clear this",
                                 a.new_tun, a.old_epoch
                             );
                         }
