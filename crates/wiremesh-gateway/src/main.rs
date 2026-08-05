@@ -864,6 +864,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         wg0_pins: wg0_pins.clone(),
         desired: ctx.desired.clone(),
         live_endpoints: live_endpoints.clone(),
+        relay_transports: ctx.relay_transports.clone(),
         retire_ready: Arc::new(std::sync::Mutex::new(None)),
         epoch_keys: epoch_keys.clone(),
         applied_version: applied_version.clone(),
@@ -899,7 +900,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     // signalled (every peer cut over to the new tun and the
                     // grace elapsed). Done HERE in the run task because it owns
                     // the non-`Send` `tunnels`/`enforcers`.
-                    service_retire(&mut tunnels, &enforcers, &rot).await;
+                    service_retire(&mut tunnels, &enforcers, &rot, &ctx).await;
                     // Likewise any completed Role-B collapse (a rotated PEER's
                     // overlap Device whose reverse make-before-break finished).
                     service_role_b_collapse(&mut tunnels, &enforcers, &rot).await;
@@ -3575,6 +3576,207 @@ async fn apply_state(
     Ok(())
 }
 
+/// Rewrite the `listen_port=` line in an encoded UAPI `set` string's device
+/// HEADER, leaving every other byte — the private key, `replace_peers`, and
+/// every peer block — byte-identical. `None` if the header carries no
+/// `listen_port=` line at all.
+///
+/// This is how the active tun's change-guard is re-seeded after
+/// [`renormalize_active_listen_port`] moves the port (port-authority fix,
+/// piece 2). Deliberately a TEXTUAL rewrite of the recorded config rather than
+/// a fresh `device_config_pinned` render: `applied_config` means "the last
+/// config actually pushed to this device", and the port is the ONLY thing the
+/// renormalization pushed. Re-rendering from the current desired state would
+/// instead record config that was never applied, silently swallowing any peer
+/// delta that accumulated since the last apply.
+///
+/// Only the header is scanned. `push_peer_block` never emits a `listen_port=`
+/// line, so the restriction is belt-and-braces rather than load-bearing — but
+/// it means a peer field that ever gained that prefix could not be corrupted
+/// by this.
+fn rewrite_listen_port(encoded: &str, port: u16) -> Option<String> {
+    let split = encoded.find("public_key=").unwrap_or(encoded.len());
+    let (header, peers) = encoded.split_at(split);
+    let mut out = String::with_capacity(encoded.len() + 8);
+    let mut replaced = false;
+    for line in header.split_inclusive('\n') {
+        if line.starts_with("listen_port=") {
+            out.push_str(&format!("listen_port={port}\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    if !replaced {
+        return None;
+    }
+    out.push_str(peers);
+    Some(out)
+}
+
+/// Point every LIVE relay transport's downlink at `127.0.0.1:<wg_port>`.
+///
+/// `RelayTransport` delivers relayed inbound to the local address it last saw
+/// sending — seeded at `start` from the then-current active listen port. Any
+/// move of that port (a Role-A cutover, or the retire-time renormalization)
+/// therefore leaves every existing transport delivering to a port boringtun no
+/// longer listens on, and every relayed peer black-holes until boringtun's next
+/// outbound datagram re-teaches the pump. Calling this immediately after the
+/// port moves closes that window; see `RelayTransport::set_local_peer`.
+///
+/// Best-effort and non-destructive by construction: it mutates one address per
+/// live transport and touches neither the QUIC connection nor WireGuard, so
+/// there is nothing here to fail or to unwind. A gateway with no relayed peers
+/// (the common case) does nothing and logs nothing.
+async fn retarget_relay_transports(
+    relay_transports: &Arc<Mutex<HashMap<u64, PeerRelay>>>,
+    wg_port: u16,
+    why: &str,
+) {
+    let local = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, wg_port));
+    let map = relay_transports.lock().await;
+    for (gid, pr) in map.iter() {
+        pr.transport.set_local_peer(local).await;
+        eprintln!(
+            "wiremesh-gateway: peer={gid} relay={} downlink re-pointed at {local} ({why})",
+            pr.relay_id
+        );
+    }
+}
+
+/// Put the surviving active tun back on the BASE WireGuard listen port after a
+/// rotation's old epoch has been torn down — the renormalization at the heart
+/// of the port-authority fix, piece 2
+/// (`docs/research/port-authority-verification-the-shape-was-wrong.md`).
+///
+/// # The invariant this restores
+///
+/// A Role-A cutover moves the active key onto a rotation offset port and, until
+/// now, NOTHING ever moved it back except a reboot (OD-1, see `run`'s boot
+/// comment). Everything durable that addresses this gateway is base-port by
+/// construction — the controller-observed candidate (the observe socket is
+/// bound to `cfg.wg_listen_port` for process life), reported locals, punch
+/// candidates, `live_endpoints` — so after one cutover none of them can reach
+/// the active key, and after a SECOND rotation the free-list allocation drifts
+/// one port further out with no side able to predict it. Both are the same
+/// invariant violated twice, which is why neither is fixable alone.
+///
+/// # Ordering: this can only run once the old Device is GONE
+///
+/// The old epoch's Device holds the base port until it is dropped, so this must
+/// follow `TunnelSet::tear_down`, never precede it. That is also why this hangs
+/// off the retire rather than the cutover: at the cutover the base port is
+/// still in use by the very key peers are still talking to.
+///
+/// # Failure posture
+///
+/// Everything is ordered so a failure leaves a COHERENT state rather than a
+/// half-moved one. The UAPI write + the `TunnelSet` record go first
+/// (`TunnelSet::set_listen_port` does both, or neither); only once the device
+/// has really moved are `ActiveTunInfo::wg_port` and the change-guard
+/// published. A failed move therefore leaves the gateway exactly where it was —
+/// on the offset port, i.e. today's behaviour — instead of advertising a port
+/// it is not on.
+///
+/// # Why the change-guard MUST be re-seeded here
+///
+/// `apply_state` compares the non-peer device header (`private_key` +
+/// `listen_port`) of the freshly built config against `applied_config`, and a
+/// mismatch forces the full `replace_peers` apply — which with this boringtun
+/// is session-destructive for EVERY peer (`uapi::apply`'s caveat). Moving the
+/// port without re-seeding the guard would therefore trade the port fix for a
+/// torn-down data plane on the very next Sync `State` event. The guard is a
+/// textual rewrite of the recorded config (see [`rewrite_listen_port`]), so it
+/// keeps describing what was actually pushed; if the rewrite cannot be made,
+/// the guard is CLEARED rather than left lying — `None` forces one full apply,
+/// which is the same cost as the mismatch but without a stale record.
+///
+/// The move and the publish (and only those — see the inline lock-order note)
+/// run under `PathCtx::endpoint_commit`, the lock a concurrent
+/// `set_peer_endpoint` (punch or relay install) already holds across its own
+/// guard read-modify-write. Without it the two interleave on `ActiveTunInfo`:
+/// `set_peer_endpoint` snapshots `wg_port`, we publish, and it then writes back
+/// a guard rendered at the OLD port — reintroducing the very header mismatch
+/// this re-seed exists to prevent.
+async fn renormalize_active_listen_port(
+    tunnels: &mut TunnelSet,
+    ctx: &PathCtx,
+    base_wg_port: u16,
+) {
+    let (id, ifname, from) = {
+        let a = ctx.active.lock().unwrap();
+        (TunnelId::Own { epoch: a.epoch }, a.ifname.clone(), a.wg_port)
+    };
+    if from == base_wg_port {
+        return; // never left the base port (no cutover happened) — nothing to do
+    }
+    // Serialize the move + publish against `set_peer_endpoint`'s guard
+    // read-modify-write; see this function's doc. Scoped to exactly that, and
+    // deliberately NOT held across the relay/poke work below: every existing
+    // site takes the `relay_transports` mutex ALONE (never while holding
+    // `endpoint_commit`), and this must not be the one call that introduces the
+    // opposite lock order.
+    {
+        let _commit = ctx.endpoint_commit.lock().await;
+        if let Err(e) = tunnels.set_listen_port(id, base_wg_port) {
+            eprintln!(
+                "wiremesh-gateway: CRITICAL: could not renormalize {ifname} from listen port \
+                 {from} back to the base port {base_wg_port}: {e:#} — the active key stays on \
+                 {from}, which NO durable candidate (controller-observed endpoint, reported \
+                 locals, punch candidates) advertises, so peers that lose their live pin cannot \
+                 re-address this gateway without a restart"
+            );
+            return;
+        }
+        // The device really moved: publish it. Both fields under one guard so
+        // no reader can observe a port/guard pair that never existed.
+        let mut a = ctx.active.lock().unwrap();
+        a.wg_port = base_wg_port;
+        a.applied_config = match a.applied_config.as_deref() {
+            Some(cfg) => match rewrite_listen_port(cfg, base_wg_port) {
+                Some(rewritten) => Some(rewritten),
+                None => {
+                    eprintln!(
+                        "wiremesh-gateway: change-guard for {ifname} carried no listen_port line; \
+                         clearing it so the next apply rebuilds rather than mismatching"
+                    );
+                    a.applied_peers.clear();
+                    None
+                }
+            },
+            // Nothing has been applied through the guard since the cutover, so
+            // there is nothing to correct: the next apply is a full one either
+            // way.
+            None => None,
+        };
+    }
+    // Relayed peers: the downlink's delivery address is the port we just left.
+    retarget_relay_transports(&ctx.relay_transports, base_wg_port, "listen port renormalized")
+        .await;
+    eprintln!(
+        "wiremesh-gateway: renormalized {ifname} from listen port {from} back to the base port \
+         {base_wg_port} — the active key is addressable at its advertised port again"
+    );
+    // Our SOURCE port changed, so every peer's boringtun is still sending to
+    // {from} until it authenticates a datagram from {base_wg_port} and roams.
+    // It will (the endpoint address we send TO is untouched by the rebind — see
+    // `uapi::set_listen_port`), but on nothing faster than the 25s keepalive,
+    // which is uncomfortably close to the degrade threshold. Poke each peer so
+    // boringtun emits now and the roam happens immediately. Best-effort and
+    // spawned: this must not hold the run task.
+    let peers: Vec<u64> = ctx
+        .desired
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|ds| ds.peers.iter().map(|p| p.gateway_id).collect())
+        .unwrap_or_default();
+    for gid in peers {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { poke_peer_overlay(&ctx, gid).await });
+    }
+}
+
 /// Service a pending old-epoch retire the rotation tick has signalled via
 /// [`RotationShared::retire_ready`]. Runs in the run task, which owns the
 /// non-`Send` `tunnels` (and drives the shared `enforcers`). Idempotent and a
@@ -3583,10 +3785,17 @@ async fn apply_state(
 /// already `Idle`. Tears the old epoch's Device down (drops the boringtun
 /// Device — its private key gone from any live Device — and `ip link del`s the
 /// tun) and evicts its enforcer (closing the map's per-epoch entry).
+///
+/// Then RENORMALIZES the surviving active tun back onto the base WireGuard
+/// listen port (port-authority fix, piece 2 — see
+/// [`renormalize_active_listen_port`] for the invariant it restores, and for
+/// why this is the only place it can happen: the base port is not free until
+/// the teardown above drops the old Device).
 async fn service_retire(
     tunnels: &mut TunnelSet,
     enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
     rot: &RotationShared,
+    ctx: &PathCtx,
 ) {
     let Some(old_epoch) = rot.retire_ready.lock().unwrap().take() else {
         return;
@@ -3610,6 +3819,12 @@ async fn service_retire(
         eprintln!("wiremesh-gateway: tearing down retired epoch {epoch} Device failed: {e}");
     }
     enforcers.lock().await.remove(&id);
+    // The base port is free again as of the teardown above — put the surviving
+    // active key back on it (port-authority fix, piece 2). Best-effort and
+    // self-contained: it publishes nothing unless the device really moved, so a
+    // failure here leaves the pre-existing (offset-port) behaviour and must not
+    // hold up the key scrub below, which is the security half of the retire.
+    renormalize_active_listen_port(tunnels, ctx, rot.base_wg_port).await;
     // Durable retire (Backlog 3 Task 1 — the SECURITY half): tearing the
     // Device down only destroys the live in-process copy of the old private
     // key; `retire` REMOVES the epoch's store entry and `persist` rewrites
@@ -3753,6 +3968,16 @@ struct RotationShared {
     /// this map), or the change-guard would mismatch and the next apply would
     /// needlessly rebuild the new tun's live session.
     live_endpoints: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    /// Live relay transports (same `Arc` [`PathCtx`] holds). Needed at the
+    /// Role-A cutover for exactly one reason: the cutover MOVES the active
+    /// tun's listen port, and a `RelayTransport` delivers relayed inbound to
+    /// the local address it last saw sending — seeded from the port the active
+    /// tun had when that transport was started. Left alone, every relayed peer
+    /// black-holes across the cutover until boringtun's next outbound datagram
+    /// re-teaches the pump. See [`retarget_relay_transports`], called from both
+    /// port-moving sites: the cutover below and the retire-time
+    /// renormalization.
+    relay_transports: Arc<Mutex<HashMap<u64, PeerRelay>>>,
     /// Signal from the rotation tick to the run task: the OLD epoch to retire
     /// (tear its Device down + evict its enforcer) once every peer has cut over
     /// to the new tun and the retire grace has elapsed. The run task owns the
@@ -4822,6 +5047,23 @@ async fn run_rotation_ticks(rot: RotationShared) {
                                     ),
                                 }
                             }
+                            // The active tun's listen port just MOVED (base ->
+                            // `a.new_port`). Every live relay transport is
+                            // still delivering relayed inbound to the port we
+                            // left, where the OLD Device — holding the OLD
+                            // private key — cannot decrypt what the peer now
+                            // sends. Re-teach them before anything else gets a
+                            // chance to notice the silence. Pre-existing bug
+                            // (every rotation has always black-holed relayed
+                            // peers this way); handled here because piece 2
+                            // adds a SECOND port move and must not make it more
+                            // frequent while leaving it unfixed.
+                            retarget_relay_transports(
+                                &rot.relay_transports,
+                                a.new_port,
+                                "Role A cutover",
+                            )
+                            .await;
                             eprintln!(
                                 "wiremesh-gateway: Role A cutover — peer routes re-derived against \
                                  {} (epoch {epoch})",

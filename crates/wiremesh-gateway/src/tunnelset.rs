@@ -387,6 +387,69 @@ impl TunnelSet {
         Ok(())
     }
 
+    /// Move a LIVE Device's WireGuard listen port — on the device AND in this
+    /// set's bookkeeping, in one call, so the two cannot drift.
+    ///
+    /// # Why this exists (port-authority fix, piece 2)
+    ///
+    /// After a Role-A cutover the surviving active Device sits on a rotation
+    /// offset port permanently (OD-1) and every durable way the fabric
+    /// addresses this gateway is base-port by construction. `service_retire`
+    /// calls this the moment the old epoch's Device is gone, putting the
+    /// survivor back on the base port — which is what makes a peer's in-flight
+    /// new-epoch tun land at a predictable offset again instead of drifting one
+    /// port further away on every rotation. See
+    /// `docs/research/port-authority-verification-the-shape-was-wrong.md`.
+    ///
+    /// # Why the bookkeeping half is not optional
+    ///
+    /// [`Self::plans`] is the ONLY input [`plan_tunnel`] has about what is
+    /// taken, and [`Tunnel::reconcile`] renders `listen_port` into a FULL
+    /// (`replace_peers=true`, session-destructive) device config. A recorded
+    /// port left describing a port the Device no longer holds would therefore
+    /// both misdirect the next rotation's allocation and arm a rebuild that
+    /// silently moves the Device back.
+    ///
+    /// The device write goes first: if it fails, the record still describes
+    /// reality and the caller can decline to publish the new port anywhere
+    /// else. A no-op when the Device is already on `port`; an error (with the
+    /// record untouched) when `id` is absent or a DIFFERENT live entry already
+    /// holds `port` — this never silently evicts another Device from a port.
+    pub fn set_listen_port(&mut self, id: TunnelId, port: u16) -> anyhow::Result<()> {
+        let (ifname, current) = {
+            let tunnel = self.tunnels.get(&id).ok_or_else(|| {
+                anyhow::anyhow!("no tunnel up for {id:?}; cannot move it to listen port {port}")
+            })?;
+            (tunnel.ifname.clone(), tunnel.listen_port)
+        };
+        if current == port {
+            return Ok(());
+        }
+        if let Some((other, t)) =
+            self.tunnels.iter().find(|(k, t)| **k != id && t.listen_port == port)
+        {
+            anyhow::bail!(
+                "cannot move {id:?} ({ifname}) to listen port {port}: the live {other:?} ({}) \
+                 already holds it",
+                t.ifname
+            );
+        }
+        uapi::set_listen_port(&ifname, port)?;
+        self.tunnels
+            .get_mut(&id)
+            .expect("presence checked immediately above, and &mut self excludes concurrent removal")
+            .listen_port = port;
+        // The port is LIVE again, so a quarantine entry still reserving it is
+        // stale — exactly the hygiene `bring_up` performs for the same reason.
+        // Releasing that entry's IFNAME claim alongside it is harmless: every
+        // name `plan_ifname` can hand out is `{base}e{n}` or `{base}o{slot}`,
+        // and the entry being dropped here is the tun that just VACATED this
+        // port, i.e. a retired own-epoch tun whose epoch number is never
+        // re-planned.
+        self.quarantine.retain(|(p, _)| p.listen_port != port);
+        Ok(())
+    }
+
     pub fn get(&self, id: TunnelId) -> Option<&Tunnel> {
         self.tunnels.get(&id)
     }

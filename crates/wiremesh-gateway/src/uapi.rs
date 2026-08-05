@@ -287,6 +287,51 @@ pub fn apply(ifname: &str, cfg: &DeviceConfig) -> anyhow::Result<()> {
     send_set(ifname, &encode_set(cfg)?)
 }
 
+/// Move a LIVE device's WireGuard listen port, in place, with **nothing else**
+/// in the `set=1` body — no `private_key`, no `replace_peers`, no peer blocks.
+///
+/// This is the renormalization primitive of the port-authority fix, piece 2
+/// (`docs/research/port-authority-verification-the-shape-was-wrong.md`): after
+/// a Role-A cutover the surviving active Device sits on a rotation OFFSET port
+/// forever (OD-1), so every durable thing that addresses this gateway — the
+/// controller-observed candidate, reported locals, punch candidates — is
+/// pointing at a port the active key has permanently left. Once the old epoch
+/// is retired the base port is free again, and this puts the survivor back on
+/// it.
+///
+/// # Why this is safe on a live device (boringtun 0.6.0, read from source)
+///
+///  - `api_set`'s device-section loop maps `listen_port` to
+///    `Device::open_listen_socket(port)` and nothing else; a body that carries
+///    only this line never reaches `set_key` or `clear_peers`
+///    (`device/api.rs`).
+///  - `open_listen_socket` closes `udp4`/`udp6`, calls `shutdown_endpoint()`
+///    on every peer, then rebinds. It does **not** touch any peer's `Tunn`, so
+///    unlike `private_key=` (which rebuilds every session) and
+///    `replace_peers=true` (`clear_peers()`) **the noise sessions survive**
+///    (`device/mod.rs`).
+///  - `Peer::shutdown_endpoint` only `take`s the CONNECTED socket
+///    (`endpoint.conn`); `endpoint.addr` is left intact (`device/peer.rs`), so
+///    every peer keeps the address it was sending to and simply falls back to
+///    `send_to` on the fresh `udp4`.
+///  - Both sockets rebind with `set_reuse_address(true)`, and the gateway's
+///    only other socket on this port — the transient observe probe — sets
+///    `SO_REUSEADDR` too (`observe::reuseport_udp`). Linux's UDP bind conflict
+///    check is skipped when BOTH sockets carry `SO_REUSEADDR`, so an in-flight
+///    observe probe cannot make this fail with `EADDRINUSE`. (The steady state
+///    after this call is byte-for-byte the boot-time arrangement: boringtun on
+///    the base port plus the periodic observe probe beside it.)
+///
+/// The peer-visible consequence is a **source-port change**, not a session
+/// reset: our datagrams now leave from `port`, and each peer's boringtun roams
+/// its endpoint for us on the first one it authenticates. The caller is
+/// expected to prompt that rather than wait for the 25s keepalive.
+pub fn set_listen_port(ifname: &str, port: u16) -> anyhow::Result<()> {
+    // Trailing blank line terminates the request (see `send_set`).
+    send_set(ifname, &format!("listen_port={port}\n\n"))
+        .with_context(|| format!("moving {ifname} to listen port {port}"))
+}
+
 /// Shared UAPI `set=1` round-trip: connect, send `body`, check `errno`.
 fn send_set(ifname: &str, body: &str) -> anyhow::Result<()> {
     let path = format!("/var/run/wireguard/{ifname}.sock");
