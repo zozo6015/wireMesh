@@ -70,6 +70,40 @@ whichever of the two claims the directory locks the other out. The unit's
 0700 at first start; nothing needs to pre-create it. **Back this directory up:**
 losing `ca.key` means re-enrolling every gateway.
 
+### Automatic key rotation (`WIREMESH_ROTATION_INTERVAL`)
+
+The controller rotates every gateway's WireGuard key on a timer — **every 30
+days by default**. Set `WIREMESH_ROTATION_INTERVAL` in
+`/etc/wiremesh/controller.env` to change or disable it; it takes effect on
+controller restart.
+
+```sh
+WIREMESH_ROTATION_INTERVAL=30d    # <integer><s|m|h|d>, lowercase unit
+WIREMESH_ROTATION_INTERVAL=off    # disable the automatic schedule
+```
+
+A malformed value (`30dd`, `30D`, `0d`) is a **startup error** — the controller
+refuses to boot rather than quietly falling back to the 30-day default and
+leaving you believing you changed something. Uppercase units are rejected on
+purpose (`M` reads as "months" to too many people); a zero interval is rejected
+because it would rotate in a hot loop — if you meant "never", write `off`.
+
+`off` disables the automatic **schedule** only. It does not disable rotation as
+a capability:
+
+- a rotation already in flight when you switch it off still completes — the
+  controller's decision sweep keeps running, including its recovery of a
+  rotation orphaned by a crash;
+- **manual rotation still works.** `fabricctl` / the Admin `RotateKey` RPC
+  rotates a chosen gateway on demand — use it if you believe a key is
+  compromised;
+- keys already in use keep working; nothing expires on its own.
+
+While it is off, no key is rotated on a schedule for as long as the controller
+runs, and the controller prints a loud `AUTOMATIC KEY ROTATION IS OFF` warning
+at every boot (visible in `journalctl -u wiremesh-controller`). Treat that
+banner as a standing to-do, not background noise.
+
 ### Upgrading from a release that used `/var/lib/wiremesh`
 
 **Your state stays exactly where it is.** If the package finds control-plane

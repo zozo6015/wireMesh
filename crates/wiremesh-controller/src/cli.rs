@@ -89,9 +89,20 @@ CONFIGURATION (environment variables — this binary takes NO flags):
                                     Kubernetes Service). The Admin TCP listener
                                     stays loopback-only regardless. A malformed
                                     value falls back to the default.
+    WIREMESH_ROTATION_INTERVAL <interval|off>
+                                    (optional, default 30d) How often every
+                                    gateway's WireGuard key is automatically
+                                    rotated. <integer><s|m|h|d>, lowercase unit
+                                    (30d, 12h, 900s). `off` disables the
+                                    automatic SCHEDULE only: in-flight rotations
+                                    still complete and manual rotation
+                                    (fabricctl / Admin RotateKey) still works,
+                                    but no key is rotated on a timer until it is
+                                    re-enabled. A zero interval is rejected —
+                                    use `off`.
 
-    A malformed port value (e.g. WIREMESH_TCP_PORT=abc) is a startup error, not
-    a silent fallback.
+    A malformed port value (e.g. WIREMESH_TCP_PORT=abc), or a malformed
+    WIREMESH_ROTATION_INTERVAL, is a startup error, not a silent fallback.
 
 DEPLOYMENT:
     The packaged systemd unit reads these variables from /etc/wiremesh/
