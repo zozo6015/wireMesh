@@ -17,9 +17,11 @@ like any VPN client. It does not front a network and does not forward.
 `docs/PRD.md` **Non-Goals item 1**: *"Device/user-level access (v1) — no per-laptop, per-user client. This is
 segment-to-segment routing… conflating the two would bloat v1."*
 
-That exclusion has a technical shadow, and findings 1–3 below **are** that shadow. Whatever
-is decided, it should be an explicit amendment in the engineering design's §11 rather than
-arriving by accretion.
+That exclusion has a technical shadow, and findings 1–3 below **are** that shadow.
+
+> **RESOLVED 2026-08-05.** The amendment landed: PRD Non-Goals item 1 (with the G-4a
+> carve-out) and engineering design **§11.8**. The quoted non-goal above is the superseded
+> original, kept because the findings below are what its technical shadow looked like.
 
 ## What already works, verified
 
@@ -208,12 +210,14 @@ pipeline.
    (option b) is the bar for calling the client production-grade** — until it ships, the
    client is explicitly not that, and no doc may imply otherwise.
 2. **PRD non-goal 1 amended** to permit a single-host client peer, with the three
-   constraints below ratified alongside it. User identity, device posture and per-user
+   constraints ratified alongside it — finding 1's carve-out, plus 3 and 4 below. User
+   identity, device posture and per-user
    policy remain excluded — this is not a ZTNA product.
 3. **Client address space: `100.64.0.0/10`.** Adopted as recommended; overlaps nothing in
    the fabric. A client may not take an address inside an existing segment's CIDR.
-4. **Scale ceiling: roughly a dozen clients, documented as a v1 limit.** Adopted as
-   recommended. Beyond it needs the per-peer address model in phase 3.
+4. **Scale ceiling: roughly a dozen `client × segment` reachability PAIRS**, documented as
+   a v1 limit — pairs, not clients, per finding 2's arithmetic. Adopted as recommended.
+   Beyond it needs the per-peer address model in phase 3.
 
 PRD non-goal 5 (Linux-only gateways) was **kept**, with its premise corrected: it now
 stands on the `pf`-enforcer cost rather than on the Kubernetes assumption that failed.

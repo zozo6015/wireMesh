@@ -76,7 +76,18 @@ portable components.
   `wiremesh-<version>.pkg` (choosable payloads) or per-component; default = one `.pkg`
   installing `fabricctl` + optional controller/relay payloads. (fabricctl is the point.)
 
-### Mac connectivity model (owner decision 2026-07-22 — keep the segment model)
+### Mac connectivity model (owner decision 2026-07-22 — ~~keep the segment model~~)
+
+> **SUPERSEDED IN PART, 2026-08-05 (owner decision).** The paragraph below is kept for the
+> record but **no longer states current scope.** A **single-host client peer** is now in
+> scope (PRD Non-Goals item 1 amendment; engineering design §11.8), so "a Mac does not run
+> WireMesh to join the mesh" and "no … per-device client in v1" are both reversed. What
+> **stands unchanged** is the *reason it gives for the gateway*: macOS has no eBPF, so no
+> macOS **gateway** — the client is a different component that needs no enforcer of its
+> own (PRD G-4a), which is exactly why it does not reopen that question. The paragraph's
+> guess at the shape was also close: a `utun` + userspace-WG data plane is roughly what
+> phase 3 would build, though phases 1–2 need far less.
+
 The macOS artifacts are **operator/admin tooling ONLY** (chiefly `fabricctl`; controller/
 relay for local dev). They are **NOT a data-plane client** — a Mac does not run WireMesh
 to join the mesh. Per WireMesh's core tenets ("one gateway per segment", "no agents on

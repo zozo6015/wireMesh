@@ -323,7 +323,7 @@ policy:
 
 Semantics (normative):
 
-1. **Default deny.** A flow with no matching rule in the matching block — or no block for its (src segment, dst segment) pair — is dropped.
+1. **Default deny.** A flow with no matching rule in the matching block — or no block for its (src segment, dst segment) pair — is dropped. **Carve-out, 2026-08-05 (§11.8, PRD G-4a): this holds for flows *arriving at a gateway*, which is every flow whose destination is a segment. It does NOT hold for flows destined to a client peer** — enforcement is ingress-on-tun only, so `segment → client` passes the sending gateway's egress unexamined, and `client → client` never touches a gateway at all. Both are unenforced until egress-side enforcement ships. Backend parity is unaffected: neither backend enforces these directions.
 2. **Blocks are directional**: `from: A, to: B` governs flows initiated A→B only. Return traffic is implicit (OQ6); B→A initiation needs its own block.
 3. **First match wins** within a block, rules in written order. This makes deny carve-outs natural and evaluation order trivially deterministic (PRD §8 requirement). At most one block per ordered segment pair (compile error otherwise) — so cross-block ordering questions cannot arise.
 4. Rule fields: `src` (CIDRs, must be ⊆ the *from*-segment's CIDRs) and `dst` (CIDRs, ⊆ the *to*-segment's CIDRs) — compile error otherwise; omitted = the whole respective segment. `ports`: list of ports and `"lo-hi"` ranges — **requires an explicit `proto` of `tcp` or `udp`; `ports` with `proto: icmp` or with `proto` omitted is a compile error.** `proto`: `tcp` | `udp` | `icmp` (ICMPv4 — v1 is IPv4-only); omitted = all three.

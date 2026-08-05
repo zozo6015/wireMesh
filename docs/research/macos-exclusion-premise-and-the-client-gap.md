@@ -100,7 +100,8 @@ otherwise.** `docs/PRD.md` **Non-Goals item 1** lists as an explicit v1 non-goal
 (v1) — no per-laptop, per-user client. This is segment-to-segment routing… conflating the
 two would bloat v1."* The macOS *gateway* exclusion (Non-Goals item 5) and the *client* exclusion (item 1)
 are two separate ratified decisions, and a client component reopens the second one. It
-needs a spec amendment in the engineering design's §11, not just a scoping note.
+needed a spec amendment in the engineering design's §11, not just a scoping note — **that
+landed 2026-08-05 as §11.8**, together with PRD G-4a.
 
 ## What should change in the record
 
