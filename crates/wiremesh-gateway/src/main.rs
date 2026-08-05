@@ -675,6 +675,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
         endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
+        endpoint_commit_gen: Arc::new(AtomicU64::new(0)),
         wg0_pins: wg0_pins.clone(),
         // Shared with the policy-apply worker (created above), which pokes it
         // after a successful install so the loop re-reports the freshly
@@ -1345,6 +1346,31 @@ struct PathCtx {
     /// BEFORE it spawns `ensure_relay_transport`, so `state != Connecting` is
     /// the earliest signal a relay install is in play.
     endpoint_commit: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic counter of [`set_peer_endpoint`] pin mutations, bumped inside
+    /// the [`PathCtx::endpoint_commit`] critical section on every
+    /// `live_endpoints` write that function performs.
+    ///
+    /// This is what subordinates the path tick's ENDPOINT READ-THROUGH (the
+    /// port-authority fix, piece 1) to the explicit punch/relay writers rather
+    /// than letting the two race. The tick reads the device's roamed
+    /// `endpoint=` OUTSIDE the commit lock (it is one leg of the same
+    /// once-per-second `get_peer_liveness` fetch that drives the state
+    /// machine), so without a guard this interleaving reverts a just-installed
+    /// endpoint:
+    ///
+    /// 1. tick reads the device and sees peer `g` at the OLD endpoint `E1`;
+    /// 2. `set_peer_endpoint` pins `E2` (punch success, or a relay install)
+    ///    and writes it to the device;
+    /// 3. the tick's read-through writes `E1` back over the pin — the device
+    ///    still holds `E2`, but the next full `apply_state` rebuild renders
+    ///    `E1` and clobbers the live path.
+    ///
+    /// The tick therefore snapshots this counter BEFORE its UAPI read and,
+    /// holding `endpoint_commit`, re-reads it before writing: any intervening
+    /// commit means the snapshot is stale, and the whole read-through is
+    /// skipped for that tick (the next tick's read is fresh, and — since the
+    /// device and the pin then agree — resolves to a no-op).
+    endpoint_commit_gen: Arc<AtomicU64>,
     /// Shared Role-B `wg0` pin map (peer `gateway_id` -> old-epoch pubkey) — so
     /// `set_peer_endpoint` builds the same pinned config `apply_state` does and
     /// a punch during a rotation overlap can't rekey `wg0` off the pin.
@@ -1360,6 +1386,18 @@ struct PathCtx {
     /// re-point at fresh candidates — and passed by every steady-state
     /// device rebuild to `reconcile::device_config_pinned`. The same `Arc`
     /// the boot loop and `RotationShared` hold.
+    ///
+    /// SECOND WRITER, deliberately subordinate (port-authority fix, piece 1):
+    /// `run_path_ticks`'s endpoint READ-THROUGH also refreshes this map, from
+    /// the device's own roamed `endpoint=`, for peers it has just judged
+    /// `Direct`/`Relayed`. That covers every endpoint boringtun chose for
+    /// itself — which `set_peer_endpoint` by construction never sees — so a
+    /// full `replace_peers` apply can no longer rewrite a live roamed peer
+    /// back to its static base-port candidate and destroy the session. The
+    /// two writers are ordered, not racing: the read-through runs under the
+    /// same `endpoint_commit` lock and drops its whole batch if
+    /// `endpoint_commit_gen` moved during its device read, so an explicit
+    /// commit always beats a stale observation.
     live_endpoints: Arc<std::sync::Mutex<HashMap<u64, String>>>,
     /// Per-peer punch back-off state (fix T3, finding §3: an undialable
     /// pair's punch directives re-fired every few seconds indefinitely, and
@@ -2231,6 +2269,16 @@ async fn set_peer_endpoint(
     // a yielded direct punch must NOT leave a stale direct pin behind, or a
     // later `apply_state` rebuild would use it to clobber the relay endpoint.
     ctx.live_endpoints.lock().unwrap().insert(gid, endpoint.to_string());
+    // Publish the pin mutation to the path tick's endpoint read-through
+    // (port-authority fix, piece 1): bumped HERE — under `endpoint_commit`,
+    // immediately after the pin write and BEFORE the device write — so a tick
+    // that read the device before this commit can detect that its snapshot is
+    // stale and decline to write `E1` back over this `E2`. See
+    // `PathCtx::endpoint_commit_gen`. Bumped on the pin write rather than on
+    // apply success because the pin is inserted unconditionally above: a
+    // failing apply still leaves the pin mutated, and the read-through must
+    // not race that either.
+    ctx.endpoint_commit_gen.fetch_add(1, Ordering::SeqCst);
     // Build the full pinned desired device (for the change-guard and the
     // `applied_peers` bookkeeping `apply_state` diffs against) AND resolve the
     // TARGET peer's pubkey — the one peer whose block the scoped apply pushes.
@@ -2675,6 +2723,11 @@ async fn run_path_ticks(ctx: PathCtx) {
         tokio::time::sleep(PATH_TICK_PERIOD).await;
 
         let ifname = ctx.active.lock().unwrap().ifname.clone();
+        // Snapshot the endpoint-commit generation BEFORE the device read, so
+        // the endpoint read-through below can tell whether a punch/relay
+        // commit landed while this fetch was in flight (see
+        // `PathCtx::endpoint_commit_gen` for the interleaving this closes).
+        let commit_gen_at_read = ctx.endpoint_commit_gen.load(Ordering::SeqCst);
         let liveness = match tokio::task::spawn_blocking(move || {
             uapi::get_peer_liveness(&ifname)
         })
@@ -2779,6 +2832,11 @@ async fn run_path_ticks(ctx: PathCtx) {
         let mut to_sweep_pin: Vec<u64> = Vec::new();
         // Peers due a liveness probe this tick (keepalive-invisibility fix).
         let mut to_probe: Vec<u64> = Vec::new();
+        // Endpoint read-through candidates (port-authority fix, piece 1):
+        // `(gid, the endpoint the DEVICE says it is using)` for every peer
+        // this tick judged live. Collected here and reconciled against the
+        // pin map after the `paths` guard drops — see the ACT phase.
+        let mut to_pin_endpoint: Vec<(u64, SocketAddr)> = Vec::new();
         {
             let mut paths = ctx.paths.lock().unwrap();
             for peer in &ds.peers {
@@ -2787,6 +2845,13 @@ async fn run_path_ticks(ctx: PathCtx) {
                 let gid = peer.gateway_id;
                 let path = paths.entry(gid).or_insert_with(|| Path::new(now));
                 let before = path.state;
+                // The endpoint the DEVICE is actually using for this peer,
+                // taken off the SAME fetch the state machine is about to act
+                // on (endpoint read-through, port-authority fix piece 1 — see
+                // the COLLECT block further down). Captured up here because
+                // `info` is scoped to the liveness block below while the
+                // read-through needs the POST-`tick` path state.
+                let dev_endpoint = liveness.get(&hex).and_then(|i| i.endpoint);
 
                 if let Some(info) = liveness.get(&hex).copied() {
                     // Publish this peer's snapshot for the metrics scrape
@@ -2989,6 +3054,64 @@ async fn run_path_ticks(ctx: PathCtx) {
                     }
                 }
 
+                // ENDPOINT READ-THROUGH — COLLECT phase (port-authority fix,
+                // piece 1; see
+                // docs/research/port-authority-verification-the-shape-was-wrong.md).
+                //
+                // WHY: `device_config_pinned` PREFERS `live_endpoints` over
+                // `primary_endpoint()`, and until now the only writer was
+                // `set_peer_endpoint` — so the map only ever learned endpoints
+                // this gateway CHOSE (a punch candidate, or a relay socket).
+                // Anything boringtun ROAMED to on its own was invisible to
+                // every rebuild, and the next full apply (`replace_peers`)
+                // rewrote the peer back to its static base-port candidate AND
+                // destroyed the session. That is what makes the key-rotation
+                // collapse arm destroy a working roamed session: the collapse
+                // unpins, the key change forces `NeedsFullApply`, and the
+                // roamed endpoint is lost — so `all_live` never holds and
+                // `service_retire` never fires.
+                //
+                // WHAT: for a peer this tick judged LIVE (`Direct`/`Relayed`),
+                // adopt the device's own `endpoint=` as the pin. This is a
+                // CONTINUOUS read-through, not a one-shot seed at the rotation
+                // cutover: the only roamed value available at the cutover is
+                // the peer's transient Role-B overlap socket, which is
+                // destroyed when that overlap collapses, so seeding from it
+                // would durably pin a dead address.
+                //
+                // The existing semantics are preserved exactly — live peers
+                // keep the endpoint their tunnel is really using, dead peers
+                // chase candidates (the pin is still cleared the moment the
+                // path leaves `Direct`/`Relayed`, in the `to_record` loop
+                // below). This does not add a competing writer: it is
+                // subordinate to `set_peer_endpoint`, which still decides
+                // where a NON-live peer gets pointed, and whose commits win
+                // over a stale read via `endpoint_commit_gen`.
+                //
+                // RELAY: for a `Relayed` peer the device's endpoint IS the
+                // loopback relay socket — `RelayTransport` serves both pump
+                // directions from the ONE socket it bound at `127.0.0.1:0`,
+                // so relayed inbound reaches boringtun sourced from exactly
+                // the `local_addr` `set_peer_endpoint` installed, and the
+                // read-through resolves to a no-op. (If a relayed peer's
+                // device did roam off-loopback, an authenticated datagram
+                // genuinely arrived direct and boringtun is ALREADY sending
+                // there — the pin then just stops a later rebuild from
+                // disagreeing with the device.)
+                //
+                // Rejected values: a port-0 or unspecified-IP endpoint is
+                // undialable, so it must never be made durable — better no
+                // pin (chase the candidate) than a black hole. Unparseable
+                // endpoints are already dropped in `uapi::parse_get_response`.
+                if matches!(path.state, PathState::Direct | PathState::Relayed) {
+                    match dev_endpoint {
+                        Some(ep) if !ep.ip().is_unspecified() && ep.port() != 0 => {
+                            to_pin_endpoint.push((gid, ep));
+                        }
+                        _ => {}
+                    }
+                }
+
                 if before != path.state {
                     to_record.push((gid, before, path.state));
                     if path.state == PathState::Direct {
@@ -3005,6 +3128,52 @@ async fn run_path_ticks(ctx: PathCtx) {
         // (fix T5). Whole-map replacement: peers dropped from desired state
         // vanish from the scrape body the same tick.
         *ctx.peer_stats.lock().unwrap() = stats_snapshot;
+
+        // ENDPOINT READ-THROUGH — ACT phase (port-authority fix, piece 1; see
+        // the COLLECT block above for the full rationale). Two steps, both
+        // outside the `paths` guard:
+        //
+        // 1. Diff against the current pins first, under a short
+        //    `live_endpoints` lock with nothing else held. In steady state the
+        //    device agrees with the pin, so this is empty and the tick costs
+        //    one uncontended lock — no `endpoint_commit` traffic, no log line.
+        // 2. Only a REAL change takes `endpoint_commit` and re-checks the
+        //    commit generation snapshotted before this tick's device read. A
+        //    mismatch means `set_peer_endpoint` committed a newer endpoint
+        //    while our read was in flight, so what we observed is stale and
+        //    the whole batch is dropped — the explicit writer always wins.
+        //    See `PathCtx::endpoint_commit_gen`.
+        let endpoint_changes: Vec<(u64, String)> = {
+            let live = ctx.live_endpoints.lock().unwrap();
+            to_pin_endpoint
+                .into_iter()
+                .filter_map(|(gid, ep)| {
+                    let ep = ep.to_string();
+                    (live.get(&gid) != Some(&ep)).then_some((gid, ep))
+                })
+                .collect()
+        };
+        if !endpoint_changes.is_empty() {
+            let _commit = ctx.endpoint_commit.lock().await;
+            if ctx.endpoint_commit_gen.load(Ordering::SeqCst) == commit_gen_at_read {
+                let mut live = ctx.live_endpoints.lock().unwrap();
+                for (gid, ep) in endpoint_changes {
+                    eprintln!(
+                        "wiremesh-gateway: peer={gid} endpoint read-through: pinning {ep} \
+                         (the endpoint the device is actually using)"
+                    );
+                    live.insert(gid, ep);
+                }
+            } else {
+                // A punch/relay commit landed mid-read; its endpoint is newer
+                // than anything this fetch could have seen. Skip — the next
+                // tick reads the post-commit device and agrees with the pin.
+                eprintln!(
+                    "wiremesh-gateway: endpoint read-through skipped: an endpoint commit \
+                     landed during the device read"
+                );
+            }
+        }
 
         // Fire this tick's due liveness probes (keepalive-invisibility fix).
         // Spawned, not awaited, so a slow send never delays the tick loop; the
@@ -5020,6 +5189,7 @@ mod tests {
             relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint_commit_gen: Arc::new(AtomicU64::new(0)),
             wg0_pins: Arc::new(std::sync::Mutex::new(HashMap::new())),
             path_report_notify: Arc::new(tokio::sync::Notify::new()),
             peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),

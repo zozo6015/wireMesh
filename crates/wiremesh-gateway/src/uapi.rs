@@ -5,6 +5,7 @@
 use anyhow::{anyhow, Context};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, SystemTime};
 
@@ -322,6 +323,23 @@ pub(crate) struct PeerGetInfo {
     /// containers because the gateway exposed no per-peer rx/tx/handshake
     /// metrics). Same `get=1` response the liveness fields come from.
     pub tx_bytes: u64,
+    /// The endpoint the DEVICE is actually using for this peer, as boringtun
+    /// reports it — the ground truth the port-authority fix reads through
+    /// (`docs/research/port-authority-verification-the-shape-was-wrong.md`,
+    /// piece 1). This is NOT necessarily the endpoint we configured:
+    /// boringtun's `register_udp_handler` calls `peer.set_endpoint(addr)` on
+    /// every SUCCESSFULLY DECAPSULATED datagram, so the value ROAMS to
+    /// wherever authenticated traffic is genuinely arriving from (roaming
+    /// requires successful decryption, so an off-path sender cannot move it),
+    /// and `api_get` emits it from `p.endpoint().addr`.
+    ///
+    /// `None` when the line is absent (boringtun omits it for a peer with no
+    /// endpoint at all) or when it does not parse as a `SocketAddr` — a value
+    /// that cannot be parsed must never become a durable pin, so it is
+    /// dropped rather than guessed at. Typed as `SocketAddr` rather than
+    /// `String` both for that validation and because `SocketAddr: Copy` keeps
+    /// this struct — and the public [`PeerLiveness`] it feeds — `Copy`.
+    pub endpoint: Option<SocketAddr>,
 }
 
 /// Parse a `get=1` UAPI response body into `{pubkey_hex -> PeerGetInfo}`.
@@ -363,6 +381,11 @@ pub(crate) fn parse_get_response(resp: &str) -> HashMap<String, PeerGetInfo> {
             info.rx_bytes = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("tx_bytes=") {
             info.tx_bytes = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("endpoint=") {
+            // Unparseable => `None` (see the field doc): the caller pins this
+            // value durably, and a garbled endpoint pin is strictly worse than
+            // no pin at all (no pin means "chase the advertised candidate").
+            info.endpoint = v.trim().parse().ok();
         }
     }
     if let Some((key, info)) = current.take() {
@@ -423,6 +446,15 @@ pub struct PeerLiveness {
     pub latest_handshake: Option<SystemTime>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// The endpoint the device is ACTUALLY using for this peer right now —
+    /// see [`PeerGetInfo::endpoint`] for why this is roamed ground truth
+    /// rather than a read-back of what we configured. Carried on the same
+    /// snapshot as the liveness counters deliberately: the path tick's
+    /// endpoint read-through must only trust an endpoint for a peer it has
+    /// just judged LIVE from the very same fetch (see `run_path_ticks`'s
+    /// endpoint read-through), so the two must not come from two round-trips
+    /// that can disagree.
+    pub endpoint: Option<SocketAddr>,
 }
 
 /// Reduce parsed `get=1` peer info to `{pubkey_hex -> PeerLiveness}`.
@@ -451,6 +483,7 @@ pub(crate) fn peer_liveness_from(
                     latest_handshake: times.get(k).copied(),
                     rx_bytes: info.rx_bytes,
                     tx_bytes: info.tx_bytes,
+                    endpoint: info.endpoint,
                 },
             )
         })
