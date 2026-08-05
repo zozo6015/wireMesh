@@ -138,7 +138,12 @@ pub struct TestController {
     // after a `restart()` — exactly the scenario
     // `sweep_retires_orphaned_retiring_row_after_crash` depends on NOT
     // happening.
-    rotation_interval: std::time::Duration,
+    //
+    // `rotation_interval` mirrors `Config::rotation_interval` exactly,
+    // `None` included: a controller booted with automatic rotation DISABLED
+    // must still be disabled after `restart()`, not silently back on the
+    // 30-day default (see `wiremesh-controller/tests/rotation_disabled.rs`).
+    rotation_interval: Option<std::time::Duration>,
     rotation_sweep_interval: std::time::Duration,
     // Held only so the directory (and everything the controller wrote under
     // it — DB, CA, secrets, the socket) is cleaned up on drop; never read
@@ -201,7 +206,9 @@ impl TestController {
     pub async fn start_on(bind_ip: std::net::Ipv4Addr) -> TestController {
         Self::start_inner(
             bind_ip,
-            Config::default_rotation_interval(),
+            // `Some(..)` — automatic rotation ENABLED at the production
+            // default, exactly as before this knob existed.
+            Some(Config::default_rotation_interval()),
             Config::default_rotation_sweep_interval(),
         )
         .await
@@ -218,8 +225,13 @@ impl TestController {
     /// reuses them (see the `rotation_interval`/`rotation_sweep_interval`
     /// fields' doc comment) — a restart must NOT silently revert to
     /// `Config`'s production defaults.
+    ///
+    /// `rotation_interval` is an `Option`, mirroring `Config::rotation_interval`:
+    /// `Some(d)` boots with the initiation timer ENABLED at `d`, `None` boots
+    /// with automatic initiation DISABLED (no timer task at all — the decision
+    /// sweep still runs at `rotation_sweep_interval`).
     pub async fn start_with_rotation_intervals(
-        rotation_interval: std::time::Duration,
+        rotation_interval: Option<std::time::Duration>,
         rotation_sweep_interval: std::time::Duration,
     ) -> TestController {
         Self::start_inner(
@@ -235,7 +247,7 @@ impl TestController {
     /// see either method's doc comment for what each is for.
     async fn start_inner(
         bind_ip: std::net::Ipv4Addr,
-        rotation_interval: std::time::Duration,
+        rotation_interval: Option<std::time::Duration>,
         rotation_sweep_interval: std::time::Duration,
     ) -> TestController {
         let data_dir = tempfile::tempdir().expect("creating temp data dir for TestController");
@@ -319,7 +331,9 @@ impl TestController {
             // defaults — so a restart doesn't silently widen a test's
             // shrunk rotation-timer/decision-sweep cadence back out. See the
             // `rotation_interval`/`rotation_sweep_interval` fields' doc
-            // comment.
+            // comment. A `None` rotation_interval is likewise carried across:
+            // a controller restarted with automatic rotation disabled stays
+            // disabled.
             rotation_interval: self.rotation_interval,
             rotation_sweep_interval: self.rotation_sweep_interval,
             // Same sentinel as the initial boot — a restart must not suddenly
@@ -398,6 +412,16 @@ impl TestController {
     /// The temp directory backing this instance's DB/CA/secrets.
     pub fn data_dir(&self) -> &Path {
         self.running().data_dir()
+    }
+
+    /// Whether the CURRENT controller booted with automatic key rotation
+    /// disabled — i.e. no rotation-initiation timer task exists, so nothing
+    /// in-process can start a rotation on a schedule. Delegates to
+    /// `RunningController::automatic_rotation_disabled`, so after a
+    /// `restart()` this reflects the freshly booted instance (which reuses
+    /// this `TestController`'s `rotation_interval`, `None` included).
+    pub fn automatic_rotation_disabled(&self) -> bool {
+        self.running().automatic_rotation_disabled()
     }
 
     /// Connects a tonic `AdminClient` over the controller's Unix socket.

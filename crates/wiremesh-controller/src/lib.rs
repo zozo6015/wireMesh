@@ -151,7 +151,7 @@ pub struct Config {
     /// task fires: on each tick, every `active` gateway whose key set is
     /// single-`active`-only (not already mid-rotation — see
     /// [`services::sync::initiate_due_rotations`]) gets a fresh `rotate_key`
-    /// call with no operator action at all. Defaults to 30 days
+    /// call with no operator action at all. `Some(30 days)`
     /// ([`Config::default_rotation_interval`]) for every real deployment;
     /// tests shrink this to sub-second values via
     /// `wiremesh_testkit::TestController::start_with_rotation_intervals` so
@@ -160,7 +160,22 @@ pub struct Config {
     /// before looping (see that call site's comment), so the first real
     /// initiation lands after one full `rotation_interval`, not immediately
     /// at boot.
-    pub rotation_interval: std::time::Duration,
+    ///
+    /// `None` DISABLES automatic initiation: [`serve`] spawns no
+    /// rotation-initiation task at all (not a very-long interval — there is
+    /// no timer). Set from `WIREMESH_ROTATION_INTERVAL=off` via
+    /// [`rotation_interval_from_env`]/[`parse_rotation_interval`]. This is the
+    /// operator escape hatch for the known-broken automatic-rotation path, and
+    /// it is deliberately narrow — it turns off the SCHEDULE only:
+    ///
+    ///   * the decision sweep ([`Config::rotation_sweep_interval`] /
+    ///     [`services::sync::sweep_rotations`]) keeps running, so a rotation
+    ///     already in flight still promotes/retires/aborts and a crash-orphaned
+    ///     `retiring` row is still recovered. Stranding a half-finished
+    ///     rotation would be worse than either rotating or not;
+    ///   * `Admin.RotateKey` still works, so an operator can still replace a
+    ///     key they believe is compromised, on demand.
+    pub rotation_interval: Option<std::time::Duration>,
     /// (Key-rotation Task 4) How often the decision-sweep background task
     /// fires: on each tick, it drives the Task-3 ack-driven promote/retire/
     /// abort decision for every gateway with an in-flight rotation (rebuilding
@@ -212,6 +227,258 @@ impl Config {
     }
 }
 
+/// The environment variable `main.rs` reads the rotation-initiation interval
+/// from — see [`rotation_interval_from_env`].
+pub const ROTATION_INTERVAL_ENV: &str = "WIREMESH_ROTATION_INTERVAL";
+
+/// The one spelling that disables automatic rotation (matched
+/// case-insensitively). Named here so the parser and every error message it
+/// emits can't drift from each other: a rejected value's only useful hint is
+/// the exact word that does what the operator meant.
+const ROTATION_DISABLED_LITERAL: &str = "off";
+
+/// Parses an operator-supplied rotation-initiation interval into
+/// [`Config::rotation_interval`].
+///
+/// Accepted forms — nothing else, ever:
+///
+///   * `<integer><s|m|h|d>` (e.g. `30d`, `12h`, `900s`) → `Ok(Some(duration))`,
+///     automatic rotation enabled at exactly that interval;
+///   * `off`, in any casing → `Ok(None)`, automatic rotation DISABLED.
+///
+/// Surrounding whitespace is trimmed (env files and Kubernetes manifests pick
+/// up stray spaces and newlines trivially, and a ` off ` that silently fell
+/// back to the 30-day timer would reinstate exactly the scheduled fabric-wide
+/// outage the operator just tried to switch off). Interior whitespace is not.
+///
+/// Everything else is an `Err` the caller is expected to turn into a non-zero
+/// exit, rather than a fallback to some default:
+///
+///   * a ZERO interval (`0s`, `0d`, …) — a zero-period ticker would hot-loop
+///     [`services::sync::initiate_due_rotations`], rotating every gateway's key
+///     as fast as the DB allows. It is also never silently reinterpreted as
+///     "disabled": the operator asked for something impossible and is told the
+///     word (`off`) that does what they meant;
+///   * an UPPERCASE unit suffix (`30D`, `15M`) — owner decision: `M` reads as
+///     "months" to many operators, and accepting it buys nothing;
+///   * an implausibly LARGE interval — anything above
+///     [`MAX_ROTATION_INTERVAL_SECS`] (`3650d`) is a timer that would never
+///     fire, i.e. a silent second spelling of "disabled" that bypasses the
+///     `off` banner (see that constant). Bounded uniformly across all four
+///     units, since `s` alone can express it without overflowing. Nothing
+///     wraps or panics on the way there: `30d`-style inputs are multiplied up
+///     into seconds with a SATURATING multiply, so an oversized count lands
+///     above the cap and is rejected by it, with the cap's own message
+///     (`rotation_interval_too_large`) rather than a weaker one that happens
+///     to name no bound. A count too large for `u64` to hold at all is the
+///     same rejection;
+///   * anything else (missing/unknown suffix, empty, negative, fractional,
+///     non-numeric, `off`-adjacent-but-not-`off`).
+pub fn parse_rotation_interval(s: &str) -> Result<Option<std::time::Duration>> {
+    let raw = s.trim();
+
+    if raw.eq_ignore_ascii_case(ROTATION_DISABLED_LITERAL) {
+        return Ok(None);
+    }
+
+    // Split the trailing unit character off by BYTE INDEX from `char_indices`
+    // (never `len() - 1`), so a multi-byte trailing character can't panic on a
+    // non-char-boundary slice.
+    let (digits, unit) = raw
+        .char_indices()
+        .next_back()
+        .map(|(i, c)| (&raw[..i], c))
+        .ok_or_else(|| invalid_rotation_interval(s, "it is empty"))?;
+
+    // Is the part before the suffix a well-formed count? Computed up front
+    // because the uppercase-unit message below is only TRUE when casing is the
+    // one and only problem: `30D` is a miscased unit, but `abcD` and a bare `D`
+    // are not — telling their author to "write `d`, not `D`" would send them
+    // back for a second controller restart with a suggestion (`d`, `abcd`) that
+    // is itself invalid.
+    let digits_ok = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+
+    // An uppercase spelling of a real unit is rejected outright rather than
+    // folded to lowercase (owner decision: `M` reads as "months" to plenty of
+    // operators, and there is no upside to guessing) — but it gets its own
+    // message, since "not a unit suffix" would be a lie for `30D`. Inputs whose
+    // count is ALSO broken fall through to the ordinary unknown-suffix/
+    // bad-number rejections below.
+    if digits_ok && matches!(unit, 'S' | 'M' | 'H' | 'D') {
+        return Err(invalid_rotation_interval(
+            s,
+            &format!(
+                "unit suffixes are lowercase — write `{}`, not `{unit}`",
+                unit.to_ascii_lowercase()
+            ),
+        ));
+    }
+
+    let unit_secs: u64 = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        _ => {
+            return Err(invalid_rotation_interval(
+                s,
+                &format!("`{unit}` is not one of the unit suffixes s|m|h|d"),
+            ))
+        }
+    };
+
+    if !digits_ok {
+        return Err(invalid_rotation_interval(
+            s,
+            "the part before the unit suffix must be a non-negative whole number",
+        ));
+    }
+
+    // `digits_ok` already guarantees a non-empty run of ASCII digits, so the
+    // ONLY way this parse fails is a literal too large for `u64` — which is the
+    // same operator mistake as tripping the cap below, and gets the same
+    // message. A bare "the number is too large" names no bound and never
+    // mentions `off`, so its author can only guess downwards, one controller
+    // restart per guess.
+    let count: u64 = digits.parse().map_err(|_| rotation_interval_too_large(s))?;
+    // Saturating, not checked: `unit_secs >= 1`, so an overflow here is
+    // unambiguously ABOVE the cap, and clamping to `u64::MAX` lets it fall
+    // through to the cap check and pick up the cap's full explanation instead
+    // of short-circuiting to a weaker one. Whether the multiply happened to
+    // overflow is an implementation detail of the unit the operator chose
+    // (`18446744073709551615s` never overflows; the same count with `d` does) —
+    // it must not decide how much help they get. Zero cannot saturate, so the
+    // zero check below still sees a true zero.
+    let secs = count.saturating_mul(unit_secs);
+
+    if secs == 0 {
+        return Err(invalid_rotation_interval(
+            s,
+            "a zero interval would rotate every gateway's key in a hot loop; to turn \
+             automatic rotation OFF, set it to `off`",
+        ));
+    }
+
+    if secs > MAX_ROTATION_INTERVAL_SECS {
+        return Err(rotation_interval_too_large(s));
+    }
+
+    Ok(Some(std::time::Duration::from_secs(secs)))
+}
+
+/// The single "that interval is too big" rejection, shared by EVERY route that
+/// reaches it: over the [`MAX_ROTATION_INTERVAL_SECS`] cap, a multiply-up into
+/// seconds that saturated, and a count literal too large for `u64`. They are
+/// one operator mistake with one fix, so they get one message — the bound they
+/// have to come under, and the `off` spelling if what they actually meant was
+/// "disabled". Which of the three an input trips is an accident of the unit it
+/// used, and the operator's only feedback channel is this string (no metrics
+/// surface, one controller restart per retry), so the help must not vary.
+fn rotation_interval_too_large(raw: &str) -> anyhow::Error {
+    invalid_rotation_interval(
+        raw,
+        &format!(
+            "an interval longer than {MAX_ROTATION_INTERVAL_DISPLAY} is a timer that would \
+             never fire, which disables automatic rotation WITHOUT the boot warning that \
+             says so; to turn automatic rotation OFF, set it to `off`"
+        ),
+    )
+}
+
+/// The largest accepted rotation interval: 10 years. Anything above it is a
+/// timer that will never fire in the life of a controller process — i.e. a
+/// SECOND, silent way to disable automatic rotation, reachable without the
+/// `off` spelling and therefore without [`warn_automatic_rotation_disabled`]'s
+/// boot banner. Since that banner is the only runtime signal this binary has
+/// (the controller exposes no metrics endpoint), a silent-disable route defeats
+/// the whole safety mechanism, so oversized values are rejected and pointed at
+/// `off`. `18446744073709551615s` was the concrete case: unit `s` means the
+/// overflow check above can never trip, and tokio's `Interval` saturates to
+/// `Instant::far_future()` rather than panicking, so it "worked" — silently.
+const MAX_ROTATION_INTERVAL_SECS: u64 = 3650 * 24 * 60 * 60;
+
+/// How [`MAX_ROTATION_INTERVAL_SECS`] is spelled to operators — the same
+/// `<integer><unit>` form they would have typed.
+const MAX_ROTATION_INTERVAL_DISPLAY: &str = "3650d (10 years)";
+
+/// Builds the one operator-facing rejection message shape used by every
+/// [`parse_rotation_interval`] error: what was rejected, why, and — always —
+/// the full set of things that would have been accepted, `off` included. A
+/// bare "invalid value" would leave an operator with no way to discover the
+/// escape hatch.
+fn invalid_rotation_interval(raw: &str, why: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "invalid rotation interval {raw:?}: {why}. Expected `<integer><s|m|h|d>` \
+         (e.g. `30d`, `12h`, `900s`), or `{ROTATION_DISABLED_LITERAL}` to disable \
+         automatic key rotation"
+    )
+}
+
+/// Resolves [`Config::rotation_interval`] from the environment, using the
+/// caller-supplied `lookup` (`main.rs` passes `|k| std::env::var(k)`; the test
+/// suite passes a closure, since `main.rs` itself is unreachable from an
+/// integration test).
+///
+/// `lookup` mirrors [`std::env::var`]'s signature ON PURPOSE, rather than the
+/// lossy `.ok()` form: `std::env::var` returns `Err(VarError::NotUnicode(..))`
+/// for a PRESENT variable whose bytes are not UTF-8, and collapsing that into
+/// `None` would make it indistinguishable from ABSENT — i.e. it would arm the
+/// 30-day timer, with no banner and no error, for an operator who believes
+/// they wrote `off`. Keeping the distinction in the signature also keeps it
+/// testable without touching the real process environment.
+///
+/// ABSENT (`Err(VarError::NotPresent)`) →
+/// `Ok(Some(Config::default_rotation_interval()))`, the unchanged 30-day
+/// behaviour. NOT UTF-8 → `Err`. PRESENT → whatever [`parse_rotation_interval`]
+/// makes of it, INCLUDING an error: a present-but-malformed value is a startup
+/// error, not a silent fallback — the same precedent (and the same reasoning)
+/// as `main.rs`'s `port_env`. An operator who mistyped `30dd` must find out at
+/// boot rather than discover a 30-day timer still running months later, and
+/// one who mistyped `of` must not be left believing rotation is off when it is
+/// not. (Deliberately NOT the warn-and-fall-back treatment `WIREMESH_BIND_IP`
+/// gets: a wrong bind IP fails loudly the moment nothing can connect, whereas
+/// a wrong rotation interval is invisible until it fires.)
+pub fn rotation_interval_from_env(
+    lookup: impl FnOnce(&str) -> std::result::Result<String, std::env::VarError>,
+) -> Result<Option<std::time::Duration>> {
+    match lookup(ROTATION_INTERVAL_ENV) {
+        Err(std::env::VarError::NotPresent) => Ok(Some(Config::default_rotation_interval())),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+            "{ROTATION_INTERVAL_ENV} is set, but its value is not valid UTF-8. It is being \
+             treated as a startup error rather than as unset, because falling back to the \
+             {}-day default here would silently arm the automatic key-rotation timer for an \
+             operator who believes they disabled it. Set {ROTATION_INTERVAL_ENV} to \
+             `<integer><s|m|h|d>` (e.g. `30d`, `12h`, `900s`), or to \
+             `{ROTATION_DISABLED_LITERAL}` to disable automatic key rotation",
+            Config::default_rotation_interval().as_secs() / (24 * 60 * 60),
+        )),
+        Ok(raw) => parse_rotation_interval(&raw)
+            .with_context(|| format!("reading {ROTATION_INTERVAL_ENV}")),
+    }
+}
+
+/// The boot-time banner [`serve`] prints when `rotation_interval: None` —
+/// automatic key rotation is off, and that is a standing operational risk an
+/// operator must not be able to forget they took on. Printed to stderr because
+/// that is this binary's only diagnostic surface: the controller exposes no
+/// metrics/Prometheus endpoint to also publish it on (unlike the gateway),
+/// and inventing one for a single gauge is not in scope for this knob.
+fn warn_automatic_rotation_disabled() {
+    eprintln!(
+        "wiremesh-controller: ############################################################\n\
+         wiremesh-controller: ##  WARNING: AUTOMATIC KEY ROTATION IS OFF                ##\n\
+         wiremesh-controller: ############################################################\n\
+         wiremesh-controller: {ROTATION_INTERVAL_ENV}={ROTATION_DISABLED_LITERAL} — no \
+         rotation-initiation timer is running, so NO gateway's WireGuard key will be \
+         rotated on a schedule, for as long as this controller runs. Keys will not be \
+         rotated until automatic rotation is re-enabled (set {ROTATION_INTERVAL_ENV} to an \
+         interval, e.g. 30d, and restart the controller).\n\
+         wiremesh-controller: Still working: rotations already in flight complete normally \
+         (the decision sweep keeps running), and manual rotation via Admin.RotateKey \
+         (fabricctl) is unaffected."
+    );
+}
+
 /// A live, in-process controller instance. Dropping it stops both servers
 /// (best effort — see the `Drop` impl) so tests don't leak listeners/tasks
 /// across cases.
@@ -246,7 +513,9 @@ pub struct RunningController {
     /// (Key-rotation Task 4) The rotation-initiation timer's background task
     /// — see [`Config::rotation_interval`] / [`services::sync::initiate_due_rotations`].
     /// Torn down the same bounded-join-then-abort way as every other server
-    /// task.
+    /// task. BOTH are `None` when `Config::rotation_interval` is `None`: that
+    /// task is then never spawned at all, and shutdown simply has nothing to
+    /// signal or join here.
     rotation_timer_shutdown_tx: Option<oneshot::Sender<()>>,
     rotation_timer_join: Option<JoinHandle<()>>,
     /// (Key-rotation Task 4) The decision-sweep's background task — see
@@ -302,6 +571,24 @@ impl RunningController {
     /// bundle (it's also the Sync listener's `client_ca_root`).
     pub fn ca_bundle_pem(&self) -> &str {
         &self.ca_bundle_pem
+    }
+
+    /// True when this controller booted with automatic key rotation DISABLED
+    /// (`rotation_interval: None`, i.e. `WIREMESH_ROTATION_INTERVAL=off`) —
+    /// no rotation-initiation task is running and no gateway key will be
+    /// rotated on a schedule for this process's lifetime.
+    ///
+    /// Read off the SPAWN ITSELF (`rotation_timer_join.is_none()`), not off a
+    /// remembered copy of the config: [`serve`] disables rotation by not
+    /// spawning that task at all, and this field is `Some` if and only if it
+    /// did spawn it. A stored `bool` could drift from what actually got
+    /// spawned; this cannot. It is the in-process counterpart of the stderr
+    /// banner ([`warn_automatic_rotation_disabled`]) `serve` prints on that
+    /// same `None` arm — the crate has no metrics surface, so without this
+    /// accessor nothing but stderr can tell an operator (or a test) that
+    /// rotation is off.
+    pub fn automatic_rotation_disabled(&self) -> bool {
+        self.rotation_timer_join.is_none()
     }
 
     /// Signals all servers to stop and waits (bounded) for their tasks to
@@ -695,23 +982,42 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     // irrelevant, but for a shrunk test interval would make "one interval
     // elapsed" tests unable to distinguish "fired at t=0" from "fired after
     // one real interval."
-    let (rotation_timer_shutdown_tx, mut rotation_timer_shutdown_rx) = oneshot::channel::<()>();
-    let rotation_timer_db = db_handle.clone();
-    let rotation_timer_change_tx = change_tx.clone();
-    let rotation_interval = config.rotation_interval;
-    let rotation_timer_join = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(rotation_interval);
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                _ = &mut rotation_timer_shutdown_rx => break,
-                _ = ticker.tick() => {
-                    services::sync::initiate_due_rotations(&rotation_timer_db, &rotation_timer_change_tx)
-                        .await;
+    //
+    // `rotation_interval: None` = DISABLED, and it is disabled by NOT SPAWNING
+    // THIS TASK AT ALL — deliberately not by substituting a very long interval,
+    // which would still be a live timer that eventually fires (and which no
+    // in-process test could tell apart from "fell back to the 30-day default").
+    // There is no `initiate_due_rotations` call site anywhere else, so with the
+    // `None` arm taken nothing in the process can initiate a rotation on its
+    // own. The decision sweep below is a SEPARATE task and is spawned
+    // unconditionally — see `Config::rotation_interval`'s doc comment for why
+    // stranding an in-flight rotation would be worse than either rotating or
+    // not.
+    let (rotation_timer_shutdown_tx, rotation_timer_join) = match config.rotation_interval {
+        Some(rotation_interval) => {
+            let (tx, mut rotation_timer_shutdown_rx) = oneshot::channel::<()>();
+            let rotation_timer_db = db_handle.clone();
+            let rotation_timer_change_tx = change_tx.clone();
+            let join = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(rotation_interval);
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = &mut rotation_timer_shutdown_rx => break,
+                        _ = ticker.tick() => {
+                            services::sync::initiate_due_rotations(&rotation_timer_db, &rotation_timer_change_tx)
+                                .await;
+                        }
+                    }
                 }
-            }
+            });
+            (Some(tx), Some(join))
         }
-    });
+        None => {
+            warn_automatic_rotation_disabled();
+            (None, None)
+        }
+    };
 
     // (Key-rotation Task 4) The decision sweep: fires every
     // `config.rotation_sweep_interval` (default 5s) and drives the Task-3
@@ -798,8 +1104,11 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         observe_join: Some(observe_join),
         broker_shutdown_tx: Some(broker_shutdown_tx),
         broker_join: Some(broker_join),
-        rotation_timer_shutdown_tx: Some(rotation_timer_shutdown_tx),
-        rotation_timer_join: Some(rotation_timer_join),
+        // Already `Option`s: both are `None` when automatic rotation is
+        // disabled (no task was spawned), which `shutdown`/`Drop` handle the
+        // same way they handle an already-taken handle.
+        rotation_timer_shutdown_tx,
+        rotation_timer_join,
         rotation_sweep_shutdown_tx: Some(rotation_sweep_shutdown_tx),
         rotation_sweep_join: Some(rotation_sweep_join),
     })

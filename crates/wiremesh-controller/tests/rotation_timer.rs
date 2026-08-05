@@ -73,11 +73,25 @@ fn pending_count(states: &[(u32, String, String)]) -> usize {
 #[tokio::test]
 async fn timer_initiates_rotation_for_idle_gateway() {
     let h = wiremesh_testkit::TestController::start_with_rotation_intervals(
-        Duration::from_secs(1),
+        // `Some(..)` = automatic rotation ENABLED (`None` disables initiation
+        // entirely — see `tests/rotation_disabled.rs`).
+        Some(Duration::from_secs(1)),
         Duration::from_millis(500),
     )
     .await;
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
+
+    // Ties the ENABLED direction of the disabled-state accessor to observed
+    // behaviour: this controller demonstrably DOES initiate a rotation below,
+    // so it must not report itself as having automatic rotation disabled. Its
+    // counterpart (a controller that provably never initiates, reporting
+    // `true`) is `rotation_disabled.rs::disabled_timer_never_initiates_a_rotation`
+    // — between them, an accessor stubbed to either constant fails.
+    assert!(
+        !h.automatic_rotation_disabled(),
+        "a controller with a live 1s rotation-initiation timer must not report automatic \
+         rotation as disabled"
+    );
 
     let pre_states = h.debug_key_states(a.id()).await;
     assert_eq!(
@@ -116,7 +130,7 @@ async fn timer_initiates_rotation_for_idle_gateway() {
 #[tokio::test]
 async fn timer_skips_gateway_already_mid_rotation() {
     let h = wiremesh_testkit::TestController::start_with_rotation_intervals(
-        Duration::from_secs(1),
+        Some(Duration::from_secs(1)),
         Duration::from_millis(500),
     )
     .await;
@@ -164,8 +178,11 @@ async fn sweep_retires_orphaned_retiring_row_after_crash() {
     let mut h = wiremesh_testkit::TestController::start_with_rotation_intervals(
         // A long rotation_interval so the timer itself never initiates a
         // SECOND rotation on A mid-test and confuses which epoch is which —
-        // this test only cares about the sweep, not the timer.
-        Duration::from_secs(3600),
+        // this test only cares about the sweep, not the timer. (Deliberately
+        // still ENABLED-but-slow rather than `None`: the disabled-timer
+        // counterpart of this scenario is
+        // `rotation_disabled.rs::sweep_still_drives_in_flight_rotations_with_the_timer_disabled`.)
+        Some(Duration::from_secs(3600)),
         Duration::from_millis(500),
     )
     .await;

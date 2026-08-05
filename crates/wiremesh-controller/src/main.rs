@@ -58,6 +58,22 @@ async fn main() -> Result<()> {
     // so those listeners are reachable via the controller Service (the Admin TCP
     // listener stays loopback-only regardless — see Config::bind_ip). Malformed
     // values fall back to the loopback default.
+    // How often (if ever) the rotation-initiation timer fires. Absent = the
+    // unchanged 30-day default; `off` disables the timer entirely. A
+    // PRESENT-but-malformed value is a startup error (the `?` below), NOT the
+    // warn-and-fall-back treatment `WIREMESH_BIND_IP` gets right after: an
+    // operator who mistyped this would otherwise be left believing rotation is
+    // off (or retimed) when it is not, and nothing would contradict them until
+    // the timer fired. Same precedent/reasoning as `port_env` above —
+    // including its NotPresent-vs-other-VarError distinction: the lookup handed
+    // over is `std::env::var` itself, NOT the lossy `|k| std::env::var(k).ok()`,
+    // so a PRESENT-but-non-UTF-8 value cannot be mistaken for "unset" and
+    // silently arm the 30-day timer. (Wrapped in a closure rather than passed
+    // as the bare `std::env::var` path: `var` is generic over `K: AsRef<OsStr>`,
+    // so the bare path infers ONE specific lifetime and fails the callee's
+    // higher-ranked `FnOnce(&str)` bound.)
+    #[allow(clippy::redundant_closure)]
+    let rotation_interval = wiremesh_controller::rotation_interval_from_env(|k| std::env::var(k))?;
     let bind_ip = match std::env::var("WIREMESH_BIND_IP") {
         Ok(s) => s.parse().unwrap_or_else(|_| {
             eprintln!("wiremesh-controller: invalid WIREMESH_BIND_IP={s:?}, using {}", Config::default_bind_ip());
@@ -74,7 +90,7 @@ async fn main() -> Result<()> {
         admin_tcp_port,
         observe_udp_port,
         bind_ip,
-        rotation_interval: Config::default_rotation_interval(),
+        rotation_interval,
         rotation_sweep_interval: Config::default_rotation_sweep_interval(),
         // Production always probes the real `/var/lib/wiremesh`. Deliberately
         // not env-configurable — see `Config::legacy_data_dir`.

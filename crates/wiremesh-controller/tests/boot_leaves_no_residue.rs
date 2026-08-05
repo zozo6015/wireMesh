@@ -326,7 +326,10 @@ fn config_for(data_dir: &Path, legacy_dir: &Path) -> Config {
         admin_tcp_port: 0,
         observe_udp_port: 0,
         bind_ip: Config::default_bind_ip(),
-        rotation_interval: Config::default_rotation_interval(),
+        // `Some(..)` = automatic rotation ENABLED at the production default.
+        // (`None` disables initiation entirely — see
+        // `tests/rotation_disabled.rs`.)
+        rotation_interval: Some(Config::default_rotation_interval()),
         rotation_sweep_interval: Config::default_rotation_sweep_interval(),
         legacy_data_dir: Some(legacy_dir.to_path_buf()),
     }

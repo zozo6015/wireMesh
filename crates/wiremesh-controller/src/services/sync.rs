@@ -627,7 +627,9 @@ pub(crate) async fn sweep_rotations(
 
 /// (Key-rotation Task 4) The rotation-initiation timer background task's
 /// per-tick body (spawned by `serve()` at `Config::rotation_interval`,
-/// default 30 days). For every currently `active` gateway that is NOT
+/// default 30 days — and NOT spawned at all when that is `None`, which is how
+/// an operator disables automatic rotation; this is the only caller). For
+/// every currently `active` gateway that is NOT
 /// already mid-rotation (i.e. not present in
 /// [`DbHandle::gateways_with_rotation_state`]), starts a fresh rotation via
 /// `db.rotate_key` with no operator action at all, then publishes a
