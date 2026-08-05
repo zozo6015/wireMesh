@@ -414,6 +414,16 @@ impl TestController {
         self.running().data_dir()
     }
 
+    /// Whether the CURRENT controller booted with automatic key rotation
+    /// disabled — i.e. no rotation-initiation timer task exists, so nothing
+    /// in-process can start a rotation on a schedule. Delegates to
+    /// `RunningController::automatic_rotation_disabled`, so after a
+    /// `restart()` this reflects the freshly booted instance (which reuses
+    /// this `TestController`'s `rotation_interval`, `None` included).
+    pub fn automatic_rotation_disabled(&self) -> bool {
+        self.running().automatic_rotation_disabled()
+    }
+
     /// Connects a tonic `AdminClient` over the controller's Unix socket.
     ///
     /// tonic's transport is hyper-1.x-based, so a plain `tokio::net::UnixStream`

@@ -573,6 +573,24 @@ impl RunningController {
         &self.ca_bundle_pem
     }
 
+    /// True when this controller booted with automatic key rotation DISABLED
+    /// (`rotation_interval: None`, i.e. `WIREMESH_ROTATION_INTERVAL=off`) —
+    /// no rotation-initiation task is running and no gateway key will be
+    /// rotated on a schedule for this process's lifetime.
+    ///
+    /// Read off the SPAWN ITSELF (`rotation_timer_join.is_none()`), not off a
+    /// remembered copy of the config: [`serve`] disables rotation by not
+    /// spawning that task at all, and this field is `Some` if and only if it
+    /// did spawn it. A stored `bool` could drift from what actually got
+    /// spawned; this cannot. It is the in-process counterpart of the stderr
+    /// banner ([`warn_automatic_rotation_disabled`]) `serve` prints on that
+    /// same `None` arm — the crate has no metrics surface, so without this
+    /// accessor nothing but stderr can tell an operator (or a test) that
+    /// rotation is off.
+    pub fn automatic_rotation_disabled(&self) -> bool {
+        self.rotation_timer_join.is_none()
+    }
+
     /// Signals all servers to stop and waits (bounded) for their tasks to
     /// finish, force-aborting any that don't wind down promptly.
     ///
