@@ -36,6 +36,29 @@ that runs five times a second. The warning now names all three consequences expl
 (`main.rs:4699`). It still deserves a metric rather than a log line — folded into the
 F2/F5 observability work, which already needs a channel out of the non-`Send` run task.
 
+## R2b — the same wedge, reached by an ordinary transient error (found by CodeRabbit)
+
+`main.rs:3747` advances the phase to `Overlapping` via `on_directive`, and *then*
+`handle_rotate` does fallible work: `plan_tunnel(...)?`, `tunnels.bring_up(...)?`, the
+enforcer attach, `uapi::apply`, `submit_epoch_key`. **Any `?` returning `Err` leaves the
+phase non-`Idle` with no reset path** — the only transition back to `Idle` is
+`rotation.rs:94`, after a completed retire. So the gateway lands in exactly R2's dead end:
+every subsequent `RotateDirective` silently ignored for the life of the process, old key
+never scrubbed.
+
+**This is far more reachable than R2.** R2 needs a peer decommissioned mid-rotation; this
+needs one transient failure — a `bring_up` that loses a name race, an enforcer attach
+refused on a restricted host, a `submit_epoch_key` that hits a closed channel.
+
+Not fixed here on purpose. A correct reset must **unwind partial setup**: by the time
+`submit_epoch_key` fails, the tun may be up, the enforcer attached and the epoch key
+persisted, so a bare `phase = Idle` would leak all three and the next directive's
+`bring_up` would bail "already has a tunnel up" — trading a wedge for a different wedge.
+That is real work with its own test, and adding a fifth fix with unwind semantics to this
+branch is how the four bugs above got written.
+
+Latent in production today, because automatic rotation is disabled fabric-wide.
+
 ## R1 — the F1 gate protects the map mutation, but not the route write derived from it
 
 `main.rs:4790` (gate ends) → `:4806` (`place_peer_routes`).

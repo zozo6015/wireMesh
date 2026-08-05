@@ -1,7 +1,11 @@
 # In-step rotation: the two cutovers fight over the peer route
 
 **Found:** 2026-08-05, by the T3 done-bar (`in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns`).
-**Status:** open. Deterministic, reproduced on two independent clean-tree runs.
+**Status:** **FIXED** by `a5e9fb6` (`rotation::route_owner` — ownership derived once rather
+than written by whichever cutover finishes last). Verified 2026-08-05: the in-step run then
+showed `routes on wg0e1 (ActiveTun)` on both gateways, where it had previously shown
+`wg0o0`. Option 2 below is what was built. Originally: deterministic, reproduced on two
+independent clean-tree runs.
 **Not** a regression in T3 — T3's de-collision is verified working; this is downstream.
 
 ## What T3 fixed, and what it did not

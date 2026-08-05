@@ -10,7 +10,7 @@ covers it and nothing regresses if it is left alone.
 Role A's cutover is gated on `any_live` — *some* peer has a live session on the new
 epoch's tun — and then places routes for **every** peer:
 
-```
+```rust
 if any_live {
     for peer in peers {
         place_peer_routes(peer, active_tun)

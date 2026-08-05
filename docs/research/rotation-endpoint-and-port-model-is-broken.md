@@ -102,6 +102,14 @@ leak permanently. This is the F9 leak shape, reachable on the green path, and it
 visible only because the in-step done-bar added the settle-to-1 gauge assertion
 (`key_rotation.rs:2226-2255`).
 
+## The mitigation already shipped
+
+**Automatic rotation is disabled fabric-wide, so neither bug can fire unattended.**
+`WIREMESH_ROTATION_INTERVAL=off` landed in **v0.7.0** (PR #47) and is set on the live px
+controller as of 2026-08-05, which defused a scheduled outage due 2026-08-31. Do **not**
+re-enable the timer until the single port authority below exists and a rotate-twice test is
+green — re-enabling it is what makes both bugs live.
+
 ## Fix shapes
 
 Two candidates were proposed and **both should be rejected**:
