@@ -131,6 +131,38 @@ pub fn render_policy_apply_failures(total: u64) -> String {
     s
 }
 
+/// Render the count of LIVE ATTACHED L4 ENFORCERS — entries currently held in
+/// the gateway's `enforcers` map (key-rotation T3).
+///
+/// Deliberately a count of map ENTRIES, not of tuns. Holding a
+/// `GatewayEnforcer` in that map is what keeps its tc-BPF/nft program
+/// attached: dropping the value detaches it (the eBPF backend's TCX
+/// `bpf_link` attach releases on drop with no explicit unload — see
+/// `wiremesh-enforcer/src/ebpf.rs` and its
+/// `dropping_enforcer_detaches_and_allows_reprobe_on_same_iface` pin). So a
+/// tun can stay perfectly up, with routes and traffic, while its enforcer
+/// entry is gone and it is enforcing NOTHING — a default-deny bypass that is
+/// invisible to every tun-shaped observation. This gauge is the one series
+/// that sees it.
+///
+/// The failure mode it exists to catch is `HashMap::insert` DISPLACING a live
+/// entry: two rotation roles that computed the same map key would silently
+/// drop one enforcer with no removal call anywhere. That is exactly why the
+/// value must be read from the map's own `len()` at scrape time, and never
+/// tracked by a counter maintained at the insert/remove sites — such a counter
+/// would be incremented by the very insert that destroyed an entry, and would
+/// report the healthy number while the datapath was open.
+///
+/// Always emitted: an absent series is indistinguishable from a dead
+/// exporter, and "live enforcers dropped below the number of live tuns" is an
+/// alert an operator must be able to write against an always-present series.
+pub fn render_live_enforcers(count: u64) -> String {
+    let mut s = String::new();
+    s.push_str("# TYPE wiremesh_gateway_live_enforcers gauge\n");
+    s.push_str(&format!("wiremesh_gateway_live_enforcers {count}\n"));
+    s
+}
+
 /// Wrap a Prometheus text body in a minimal HTTP/1.1 response.
 fn http_response(body: &str) -> String {
     format!(
@@ -143,17 +175,19 @@ fn http_response(body: &str) -> String {
 /// Serve one Prometheus scrape per accepted TCP connection on `listener`,
 /// forever (until `listener` errors). `fetch` is called once per connection
 /// to obtain `(backend_kind, applied_policy_version, counters, peer_states,
-/// transition_counts, peer_stats, policy_apply_failures)`, which is rendered
-/// via [`render`] + [`render_path_state`] + [`render_path_transitions`] +
-/// [`render_peer_stats`] + [`render_policy_apply_failures`] and written back
-/// verbatim (any HTTP request line the client sent is drained and ignored —
-/// this is a scrape-only stub server, not a general HTTP server).
+/// transition_counts, peer_stats, policy_apply_failures, live_enforcers)`,
+/// which is rendered via [`render`] + [`render_path_state`] +
+/// [`render_path_transitions`] + [`render_peer_stats`] +
+/// [`render_policy_apply_failures`] + [`render_live_enforcers`] and written
+/// back verbatim (any HTTP request line the client sent is drained and
+/// ignored — this is a scrape-only stub server, not a general HTTP server).
 ///
-/// `peer_stats` (sixth, mesh-convergence fix T5) and
-/// `policy_apply_failures` (seventh, Backlog item 1) ride the fetch tuple —
-/// rather than being rendered by a caller elsewhere — so they provably reach
-/// the real scrape body. That is the same wiring failure mode the path-state
-/// gauges once had: rendered, unit-tested, and never actually served.
+/// `peer_stats` (sixth, mesh-convergence fix T5),
+/// `policy_apply_failures` (seventh, Backlog item 1) and `live_enforcers`
+/// (eighth, key-rotation T3) ride the fetch tuple — rather than being
+/// rendered by a caller elsewhere — so they provably reach the real scrape
+/// body. That is the same wiring failure mode the path-state gauges once had:
+/// rendered, unit-tested, and never actually served.
 pub async fn serve_metrics<F, Fut>(listener: TcpListener, fetch: F) -> anyhow::Result<()>
 where
     F: Fn() -> Fut + Clone + Send + 'static,
@@ -165,6 +199,7 @@ where
                 Vec<(String, PathState)>,
                 Vec<((PathState, PathState), u64)>,
                 Vec<(String, PeerStats)>,
+                u64,
                 u64,
             )>,
         > + Send
@@ -187,12 +222,14 @@ where
                     transitions,
                     peer_stats,
                     policy_apply_failures,
+                    live_enforcers,
                 )) => {
                     let mut body = render(&kind, version, &counters);
                     body.push_str(&render_path_state(&peer_states));
                     body.push_str(&render_path_transitions(&transitions));
                     body.push_str(&render_peer_stats(&peer_stats));
                     body.push_str(&render_policy_apply_failures(policy_apply_failures));
+                    body.push_str(&render_live_enforcers(live_enforcers));
                     body
                 }
                 Err(e) => format!("# error collecting counters: {e:#}\n"),
@@ -266,6 +303,9 @@ mod tests {
             let peer_stats: Vec<(String, PeerStats)> = vec![];
             // Likewise mechanical (Backlog item 1); the apply-failure
             // scrape assertion lives in `tests/policy_apply_liveness.rs`.
+            // And likewise the trailing `1u64` (key-rotation T3): the
+            // steady-state live-enforcer count is the lone boot tun's, and
+            // the scrape assertion for it lives in the rotation netns suite.
             Ok::<_, anyhow::Error>((
                 "ebpf".to_string(),
                 9u64,
@@ -274,6 +314,7 @@ mod tests {
                 transitions,
                 peer_stats,
                 0u64,
+                1u64,
             ))
         }));
 

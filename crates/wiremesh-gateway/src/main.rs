@@ -707,6 +707,21 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         // empty map — the boot epoch is always present.
                         Some(BackendKind::Ebpf) | None => "ebpf",
                     };
+                    // The `wiremesh_gateway_live_enforcers` gauge (T3), read
+                    // from the map's own `len()` under the SAME acquisition
+                    // the counter fold below uses — no second lock, and no
+                    // parallel counter.
+                    //
+                    // Reading `len()` is the entire point. An enforcer entry
+                    // is what holds a tun's tc-BPF/nft program attached, and
+                    // `HashMap::insert` can DISPLACE one — dropping it, hence
+                    // detaching it — with no removal call to hook a counter
+                    // onto. A counter maintained at the insert/remove sites
+                    // would therefore be incremented by the very insert that
+                    // silently disarmed a live tun, and would keep reporting
+                    // the healthy number while the datapath ran open. Only
+                    // the map itself knows.
+                    let live_enforcers = map.len() as u64;
                     let mut per_tun = Vec::with_capacity(map.len());
                     for e in map.values_mut() {
                         per_tun.push(e.counters()?);
@@ -763,6 +778,11 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         // and it has to ride the fetch tuple to actually
                         // reach the body.
                         policy_apply.failures(),
+                        // Key-rotation T3: how many enforcers are actually
+                        // ATTACHED right now. Rides the tuple for the same
+                        // reason — a gauge that never reaches the scrape body
+                        // proves nothing. See `render_live_enforcers`.
+                        live_enforcers,
                     ))
                 }
             };
