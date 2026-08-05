@@ -78,15 +78,29 @@ The unmet requirement is *a Mac joins the fabric, reaches the segments, no routi
 anywhere, toggled on and off like any VPN client*. That is a **client/agent** — a peer that
 joins **for itself only**, does not front a network, and does not forward.
 
-The key asymmetry that makes this cheap: **a client does not need an enforcer.** The
-gateway's enforcer attaches to its own tun (`GatewayEnforcer::attach(&cfg.tun_ifname)`,
-`crates/wiremesh-gateway/src/main.rs:493`), and a client's traffic to another segment
-traverses that tun. Policy is therefore applied at the gateway either way. The `pf` backend
-that blocks a macOS *gateway* is not on the critical path for a macOS *client*.
+A client needs no enforcer **in the direction it initiates**. The gateway's enforcer
+attaches to its own tun (`GatewayEnforcer::attach(&cfg.tun_ifname)`,
+`crates/wiremesh-gateway/src/main.rs:493`), so `client → segment` traffic is matched on
+tun **ingress** at the receiving gateway and correctly policed with no new mechanism. The
+`pf` backend that blocks a macOS *gateway* is therefore not on the critical path for a
+macOS *client*.
 
-A client is also a different component from the one PRD §47 and the release-distribution
-spec exclude. Those exclude the **gateway** on non-Linux hosts. Scoping a client for macOS
-is a new scope decision, not a reversal of a ratified one.
+> **CORRECTION (verified 2026-08-05, after this note's first draft).** The first draft
+> claimed policy is applied at the gateway "either way". That is **wrong in the receive
+> direction.** Enforcement is *ingress-on-tun only* — `aeth_egress` unconditionally returns
+> `TC_ACT_PIPE` (`crates/wiremesh-enforcer-ebpf/program/src/main.rs:418-420`), and the nft
+> backend hooks only `iifname "<iface>"` (`nft.rs:103,107`). So **`segment → client` is
+> policed by nothing**: the sending gateway's egress never drops, and the client has no
+> enforcer. Every *existing* peer is protected because every existing peer runs an enforcer
+> on its own tun; a client would be the first peer in the fabric that nothing protects.
+> This is an owner decision, not a detail — see the client scoping note.
+
+**This IS a reversal of a ratified decision, and the first draft was wrong to say
+otherwise.** `docs/PRD.md:43` lists as an explicit v1 non-goal: *"Device/user-level access
+(v1) — no per-laptop, per-user client. This is segment-to-segment routing… conflating the
+two would bloat v1."* The macOS *gateway* exclusion (§47) and the *client* exclusion (§43)
+are two separate ratified decisions, and a client component reopens the second one. It
+needs a spec amendment in the engineering design's §11, not just a scoping note.
 
 ## What should change in the record
 
