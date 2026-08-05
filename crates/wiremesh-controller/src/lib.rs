@@ -261,14 +261,17 @@ const ROTATION_DISABLED_LITERAL: &str = "off";
 ///     word (`off`) that does what they meant;
 ///   * an UPPERCASE unit suffix (`30D`, `15M`) — owner decision: `M` reads as
 ///     "months" to many operators, and accepting it buys nothing;
-///   * an out-of-range value: `30d`-style inputs are multiplied up into
-///     seconds, and that multiplication is checked, so nothing wraps,
-///     saturates, or panics;
 ///   * an implausibly LARGE interval — anything above
 ///     [`MAX_ROTATION_INTERVAL_SECS`] (`3650d`) is a timer that would never
 ///     fire, i.e. a silent second spelling of "disabled" that bypasses the
 ///     `off` banner (see that constant). Bounded uniformly across all four
-///     units, since `s` alone can express it without overflowing;
+///     units, since `s` alone can express it without overflowing. Nothing
+///     wraps or panics on the way there: `30d`-style inputs are multiplied up
+///     into seconds with a SATURATING multiply, so an oversized count lands
+///     above the cap and is rejected by it, with the cap's own message
+///     (`rotation_interval_too_large`) rather than a weaker one that happens
+///     to name no bound. A count too large for `u64` to hold at all is the
+///     same rejection;
 ///   * anything else (missing/unknown suffix, empty, negative, fractional,
 ///     non-numeric, `off`-adjacent-but-not-`off`).
 pub fn parse_rotation_interval(s: &str) -> Result<Option<std::time::Duration>> {
@@ -331,12 +334,22 @@ pub fn parse_rotation_interval(s: &str) -> Result<Option<std::time::Duration>> {
         ));
     }
 
-    let count: u64 = digits
-        .parse()
-        .map_err(|_| invalid_rotation_interval(s, "the number is too large"))?;
-    let secs = count
-        .checked_mul(unit_secs)
-        .ok_or_else(|| invalid_rotation_interval(s, "the interval is too large"))?;
+    // `digits_ok` already guarantees a non-empty run of ASCII digits, so the
+    // ONLY way this parse fails is a literal too large for `u64` — which is the
+    // same operator mistake as tripping the cap below, and gets the same
+    // message. A bare "the number is too large" names no bound and never
+    // mentions `off`, so its author can only guess downwards, one controller
+    // restart per guess.
+    let count: u64 = digits.parse().map_err(|_| rotation_interval_too_large(s))?;
+    // Saturating, not checked: `unit_secs >= 1`, so an overflow here is
+    // unambiguously ABOVE the cap, and clamping to `u64::MAX` lets it fall
+    // through to the cap check and pick up the cap's full explanation instead
+    // of short-circuiting to a weaker one. Whether the multiply happened to
+    // overflow is an implementation detail of the unit the operator chose
+    // (`18446744073709551615s` never overflows; the same count with `d` does) —
+    // it must not decide how much help they get. Zero cannot saturate, so the
+    // zero check below still sees a true zero.
+    let secs = count.saturating_mul(unit_secs);
 
     if secs == 0 {
         return Err(invalid_rotation_interval(
@@ -347,17 +360,29 @@ pub fn parse_rotation_interval(s: &str) -> Result<Option<std::time::Duration>> {
     }
 
     if secs > MAX_ROTATION_INTERVAL_SECS {
-        return Err(invalid_rotation_interval(
-            s,
-            &format!(
-                "an interval longer than {MAX_ROTATION_INTERVAL_DISPLAY} is a timer that would \
-                 never fire, which disables automatic rotation WITHOUT the boot warning that \
-                 says so; to turn automatic rotation OFF, set it to `off`"
-            ),
-        ));
+        return Err(rotation_interval_too_large(s));
     }
 
     Ok(Some(std::time::Duration::from_secs(secs)))
+}
+
+/// The single "that interval is too big" rejection, shared by EVERY route that
+/// reaches it: over the [`MAX_ROTATION_INTERVAL_SECS`] cap, a multiply-up into
+/// seconds that saturated, and a count literal too large for `u64`. They are
+/// one operator mistake with one fix, so they get one message — the bound they
+/// have to come under, and the `off` spelling if what they actually meant was
+/// "disabled". Which of the three an input trips is an accident of the unit it
+/// used, and the operator's only feedback channel is this string (no metrics
+/// surface, one controller restart per retry), so the help must not vary.
+fn rotation_interval_too_large(raw: &str) -> anyhow::Error {
+    invalid_rotation_interval(
+        raw,
+        &format!(
+            "an interval longer than {MAX_ROTATION_INTERVAL_DISPLAY} is a timer that would \
+             never fire, which disables automatic rotation WITHOUT the boot warning that \
+             says so; to turn automatic rotation OFF, set it to `off`"
+        ),
+    )
 }
 
 /// The largest accepted rotation interval: 10 years. Anything above it is a
