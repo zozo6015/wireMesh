@@ -81,6 +81,18 @@ async fn timer_initiates_rotation_for_idle_gateway() {
     .await;
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
 
+    // Ties the ENABLED direction of the disabled-state accessor to observed
+    // behaviour: this controller demonstrably DOES initiate a rotation below,
+    // so it must not report itself as having automatic rotation disabled. Its
+    // counterpart (a controller that provably never initiates, reporting
+    // `true`) is `rotation_disabled.rs::disabled_timer_never_initiates_a_rotation`
+    // — between them, an accessor stubbed to either constant fails.
+    assert!(
+        !h.automatic_rotation_disabled(),
+        "a controller with a live 1s rotation-initiation timer must not report automatic \
+         rotation as disabled"
+    );
+
     let pre_states = h.debug_key_states(a.id()).await;
     assert_eq!(
         pending_count(&pre_states),

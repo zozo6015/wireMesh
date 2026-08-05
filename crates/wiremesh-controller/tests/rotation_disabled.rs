@@ -9,6 +9,9 @@
 //! timer off. `None` is that switch, and these tests pin the three things it
 //! must and must not do:
 //!
+//!   0. `disabled_state_is_observable_and_survives_restart` — the disabled
+//!      state is detectable programmatically, not only by a human reading the
+//!      boot banner off stderr, and it stays detectable across a restart.
 //!   1. `disabled_timer_never_initiates_a_rotation` — with `None`, no
 //!      rotation is EVER initiated on its own, across many ticks of a sweep
 //!      that keeps running the whole time. The control for this test is
@@ -69,6 +72,74 @@ async fn poll_key_states(
     states
 }
 
+/// The disabled state must be DETECTABLE by something other than a human
+/// reading stderr.
+///
+/// This accessor is a proxy for `warn_automatic_rotation_disabled()`'s boot
+/// banner, and it is deliberately not a test of the banner text — nothing here
+/// asserts that any particular string was printed. What it pins is that the
+/// fact the banner conveys is observable at all. That matters because two
+/// separate safety arguments rest on the banner: it is this binary's ONLY
+/// runtime signal that rotation is off (the controller exposes no metrics
+/// endpoint, unlike the gateway), and it is the stated justification for
+/// rejecting over-long intervals — see `MAX_ROTATION_INTERVAL_SECS`, whose
+/// whole rationale is that a never-firing timer would disable rotation
+/// *without* the banner. A refactor that dropped the `eprintln!` would leave a
+/// fabric with rotation permanently off and nothing at all to say so; with the
+/// state exposed, that refactor has something to fail against.
+///
+/// Both directions are asserted, against two controllers that differ only in
+/// this setting, so an accessor stubbed to a constant cannot pass. The `false`
+/// direction is additionally tied to observed behaviour in
+/// `rotation_timer.rs::timer_initiates_rotation_for_idle_gateway` (a controller
+/// that provably DOES rotate), and the `true` direction in
+/// `disabled_timer_never_initiates_a_rotation` (one that provably does not).
+#[tokio::test]
+async fn disabled_state_is_observable_and_survives_restart() {
+    // ENABLED: a long interval, so the timer never actually fires during the
+    // test — the accessor must report on how the controller was CONFIGURED
+    // (i.e. whether the initiation task exists), not on whether a rotation has
+    // happened to occur yet.
+    let enabled = wiremesh_testkit::TestController::start_with_rotation_intervals(
+        Some(Duration::from_secs(3600)),
+        Duration::from_millis(500),
+    )
+    .await;
+    assert!(
+        !enabled.automatic_rotation_disabled(),
+        "a controller booted with rotation_interval = Some(1h) has a live rotation-initiation \
+         timer and must NOT report automatic rotation as disabled — reporting `true` here \
+         would tell an operator their fabric is unprotected when it is not, and would let a \
+         constant-returning stub satisfy the disabled case below"
+    );
+    drop(enabled);
+
+    // DISABLED.
+    let mut h = wiremesh_testkit::TestController::start_with_rotation_intervals(
+        None,
+        Duration::from_millis(500),
+    )
+    .await;
+    assert!(
+        h.automatic_rotation_disabled(),
+        "a controller booted with rotation_interval = None has no rotation-initiation task \
+         and must report automatic rotation as DISABLED"
+    );
+
+    // And it must still say so after a restart. A restart is the one moment a
+    // controller could silently re-arm rotation (or silently stay disabled)
+    // with no operator watching the console — the boot banner scrolls past
+    // once, whereas this remains queryable afterwards.
+    h.restart().await;
+    assert!(
+        h.automatic_rotation_disabled(),
+        "a RESTARTED controller must still report automatic rotation as disabled — the \
+         setting is preserved across restarts (see the restart-preservation assertions in \
+         the tests below), so the reported state has to be preserved with it, or the two \
+         disagree precisely when nobody is looking at the boot output"
+    );
+}
+
 /// With `rotation_interval: None`, the rotation-initiation timer must not run
 /// at all: no gateway ever acquires a `pending` epoch without an operator
 /// asking for one.
@@ -90,6 +161,18 @@ async fn disabled_timer_never_initiates_a_rotation() {
     .await;
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
     let b = wiremesh_testkit::enroll_one(&h, "gcp", "10.1.0.0/16").await;
+
+    // The observable flag and the observed behaviour, pinned against the SAME
+    // controller: everything below proves this instance never initiates a
+    // rotation, so this assertion is what stops the flag drifting away from
+    // the reality it reports. See
+    // `disabled_state_is_observable_and_survives_restart` for what the flag is
+    // for.
+    assert!(
+        h.automatic_rotation_disabled(),
+        "a controller booted with rotation_interval = None must REPORT itself as having \
+         automatic rotation disabled"
+    );
 
     for (label, id) in [("A", a.id()), ("B", b.id())] {
         let states = h.debug_key_states(id).await;
@@ -240,6 +323,11 @@ async fn manual_rotate_key_still_works_with_the_timer_disabled() {
     // precisely the population an enabled `initiate_due_rotations` targets on
     // its very next tick.
     h.restart().await;
+    assert!(
+        h.automatic_rotation_disabled(),
+        "the restarted controller must still REPORT automatic rotation as disabled — the \
+         reported state and the observed behaviour asserted just below have to agree"
+    );
     tokio::time::sleep(Duration::from_secs(2)).await;
     let b_states = h.debug_key_states(b.id()).await;
     assert_eq!(
@@ -268,6 +356,16 @@ async fn manual_rotate_key_still_works_with_the_timer_disabled() {
 /// The whole scenario runs with `rotation_interval: None` from the first boot
 /// through the restart, so it also pins that `restart()` preserves the
 /// disabled setting rather than reverting to the 30-day default.
+///
+/// NOT INDEPENDENT EVIDENCE, for whoever reads this next: this test and
+/// `rotation_timer.rs::sweep_retires_orphaned_retiring_row_after_crash` both
+/// manufacture the orphan the same way — by restarting the controller to drop
+/// the in-memory `RotationTracker` while the on-disk `retiring` row survives.
+/// If that path ever changes shape (say a tracker is rebuilt from the DB on
+/// boot, or `retiring` rows are reconciled during startup rather than by the
+/// sweep), BOTH tests go red together and neither corroborates the other. They
+/// differ only in whether the initiation timer is on, which is the one thing
+/// this test is actually about.
 #[tokio::test]
 async fn sweep_still_drives_in_flight_rotations_with_the_timer_disabled() {
     let mut h = wiremesh_testkit::TestController::start_with_rotation_intervals(
