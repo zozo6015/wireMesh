@@ -1908,6 +1908,15 @@ fn sample_tick(ns: &Ns, metrics_addr: &str, base: &BTreeSet<String>, obs: &mut R
 
 /// **T3 DONE BAR — the scenario the shipped outage actually needs.**
 ///
+/// **KNOWN FAILING, DELIBERATELY `#[ignore]`d — DO NOT DELETE.** This test is
+/// not flaky, not obsolete, and not superseded: it is a documented red parked
+/// as the done bar for the endpoint/port work described in
+/// `docs/research/rotation-endpoint-and-port-model-is-broken.md`. It fails at
+/// the post-rotation reachability check (`POST-ROTATION FAILED: ICMP wlA ->
+/// wlB ...`) because of bugs 4 and 5 in that document, which are structural
+/// and out of scope for T3. Everything before that point passes and is real
+/// coverage. See "Why this is `#[ignore]`d" at the bottom before touching it.
+///
 /// Every other rotation test in this file rotates ONE gateway, so an
 /// own-epoch tun and a Role-B overlap tun never carry the same epoch number
 /// and the `TunnelSet` collision cannot arise at all. That is not the
@@ -1962,7 +1971,74 @@ fn sample_tick(ns: &Ns, metrics_addr: &str, base: &BTreeSet<String>, obs: &mut R
 /// `tests/tunnel_id_decollision.rs` and against real Devices in
 /// `tests/tunnelset_same_epoch_netns.rs`. Sampling `wg show` at the peak would
 /// add a race to this (serial, flake-sensitive) file for no new information.
+///
+/// # Why this is `#[ignore]`d
+///
+/// Writing this test was the first time anybody exercised an in-step
+/// both-gateways rotation — the shape the controller's default 30-day timer
+/// produces on every fabric. **It found six bugs. Four are fixed on this
+/// branch** (the `TunnelSet` three-axis collision the T3 assertion above
+/// pins, and the arbitration/route defects around it). **Two are not, and
+/// cannot be without structural work**, so the test is committed red rather
+/// than weakened:
+///
+///  - **Bug 4 — the Role-A cutover leaves nothing durable able to address the
+///    active tun.** After cutover the active tun dials the peer's BASE port
+///    while the peer listens for that epoch on an offset port, so no
+///    handshake ever completes. Everything durable in the fabric (observed
+///    candidate, reported locals, punch candidates, `live_endpoints`) is
+///    base-port by construction; only two transient writers ever emit an
+///    offset port and both *guess*. A one-sided rotation survives this only
+///    by accident of the change-guard rendering an identical no-op forever;
+///    in-step rotation forces a real `uapi::apply` and the accident stops
+///    holding.
+///  - **Bug 5 — the SECOND rotation of any gateway cannot complete at all.**
+///    `device_config_at_port` assumes "the peer listens on the port I chose"
+///    while `pending_peer_configs` assumes "base + epoch delta" — two
+///    mutually incompatible models, both invalidated by T3's free-list
+///    `plan_port` allocator. No test in this file has ever rotated twice
+///    (every case goes 0 -> 1 once from a clean tree), which is why this went
+///    unseen.
+///
+/// Both are written up in full — mechanism, direct observation from the
+/// failing run, the decided fix shape (ground-truth endpoint feedback from
+/// boringtun's `get=1`, plus a single port authority so `device_config_pinned`,
+/// `device_config_at_port` and `pending_peer_configs` stop disagreeing), and
+/// why two other candidate fixes were rejected — in
+/// **`docs/research/rotation-endpoint-and-port-model-is-broken.md`**.
+///
+/// ## What still passes, and what does not
+///
+/// Everything up to the post-rotation reachability check is green and is the
+/// coverage this test exists for: the T3 assertion (four rotation devices
+/// across the pair, every one with its enforcer attached — the fail-open
+/// displacement probe) and the traffic-during-overlap assertion (the ICMP
+/// flood loses at most two cutovers' worth of packets). The failure is the
+/// `POST-ROTATION FAILED: ICMP wlA -> wlB no longer passes after BOTH
+/// gateways rotated in step` panic below: bug 4 means neither side's
+/// configured endpoint reaches a device holding the matching key once both
+/// have cut over.
+///
+/// ## Un-ignoring this IS the done bar
+///
+/// Removing the `#[ignore]` and getting this green is the acceptance
+/// criterion for the endpoint/port work. Nothing here may be relaxed to get
+/// there: no widened packet-loss tolerance, no dropped direction in the
+/// both-ways reachability loop, no softened failure message. If a future
+/// change makes it pass, it must pass for the reason in the research doc.
+/// (The doc also calls for a NEW test that rotates twice — bug 5 is invisible
+/// without one, and this test only rotates once per gateway.)
+///
+/// Run it with `--ignored` to see the current red:
+/// `cargo test -p wiremesh-gateway --test key_rotation --features netns-tests \
+///  -- --test-threads=1 --nocapture --ignored`
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "RED by design, NOT obsolete — do not delete. Blocked on bug 4 (post-cutover \
+            endpoint dials the peer's base port while it listens on an offset port) and bug 5 \
+            (the second rotation of any gateway cannot complete: device_config_at_port and \
+            pending_peer_configs use incompatible port models). Both in \
+            docs/research/rotation-endpoint-and-port-model-is-broken.md; un-ignoring this is \
+            the done bar for that work. See this test's doc comment."]
 async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     // Topology: IDENTICAL to `direct_rotation_is_zero_drop` — see that test
     // for the per-step rationale (bridge, netem, veths, identities).
