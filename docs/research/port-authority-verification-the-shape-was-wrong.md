@@ -91,6 +91,13 @@ The moment that actually clobbers is not the cutover. It is the **collapse-arm a
 
 Plus the **rotate-twice test**, and realistically the **R2b wedge reset**.
 
+> **Note from building piece 2:** bug 5's arithmetic partially resolves itself once
+> renormalization lands — rotation 1→2 plans `Own{2}` at `base+1` (the survivor is back at
+> `base`, so the free-list's lowest free is `base+1`), and the peer's `pending_peer_configs`
+> computes `active_port + (2-1)` = `base+1`. They agree. **But only if no overlap grabbed
+> `base+1` first**, which is precisely the coincidence piece 3's reserved range makes
+> structural. Nobody should read the arithmetic working here as piece 3 being optional.
+
 ### The deadlock that orders 1 before 2
 
 The collapse-arm apply kills the roamed session → `all_live` never holds → `service_retire`
@@ -102,11 +109,41 @@ hard ordering.
 
 `on_directive` is honoured only from `Idle`, reachable only via `on_epoch_retired` from
 `CutOver`, which requires `service_retire`. Today a wedge leaks a Device and an unscrubbed
-key. **If renormalization hangs off retire, a wedge also leaves the gateway permanently
-unaddressable at its advertised port** — and R2b makes that reachable from one transient
-error in `handle_rotate`.
+key.
 
-## New finding — relay black-holes on every rotation
+> **CORRECTED 2026-08-06.** This note originally claimed renormalization makes a wedge
+> *worse* — "a wedge also leaves the gateway permanently unaddressable at its advertised
+> port". **That is wrong.** A cutover already leaves the gateway off its base port, wedge
+> or not; a wedge simply means renormalization never runs, so a wedged gateway is exactly
+> as unaddressable as it is today. Piece 2 does not raise the **cost** of a wedge — it
+> raises the **value of fixing one**, because task #20 becomes the difference between
+> getting the cure and not. The conclusion (fix the wedge) stands; the argument for it
+> was bad.
+
+## Relay finding — real, but this note had the mechanism wrong
+
+> **CORRECTED 2026-08-06 while building piece 2.** The claim below — that the forward
+> target is *"fixed for the transport's life"* — **is wrong**, and getting it wrong would
+> have bought an expensive fix for a cheap problem.
+>
+> `RelayTransport`'s uplink pump rewrites `last_seen` on **every** datagram;
+> `local_peer_hint` is only a seed. So the exposure is not "until the ~45s Degraded
+> rebuild" but "until boringtun's next outbound datagram through the relay socket" —
+> at most one keepalive, ≤25s. Still real: inbound relayed datagrams in that window hit a
+> port with no socket.
+>
+> That makes **rebuilding the transports the wrong fix.** It would cost a QUIC reconnect,
+> a fresh local socket, a `set_one_peer` remove + re-add and a forced rehandshake *per
+> relayed peer* — to close a window that closes itself. `set_local_peer` overwrites
+> `last_seen` in place: no QUIC, no WireGuard, no rehandshake. Applied at **both**
+> port-moving sites, since the Role-A cutover has the identical bug today.
+>
+> One thing this note also missed: renormalization moves **our own source port**, so each
+> peer keeps sending to the old one until it authenticates a datagram from the new one and
+> roams. Unprompted that is up to 25s. Piece 2 pokes each peer so boringtun emits
+> immediately.
+
+*Original text, kept for the record:*
 
 `RelayTransport::start` is handed `127.0.0.1:<ctx.active.wg_port>` as its forward target
 (`main.rs:2440-2449`), **fixed for the transport's life**. A Role-A cutover changes
