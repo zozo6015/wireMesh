@@ -187,6 +187,86 @@ fn decide_role_b(peer: &PeerState, overlapped: Option<u32>) -> RoleBDecision {
     }
 }
 
+// --- Deferred write-backs into the shared Role-B map ------------------------
+
+/// The two facts that identify ONE Role-B overlap: the peer pending epoch it
+/// was stood up toward, and the Device that carries it. Together with the peer
+/// id the entry is keyed by, this is the full identity of an overlap — the peer
+/// id ALONE is not, which is the whole of [`overlap_write_back`]'s reason to
+/// exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlapIdentity {
+    /// The rotating peer's pending epoch this overlap targets.
+    pub pending_epoch: u32,
+    /// The overlap Device's ifname (`wg0o<slot>`). Carried as well as the
+    /// epoch because a peer that re-rotates and then rotates BACK to the same
+    /// pending epoch number (a controller restarting its epoch counter, a
+    /// roster replay) would be indistinguishable on the epoch alone, while the
+    /// Device is freshly allocated every time.
+    pub new_tun: String,
+}
+
+/// Whether a value read out of the shared `role_b` map, `.await`ed on, and now
+/// about to be written back may still be written back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteBack {
+    /// The entry under the lock is the SAME overlap the caller's clone was
+    /// taken from. The write-back is about the thing it was computed for.
+    Apply,
+    /// There is an entry for this peer, but it is a DIFFERENT overlap — the
+    /// peer re-rotated while the caller was awaiting, `retire_stale_overlap`
+    /// dropped the old entry and `maybe_start_role_b` inserted a new one.
+    Replaced,
+    /// The entry is gone entirely: the peer's overlap was retired or collapsed
+    /// while the caller was awaiting.
+    Vanished,
+}
+
+/// May a deferred write-back into `role_b[peer]` still be applied?
+///
+/// # The bug this exists to prevent
+///
+/// The rotation tick CLONES `role_b`'s entries, then per entry `.await`s a UAPI
+/// liveness read and — on the cutover arm — `send_epoch_ack`, which opens a
+/// fresh mTLS channel and can take hundreds of milliseconds. It then writes its
+/// conclusions back with `role_b.lock().get_mut(&peer_id)`, i.e. matching on the
+/// peer id ALONE.
+///
+/// That was safe only for as long as an entry for a given peer could never be
+/// REPLACED while it existed — which was true while `maybe_start_role_b`'s
+/// guard was `contains_key(&gid)`, and stopped being true the moment
+/// [`RoleBDecision::Restart`] started removing and re-inserting. A peer that
+/// re-rotates mid-`await` now gets its entry torn down and a new one built
+/// toward the newer pending epoch, and every id-only write-back lands on the
+/// WRONG overlap:
+///
+///  - `cut_over = true` on an overlap whose session has never been observed,
+///    which then feeds `route_owner` an [`OverlapClaim`] claiming a proven-live
+///    path — a direct make-before-break violation, routing a peer's CIDRs at a
+///    Device with no session;
+///  - `done = true` on the new entry, which permanently filters it out of the
+///    tick's pending set, so the new epoch never gets its own cutover or ack
+///    and the peer stalls until the controller grace-promotes onto a dead key;
+///  - on the collapse arm, `remove(&peer_id)` drops the NEW entry while the
+///    teardown that follows names the OLD epoch's Device — leaving the new
+///    overlap Device and its enforcer live with no `role_b` entry to ever
+///    collapse them, and `maybe_start_role_b` looping forever on a `bring_up`
+///    that bails "already has a tunnel up".
+///
+/// So every write-back states the identity it was computed against, and this
+/// decides. On anything but [`WriteBack::Apply`] the correct action is to leave
+/// the entry alone: the next tick re-reads it and drives it from scratch.
+pub fn overlap_write_back(
+    taken: &OverlapIdentity,
+    current: Option<&OverlapIdentity>,
+) -> WriteBack {
+    match current {
+        None => WriteBack::Vanished,
+        Some(cur) if cur == taken => WriteBack::Apply,
+        Some(_) => WriteBack::Replaced,
+    }
+}
+
 // --- Route ownership: which device ONE peer's CIDRs belong on --------------
 
 /// The device a single peer's segment CIDRs belong on.
@@ -329,10 +409,27 @@ pub enum EpochWatch {
 /// the same two inputs the writer uses is what keeps the watcher and the
 /// device from drifting again.
 ///
-/// A peer absent from the roster is [`EpochWatch::Gone`]. A peer whose
-/// selected key does not decode falls back to the snapshot hex: watching a
-/// stale key merely delays the retire, whereas dropping the peer would let a
-/// roster glitch retire a key a live peer still needs.
+/// # Where the two functions must agree, exactly
+///
+/// [`crate::reconcile::device_config_pinned`] `filter_map`s a peer AWAY when
+/// there is no pin and no `active_pubkey_b64` (the `?` on
+/// `p.active_pubkey_b64.clone()`), so such a peer is simply NOT ON THE DEVICE.
+/// This function therefore returns [`EpochWatch::Gone`] for it. Falling back to
+/// the snapshot hex there — which is what it used to do, by collapsing "no key
+/// selected" and "the selected key does not decode" into one `unwrap_or_else`
+/// — would watch a key the device provably does not hold, so `all_live` would
+/// be false on every tick, `retire_all_live_since` would reset forever, and the
+/// old Device + enforcer would never be torn down. That is precisely the stall
+/// this function exists to remove, re-entered through the fallback.
+///
+/// The snapshot fallback survives for the OTHER case only: a `Some` key that
+/// fails to decode. That one is defensible, because an undecodable active key
+/// also makes `uapi::encode_set` fail inside `apply_state`, so the device keeps
+/// whatever it last held — which is what the snapshot records. Watching a stale
+/// key merely delays the retire, whereas dropping the peer would let a decode
+/// glitch retire a key a live peer still needs.
+///
+/// A peer absent from the roster is likewise [`EpochWatch::Gone`].
 ///
 /// # If the peer rotates AGAIN mid-grace
 ///
@@ -384,8 +481,15 @@ pub fn new_epoch_watch_keys(
                 Some(pinned) => Some(pinned.as_str()),
                 None => peer.active_pubkey_b64.as_deref(),
             };
-            let hex =
-                selected.and_then(pubkey_b64_to_hex).unwrap_or_else(|| snapshot_hex.clone());
+            // NOTHING selected mirrors `device_config_pinned`'s `?`: the writer
+            // dropped this peer from the device, so there is no session to
+            // watch for and watching one would stall the retire forever.
+            let Some(selected) = selected else {
+                return (*gid, EpochWatch::Gone);
+            };
+            // Selected but undecodable: `encode_set` would have failed for the
+            // same reason, so the device still holds what the snapshot recorded.
+            let hex = pubkey_b64_to_hex(selected).unwrap_or_else(|| snapshot_hex.clone());
             (*gid, EpochWatch::Key(hex))
         })
         .collect()

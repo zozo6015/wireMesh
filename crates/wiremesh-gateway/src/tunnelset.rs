@@ -35,7 +35,8 @@ use crate::state::DesiredState;
 use crate::tunnel::Tunnel;
 use crate::uapi::{self, DeviceConfig};
 use anyhow::Context;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 /// Identity of one live Device in a [`TunnelSet`]. Replaces the bare `u32`
 /// epoch, which conflated our own epochs with peers' pending epochs.
@@ -80,9 +81,54 @@ const OVERLAP_MARK: char = 'o';
 /// hard error, never a silent wrap onto an in-use port.
 const MAX_ROTATION_TUNS: u16 = 64;
 
-/// Derive the plan for `id` against everything already live (`live`), which
+/// How long a torn-down rotation tun's ifname AND listen port stay reserved
+/// against re-allocation (F6).
+///
+/// # Why a freed slot cannot be handed straight back
+///
+/// [`plan_ifname`] hands back the LOWEST free overlap slot and [`plan_port`]
+/// the lowest free port, so before this existed a teardown followed by an
+/// allocation returned the very name and port that had just been released. On
+/// the [`crate::rotation::RoleBDecision::Restart`] path those two run
+/// back-to-back with no `.await` between them (`retire_stale_overlap` ->
+/// `plan_tunnel` -> `bring_up`), i.e. microseconds apart, and neither half of
+/// the teardown is synchronous:
+///
+///  - dropping the `Tunnel` stops boringtun's device threads, but the UAPI
+///    socket `/var/run/wireguard/<ifname>.sock` is not necessarily unlinked by
+///    the time the next `Tunnel::up` starts POLLING FOR THAT EXACT PATH to
+///    appear — a stale socket satisfies that wait instantly, and the caller
+///    then talks UAPI to a dead listener;
+///  - `ip link del` is spawned best-effort and the kernel may still be
+///    tearing the tun down (or the command may have failed outright, which is
+///    only logged), so `DeviceHandle::new` on the same name races a device
+///    that still exists.
+///
+/// Five seconds is far longer than either the kernel's link deletion or
+/// boringtun's socket cleanup, and 25x the 200ms rotation tick, so a reused
+/// name/port is always separated from its predecessor by many ticks rather
+/// than by microseconds.
+const QUARANTINE: Duration = Duration::from_secs(5);
+
+/// Hard ceiling on simultaneously-quarantined entries, so the quarantine can
+/// never eat the allocation window that [`MAX_ROTATION_TUNS`] bounds. At half
+/// the window, at least 32 slots and 32 ports are always allocatable no matter
+/// how hard the gateway churns; the OLDEST entry is evicted first, i.e. the one
+/// whose Device has been down longest and is therefore likeliest to be gone.
+/// Expiry does the work in every realistic case (a burst would have to tear
+/// down more than 32 rotation tuns inside [`QUARANTINE`]); this only ensures
+/// the failure mode of an implausible burst is "reuse sooner" rather than
+/// "cannot allocate at all".
+const MAX_QUARANTINE: usize = (MAX_ROTATION_TUNS / 2) as usize;
+
+/// Derive the plan for `id` against everything already reserved (`live`), which
 /// the returned plan must not collide with on ANY of the three axes. Pure: no
 /// I/O, no devices, safe to call anywhere.
+///
+/// `live` is whatever the caller declares reserved. In production that is
+/// [`TunnelSet::plans`], which reports live Devices AND recently torn-down ones
+/// still inside [`QUARANTINE`] — so this allocator never needs to know about
+/// time to stop handing a just-freed ifname/port straight back (F6).
 ///
 /// # The scheme (owner decision E)
 ///
@@ -139,8 +185,8 @@ pub fn plan_tunnel(
     let listen_port = plan_port(base_port, live).ok_or_else(|| {
         anyhow::anyhow!(
             "no free rotation listen port for {id:?}: every port in {}..={} is held by one of \
-             the {} live tun(s) (rotation tuns are not being torn down), or the window overflows \
-             u16",
+             the {} reserved tun(s) (rotation tuns are not being torn down, or too many are in \
+             post-teardown quarantine), or the window overflows u16",
             base_port.saturating_add(1),
             base_port.saturating_add(MAX_ROTATION_TUNS),
             live.len(),
@@ -165,8 +211,9 @@ fn plan_ifname(id: TunnelId, base_tun: &str, live: &[TunnelPlan]) -> anyhow::Res
             })?;
             if taken(&ifname) {
                 anyhow::bail!(
-                    "own-epoch tun name {ifname:?} is already live — {id:?} has already been \
-                     planned and brought up; keep the original plan rather than re-deriving it"
+                    "own-epoch tun name {ifname:?} is already reserved — {id:?} has already been \
+                     planned and brought up (or was torn down so recently that its name is still \
+                     quarantined); keep the original plan rather than re-deriving it"
                 );
             }
             Ok(ifname)
@@ -190,8 +237,9 @@ fn plan_ifname(id: TunnelId, base_tun: &str, live: &[TunnelPlan]) -> anyhow::Res
                 }
             }
             anyhow::bail!(
-                "all {MAX_ROTATION_TUNS} overlap tun slots on base tun {base_tun:?} are occupied; \
-                 cannot name an overlap for {id:?} (overlap Devices are not being torn down)"
+                "all {MAX_ROTATION_TUNS} overlap tun slots on base tun {base_tun:?} are reserved; \
+                 cannot name an overlap for {id:?} (overlap Devices are not being torn down, or \
+                 more than half the window is in post-teardown quarantine)"
             )
         }
     }
@@ -209,6 +257,12 @@ fn plan_port(base_port: u16, live: &[TunnelPlan]) -> Option<u16> {
 #[derive(Default)]
 pub struct TunnelSet {
     tunnels: HashMap<TunnelId, Tunnel>,
+    /// Recently torn-down rotation tuns, oldest first, each with the instant it
+    /// was released. [`Self::plans`] reports them alongside the live set so the
+    /// planner treats their ifname and port as taken for [`QUARANTINE`] — see
+    /// that constant for why an immediately-reused name/port is a real defect
+    /// rather than an aesthetic one.
+    quarantine: VecDeque<(TunnelPlan, Instant)>,
 }
 
 impl TunnelSet {
@@ -266,8 +320,27 @@ impl TunnelSet {
                 peers: vec![],
             },
         )?;
+        // Whatever this Device now holds is LIVE, so any quarantine reservation
+        // that named the same id, ifname or port is stale and must not keep
+        // being reported as taken on top of the live entry. (A caller reaching
+        // here with a quarantined name did not get it from `plan_tunnel` — the
+        // boot tun, or a test — but the bookkeeping has to stay honest either
+        // way, or `plans()` would report the same resource twice.)
+        self.quarantine
+            .retain(|(p, _)| p.id != id && p.ifname != ifname && p.listen_port != listen_port);
         self.tunnels.insert(id, tunnel);
         Ok(())
+    }
+
+    /// Drop quarantine entries whose [`QUARANTINE`] window has elapsed, then
+    /// evict oldest-first down to [`MAX_QUARANTINE`].
+    fn prune_quarantine(&mut self) {
+        let now = Instant::now();
+        self.quarantine
+            .retain(|(_, freed)| now.duration_since(*freed) < QUARANTINE);
+        while self.quarantine.len() > MAX_QUARANTINE {
+            self.quarantine.pop_front();
+        }
     }
 
     /// Tear `id` down: remove it from the map first — dropping the `Tunnel`
@@ -276,18 +349,41 @@ impl TunnelSet {
     /// (dropping the handle stops the device but may not delete the netlink
     /// interface itself). A missing `id` is a no-op success: tearing down
     /// something that was never up isn't an error for the caller.
+    ///
+    /// The released ifname + port then enter [`QUARANTINE`], so the next
+    /// allocation cannot hand them straight back while the kernel is still
+    /// deleting the link and boringtun is still unlinking the UAPI socket (F6).
+    /// The quarantine is what makes `ip link del`'s best-effort posture
+    /// tolerable: a delete that fails, or that has not finished, no longer
+    /// hands the very next allocation a name that is still occupied.
     pub fn tear_down(&mut self, id: TunnelId) -> anyhow::Result<()> {
         let Some(tunnel) = self.tunnels.remove(&id) else {
             return Ok(());
         };
         let ifname = tunnel.ifname.clone();
+        let listen_port = tunnel.listen_port;
         drop(tunnel);
-        let status = std::process::Command::new("ip")
+        match std::process::Command::new("ip")
             .args(["link", "del", &ifname])
-            .status();
-        if let Err(e) = status {
-            eprintln!("wiremesh-gateway: best-effort `ip link del {ifname}` failed to spawn: {e}");
+            .status()
+        {
+            Err(e) => eprintln!(
+                "wiremesh-gateway: best-effort `ip link del {ifname}` failed to spawn: {e} — the \
+                 link may linger; its name and port stay quarantined"
+            ),
+            // A non-zero exit was previously discarded entirely. It is still
+            // not fatal (the interface may already be gone), but it is the
+            // exact condition under which the name is still occupied, so it
+            // must at least be visible.
+            Ok(st) if !st.success() => eprintln!(
+                "wiremesh-gateway: best-effort `ip link del {ifname}` exited {st} — the link may \
+                 linger; its name and port stay quarantined"
+            ),
+            Ok(_) => {}
         }
+        self.quarantine
+            .push_back((TunnelPlan { id, ifname, listen_port }, Instant::now()));
+        self.prune_quarantine();
         Ok(())
     }
 
@@ -302,12 +398,23 @@ impl TunnelSet {
         ids
     }
 
-    /// What is currently live, in the shape [`plan_tunnel`] consumes — the
+    /// What is currently RESERVED, in the shape [`plan_tunnel`] consumes — the
     /// authoritative "don't collide with these" input. Includes the boot tun
     /// (`base_tun` at `base_port`), which is never itself planned, which is
     /// exactly why the planner has to be handed this rather than deriving it.
-    /// Sorted by id so the allocation is deterministic for a given live set.
+    /// Sorted so the allocation is deterministic for a given reserved set.
+    ///
+    /// Reserved is deliberately WIDER than live: it is the live Devices PLUS
+    /// every still-quarantined teardown ([`QUARANTINE`], F6). The planner is a
+    /// pure lowest-free-index allocator over exactly this list, so putting the
+    /// quarantine in here — rather than teaching the planner about time — is
+    /// what keeps a just-freed ifname and port out of the very next plan while
+    /// [`plan_tunnel`] stays a pure function of its arguments.
+    ///
+    /// Expired entries are filtered on read rather than pruned, since this
+    /// takes `&self`; `tear_down` prunes for real.
     pub fn plans(&self) -> Vec<TunnelPlan> {
+        let now = Instant::now();
         let mut plans: Vec<TunnelPlan> = self
             .tunnels
             .iter()
@@ -316,8 +423,19 @@ impl TunnelSet {
                 ifname: t.ifname.clone(),
                 listen_port: t.listen_port,
             })
+            .chain(
+                self.quarantine
+                    .iter()
+                    .filter(|(_, freed)| now.duration_since(*freed) < QUARANTINE)
+                    .map(|(p, _)| p.clone()),
+            )
             .collect();
-        plans.sort_unstable_by_key(|p| p.id);
+        // By (id, ifname, port), not id alone: a quarantined entry and a live
+        // one can share an id only transiently, but the order must still be
+        // total or the allocation would not be reproducible.
+        plans.sort_unstable_by(|a, b| {
+            (a.id, &a.ifname, a.listen_port).cmp(&(b.id, &b.ifname, b.listen_port))
+        });
         plans
     }
 
