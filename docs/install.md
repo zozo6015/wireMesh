@@ -87,9 +87,11 @@ refuses to boot rather than quietly falling back to the 30-day default and
 leaving you believing you changed something. Uppercase units are rejected on
 purpose (`M` reads as "months" to too many people). A zero interval is rejected
 because it would rotate in a hot loop. An interval longer than `3650d`
-(10 years) is rejected as well: such a timer would never fire, which stops
-rotation without the boot banner below that tells you rotation is off. If you
-meant "never" in any of these cases, write `off`.
+(10 years) is rejected as well: at that scale a schedule is indistinguishable
+from no schedule, and in the extreme — a count near the 64-bit limit — the timer
+genuinely never fires. Either way you would have rotation switched off without
+the boot banner below that says so. If you meant "never" in any of these cases,
+write `off`.
 
 `off` disables the automatic **schedule** only. It does not disable rotation as
 a capability:
