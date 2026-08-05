@@ -83,7 +83,7 @@ Three independent mechanisms combine:
 
 - `insert_cidrs_tx` rejects any CIDR that contains or is contained by another segment's
   (`db.rs:301-318`). A Mac at `10.0.0.50/32` inside `aether 10.0.0.0/24` is **rejected**.
-  Clients need their own non-overlapping space (e.g. `100.64.0.0/10`).
+  Clients need their own non-overlapping space — operator-chosen, and NOT `100.64.0.0/10`, which Tailscale and Twingate already claim.
 - One active gateway per segment (`db.rs:1466-1474`), so a client cannot join an existing
   segment as a second occupant.
 - `allowed_ips` is a pure function of the segment (`routes.rs:47`, `projection.rs:441`) —
@@ -213,8 +213,13 @@ pipeline.
    constraints ratified alongside it — finding 1's carve-out, plus 3 and 4 below. User
    identity, device posture and per-user
    policy remain excluded — this is not a ZTNA product.
-3. **Client address space: `100.64.0.0/10`.** Adopted as recommended; overlaps nothing in
-   the fabric. A client may not take an address inside an existing segment's CIDR.
+3. **Client address space: operator-chosen, no default.** `100.64.0.0/10` was adopted on
+   recommendation and **retracted the same day**: the intended first client already runs
+   Twingate on `100.96.0.2` plus a second tunnel on `100.116.0.0/16`, both inside it.
+   "Overlaps nothing in the fabric" was the wrong test — Tailscale and Twingate both claim
+   RFC 6598 space, so any hardcoded default is a latent collision. A client may not take an
+   address inside an existing segment's CIDR, and the provisioning preflight is what makes
+   an operator's choice safe.
 4. **Scale ceiling: roughly a dozen `client × segment` reachability PAIRS**, documented as
    a v1 limit — pairs, not clients, per finding 2's arithmetic. Adopted as recommended.
    Beyond it needs the per-peer address model in phase 3.
