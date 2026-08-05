@@ -73,7 +73,7 @@ pub fn device_config(ds: &DesiredState, private_key_b64: &str, listen_port: u16)
 /// current `active_pubkey_b64` (key-rotation Task 9, Role B make-before-break).
 ///
 /// While this gateway is overlapping a rotating peer — carrying the peer's NEW
-/// epoch on a transient `wg0e<N>` Device — its base `wg0` Device must keep the
+/// epoch on a transient `wg0o<slot>` overlap Device — its base `wg0` Device must keep the
 /// peer's OLD-epoch session alive so traffic the peer is still sending on its
 /// old key (until it cuts over) keeps decrypting. But a `replace_peers` apply
 /// driven by the peer's promote delta (which flips the peer's advertised

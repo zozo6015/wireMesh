@@ -1,6 +1,6 @@
 //! wiremesh-gateway boot sequence + supervision (spec §5.1).
 use anyhow::Context;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -21,10 +21,12 @@ use wiremesh_gateway::path::{
 use wiremesh_gateway::policy_apply::needs_policy_write;
 use wiremesh_gateway::punch_backoff::{PunchBackoff, PunchDecision};
 use wiremesh_gateway::relay::{RelayDeathReason, RelayTransport};
-use wiremesh_gateway::rotation::{Rotation, RotationAction, RotationPhase};
+use wiremesh_gateway::rotation::{
+    role_b_decisions, RoleBDecision, Rotation, RotationAction, RotationPhase,
+};
 use wiremesh_gateway::state::{DesiredState, FailStaticWriter};
-use wiremesh_gateway::tunnelset::TunnelSet;
-use wiremesh_gateway::uapi::DeviceConfig;
+use wiremesh_gateway::tunnelset::{plan_tunnel, TunnelId, TunnelSet};
+use wiremesh_gateway::uapi::{pubkey_b64_to_hex, DeviceConfig};
 use wiremesh_gateway::{netif, observe, punch, reconcile, routes, sync, uapi};
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{EpochAck, PeerPath, RelayHealth};
@@ -39,8 +41,8 @@ const MSS: u16 = 1240;
 // `docs/research/ops-finding-multi-gateway-convergence.md` §5 (idle NAT
 // mappings expired because no keepalive was set, sawtoothing working paths).
 
-/// Persistent-keepalive for a rotation's transient overlap Devices
-/// (`wg0e<N>`), deliberately much shorter than the steady-state
+/// Persistent-keepalive for a rotation's transient Devices (our own
+/// `wg0e<N>`, a Role-B overlap's `wg0o<slot>`), deliberately much shorter than the steady-state
 /// `uapi::PERSISTENT_KEEPALIVE_SECS`. persistent-keepalive is what makes boringtun proactively
 /// INITIATE (and retry) a handshake for a peer that has an endpoint but no
 /// data yet — a rotation Device carries no traffic until the cutover, so
@@ -63,11 +65,11 @@ const OBSERVE_PERIOD: Duration = Duration::from_secs(20);
 const POLICY_APPLY_RETRY: Duration = Duration::from_secs(5);
 
 /// The real [`wiremesh_gateway::policy_apply::PolicyApplyTarget`]: the live
-/// per-epoch enforcer map, plus the two things that must only move once an
+/// per-tun enforcer map, plus the two things that must only move once an
 /// install has ACTUALLY landed in the datapath (the `applied_version` gauge
 /// and a nudge to re-report it).
 struct EnforcerApplyTarget {
-    enforcers: Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
+    enforcers: Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
     applied_version: Arc<AtomicU64>,
     report_notify: Arc<tokio::sync::Notify>,
 }
@@ -120,15 +122,15 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
     /// suffer, in either the stale-snapshot or the rollback case. See the
     /// store itself for why both halves need saying.
     fn install(&self, ds: &DesiredState, ds_is_newest: bool) -> anyhow::Result<()> {
-        // `(epoch, how much of its grace is left)` for every entry this call
+        // `(tun id, how much of its grace is left)` for every entry this call
         // refused to write. Both halves are in the error text below: the
-        // epoch says WHICH tun is still on the old policy, and the remaining
+        // id says WHICH tun is still on the old policy, and the remaining
         // duration says how long the retry will take to finish the job —
         // without them an operator reading a `policy_apply_failures_total`
         // bump has no way to tell a benign rotation race from a real
         // rejection.
-        let mut deferred: Vec<(u32, Duration)> = Vec::new();
-        let mut installed: Vec<u32> = Vec::new();
+        let mut deferred: Vec<(TunnelId, Duration)> = Vec::new();
+        let mut installed: Vec<TunnelId> = Vec::new();
         let mut failure: Option<anyhow::Error> = None;
         // "At least one live tun is enforcing SOME policy", evaluated under
         // the same lock as the loop below. This replaces an `ever_installed`
@@ -148,7 +150,7 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
         {
             let mut map = self.enforcers.blocking_lock();
             let now = Instant::now();
-            for (epoch, enforcer) in map.iter_mut() {
+            for (id, enforcer) in map.iter_mut() {
                 if !needs_policy_write(enforcer.applied_version(), ds.policy_version, ds_is_newest)
                 {
                     continue; // nothing would be written; nothing to gate on
@@ -157,15 +159,15 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
                     enforcer.apply_ready_at().map(|t| t.saturating_duration_since(now))
                 {
                     if !left.is_zero() {
-                        deferred.push((*epoch, left));
+                        deferred.push((*id, left));
                         continue;
                     }
                 }
                 if let Err(err) = enforcer.apply_if_changed(ds) {
-                    failure = Some(err.context(format!("applying policy to epoch {epoch}")));
+                    failure = Some(err.context(format!("applying policy to {id:?}")));
                     break;
                 }
-                installed.push(*epoch);
+                installed.push(*id);
             }
             any_policy_live = map.values().any(|e| e.applied_version().is_some());
             live_max = map.values().filter_map(|e| e.applied_version()).max();
@@ -187,7 +189,7 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
                 e
             } else {
                 e.context(format!(
-                    "policy version {} had already landed on epoch(s) {installed:?}",
+                    "policy version {} had already landed on tun(s) {installed:?}",
                     ds.policy_version
                 ))
             });
@@ -202,19 +204,19 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
             // assert its contents. It must therefore say, on its own, what
             // happened, what is stale right now, and what will fix it.
             let longest = deferred.iter().map(|(_, left)| *left).max().unwrap_or_default();
-            let epochs: Vec<String> =
-                deferred.iter().map(|(e, left)| format!("{e} ({left:?} left)")).collect();
+            let tuns: Vec<String> =
+                deferred.iter().map(|(id, left)| format!("{id:?} ({left:?} left)")).collect();
             anyhow::bail!(
-                "policy version {} was installed on epoch(s) {installed:?} but NOT on {} of \
-                 them — epoch(s) [{}] are still inside their post-flip reap grace. They were \
+                "policy version {} was installed on tun(s) {installed:?} but NOT on {} of \
+                 them — tun(s) [{}] are still inside their post-flip reap grace. They were \
                  created after this apply's deadline was read (a key rotation starting \
                  concurrently with a policy update), so writing them now could pull maps out \
                  from under in-flight packets. No policy is lost: the worker retries and the \
                  longest outstanding grace is {longest:?}. Persistent repeats of this for the \
-                 SAME epoch mean a rotation tun is stuck flipping, not a bad policy.",
+                 SAME tun mean a rotation tun is stuck flipping, not a bad policy.",
                 ds.policy_version,
                 deferred.len(),
-                epochs.join(", "),
+                tuns.join(", "),
             );
         }
         // The gauge is the highest version OBSERVED LIVE on the enforcers,
@@ -469,28 +471,48 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // `ip link del`). `bring_up` creates the boringtun Device, brings the tun
     // link up at `TUN_MTU`, and applies the boot epoch's private key + listen
     // port with an EMPTY peer set; `apply_state` (boot fail-static below, and
-    // every Sync snapshot) fills in the peers. Keyed by the boot key's EPOCH
-    // number so a later rotation's retire (`old_epoch` = the store's active
-    // epoch at mint time) tears down THIS entry.
+    // every Sync snapshot) fills in the peers. Keyed by `Own { epoch }` for
+    // the boot key's epoch, so a later rotation's retire (`old_epoch` = the
+    // store's active epoch at mint time) tears down THIS entry — and so a
+    // Role-B overlap toward a PEER whose pending epoch happens to carry the
+    // same NUMBER can never address it (the T3 de-collision; see
+    // `tunnelset::TunnelId`). Not planned via `plan_tunnel`: the boot tun IS
+    // the base tun at the base port by definition (OD-1), which is exactly
+    // why the planner has to be handed the live set rather than deriving it.
+    let boot_tun_id = TunnelId::Own { epoch: boot_key.epoch };
     let mut tunnels = TunnelSet::new();
     tunnels.bring_up(
-        boot_key.epoch,
+        boot_tun_id,
         &cfg.tun_ifname,
         &boot_key.private_key_b64,
         cfg.wg_listen_port,
         TUN_MTU,
     )?;
     routes::install_mss_clamp(&cfg.tun_ifname, MSS)?;
-    // All live L4 enforcers, keyed by epoch (boot epoch = boot tun `wg0`; `wg0e<N>` per
-    // rotation). `apply_state` applies the current policy to EVERY entry so a
-    // policy update reaches every tun that may be carrying traffic during a
-    // rotation overlap (not just `wg0`). A `tokio::sync::Mutex` (same as the
-    // old single `enforcer`) because `apply_if_changed`/`counters` are held
-    // across the metrics task's `.await`. The map only grows in Step 1 — old
-    // entries are torn down in a later step.
-    let enforcers: Arc<Mutex<HashMap<u32, GatewayEnforcer>>> = Arc::new(Mutex::new({
+    // All live L4 enforcers, keyed by `TunnelId` — the SAME key space as
+    // `tunnels`, deliberately (boot tun = `Own { boot epoch }`; one entry per
+    // rotation tun). `apply_state` applies the current policy to EVERY entry
+    // so a policy update reaches every tun that may be carrying traffic during
+    // a rotation overlap (not just `wg0`).
+    //
+    // SECURITY — why the key type matters here as much as it does in
+    // `TunnelSet` (T3): this map used to be keyed by a bare `u32` epoch that
+    // meant OUR epoch for Role A and the PEER's pending epoch for Role B. That
+    // is the identical collision `TunnelSet` had, one map over — masked only
+    // because `bring_up` bailed first. De-colliding the tunnels alone would
+    // have converted that loud bail into a silent fail-open: `HashMap::insert`
+    // returns and DROPS the displaced `GatewayEnforcer`, and holding it in
+    // this map is precisely what keeps its tc-BPF/nft program attached (see
+    // the note above `RotationShared`'s construction), so the displaced tun
+    // would go on carrying traffic with NO policy hook at all — the very
+    // default-deny-bypass gap this map exists to close.
+    //
+    // A `tokio::sync::Mutex` (same as the old single `enforcer`) because
+    // `apply_if_changed`/`counters` are held across the metrics task's
+    // `.await`.
+    let enforcers: Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>> = Arc::new(Mutex::new({
         let mut m = HashMap::new();
-        m.insert(boot_key.epoch, GatewayEnforcer::attach(&cfg.tun_ifname)?);
+        m.insert(boot_tun_id, GatewayEnforcer::attach(&cfg.tun_ifname)?);
         m
     }));
 
@@ -783,13 +805,19 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // old-epoch teardown after a retire runs here in the run task (which owns
     // `tunnels`), driven by a shared `retire_ready` flag the tick sets.
     //
-    // Each transient rotation tun's (`wg0e<N>`) L4 enforcer is inserted into the
-    // shared `enforcers` map above, keyed by EPOCH — so `apply_state` reaches
-    // it on every policy update AND holding it in the map keeps its tc-BPF/nft
-    // program attached for the overlap Device's lifetime (dropping it would
-    // detach). Closes the default-deny-bypass-on-new-tun security gap: without
-    // this, a rotation's new-epoch tun carries traffic with NO policy hook at
-    // all.
+    // Each transient rotation tun's (`wg0e<N>` / `wg0o<slot>`) L4 enforcer is
+    // inserted into the shared `enforcers` map above, under the SAME
+    // `TunnelId` the Device itself is keyed by — so `apply_state` reaches it
+    // on every policy update AND holding it in the map keeps its tc-BPF/nft
+    // program attached for that Device's lifetime (dropping it would detach).
+    // Closes the default-deny-bypass-on-new-tun security gap: without this, a
+    // rotation tun carries traffic with NO policy hook at all.
+    //
+    // The key type is part of that guarantee (T3). Keyed by a bare epoch —
+    // which meant OUR epoch for Role A and the PEER's pending epoch for Role
+    // B — an insert could displace a DIFFERENT live tun's enforcer, and
+    // `HashMap::insert` drops what it displaces. See the map's construction
+    // above.
     let rot = RotationShared {
         base_wg_port: cfg.wg_listen_port,
         base_tun: cfg.tun_ifname.clone(),
@@ -979,11 +1007,15 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // peer's new key so the make-before-break cutover
                             // can happen once that session is live. No-op for
                             // steady state (no rotating peers).
-                            if let Err(e) =
-                                maybe_start_role_b(&mut tunnels, &enforcers, &rot, &ds).await
-                            {
-                                eprintln!("wiremesh-gateway: Role B setup failed: {e}");
-                            }
+                            //
+                            // Infallible by construction now (T3): every
+                            // failure is per-peer, logged there, and does not
+                            // stop the remaining peers being attempted. This
+                            // used to return `Err` on the FIRST bad peer and
+                            // the handling here was exactly this log line —
+                            // i.e. every peer behind it was silently skipped,
+                            // on every `State` event, forever.
+                            maybe_start_role_b(&mut tunnels, &enforcers, &rot, &ds).await;
                             // Publish the latest desired state to the punch /
                             // path-tick tasks (guard dropped before the await
                             // below — never held across it).
@@ -1624,44 +1656,6 @@ fn punch_jitter_seed(own_gateway_id: u64, peer_gateway_id: u64) -> u64 {
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .rotate_left(32)
         ^ peer_gateway_id.wrapping_mul(0xBF58_476D_1CE4_E5B9)
-}
-
-/// Decode a base64 WireGuard public key into the lowercase-hex form the WG
-/// UAPI keys its per-peer state by (`uapi::get_peer_liveness`), so a
-/// controller-provided `active_pubkey_b64` can be correlated with the device's
-/// live handshake/rx_bytes state. Mirrors `uapi`'s private `key_b64_to_hex`
-/// (not part of the library's public surface). Returns `None` for malformed
-/// input or a key that isn't exactly 32 bytes.
-fn pubkey_b64_to_hex(b64: &str) -> Option<String> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62),
-            b'/' => Some(63),
-            _ => None,
-        }
-    }
-    let bytes: Vec<u8> = b64.bytes().filter(|&c| c != b'=' && !c.is_ascii_whitespace()).collect();
-    let mut out = Vec::new();
-    for chunk in bytes.chunks(4) {
-        let mut n = 0u32;
-        for (i, &c) in chunk.iter().enumerate() {
-            n |= val(c)? << (18 - 6 * i);
-        }
-        out.push((n >> 16) as u8);
-        if chunk.len() > 2 {
-            out.push((n >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            out.push(n as u8);
-        }
-    }
-    if out.len() != 32 {
-        return None;
-    }
-    Some(out.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Production [`punch::NudgeSink`]: sends ONE datagram from a fresh EPHEMERAL
@@ -3390,7 +3384,7 @@ async fn apply_state(
 /// tun) and evicts its enforcer (closing the map's per-epoch entry).
 async fn service_retire(
     tunnels: &mut TunnelSet,
-    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
+    enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
     rot: &RotationShared,
 ) {
     let Some(old_epoch) = rot.retire_ready.lock().unwrap().take() else {
@@ -3406,10 +3400,15 @@ async fn service_retire(
         );
         return;
     };
-    if let Err(e) = tunnels.tear_down(epoch) {
+    // Always OUR OWN epoch: a retire only ever tears down the epoch this
+    // gateway rotated off. A Role-B overlap toward a peer that happens to
+    // carry the same epoch NUMBER is a different `TunnelId` and is retired by
+    // `service_role_b_collapse`, never here (T3).
+    let id = TunnelId::Own { epoch };
+    if let Err(e) = tunnels.tear_down(id) {
         eprintln!("wiremesh-gateway: tearing down retired epoch {epoch} Device failed: {e}");
     }
-    enforcers.lock().await.remove(&epoch);
+    enforcers.lock().await.remove(&id);
     // Durable retire (Backlog 3 Task 1 — the SECURITY half): tearing the
     // Device down only destroys the live in-process copy of the old private
     // key; `retire` REMOVES the epoch's store entry and `persist` rewrites
@@ -3456,18 +3455,23 @@ async fn service_retire(
 /// ran this gateway's OWN active key, which stays active.
 async fn service_role_b_collapse(
     tunnels: &mut TunnelSet,
-    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
+    enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
     rot: &RotationShared,
 ) {
     let ready: Vec<(u64, u32)> = std::mem::take(&mut *rot.collapse_ready.lock().unwrap());
     for (aid, epoch) in ready {
-        if let Err(e) = tunnels.tear_down(epoch) {
+        // The overlap's id is a pure function of `(peer, its pending epoch)`,
+        // so reconstructing it here cannot drift from what `maybe_start_role_b`
+        // brought up — and it can never alias our OWN tun at the same epoch
+        // number, which is the whole point of `TunnelId` (T3).
+        let id = TunnelId::Overlap { gateway_id: aid, epoch };
+        if let Err(e) = tunnels.tear_down(id) {
             eprintln!(
                 "wiremesh-gateway: tearing down collapsed Role-B overlap epoch {epoch} (peer \
                  {aid}) failed: {e}"
             );
         }
-        enforcers.lock().await.remove(&epoch);
+        enforcers.lock().await.remove(&id);
         eprintln!(
             "wiremesh-gateway: Role B overlap for peer {aid} collapsed — epoch-{epoch} Device \
              torn down, enforcer evicted; wg0 is the routed device on the peer's new key"
@@ -3508,7 +3512,9 @@ struct RotationShared {
     /// Base WireGuard listen port (epoch-0 / `wg0`), the offset anchor for a
     /// rotation Device's port (`base + (N - active_epoch)`).
     base_wg_port: u16,
-    /// Boot tun ifname (`wg0`); a rotation Device is `<base_tun>e<N>`.
+    /// Boot tun ifname (`wg0`); one of OUR epochs is `<base_tun>e<N>` and a
+    /// Role-B overlap toward a rotating peer is `<base_tun>o<slot>` — disjoint
+    /// namespaces, see [`wiremesh_gateway::tunnelset::plan_tunnel`] (T3).
     base_tun: String,
     state_dir: PathBuf,
     identity: Arc<Identity>,
@@ -3634,7 +3640,7 @@ struct RoleB {
     /// key IS `peer_pending_hex`'s key, now active). Arms the reverse
     /// make-before-break in the rotation tick: wait for the peer's session on
     /// the BASE tun (rekeyed to the new key by the unpinned apply) to become
-    /// rx-corroborated live, THEN flip routes back `wg0e<N>` -> `wg0` and
+    /// rx-corroborated live, THEN flip routes back `wg0o<slot>` -> `wg0` and
     /// tear the overlap Device down. While armed, the normal cutover arm
     /// skips this entry.
     collapse_armed: bool,
@@ -3647,7 +3653,7 @@ struct RoleB {
 /// against a re-entrant directive (the SM only honors one from `Idle`).
 async fn handle_rotate(
     tunnels: &mut TunnelSet,
-    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
+    enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
     rot: &RotationShared,
     directive_epoch: u32,
     applied: Option<&DesiredState>,
@@ -3685,11 +3691,26 @@ async fn handle_rotate(
         );
     }
 
-    let offset = u16::try_from(n.saturating_sub(active_epoch)).unwrap_or(0);
-    let new_port = rot.base_wg_port.saturating_add(offset);
-    let new_tun = format!("{}e{}", rot.base_tun, n);
+    // Plan the new tun's ifname + listen port against everything already live
+    // (T3). The NAME is unchanged — `{base}e{n}`, exactly as before, since an
+    // own-epoch number is unique among our own tuns. The PORT is what moves:
+    // the old `base + (n - active_epoch)` was derived from the epoch number
+    // alone, and a Role-B overlap toward a peer's identically-numbered pending
+    // epoch derived the very same value — guaranteed, not incidental, because
+    // the controller rotates the whole fabric off one timer. The planner hands
+    // back a port free of the boot tun, of any previous rotation tun, and of
+    // every overlap we hold.
+    let plan = plan_tunnel(
+        TunnelId::Own { epoch: n },
+        &rot.base_tun,
+        rot.base_wg_port,
+        &tunnels.plans(),
+    )
+    .context("planning this gateway's new epoch tun")?;
+    let new_tun = plan.ifname.clone();
+    let new_port = plan.listen_port;
 
-    tunnels.bring_up(n, &new_tun, &new_key.private_key_b64, new_port, TUN_MTU)?;
+    tunnels.bring_up(plan.id, &new_tun, &new_key.private_key_b64, new_port, TUN_MTU)?;
 
     // SECURITY (fail-closed): attach the L4 enforcer to the new epoch tun with
     // the current policy BEFORE the device is made session-capable (peer
@@ -3705,18 +3726,22 @@ async fn handle_rotate(
     let mut ke = match GatewayEnforcer::attach(&new_tun) {
         Ok(ke) => ke,
         Err(e) => {
-            let _ = tunnels.tear_down(n);
+            let _ = tunnels.tear_down(plan.id);
             return Err(e).with_context(|| format!("attaching enforcer to rotation tun {new_tun}"));
         }
     };
     if let Err(e) = ke.apply_if_changed(ds) {
-        let _ = tunnels.tear_down(n);
+        let _ = tunnels.tear_down(plan.id);
         return Err(e).with_context(|| format!("applying policy to rotation tun {new_tun}"));
     }
-    // Insert into the SHARED enforcer map keyed by EPOCH (insert is last on this
-    // path, so the fail-closed teardown above never has to remove it), so every
-    // later `apply_state` reaches this new tun's enforcer.
-    enforcers.lock().await.insert(n, ke);
+    // Insert into the SHARED enforcer map under the SAME `TunnelId` the Device
+    // is keyed by (insert is last on this path, so the fail-closed teardown
+    // above never has to remove it), so every later `apply_state` reaches this
+    // new tun's enforcer. Keying by `TunnelId` rather than the bare epoch is
+    // load-bearing, not cosmetic: an `insert` colliding with a Role-B overlap
+    // at the same epoch number would DROP the displaced enforcer and detach
+    // its tc-BPF/nft program from a tun that is still carrying traffic.
+    enforcers.lock().await.insert(plan.id, ke);
 
     let dev =
         reconcile::device_config_at_port(ds, &new_key.private_key_b64, new_port, ROTATION_KEEPALIVE);
@@ -3747,29 +3772,86 @@ async fn handle_rotate(
 }
 
 /// Role B: for each peer in `ds` that is rotating (advertises a real-keyed
-/// `pending` epoch alongside its `active` one) and isn't already being
-/// overlapped, bring up a transient overlap Device toward the peer's pending
-/// key (this gateway's OWN active key on the offset port) and arm the tick to
-/// flip+ack once that session is live. No-op in steady state.
+/// `pending` epoch alongside its `active` one) and isn't already overlapped at
+/// exactly that epoch, bring up a transient overlap Device toward the peer's
+/// pending key (this gateway's OWN active key on a planned free port) and arm
+/// the tick to flip+ack once that session is live. No-op in steady state.
+///
+/// # Structure (T3): decide first, then execute per peer
+///
+/// The *decision* — one [`RoleBDecision`] per peer, in roster order — is made
+/// by the pure [`role_b_decisions`], and this function only executes it. The
+/// split is not tidiness; it is the fix for two shipped defects that a single
+/// imperative loop kept producing:
+///
+///  - **Totality.** [`role_b_decisions`] cannot return fewer decisions than
+///    there are peers, so "peer 2 is broken" can no longer mean "peers 3..N
+///    were never considered".
+///  - **Re-rotation.** The old `contains_key(&gid)` guard keyed on the peer id
+///    alone; a peer rotating AGAIN while we still held an overlap toward its
+///    previous pending epoch was skipped silently and permanently. That is now
+///    [`RoleBDecision::Restart`], and this function honours it.
+///
+/// **This function cannot fail** — hence no `Result`. Every step that used to
+/// `?`/`bail!`/`return Err` out of the loop body now logs and `continue`s to
+/// the NEXT peer: `bring_up`, the two enforcer steps, the peer `uapi::apply`,
+/// and the unusable-pubkey case. One unusable peer must never starve the peers
+/// behind it, and the caller only logged the error anyway, so an early return
+/// was pure loss.
 async fn maybe_start_role_b(
     tunnels: &mut TunnelSet,
-    enforcers: &Arc<Mutex<HashMap<u32, GatewayEnforcer>>>,
+    enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
     rot: &RotationShared,
     ds: &DesiredState,
-) -> anyhow::Result<()> {
-    for peer in &ds.peers {
+) {
+    // What we currently overlap toward, as `gateway_id -> the pending epoch
+    // that overlap Device targets`. The epoch is what makes a re-rotation
+    // distinguishable from the steady mid-rotation state.
+    let overlapped: BTreeMap<u64, u32> = rot
+        .role_b
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(gid, b)| (*gid, b.pending_epoch))
+        .collect();
+
+    for (aid, decision) in role_b_decisions(ds, &overlapped) {
+        let pending_epoch = match decision {
+            RoleBDecision::Skip => continue,
+            RoleBDecision::Unusable { pending_epoch } => {
+                // Used to be `anyhow::bail!`, which destroyed the whole loop.
+                eprintln!(
+                    "wiremesh-gateway: Role B — rotating peer {aid}'s pending epoch \
+                     {pending_epoch} pubkey is not a valid 32-byte base64 WG key; no overlap \
+                     stood up for it (other peers unaffected)"
+                );
+                continue;
+            }
+            RoleBDecision::Start { pending_epoch } => pending_epoch,
+            RoleBDecision::Restart { stale_epoch, pending_epoch } => {
+                // The peer has moved past the epoch we overlapped toward (it
+                // re-rotated, or the entry leaked from an aborted rotation).
+                // Retire the stale overlap before standing up the new one, so
+                // the peer ends up with exactly one overlap Device.
+                retire_stale_overlap(tunnels, enforcers, rot, aid, stale_epoch).await;
+                pending_epoch
+            }
+        };
+
+        // Re-find the peer the decision was made about. `role_b_decisions`
+        // emits one entry per `ds.peers`, so this always resolves; the three
+        // `else continue`s below are unreachable-by-construction restatements
+        // of what a `Start`/`Restart` already implies, kept as guards rather
+        // than `expect`s because a panic in the sync loop kills the gateway.
+        let Some(peer) = ds.peers.iter().find(|p| p.gateway_id == aid) else {
+            continue;
+        };
         let (Some(active), Some(pending)) = (peer.active_key(), peer.pending_key()) else {
             continue;
         };
-        let aid = peer.gateway_id;
-        if rot.role_b.lock().unwrap().contains_key(&aid) {
+        let Some(peer_pending_hex) = pubkey_b64_to_hex(&pending.pubkey_b64) else {
             continue;
-        }
-
-        let pending_epoch = pending.epoch;
-        let offset = u16::try_from(pending_epoch.saturating_sub(active.epoch)).unwrap_or(0);
-        let listen_port = rot.base_wg_port.saturating_add(offset);
-        let new_tun = format!("{}e{}", rot.base_tun, pending_epoch);
+        };
 
         // Peer set for the overlap Device: exactly the rotating peer at its
         // pending key + offset endpoint (`pending_peer_configs`, filtered to
@@ -3780,8 +3862,38 @@ async fn maybe_start_role_b(
             .filter(|pc| pc.public_key_b64 == pending.pubkey_b64)
             .collect();
         if peers.is_empty() {
-            continue; // couldn't build the peer's offset endpoint — skip this round
+            // Transient: the peer has no usable candidate endpoint yet. The
+            // next `State` event re-decides, and until then `role_b` holds no
+            // entry, so this is a genuine retry rather than a drop.
+            eprintln!(
+                "wiremesh-gateway: Role B — no offset endpoint could be built for rotating peer \
+                 {aid} (epoch {pending_epoch}); skipping this round"
+            );
+            continue;
         }
+
+        // Plan the overlap's ifname + listen port against everything already
+        // live (T3). The old scheme derived both from the peer's pending epoch
+        // NUMBER — `{base}e{pending}` at `base + (pending - peer active)` —
+        // which is exactly the namespace and formula our OWN tuns used, so an
+        // in-step fabric collided on all three axes at once and the first
+        // collision aborted the loop. Overlaps now live in their own
+        // `{base}o{slot}` namespace, and the planner sees the boot tun, our
+        // own rotation tun and every other peer's overlap in
+        // `tunnels.plans()`, so the port is free of all of them too.
+        let id = TunnelId::Overlap { gateway_id: aid, epoch: pending_epoch };
+        let plan = match plan_tunnel(id, &rot.base_tun, rot.base_wg_port, &tunnels.plans()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!(
+                    "wiremesh-gateway: Role B — cannot plan an overlap tun for peer {aid} epoch \
+                     {pending_epoch}: {e:#}"
+                );
+                continue;
+            }
+        };
+        let new_tun = plan.ifname.clone();
+        let listen_port = plan.listen_port;
 
         // This gateway's OWN key for the overlap Device: the CURRENT ACTIVE
         // key (what the rotating peer's roster advertises for us), not
@@ -3791,7 +3903,13 @@ async fn maybe_start_role_b(
         // could never complete the peer's handshake. Pre-rotation the two are
         // identical, so steady-state behavior is unchanged.
         let own_priv = rot.active.lock().unwrap().priv_key.clone();
-        tunnels.bring_up(pending_epoch, &new_tun, &own_priv, listen_port, TUN_MTU)?;
+        if let Err(e) = tunnels.bring_up(id, &new_tun, &own_priv, listen_port, TUN_MTU) {
+            eprintln!(
+                "wiremesh-gateway: Role B — bringing up overlap Device {new_tun}:{listen_port} \
+                 for peer {aid} epoch {pending_epoch} failed: {e:#}"
+            );
+            continue;
+        }
 
         // SECURITY (fail-closed): attach the L4 enforcer to this overlap
         // Device with the current policy BEFORE the device is made
@@ -3801,35 +3919,61 @@ async fn maybe_start_role_b(
         // enforcer here, ahead of the peer-apply, closes the
         // default-deny-bypass-on-new-tun gap with no unfiltered window. If
         // `attach`/`apply_if_changed` errors, tear the half-built tun back
-        // down and propagate the error: the device never received peers, so
-        // it never became traffic-capable — no fail-open on this path, unlike
-        // attaching after the peer-apply (which would leave a
+        // down and move on to the next peer: the device never received peers,
+        // so it never became traffic-capable — no fail-open on this path,
+        // unlike attaching after the peer-apply (which would leave a
         // session-capable, unenforced tun on an attach failure).
         let mut ke = match GatewayEnforcer::attach(&new_tun) {
             Ok(ke) => ke,
             Err(e) => {
-                let _ = tunnels.tear_down(pending_epoch);
-                return Err(e).with_context(|| format!("attaching enforcer to rotation tun {new_tun}"));
+                let _ = tunnels.tear_down(id);
+                eprintln!(
+                    "wiremesh-gateway: Role B — attaching enforcer to overlap tun {new_tun} \
+                     (peer {aid}) failed, tun torn back down: {e:#}"
+                );
+                continue;
             }
         };
         if let Err(e) = ke.apply_if_changed(ds) {
-            let _ = tunnels.tear_down(pending_epoch);
-            return Err(e).with_context(|| format!("applying policy to rotation tun {new_tun}"));
+            let _ = tunnels.tear_down(id);
+            eprintln!(
+                "wiremesh-gateway: Role B — applying policy to overlap tun {new_tun} (peer \
+                 {aid}) failed, tun torn back down: {e:#}"
+            );
+            continue;
         }
-        // Insert into the SHARED enforcer map keyed by EPOCH (insert is last on
-        // this path, so the fail-closed teardown above never has to remove it),
-        // so every later `apply_state` reaches this overlap tun's enforcer. No
-        // `std::sync::Mutex` guard is held across this `.await`.
-        enforcers.lock().await.insert(pending_epoch, ke);
+        // Insert into the SHARED enforcer map under the SAME `TunnelId` the
+        // Device is keyed by, so every later `apply_state` reaches this
+        // overlap tun's enforcer. No `std::sync::Mutex` guard is held across
+        // this `.await`.
+        //
+        // SECURITY: the `TunnelId` key is what makes this insert safe. Keyed
+        // by the bare pending epoch, it could displace the enforcer of OUR own
+        // tun at the same epoch number — `insert` drops the old value, which
+        // detaches its tc-BPF/nft program — leaving a live tun with no policy
+        // hook. `TunnelId::Overlap` and `TunnelId::Own` are disjoint, so this
+        // can only ever replace an entry for this very peer at this very
+        // epoch, which `Restart` has already removed.
+        enforcers.lock().await.insert(id, ke);
 
-        uapi::apply(
+        if let Err(e) = uapi::apply(
             &new_tun,
             &DeviceConfig { private_key_b64: own_priv, listen_port, peers },
-        )?;
+        ) {
+            // The peer-apply is what makes the Device session-capable, so a
+            // failure here leaves a tun that cannot carry traffic. Unwind BOTH
+            // resources — the enforcer entry as well as the Device — or the
+            // map would retain an attached program for a tun that no longer
+            // exists and keep it out of a later slot's reach.
+            let _ = tunnels.tear_down(id);
+            enforcers.lock().await.remove(&id);
+            eprintln!(
+                "wiremesh-gateway: Role B — applying the rotating peer's config to overlap tun \
+                 {new_tun} (peer {aid}) failed, tun torn back down: {e:#}"
+            );
+            continue;
+        }
 
-        let Some(peer_pending_hex) = pubkey_b64_to_hex(&pending.pubkey_b64) else {
-            anyhow::bail!("rotating peer {aid} pending pubkey is not valid base64");
-        };
         // Pin this peer's `wg0` entry to its CURRENT (old) epoch key for the
         // overlap, so its later promote delta can't rekey `wg0` and reset the
         // still-in-use old session (make-before-break on the base tun).
@@ -3850,7 +3994,55 @@ async fn maybe_start_role_b(
              {aid} epoch {pending_epoch}"
         );
     }
-    Ok(())
+}
+
+/// Retire the overlap Device we hold toward `aid` at `stale_epoch`, because
+/// the peer has moved on to a newer pending epoch ([`RoleBDecision::Restart`]).
+/// Best-effort throughout: every step is independently logged and none can
+/// abort the caller's peer loop.
+///
+/// Order matters. The peer's segment routes may already have been flipped onto
+/// the overlap tun by a completed Role-B cutover, so they are moved BACK onto
+/// the base tun before the Device is deleted — `routes::add_route` is `ip
+/// route replace`, so it is an idempotent no-op when the cutover never
+/// happened, and when it did it is what stops those CIDRs from pointing at an
+/// interface that is about to disappear. The `wg0` pin is dropped too: it
+/// holds the base tun on a key the peer has since rotated past, and the caller
+/// re-pins to the peer's CURRENT active key as soon as the replacement overlap
+/// is up (and if the replacement fails, no pin at all is the correct state —
+/// `wg0` then follows the roster's active key).
+async fn retire_stale_overlap(
+    tunnels: &mut TunnelSet,
+    enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
+    rot: &RotationShared,
+    aid: u64,
+    stale_epoch: u32,
+) {
+    let stale = rot.role_b.lock().unwrap().remove(&aid);
+    rot.wg0_pins.lock().unwrap().remove(&aid);
+    if let Some(b) = &stale {
+        for cidr in &b.peer_cidrs {
+            if let Err(e) = routes::add_route(cidr, &rot.base_tun) {
+                eprintln!(
+                    "wiremesh-gateway: Role B restart — moving {cidr} back onto {} before \
+                     retiring peer {aid}'s stale overlap failed: {e}",
+                    rot.base_tun
+                );
+            }
+        }
+    }
+    let id = TunnelId::Overlap { gateway_id: aid, epoch: stale_epoch };
+    if let Err(e) = tunnels.tear_down(id) {
+        eprintln!(
+            "wiremesh-gateway: Role B restart — tearing down peer {aid}'s stale overlap (epoch \
+             {stale_epoch}) failed: {e}"
+        );
+    }
+    enforcers.lock().await.remove(&id);
+    eprintln!(
+        "wiremesh-gateway: Role B restart — peer {aid} has re-rotated past epoch {stale_epoch}; \
+         stale overlap retired, standing up a fresh one"
+    );
 }
 
 /// Role-B collapse trigger (the minimal reverse-make-before-break slice of
@@ -3877,7 +4069,7 @@ async fn maybe_start_role_b(
 ///      rebuild is guaranteed by that very apply);
 ///  (b) arm `collapse_armed` — the rotation tick then waits for the peer's
 ///      session on the BASE tun to become rx-corroborated live;
-///  (c) the tick flips routes back `wg0e<N>` -> `wg0` and signals the run
+///  (c) the tick flips routes back `wg0o<slot>` -> `wg0` and signals the run
 ///      task to tear the overlap Device down (`service_role_b_collapse`).
 ///
 /// Deliberately does NOT require `b.done`: the controller's ack-less Rule-4
@@ -4321,7 +4513,7 @@ async fn run_rotation_ticks(rot: RotationShared) {
         // live, rx-corroborated session toward the peer's NEW active key
         // (== `peer_pending_hex` — the pending key we overlapped toward is
         // the one the roster promoted). Ordering guarantee: the overlap
-        // Device `wg0e<N>` is NEVER torn down — and its routes never moved —
+        // Device `wg0o<slot>` is NEVER torn down — and its routes never moved —
         // before `wg0` is proven live, mirroring (in reverse) the Role-A
         // cutover's make-before-break. Until `wg0` goes live the overlap
         // keeps carrying whatever traffic still flows (steady-state
@@ -4347,7 +4539,7 @@ async fn run_rotation_ticks(rot: RotationShared) {
             // wg0 is live on the new key: flip the peer's routes back onto the
             // base tun (reverse of the Role-B cutover flip; `add_route` is
             // `ip route replace`, so this atomically moves each CIDR off
-            // `wg0e<N>`)...
+            // `wg0o<slot>`)...
             for cidr in &b.peer_cidrs {
                 if let Err(e) = routes::add_route(cidr, &rot.base_tun) {
                     eprintln!(
