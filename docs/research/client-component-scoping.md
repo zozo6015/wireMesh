@@ -169,15 +169,23 @@ menu-bar app with a Network Extension, which needs a paid Apple Developer accoun
 notarization step that is currently *guarded pending owner secrets* in the release
 pipeline.
 
-## Owner decisions required before any code
+## Owner decisions — SETTLED 2026-08-05
 
-1. **Finding 1** — accept the unprotected receive direction with documentation (a), commit
-   to egress enforcement (b), or stop. **This is the one that should not be deferred.**
-2. **Amend PRD §43** to permit a client, or decide the client stays out of v1 and this note
-   is a record of why.
-3. **Client address space** — `100.64.0.0/10` (CGNAT) is the conventional choice and
-   overlaps nothing in the current fabric.
-4. **Scale ceiling** — is "about a dozen clients" acceptable as a documented v1 limit?
+1. **Finding 1 — accept and document (option a).** The unprotected receive direction is
+   accepted for phase 1, stated explicitly in the PRD amendment, with the client host's own
+   firewall as the operator's responsibility. **Egress-side enforcement on gateways
+   (option b) is the bar for calling the client production-grade** — until it ships, the
+   client is explicitly not that, and no doc may imply otherwise.
+2. **PRD non-goal 1 amended** to permit a single-host client peer, with the three
+   constraints below ratified alongside it. User identity, device posture and per-user
+   policy remain excluded — this is not a ZTNA product.
+3. **Client address space: `100.64.0.0/10`.** Adopted as recommended; overlaps nothing in
+   the fabric. A client may not take an address inside an existing segment's CIDR.
+4. **Scale ceiling: roughly a dozen clients, documented as a v1 limit.** Adopted as
+   recommended. Beyond it needs the per-peer address model in phase 3.
+
+PRD non-goal 5 (Linux-only gateways) was **kept**, with its premise corrected: it now
+stands on the `pf`-enforcer cost rather than on the Kubernetes assumption that failed.
 
 ## What is not claimed
 

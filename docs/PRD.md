@@ -41,10 +41,27 @@ A standalone, cloud-agnostic, zero-trust L3/L4 network fabric written in Rust. I
 ## 4. Non-Goals
 
 1. **Device/user-level access (v1)** — no per-laptop, per-user client. This is segment-to-segment routing. User-to-resource zero-trust (Twingate's core use case) is a possible future layer, but conflating the two would bloat v1. Twingate/Tailscale already serve that need.
+
+   > **AMENDED 2026-08-05 (owner decision).** A **single-host client peer** is now IN scope, narrowly: a host that joins the fabric **for itself only**, does not front a network, and does not forward. It exists because the "a workstation reaches the fabric" requirement was implicitly assigned to a Kubernetes deployment that cannot carry it — see [`docs/research/macos-exclusion-premise-and-the-client-gap.md`](research/macos-exclusion-premise-and-the-client-gap.md).
+   >
+   > **Still excluded, and this is not a ZTNA product:** user identity, device posture, per-user policy. Policy remains segment-to-segment; a client is simply another named CIDR set to the policy pipeline, which has no concept of peer identity.
+   >
+   > Three constraints are ratified with this amendment:
+   > - **The receive direction is unprotected in phase 1.** Enforcement is ingress-on-tun only, so `client → segment` is policed at the receiving gateway while `segment → client` is policed by nothing. Accepted, documented, and the client host's own firewall is the operator's responsibility. **Egress-side enforcement on gateways is the bar for calling the client production-grade** — until it ships, the client is explicitly not that.
+   > - **Clients live in `100.64.0.0/10`**, which overlaps nothing in the fabric. A client cannot take an address inside an existing segment's CIDR: the overlap check rejects it, and a more-specific `/32` route would hijack traffic to the real host at that address.
+   > - **Roughly a dozen clients is the v1 ceiling.** One client is one segment (no per-peer address column exists), so client count multiplies policy blocks against `MAX_RULES = 256`. Beyond that needs a per-peer address model.
+   >
+   > Scope and phasing: [`docs/research/client-component-scoping.md`](research/client-component-scoping.md).
 2. **L7 policy** — no HTTP-aware rules, no identity-aware proxying, no TLS inspection. L4 (CIDR/port/protocol) only. L7 belongs to service meshes and is a different trust model.
 3. **Overlapping CIDR support / NAT translation between segments** — rejected at onboarding by the controller. NAT-ing overlapping ranges is a complexity tarpit; document it as a hard constraint. (P2: evaluate 1:1 NAT for brownfield environments.)
 4. **Pod/container-level networking** — this is not a CNI and does not replace Cilium. Kubernetes clusters participate as a subnet behind a gateway, not per-pod. (Running the gateway *as* a Kubernetes workload is in scope — see X-1; per-pod policy/identity is not.)
 5. **Windows/BSD gateway hosts (v1)** — Linux-only gateways. Workloads behind gateways can be any OS since they're untouched.
+
+   > **PREMISE CORRECTED 2026-08-05 — the exclusion STANDS, for a better reason.** This was accepted partly on the understanding that Kubernetes plus the operator would cover the workstation case end-to-end. That premise does not hold as built: the gateway's identity lives in an RWO node-local PVC, so there is no HA and an autoscaled cluster makes it worse than a single box; a gateway fronting a network still requires that network to route to it in both directions; and the operator cannot set the rotation interval or perform fabric admin.
+   >
+   > The exclusion is nonetheless **kept**, on its own technical merits: a non-Linux gateway needs a third enforcer backend (`pf` on macOS) proven equivalent to eBPF and nftables against a conformance suite that only runs in Linux netns.
+   >
+   > **Reversing it would not have fixed anything.** A gateway fronting a network requires that network to route to it because of *no agents on workloads* (§3.2), not because of Linux — so a macOS gateway inherits the same static routes and the same single point of failure. The remedy for the workstation case is the **client** in non-goal 1, not a macOS gateway. See [`docs/research/macos-exclusion-premise-and-the-client-gap.md`](research/macos-exclusion-premise-and-the-client-gap.md).
 6. **Bandwidth/QoS shaping, traffic engineering, multipath** — out of scope for v1; full mesh with relay fallback is the only topology.
 
 ## 5. Target Users & Personas
