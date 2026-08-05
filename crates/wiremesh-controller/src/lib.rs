@@ -264,6 +264,11 @@ const ROTATION_DISABLED_LITERAL: &str = "off";
 ///   * an out-of-range value: `30d`-style inputs are multiplied up into
 ///     seconds, and that multiplication is checked, so nothing wraps,
 ///     saturates, or panics;
+///   * an implausibly LARGE interval — anything above
+///     [`MAX_ROTATION_INTERVAL_SECS`] (`3650d`) is a timer that would never
+///     fire, i.e. a silent second spelling of "disabled" that bypasses the
+///     `off` banner (see that constant). Bounded uniformly across all four
+///     units, since `s` alone can express it without overflowing;
 ///   * anything else (missing/unknown suffix, empty, negative, fractional,
 ///     non-numeric, `off`-adjacent-but-not-`off`).
 pub fn parse_rotation_interval(s: &str) -> Result<Option<std::time::Duration>> {
@@ -282,11 +287,21 @@ pub fn parse_rotation_interval(s: &str) -> Result<Option<std::time::Duration>> {
         .map(|(i, c)| (&raw[..i], c))
         .ok_or_else(|| invalid_rotation_interval(s, "it is empty"))?;
 
+    // Is the part before the suffix a well-formed count? Computed up front
+    // because the uppercase-unit message below is only TRUE when casing is the
+    // one and only problem: `30D` is a miscased unit, but `abcD` and a bare `D`
+    // are not — telling their author to "write `d`, not `D`" would send them
+    // back for a second controller restart with a suggestion (`d`, `abcd`) that
+    // is itself invalid.
+    let digits_ok = !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit());
+
     // An uppercase spelling of a real unit is rejected outright rather than
     // folded to lowercase (owner decision: `M` reads as "months" to plenty of
     // operators, and there is no upside to guessing) — but it gets its own
-    // message, since "not a unit suffix" would be a lie for `30D`.
-    if matches!(unit, 'S' | 'M' | 'H' | 'D') {
+    // message, since "not a unit suffix" would be a lie for `30D`. Inputs whose
+    // count is ALSO broken fall through to the ordinary unknown-suffix/
+    // bad-number rejections below.
+    if digits_ok && matches!(unit, 'S' | 'M' | 'H' | 'D') {
         return Err(invalid_rotation_interval(
             s,
             &format!(
@@ -309,7 +324,7 @@ pub fn parse_rotation_interval(s: &str) -> Result<Option<std::time::Duration>> {
         }
     };
 
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if !digits_ok {
         return Err(invalid_rotation_interval(
             s,
             "the part before the unit suffix must be a non-negative whole number",
@@ -331,8 +346,35 @@ pub fn parse_rotation_interval(s: &str) -> Result<Option<std::time::Duration>> {
         ));
     }
 
+    if secs > MAX_ROTATION_INTERVAL_SECS {
+        return Err(invalid_rotation_interval(
+            s,
+            &format!(
+                "an interval longer than {MAX_ROTATION_INTERVAL_DISPLAY} is a timer that would \
+                 never fire, which disables automatic rotation WITHOUT the boot warning that \
+                 says so; to turn automatic rotation OFF, set it to `off`"
+            ),
+        ));
+    }
+
     Ok(Some(std::time::Duration::from_secs(secs)))
 }
+
+/// The largest accepted rotation interval: 10 years. Anything above it is a
+/// timer that will never fire in the life of a controller process — i.e. a
+/// SECOND, silent way to disable automatic rotation, reachable without the
+/// `off` spelling and therefore without [`warn_automatic_rotation_disabled`]'s
+/// boot banner. Since that banner is the only runtime signal this binary has
+/// (the controller exposes no metrics endpoint), a silent-disable route defeats
+/// the whole safety mechanism, so oversized values are rejected and pointed at
+/// `off`. `18446744073709551615s` was the concrete case: unit `s` means the
+/// overflow check above can never trip, and tokio's `Interval` saturates to
+/// `Instant::far_future()` rather than panicking, so it "worked" — silently.
+const MAX_ROTATION_INTERVAL_SECS: u64 = 3650 * 24 * 60 * 60;
+
+/// How [`MAX_ROTATION_INTERVAL_SECS`] is spelled to operators — the same
+/// `<integer><unit>` form they would have typed.
+const MAX_ROTATION_INTERVAL_DISPLAY: &str = "3650d (10 years)";
 
 /// Builds the one operator-facing rejection message shape used by every
 /// [`parse_rotation_interval`] error: what was rejected, why, and — always —
@@ -348,26 +390,44 @@ fn invalid_rotation_interval(raw: &str, why: &str) -> anyhow::Error {
 }
 
 /// Resolves [`Config::rotation_interval`] from the environment, using the
-/// caller-supplied `lookup` (`main.rs` passes `|k| std::env::var(k).ok()`; the
-/// test suite passes a closure, since `main.rs` itself is unreachable from an
+/// caller-supplied `lookup` (`main.rs` passes `|k| std::env::var(k)`; the test
+/// suite passes a closure, since `main.rs` itself is unreachable from an
 /// integration test).
 ///
-/// ABSENT → `Ok(Some(Config::default_rotation_interval()))`, the unchanged
-/// 30-day behaviour. PRESENT → whatever [`parse_rotation_interval`] makes of
-/// it, INCLUDING an error: a present-but-malformed value is a startup error,
-/// not a silent fallback — the same precedent (and the same reasoning) as
-/// `main.rs`'s `port_env`. An operator who mistyped `30dd` must find out at
+/// `lookup` mirrors [`std::env::var`]'s signature ON PURPOSE, rather than the
+/// lossy `.ok()` form: `std::env::var` returns `Err(VarError::NotUnicode(..))`
+/// for a PRESENT variable whose bytes are not UTF-8, and collapsing that into
+/// `None` would make it indistinguishable from ABSENT — i.e. it would arm the
+/// 30-day timer, with no banner and no error, for an operator who believes
+/// they wrote `off`. Keeping the distinction in the signature also keeps it
+/// testable without touching the real process environment.
+///
+/// ABSENT (`Err(VarError::NotPresent)`) →
+/// `Ok(Some(Config::default_rotation_interval()))`, the unchanged 30-day
+/// behaviour. NOT UTF-8 → `Err`. PRESENT → whatever [`parse_rotation_interval`]
+/// makes of it, INCLUDING an error: a present-but-malformed value is a startup
+/// error, not a silent fallback — the same precedent (and the same reasoning)
+/// as `main.rs`'s `port_env`. An operator who mistyped `30dd` must find out at
 /// boot rather than discover a 30-day timer still running months later, and
 /// one who mistyped `of` must not be left believing rotation is off when it is
 /// not. (Deliberately NOT the warn-and-fall-back treatment `WIREMESH_BIND_IP`
 /// gets: a wrong bind IP fails loudly the moment nothing can connect, whereas
 /// a wrong rotation interval is invisible until it fires.)
 pub fn rotation_interval_from_env(
-    lookup: impl FnOnce(&str) -> Option<String>,
+    lookup: impl FnOnce(&str) -> std::result::Result<String, std::env::VarError>,
 ) -> Result<Option<std::time::Duration>> {
     match lookup(ROTATION_INTERVAL_ENV) {
-        None => Ok(Some(Config::default_rotation_interval())),
-        Some(raw) => parse_rotation_interval(&raw)
+        Err(std::env::VarError::NotPresent) => Ok(Some(Config::default_rotation_interval())),
+        Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
+            "{ROTATION_INTERVAL_ENV} is set, but its value is not valid UTF-8. It is being \
+             treated as a startup error rather than as unset, because falling back to the \
+             {}-day default here would silently arm the automatic key-rotation timer for an \
+             operator who believes they disabled it. Set {ROTATION_INTERVAL_ENV} to \
+             `<integer><s|m|h|d>` (e.g. `30d`, `12h`, `900s`), or to \
+             `{ROTATION_DISABLED_LITERAL}` to disable automatic key rotation",
+            Config::default_rotation_interval().as_secs() / (24 * 60 * 60),
+        )),
+        Ok(raw) => parse_rotation_interval(&raw)
             .with_context(|| format!("reading {ROTATION_INTERVAL_ENV}")),
     }
 }

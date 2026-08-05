@@ -99,7 +99,9 @@ CONFIGURATION (environment variables — this binary takes NO flags):
                                     (fabricctl / Admin RotateKey) still works,
                                     but no key is rotated on a timer until it is
                                     re-enabled. A zero interval is rejected —
-                                    use `off`.
+                                    use `off`. So is anything above 3650d (10
+                                    years): a timer that never fires is `off`
+                                    without the warning that says so.
 
     A malformed port value (e.g. WIREMESH_TCP_PORT=abc), or a malformed
     WIREMESH_ROTATION_INTERVAL, is a startup error, not a silent fallback.
@@ -107,7 +109,11 @@ CONFIGURATION (environment variables — this binary takes NO flags):
 DEPLOYMENT:
     The packaged systemd unit reads these variables from /etc/wiremesh/
     controller.env. The Kubernetes operator sets them on the controller
-    Deployment. This binary is Unix-only.
+    Deployment — except WIREMESH_ROTATION_INTERVAL, which it does NOT yet
+    expose: there is no CRD field for it, and the operator force-applies the
+    Deployment's env, so hand-editing it is reverted on the next reconcile.
+    On Kubernetes this knob is currently reachable only by running the
+    controller outside the operator. This binary is Unix-only.
 
 EXAMPLE:
     WIREMESH_DATA_DIR=/var/lib/wiremesh WIREMESH_BIND_IP=0.0.0.0 \\

@@ -86,7 +86,9 @@ A malformed value (`30dd`, `30D`, `0d`) is a **startup error** — the controlle
 refuses to boot rather than quietly falling back to the 30-day default and
 leaving you believing you changed something. Uppercase units are rejected on
 purpose (`M` reads as "months" to too many people); a zero interval is rejected
-because it would rotate in a hot loop — if you meant "never", write `off`.
+because it would rotate in a hot loop — if you meant "never", write `off`. So is
+anything longer than `3650d` (10 years): a timer that never fires is "never"
+without the boot banner below that tells you so — again, write `off`.
 
 `off` disables the automatic **schedule** only. It does not disable rotation as
 a capability:

@@ -64,8 +64,16 @@ async fn main() -> Result<()> {
     // warn-and-fall-back treatment `WIREMESH_BIND_IP` gets right after: an
     // operator who mistyped this would otherwise be left believing rotation is
     // off (or retimed) when it is not, and nothing would contradict them until
-    // the timer fired. Same precedent/reasoning as `port_env` above.
-    let rotation_interval = wiremesh_controller::rotation_interval_from_env(|k| std::env::var(k).ok())?;
+    // the timer fired. Same precedent/reasoning as `port_env` above —
+    // including its NotPresent-vs-other-VarError distinction: the lookup handed
+    // over is `std::env::var` itself, NOT the lossy `|k| std::env::var(k).ok()`,
+    // so a PRESENT-but-non-UTF-8 value cannot be mistaken for "unset" and
+    // silently arm the 30-day timer. (Wrapped in a closure rather than passed
+    // as the bare `std::env::var` path: `var` is generic over `K: AsRef<OsStr>`,
+    // so the bare path infers ONE specific lifetime and fails the callee's
+    // higher-ranked `FnOnce(&str)` bound.)
+    #[allow(clippy::redundant_closure)]
+    let rotation_interval = wiremesh_controller::rotation_interval_from_env(|k| std::env::var(k))?;
     let bind_ip = match std::env::var("WIREMESH_BIND_IP") {
         Ok(s) => s.parse().unwrap_or_else(|_| {
             eprintln!("wiremesh-controller: invalid WIREMESH_BIND_IP={s:?}, using {}", Config::default_bind_ip());
