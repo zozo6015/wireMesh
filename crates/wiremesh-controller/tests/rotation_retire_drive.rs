@@ -100,24 +100,47 @@ async fn poll_key_states(
     states
 }
 
-/// Every gateway id the controller currently considers mid-rotation — read
-/// straight off the on-disk DB via the SAME query
+/// Every gateway id the controller currently considers mid-rotation, rendered
+/// for a failure message — read straight off the on-disk DB via the SAME query
 /// `initiate_due_rotations` consults for its skip check
 /// (`Db::gateways_with_rotation_state`). Read directly rather than through a
-/// debug RPC for the same reason `TestController::gateway_exists` does: this
-/// is test-harness introspection, not a wire contract. Used only to make a
-/// failure message name the mechanism; the behavioural assertion is always on
-/// the timer itself.
-async fn mid_rotation_gateway_ids(h: &TestController) -> Vec<i64> {
+/// debug RPC for the same reason `TestController::gateway_exists` does: this is
+/// test-harness introspection, not a wire contract.
+///
+/// # This is a diagnostic, and diagnostics must not fail
+///
+/// Two rules follow from that, and both are load-bearing:
+///
+///  1. **Call it only on the failure path.** It opens a SECOND connection to a
+///     SQLite file the live controller process is actively writing. On a
+///     passing run that is pure contention for no benefit. Because it is
+///     `async` it cannot sit in `assert!`'s format arguments (those are
+///     evaluated lazily but must be sync), so the caller has to evaluate the
+///     predicate first and only reach here inside the failure branch. That
+///     awkwardness is exactly why the eager version looked like the only
+///     option — it isn't.
+///  2. **It returns a `String` and never panics.** Every error — including a
+///     `SQLITE_BUSY` from racing the controller's own connection — is folded
+///     INTO the returned text. An `.expect()` here would let the diagnostic
+///     panic while explaining a real failure, replacing the message that
+///     matters with one that doesn't.
+///
+/// The rendering matches `{:?}` on the underlying `Vec<i64>`, so a successful
+/// read reads identically to the direct debug format it replaced.
+async fn mid_rotation_gateway_ids(h: &TestController) -> String {
     let db_path = h.data_dir().join("controller.db");
-    tokio::task::spawn_blocking(move || {
+    let joined = tokio::task::spawn_blocking(move || {
         let db = wiremesh_controller::db::Db::open(&db_path)
-            .expect("opening the controller DB for mid_rotation_gateway_ids");
+            .map_err(|e| format!("<unavailable: opening the controller DB failed: {e}>"))?;
         db.gateways_with_rotation_state()
-            .expect("querying gateways_with_rotation_state")
+            .map_err(|e| format!("<unavailable: the gateways_with_rotation_state query failed: {e}>"))
     })
-    .await
-    .expect("mid_rotation_gateway_ids blocking task panicked")
+    .await;
+    match joined {
+        Ok(Ok(ids)) => format!("{ids:?}"),
+        Ok(Err(rendered)) => rendered,
+        Err(e) => format!("<unavailable: the diagnostic DB read task panicked or was cancelled: {e}>"),
+    }
 }
 
 /// Opens `gw`'s `Sync.Watch` stream and consumes its initial `StateSnapshot`,
@@ -367,8 +390,8 @@ async fn promoted_rotation_retires_prior_epoch_with_no_second_rotation_and_no_re
 ///
 /// Driven through the real timer, not through row inspection: the assertion
 /// is "a second pending epoch appears on its own", which is precisely the
-/// behaviour a deployment loses. The DB set is read only to name the
-/// mechanism in the failure message.
+/// behaviour a deployment loses. The DB set is read only on the FAILURE path,
+/// purely to name the mechanism in the message.
 ///
 /// Cadence: a 2s `rotation_interval` and a 500ms sweep. The budget has to
 /// cover RETIRE_GRACE (30s, uncompressible) plus a timer tick, hence 60s.
@@ -410,18 +433,25 @@ async fn timer_still_rotates_a_gateway_after_a_completed_rotation() {
     })
     .await;
 
-    let mid_rotation = mid_rotation_gateway_ids(&h).await;
-    assert!(
-        pending_epoch(&states).is_some_and(|n| n > n1),
-        "after completing rotation to epoch {n1}, gateway A (id {}) must become eligible for \
-         automatic rotation again — the timer (2s interval) must create a further pending \
-         epoch within {budget:?}. It cannot, because the prior epoch's 'retiring' row is \
-         never deleted, Db::gateways_with_rotation_state still returns A, and \
-         initiate_due_rotations skips every id in that set. Automatic rotation for this \
-         gateway is wedged permanently (Admin.RotateKey still works, which is what hides it). \
-         gateways_with_rotation_state = {mid_rotation:?}; A's keys = {states:?}",
-        a.id()
-    );
+    // Predicate FIRST, diagnostic second. `mid_rotation_gateway_ids` opens its
+    // own connection to the SQLite file the controller is live against, so on
+    // a passing run it must not run at all — see that helper's doc comment.
+    // The assertion is unchanged: this is the same condition the `assert!` it
+    // replaced evaluated, just hoisted out so the DB read can sit behind it.
+    let rotated_again = pending_epoch(&states).is_some_and(|n| n > n1);
+    if !rotated_again {
+        let mid_rotation = mid_rotation_gateway_ids(&h).await;
+        panic!(
+            "after completing rotation to epoch {n1}, gateway A (id {}) must become eligible for \
+             automatic rotation again — the timer (2s interval) must create a further pending \
+             epoch within {budget:?}. It cannot, because the prior epoch's 'retiring' row is \
+             never deleted, Db::gateways_with_rotation_state still returns A, and \
+             initiate_due_rotations skips every id in that set. Automatic rotation for this \
+             gateway is wedged permanently (Admin.RotateKey still works, which is what hides it). \
+             gateways_with_rotation_state = {mid_rotation}; A's keys = {states:?}",
+            a.id()
+        );
+    }
 }
 
 /// A second rotation started INSIDE the first one's `RETIRE_GRACE` must

@@ -236,9 +236,37 @@ tracker with `promoted_at: None`, so rotation 2 strands its own while epoch 0 st
 by the `has_tracker` guard. They are cleared only by a controller restart or an `Abort`.
 
 So the classification changes from "key-lifetime exposure" to "**security-posture failure**":
-rotation quietly stops happening. It remains the next thing to fix — arguably more urgently,
-since it means automatic rotation is self-disabling after one round and would not have
-survived re-enabling the timer even with everything else on this branch correct.
+rotation quietly stops happening. Automatic rotation is self-disabling after one round, and
+would not have survived re-enabling the timer even with everything else on the v0.7.2 branch
+correct.
+
+> **FIXED** — everything above this line describes behaviour BEFORE the fix on branch
+> `fix/rotation-retire-drive`, and is kept as the diagnosis rather than as a live defect.
+>
+> `sweep_rotations` gained an unconditional **step 2b** that calls `drive_rotation_for` for
+> every id from `gateways_with_rotation_state`, not only for ids with a `pending` row. A
+> promoted tracker now reaches `decide` rule 1 and fires `Retire{prior_active_epoch}`,
+> validated by `retire_epoch`'s `state='retiring'` CAS. Step 3's orphan path is unchanged for
+> the genuinely trackerless case.
+>
+> The accumulation resolves in a **single sweep tick**, not over several: step 2b retires the
+> newest row and removes its tracker, then step 3 re-reads the keys — the re-read is
+> load-bearing for exactly this — sees the older row with no tracker held, and orphan-retires
+> it.
+>
+> Covered by `crates/wiremesh-controller/tests/rotation_retire_drive.rs`, all four written
+> before the fix and proven red against it:
+> `one_completed_rotation_leaves_exactly_one_key_row`,
+> `promoted_rotation_retires_prior_epoch_with_no_second_rotation_and_no_restart`,
+> `second_rotation_inside_retire_grace_keeps_the_grace_and_leaves_one_row` (its (c) clause is
+> the accumulation case), and `timer_still_rotates_a_gateway_after_a_completed_rotation` —
+> which drives the real timer rather than inspecting rows, so it fails for the consequence
+> that actually matters.
+>
+> Still open, and introduced BY this fix: a `report` that seeds a tracker from an unlocked
+> keys read can wedge that tracker if an `Abort` commits in between. It does not block the
+> timer, but it eats the next rotation's single ack and silently degrades that rotation to
+> the 90s grace promote.
 
 ### Two smaller corrections from the same pass
 
