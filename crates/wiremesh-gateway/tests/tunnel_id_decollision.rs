@@ -254,6 +254,19 @@ fn whole_fabric_rotating_in_step_yields_pairwise_distinct_tuns() {
 /// first. Whichever order they arrive in, the resulting pair must be usable —
 /// a scheme whose second plan depends destructively on ordering would work in
 /// one interleaving and wedge in the other.
+///
+/// # The name is now literally true (piece 3)
+///
+/// This test only ever asserted that each ORDER produced a usable, pairwise
+/// distinct pair — not that the two orders produced the same plans, which under
+/// one shared free list they did not: Role-A-first put the own tun on `base + 1`
+/// and the overlap on `base + 2`, Role-B-first swapped them. That swap is bug 5
+/// in miniature — the own tun's port depending on who happened to be planned
+/// first, while the peer computing where to dial it knows nothing about that
+/// ordering. With the own port RESERVED and overlaps free-listing above it, both
+/// orders yield identical plans, so the equality below is now assertable and is
+/// the sharper statement. It fails immediately if the two ranges are ever merged
+/// back into one free list.
 #[test]
 fn plan_order_does_not_change_the_outcome() {
     let boot = TunnelPlan {
@@ -277,6 +290,18 @@ fn plan_order_does_not_change_the_outcome() {
         .expect("B first: own");
     assert_three_way_distinct(&a2, &b2, "Role B planned first");
     assert_three_way_distinct(&boot, &a2, "Role B planned first, own vs boot tun");
+
+    // ...and the two orders agree, plan for plan.
+    assert_eq!(
+        a1, a2,
+        "the own-epoch tun's plan must not depend on whether an overlap was planned first — a \
+         peer computes its port as `candidate_port + OWN_TUN_PORT_OFFSET` and has no way to \
+         know the local planning order"
+    );
+    assert_eq!(
+        b1, b2,
+        "and the overlap's plan must not depend on whether the own tun was planned first"
+    );
 }
 
 /// Pure-function determinism: identical inputs, identical output. The rotation

@@ -76,6 +76,12 @@ fn classify(err: &quinn::ConnectionError) -> RelayDeathReason {
 pub struct RelayTransport {
     local_addr: SocketAddr,
     client: Client,
+    /// Where the downlink pump delivers relayed datagrams: the local address
+    /// last seen sending INTO this transport's socket (seeded by
+    /// `start`'s `local_peer_hint`). Held here — not only inside the pump
+    /// closures — so [`Self::set_local_peer`] can re-teach it out-of-band; see
+    /// that method.
+    last_seen: Arc<Mutex<Option<SocketAddr>>>,
     uplink: JoinHandle<()>,
     downlink: JoinHandle<()>,
     /// First connection-death classification either pump observed (write-once;
@@ -193,6 +199,9 @@ impl RelayTransport {
         let downlink = {
             let client = client.clone();
             let death = death_reason.clone();
+            // Cloned (not moved): the handle keeps its own `Arc` so
+            // `set_local_peer` can re-teach the delivery address later.
+            let last_seen = last_seen.clone();
             tokio::spawn(async move {
                 loop {
                     let (_src, data) = match client.recv().await {
@@ -232,7 +241,7 @@ impl RelayTransport {
             })
         };
 
-        Ok(RelayTransport { local_addr, client, uplink, downlink, death_reason })
+        Ok(RelayTransport { local_addr, client, last_seen, uplink, downlink, death_reason })
     }
 
     /// The bound local UDP address. WireGuard's peer endpoint gets pointed
@@ -240,6 +249,37 @@ impl RelayTransport {
     /// flows into the uplink pump above.
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// Re-teach the downlink pump WHERE to deliver relayed datagrams, without
+    /// disturbing the QUIC connection, the local socket, or WireGuard.
+    ///
+    /// # Why this exists (port-authority fix, piece 2)
+    ///
+    /// The only thing that ever sends into this transport's local socket is
+    /// this gateway's own boringtun, sourced from the ACTIVE tun's listen
+    /// port — which is why `start` can seed `last_seen` with it. But that port
+    /// is not immutable: a Role-A key-rotation cutover moves the active tun to
+    /// an offset port, and the retire-time renormalization moves it back. In
+    /// the window between the move and boringtun's next outbound datagram
+    /// through here, the downlink is still delivering to the OLD port — where,
+    /// after a retire, no socket exists at all. Every relayed peer black-holes
+    /// for that window.
+    ///
+    /// The window is self-closing (the uplink pump re-learns `last_seen` from
+    /// the first datagram boringtun sends, and a WireGuard keepalive is 25s),
+    /// but 25s of a silent relay path is most of the way to the path state
+    /// machine's degrade threshold. Calling this right after the port moves
+    /// closes it immediately, and — unlike rebuilding the transport — costs no
+    /// QUIC reconnect, no `set_one_peer` remove+re-add, and no rehandshake.
+    ///
+    /// Benign narrow race: a datagram that was already queued on the local
+    /// socket before the port moved still carries the old source, so the
+    /// uplink pump can overwrite this value once. The next datagram — which
+    /// necessarily carries the new source — corrects it, so the worst case
+    /// degenerates to the self-closing behaviour this call is optimizing away.
+    pub async fn set_local_peer(&self, addr: SocketAddr) {
+        *self.last_seen.lock().await = Some(addr);
     }
 
     /// Whether the underlying relay `Client`'s QUIC connection is still

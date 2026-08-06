@@ -1,6 +1,7 @@
 //! Pure reconciliation: turn desired state into a WG device config and a route
 //! add/remove diff, and decide when the enforcer needs re-`apply` (spec §5.2).
 use crate::state::DesiredState;
+use crate::tunnelset::OWN_TUN_PORT_OFFSET;
 use crate::uapi::{DeviceConfig, PeerConfig, PERSISTENT_KEEPALIVE_SECS};
 
 /// Steady-state peer builder. Every peer it emits carries
@@ -29,24 +30,53 @@ pub fn peer_configs(ds: &DesiredState) -> Vec<PeerConfig> {
         .collect()
 }
 
-/// Peer-configs targeting each peer's real-keyed PENDING epoch. The pending
-/// endpoint reuses the peer's active-candidate IP with the UDP port offset by
-/// `(pending_epoch - active_epoch)`, matching the `base_wg_port + epoch` port
-/// convention both gateways use for their per-epoch Devices (key-rotation
-/// Task 6). A peer with no real pending key (active-only, or a sentinel
-/// pending) contributes nothing.
+/// Peer-configs targeting each peer's real-keyed PENDING epoch — the peer set
+/// of a Role-B overlap Device. The pending endpoint reuses the peer's
+/// advertised candidate IP with the UDP port at
+/// [`OWN_TUN_PORT_OFFSET`] above the candidate's own port. A peer with no real
+/// pending key (active-only, or a sentinel pending) contributes nothing.
+///
+/// # Why `candidate_port + 1`, and why there is no epoch arithmetic left here
+///
+/// This used to compute `active_port + (pending_epoch - active_epoch)` on the
+/// theory that both gateways placed epoch `n`'s Device at `base_wg_port + n`.
+/// Nothing has placed a Device that way since T3 made the listen port an
+/// ALLOCATION (`tunnelset::plan_port`), and the formula survived only because
+/// its answer coincides with the allocator's on rotation 0 -> 1. On any later
+/// rotation the two diverged and the peer dialled a port the rotating gateway
+/// was not on — bug 5, i.e. "the second rotation of any gateway cannot
+/// complete" (`docs/research/port-authority-verification-the-shape-was-wrong.md`).
+///
+/// The formula is deleted rather than kept as a fallback, because a fallback
+/// would be an alternative answer to a question that admits exactly one:
+///
+///  - piece 2 puts the rotating gateway's ACTIVE key back on its base port at
+///    every retire, so the candidate this endpoint is derived from is the port
+///    the peer's active key is really on, at every rotation and not just the
+///    first; and
+///  - piece 3 RESERVES [`OWN_TUN_PORT_OFFSET`] for a gateway's own new-epoch
+///    tun, so its in-flight new epoch is at `base + 1` regardless of the epoch
+///    NUMBER and regardless of how many overlaps that gateway is carrying.
+///
+/// So the target is `candidate_port + OWN_TUN_PORT_OFFSET`, and the constant is
+/// imported from the allocator that enforces it rather than restated here:
+/// one definition, two readers, nothing to drift.
 pub fn pending_peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerConfig> {
     ds.peers
         .iter()
         .filter_map(|p| {
-            let active = p.active_key()?;
+            // Required but unused: a peer mid-make-before-break advertises BOTH
+            // rows, and `main.rs`'s `role_b_decisions` — the only consumer of
+            // this builder — demands both too. Keeping the guard keeps the two
+            // peer sets identical, so a malformed pending-without-active roster
+            // entry can never produce an overlap here that the decision layer
+            // would refuse to stand up.
+            p.active_key()?;
             let pending = p.pending_key()?;
             let endpoint = p.primary_endpoint()?;
             let (ip, port_str) = endpoint.rsplit_once(':')?;
-            let active_port: u16 = port_str.parse().ok()?;
-            let offset = pending.epoch.checked_sub(active.epoch)?;
-            let offset: u16 = offset.try_into().ok()?;
-            let pending_port = active_port.checked_add(offset)?;
+            let candidate_port: u16 = port_str.parse().ok()?;
+            let pending_port = candidate_port.checked_add(OWN_TUN_PORT_OFFSET)?;
             Some(PeerConfig {
                 public_key_b64: pending.pubkey_b64.clone(),
                 endpoint: Some(format!("{ip}:{pending_port}")),
@@ -146,23 +176,50 @@ pub fn device_config_pinned(
     DeviceConfig { private_key_b64: private_key_b64.to_string(), listen_port, peers }
 }
 
-/// Rewrite the UDP port of an `ip:port` endpoint string, preserving the host.
-/// `None` for a malformed endpoint (no `:port` suffix). Used by
-/// [`device_config_at_port`] to retarget peers at a rotation epoch's offset
-/// port (key-rotation Task 9).
-fn rewrite_endpoint_port(endpoint: &str, port: u16) -> Option<String> {
-    let (ip, _) = endpoint.rsplit_once(':')?;
-    Some(format!("{ip}:{port}"))
-}
-
 /// A device config for a NEW own-epoch Device (key-rotation Task 9, Role A):
 /// the gateway's own rotated private key on `port`, peering the SAME current
-/// peers by their ACTIVE keys, but with each peer's endpoint retargeted to
-/// `port` — the peer's own new-epoch Device listens on the identical offset
-/// port (`base_wg_port + (N - active_epoch)`), so both sides rendezvous on it
-/// during the make-before-break overlap while the old epoch keeps carrying
-/// traffic on the base port. A peer with no active key or no endpoint
-/// contributes nothing (it can't be reached on the new epoch yet).
+/// peers by their ACTIVE keys, **with no endpoint on any peer**. A peer with no
+/// active key contributes nothing (it can't be reached on the new epoch yet).
+///
+/// # This device is a RECEIVER. It is not supposed to dial anyone.
+///
+/// Until piece 3 this rewrote every peer's endpoint to `ip:port` — our OWN
+/// listen port on the peer's address — justified as "the peer's own new-epoch
+/// Device listens on the identical offset port". **That premise is false and
+/// cannot be made true**, so the rewrite is gone rather than corrected:
+///
+///  - The peers here are keyed by each peer's **active** public key, and a
+///    peer's active key lives on that peer's **active** Device, at its
+///    advertised candidate port. Dialling it would reach a Device that has
+///    never heard of the brand-new static key this one runs, so its handshake
+///    initiation is dropped as an unknown peer.
+///  - The only Device in the fabric that CAN answer this one is the peer's
+///    Role-B **overlap** toward our pending epoch — which runs the peer's
+///    active key (hence the key match) and lives at a port that peer's own
+///    `tunnelset::plan_port` allocated from its own free list. That port is
+///    genuinely unknowable from here: it depends on how many other peers that
+///    gateway is overlapping, and on nothing we are told.
+///  - The old rewrite appeared to work only on rotation 0 -> 1, where both
+///    sides' free lists happened to hand out `base + 1`. Piece 3's reserved
+///    own-epoch slot ends even that coincidence — the peer's overlaps now start
+///    at `base + 2` — so an emitted endpoint could not be right even by luck.
+///
+/// What actually brings this Device live is the peer's overlap initiating (its
+/// rotation tick kicks the handshake until the session is up), after which
+/// boringtun roams this peer entry onto the authenticated source address. An
+/// endpoint-less peer is exactly how WireGuard expresses "wait to be dialled",
+/// and it is honest: no value here is ever read back as authority, so there is
+/// nothing for a later apply to have to "restore".
+///
+/// **Known consequence, deliberately accepted:** with no endpoint, this Device
+/// emits nothing, so Role A's `kick_overlap` probe is inert for the whole
+/// overlap and a NAT in front of this gateway sees no outbound datagram from
+/// `port` and opens no mapping for it. Neither is a regression the endpoint
+/// could have avoided — a datagram aimed at the peer's active Device punches a
+/// hole for an address the peer's overlap does not send from — and rotation
+/// behind NAT is separately unsupported anyway: the observe socket is bound to
+/// the base port for process life, so an offset port is never observed,
+/// reported, or advertised as a candidate.
 pub fn device_config_at_port(
     ds: &DesiredState,
     private_key_b64: &str,
@@ -173,11 +230,10 @@ pub fn device_config_at_port(
         .peers
         .iter()
         .filter_map(|p| {
-            let public_key_b64 = p.active_pubkey_b64.clone()?;
-            let endpoint = p.primary_endpoint().and_then(|ep| rewrite_endpoint_port(ep, port));
             Some(PeerConfig {
-                public_key_b64,
-                endpoint,
+                public_key_b64: p.active_pubkey_b64.clone()?,
+                // See the doc above: receive-and-roam, never dial.
+                endpoint: None,
                 allowed_ips: p.allowed_ips.clone(),
                 keepalive_secs,
             })
@@ -270,24 +326,131 @@ mod tests {
         assert!(!policy_changed(&ds_with(vec![], 2), &ds_with(vec![], 2)));
     }
 
+    /// Parse the UDP port out of the single endpoint `pending_peer_configs`
+    /// emitted, so a test can compare it against a port the ALLOCATOR produced
+    /// rather than against a literal it copied from the same formula it is
+    /// trying to check.
+    fn dialled_port(cfgs: &[PeerConfig]) -> u16 {
+        assert_eq!(cfgs.len(), 1, "expected exactly one pending peer config, got {cfgs:?}");
+        let ep = cfgs[0].endpoint.as_deref().expect("a pending peer config carries an endpoint");
+        ep.rsplit_once(':').expect("endpoint is ip:port").1.parse().expect("port is a u16")
+    }
+
+    /// **Epoch-independence by RESERVATION, not by epoch arithmetic.** The
+    /// endpoint a peer dials this gateway's in-flight new epoch at is
+    /// `candidate_port + OWN_TUN_PORT_OFFSET` — the same constant the allocator
+    /// reserves — for every distance between the peer's active and pending
+    /// epoch numbers.
+    ///
+    /// # Why a table, and why `pending == active + 1` is only one row of it
+    ///
+    /// The two tests this replaces (`pending_peer_configs_builds_offset_endpoint`
+    /// and `pending_peer_configs_offset_survives_nonzero_active_epoch`) both used
+    /// `pending == active + 1` — the *one* distance at which the deleted
+    /// `active_port + (pending_epoch - active_epoch)` formula and
+    /// `candidate_port + OWN_TUN_PORT_OFFSET` return the same number. They
+    /// therefore agreed with both models at once, never discriminated between
+    /// them, and would still pass today against an implementation with the
+    /// epoch-delta formula restored. Worse, `k -> k+1` is precisely the
+    /// coincidence that hid bug 5 ("the second rotation of any gateway cannot
+    /// complete",
+    /// `docs/research/port-authority-verification-the-shape-was-wrong.md`), so
+    /// what they pinned was the bug's camouflage.
+    ///
+    /// Every row below whose distance is not 1 is RED against that
+    /// implementation. Independence cannot be expressed by a single sample,
+    /// which is the whole reason the old pair could not express it.
     #[test]
-    fn pending_peer_configs_builds_offset_endpoint() {
+    fn pending_endpoint_is_the_reserved_offset_at_every_epoch_distance() {
+        // (active epoch, pending epoch, candidate endpoint). Distances 1, 2, 6
+        // and 7, from both a zero and a non-zero active epoch, and over two
+        // different candidate ports so the answer is visibly derived from the
+        // CANDIDATE rather than from a hard-coded base.
+        let cases: [(u32, u32, &str); 5] = [
+            // Distance 1 kept as ONE row of a discriminating family: it is real
+            // coverage (rotation 0 -> 1 is the first rotation a fabric ever
+            // does), it just cannot carry the property on its own.
+            (0, 1, "10.9.0.2:51820"),
+            (2, 3, "10.9.0.2:51822"),
+            // The rows that kill the epoch-delta formula.
+            (2, 4, "10.9.0.2:51820"),
+            (3, 9, "10.9.0.3:40000"),
+            (0, 7, "10.9.0.4:1024"),
+        ];
+        for (active_epoch, pending_epoch, candidate) in cases {
+            let peer = peer_full(
+                2,
+                candidate,
+                vec![
+                    PeerKeyInfo {
+                        epoch: active_epoch,
+                        pubkey_b64: "KA".into(),
+                        state: "active".into(),
+                    },
+                    PeerKeyInfo {
+                        epoch: pending_epoch,
+                        pubkey_b64: "KP".into(),
+                        state: "pending".into(),
+                    },
+                ],
+                "10.10.2.0/24",
+            );
+            let ds = ds_with(vec![peer], 0);
+            let cfgs = pending_peer_configs(&ds, 25);
+            let candidate_port: u16 =
+                candidate.rsplit_once(':').unwrap().1.parse().expect("test candidate port");
+            assert_eq!(
+                dialled_port(&cfgs),
+                candidate_port + OWN_TUN_PORT_OFFSET,
+                "active epoch {active_epoch} -> pending epoch {pending_epoch} on candidate \
+                 {candidate}: the overlap must dial candidate_port + OWN_TUN_PORT_OFFSET \
+                 ({}), NOT candidate_port + (pending - active) ({}). The two agree only at \
+                 distance 1; anywhere else the deleted formula sends the overlap to a port \
+                 the rotating gateway's new epoch is not on — bug 5.",
+                candidate_port + OWN_TUN_PORT_OFFSET,
+                candidate_port + (pending_epoch - active_epoch) as u16,
+            );
+            // Plumbing the old `..._builds_offset_endpoint` also covered, kept
+            // here so deleting it costs nothing.
+            assert_eq!(cfgs[0].public_key_b64, "KP", "the overlap peers the PENDING key");
+            assert_eq!(
+                cfgs[0].endpoint.as_deref().unwrap().rsplit_once(':').unwrap().0,
+                candidate.rsplit_once(':').unwrap().0,
+                "the IP is the peer's advertised candidate IP, unmodified"
+            );
+            assert_eq!(cfgs[0].allowed_ips, vec!["10.10.2.0/24".to_string()]);
+            assert_eq!(cfgs[0].keepalive_secs, 25);
+        }
+    }
+
+    /// The strongest form of the same property: the epoch NUMBERS are not read
+    /// at all. A roster whose pending epoch is *below* its active epoch is
+    /// malformed, and the deleted formula's `checked_sub` silently dropped the
+    /// peer — so this case cannot even be produced by the old implementation,
+    /// let alone produced with the right port. The reservation has no opinion
+    /// about epoch ordering because it never looks: the peer has a real pending
+    /// key, so it gets an overlap, at the one port that key can be reachable on.
+    #[test]
+    fn pending_endpoint_does_not_read_the_epoch_numbers_at_all() {
         let peer = peer_full(
-            2,
-            "10.9.0.2:51820",
+            6,
+            "10.9.0.6:51820",
             vec![
-                PeerKeyInfo { epoch: 0, pubkey_b64: "KA".into(), state: "active".into() },
-                PeerKeyInfo { epoch: 1, pubkey_b64: "KP".into(), state: "pending".into() },
+                PeerKeyInfo { epoch: 9, pubkey_b64: "KA".into(), state: "active".into() },
+                PeerKeyInfo { epoch: 4, pubkey_b64: "KP".into(), state: "pending".into() },
             ],
-            "10.10.2.0/24",
+            "10.10.6.0/24",
         );
         let ds = ds_with(vec![peer], 0);
         let cfgs = pending_peer_configs(&ds, 25);
-        assert_eq!(cfgs.len(), 1);
+        assert_eq!(
+            dialled_port(&cfgs),
+            51820 + OWN_TUN_PORT_OFFSET,
+            "a descending epoch pair must still dial the reserved offset — the builder derives \
+             the port from the candidate and a constant, so there is no subtraction left to \
+             underflow and no peer to silently drop"
+        );
         assert_eq!(cfgs[0].public_key_b64, "KP");
-        assert_eq!(cfgs[0].endpoint.as_deref(), Some("10.9.0.2:51821"));
-        assert_eq!(cfgs[0].allowed_ips, vec!["10.10.2.0/24".to_string()]);
-        assert_eq!(cfgs[0].keepalive_secs, 25);
     }
 
     #[test]
@@ -317,20 +480,146 @@ mod tests {
         assert!(pending_peer_configs(&ds, 25).is_empty());
     }
 
+    /// **The cross-module pin — the assertion that would have caught bug 5.**
+    ///
+    /// Bug 5 was never a wrong number in one place. It was two functions in two
+    /// modules answering the same question — "which UDP port is a rotating
+    /// gateway's in-flight new epoch on?" — with two different derivations that
+    /// happened to agree on the first rotation. No test compared them, so
+    /// nothing was red until the second rotation of a real gateway.
+    ///
+    /// This test asks both sides and compares the ANSWERS, so neither side can
+    /// move without the other. The right-hand side is not a literal and not a
+    /// restatement of the formula: it is whatever `tunnelset::plan_tunnel`
+    /// actually hands the rotating gateway's own new-epoch tun, computed under
+    /// realistic pressure — the gateway is already carrying three Role-B
+    /// overlaps toward other peers, planned FIRST, which under the pre-piece-3
+    /// shared free list is exactly what pushed the own tun off `base + 1`.
+    ///
+    /// The peer's active tun sits at `base_port` by piece 2's renormalization
+    /// (the survivor returns to base at every retire), which is what makes the
+    /// peer's advertised candidate port and the rotating gateway's base port the
+    /// same number at every rotation and not just the first.
     #[test]
-    fn pending_peer_configs_offset_survives_nonzero_active_epoch() {
-        let peer = peer_full(
-            5,
-            "10.9.0.2:51822",
-            vec![
-                PeerKeyInfo { epoch: 2, pubkey_b64: "KA".into(), state: "active".into() },
-                PeerKeyInfo { epoch: 3, pubkey_b64: "KP".into(), state: "pending".into() },
-            ],
-            "10.10.5.0/24",
+    fn the_port_a_peer_dials_is_the_port_the_allocator_reserves() {
+        use crate::tunnelset::{plan_tunnel, TunnelId, TunnelPlan};
+        const BASE_TUN: &str = "wg0";
+
+        for base_port in [51820u16, 1024, 40000] {
+            for (active_epoch, pending_epoch) in [(0u32, 1u32), (1, 2), (2, 4), (5, 11)] {
+                // --- Side 1: the rotating gateway G allocates its new epoch. ---
+                // G's active key is back on its base port (piece 2).
+                let mut live = vec![TunnelPlan {
+                    id: TunnelId::Own { epoch: active_epoch },
+                    ifname: BASE_TUN.to_string(),
+                    listen_port: base_port,
+                }];
+                // G is also Role-B for three other peers that are rotating too
+                // (one global timer => the in-step fabric is the default case).
+                // Planned BEFORE its own new tun, which is the ordering that
+                // used to steal `base + 1`.
+                for gid in [21u64, 22, 23] {
+                    let id = TunnelId::Overlap { gateway_id: gid, epoch: pending_epoch };
+                    let plan = plan_tunnel(id, BASE_TUN, base_port, &live)
+                        .unwrap_or_else(|e| panic!("overlap toward {gid}: {e:#}"));
+                    live.push(plan);
+                }
+                let own_id = TunnelId::Own { epoch: pending_epoch };
+                let own = plan_tunnel(own_id, BASE_TUN, base_port, &live)
+                    .unwrap_or_else(|e| panic!("G's own new epoch {pending_epoch}: {e:#}"));
+
+                // --- Side 2: peer P decides where to dial G's new epoch. ---
+                let peer = peer_full(
+                    7,
+                    &format!("10.9.0.7:{base_port}"),
+                    vec![
+                        PeerKeyInfo {
+                            epoch: active_epoch,
+                            pubkey_b64: "KA".into(),
+                            state: "active".into(),
+                        },
+                        PeerKeyInfo {
+                            epoch: pending_epoch,
+                            pubkey_b64: "KP".into(),
+                            state: "pending".into(),
+                        },
+                    ],
+                    "10.10.7.0/24",
+                );
+                let cfgs = pending_peer_configs(&ds_with(vec![peer], 0), 25);
+
+                assert_eq!(
+                    dialled_port(&cfgs),
+                    own.listen_port,
+                    "base {base_port}, epoch {active_epoch} -> {pending_epoch}: P dials port \
+                     {} but G's new-epoch tun was allocated on {}. These are computed by two \
+                     different functions in two different modules and MUST agree at every \
+                     rotation; they agreed only at the first one before the own-tun port was \
+                     reserved.",
+                    dialled_port(&cfgs),
+                    own.listen_port,
+                );
+            }
+        }
+    }
+
+    /// The reservation itself, from the allocator's side — the half that makes
+    /// the agreement above structural rather than lucky.
+    ///
+    /// An overlap must be **incapable** of standing on `base +
+    /// OWN_TUN_PORT_OFFSET`, not merely unlikely to. As one shared free list it
+    /// was ordinary: any peer that rotated before we did took `base + 1` first,
+    /// and our own new epoch then landed somewhere no peer could compute. So the
+    /// test drains the ENTIRE overlap free list and then demands the reserved
+    /// port still be there for the own tun — maximum pressure, which is where a
+    /// shared list fails on its very first allocation.
+    #[test]
+    fn the_reserved_own_port_is_never_handed_to_an_overlap() {
+        use crate::tunnelset::{plan_tunnel, TunnelId, TunnelPlan};
+        const BASE_TUN: &str = "wg0";
+        const BASE_PORT: u16 = 51820;
+        let reserved_port = BASE_PORT + OWN_TUN_PORT_OFFSET;
+
+        let mut live = vec![TunnelPlan {
+            id: TunnelId::Own { epoch: 3 },
+            ifname: BASE_TUN.to_string(),
+            listen_port: BASE_PORT,
+        }];
+
+        // Drain the overlap range dry. Its size is whatever the production
+        // window is minus the one reserved slot, so this loop keeps going until
+        // the allocator refuses rather than hard-coding a count.
+        let mut allocated = 0usize;
+        while let Ok(plan) = plan_tunnel(
+            TunnelId::Overlap { gateway_id: 100 + allocated as u64, epoch: 4 },
+            BASE_TUN,
+            BASE_PORT,
+            &live,
+        ) {
+            assert_ne!(
+                plan.listen_port, reserved_port,
+                "overlap #{allocated} was planned onto {reserved_port} = base + \
+                 OWN_TUN_PORT_OFFSET. That is the ONLY port a rotating peer can compute for \
+                 this gateway's new epoch (`pending_peer_configs`), so an overlap standing \
+                 there makes the next rotation unreachable — bug 5, reintroduced."
+            );
+            live.push(plan);
+            allocated += 1;
+            assert!(allocated < 1000, "the overlap range must be bounded");
+        }
+        assert!(
+            allocated > 0,
+            "the overlap range must not be empty at a conventional base port"
         );
-        let ds = ds_with(vec![peer], 0);
-        let cfgs = pending_peer_configs(&ds, 25);
-        assert_eq!(cfgs.len(), 1);
-        assert_eq!(cfgs[0].endpoint.as_deref(), Some("10.9.0.2:51823"));
+
+        // With every overlap port taken, the reserved one is still free —
+        // because it was never in the free list to begin with.
+        let own = plan_tunnel(TunnelId::Own { epoch: 4 }, BASE_TUN, BASE_PORT, &live)
+            .expect("the own-epoch tun must still be plannable with the overlap range exhausted");
+        assert_eq!(
+            own.listen_port, reserved_port,
+            "the own-epoch tun takes the RESERVED base + OWN_TUN_PORT_OFFSET, under any amount \
+             of overlap pressure — {allocated} overlaps are live here"
+        );
     }
 }

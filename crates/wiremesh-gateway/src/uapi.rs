@@ -5,6 +5,7 @@
 use anyhow::{anyhow, Context};
 use std::collections::HashMap;
 use std::io::{Read, Write};
+use std::net::SocketAddr;
 use std::os::unix::net::UnixStream;
 use std::time::{Duration, SystemTime};
 
@@ -286,6 +287,73 @@ pub fn apply(ifname: &str, cfg: &DeviceConfig) -> anyhow::Result<()> {
     send_set(ifname, &encode_set(cfg)?)
 }
 
+/// Move a LIVE device's WireGuard listen port, in place, with **nothing else**
+/// in the `set=1` body — no `private_key`, no `replace_peers`, no peer blocks.
+///
+/// This is the renormalization primitive of the port-authority fix, piece 2
+/// (`docs/research/port-authority-verification-the-shape-was-wrong.md`): after
+/// a Role-A cutover the surviving active Device sits on a rotation OFFSET port
+/// forever (OD-1), so every durable thing that addresses this gateway — the
+/// controller-observed candidate, reported locals, punch candidates — is
+/// pointing at a port the active key has permanently left. Once the old epoch
+/// is retired the base port is free again, and this puts the survivor back on
+/// it.
+///
+/// # Why this is safe on a live device (boringtun 0.6.0, read from source)
+///
+///  - `api_set`'s device-section loop maps `listen_port` to
+///    `Device::open_listen_socket(port)` and nothing else; a body that carries
+///    only this line never reaches `set_key` or `clear_peers`
+///    (`device/api.rs`).
+///  - `open_listen_socket` closes `udp4`/`udp6`, calls `shutdown_endpoint()`
+///    on every peer, then rebinds. It does **not** touch any peer's `Tunn`, so
+///    unlike `private_key=` (which rebuilds every session) and
+///    `replace_peers=true` (`clear_peers()`) **the noise sessions survive**
+///    (`device/mod.rs`).
+///  - `Peer::shutdown_endpoint` only `take`s the CONNECTED socket
+///    (`endpoint.conn`); `endpoint.addr` is left intact (`device/peer.rs`), so
+///    every peer keeps the address it was sending to and simply falls back to
+///    `send_to` on the fresh `udp4`.
+///  - Both sockets rebind with `set_reuse_address(true)`, and the gateway's
+///    only other socket on this port — the transient observe probe — sets
+///    `SO_REUSEADDR` too (`observe::reuseport_udp`). Linux's UDP bind conflict
+///    check is skipped when BOTH sockets carry `SO_REUSEADDR`, so an in-flight
+///    observe probe cannot make this fail with `EADDRINUSE`. (The steady state
+///    after this call is byte-for-byte the boot-time arrangement: boringtun on
+///    the base port plus the periodic observe probe beside it.)
+///
+/// The peer-visible consequence is a **source-port change**, not a session
+/// reset: our datagrams now leave from `port`, and each peer's boringtun roams
+/// its endpoint for us on the first one it authenticates. The caller is
+/// expected to prompt that rather than wait for the 25s keepalive.
+///
+/// # Failure posture: an `Err` here is a DATA-PLANE OUTAGE, not a no-op
+///
+/// `open_listen_socket` is **not** atomic. It closes `udp4` **and** `udp6` and
+/// calls `shutdown_endpoint()` on every peer BEFORE attempting either bind, and
+/// assigns `self.udp4`/`self.udp6` only at the very end (boringtun 0.6.0,
+/// `device/mod.rs`). Any error in between — `Socket::new(Domain::IPV6, ..)` on
+/// a host with IPv6 disabled, an `EADDRINUSE` from a v4 or v6 conflict,
+/// `ENFILE` — surfaces here while leaving the Device with `udp4 = None,
+/// udp6 = None`: **deaf and mute on every port**, receiving nothing and able to
+/// send nothing, for every peer.
+///
+/// So an `Err` from this call does NOT mean "the device stayed on its old
+/// port". It means the device may hold no port at all, and only a process
+/// restart recovers it — there is no in-process retry. Callers must report it
+/// that way; `TunnelSet::set_listen_port` correctly declines to update its
+/// recorded port on an error, but that record is then describing a port the
+/// Device is not necessarily listening on either.
+///
+/// The specific `EADDRINUSE`-against-the-observe-probe case IS ruled out, by
+/// the `SO_REUSEADDR` reasoning above; it is every OTHER error that is
+/// unsurvivable.
+pub fn set_listen_port(ifname: &str, port: u16) -> anyhow::Result<()> {
+    // Trailing blank line terminates the request (see `send_set`).
+    send_set(ifname, &format!("listen_port={port}\n\n"))
+        .with_context(|| format!("moving {ifname} to listen port {port}"))
+}
+
 /// Shared UAPI `set=1` round-trip: connect, send `body`, check `errno`.
 fn send_set(ifname: &str, body: &str) -> anyhow::Result<()> {
     let path = format!("/var/run/wireguard/{ifname}.sock");
@@ -322,6 +390,23 @@ pub(crate) struct PeerGetInfo {
     /// containers because the gateway exposed no per-peer rx/tx/handshake
     /// metrics). Same `get=1` response the liveness fields come from.
     pub tx_bytes: u64,
+    /// The endpoint the DEVICE is actually using for this peer, as boringtun
+    /// reports it — the ground truth the port-authority fix reads through
+    /// (`docs/research/port-authority-verification-the-shape-was-wrong.md`,
+    /// piece 1). This is NOT necessarily the endpoint we configured:
+    /// boringtun's `register_udp_handler` calls `peer.set_endpoint(addr)` on
+    /// every SUCCESSFULLY DECAPSULATED datagram, so the value ROAMS to
+    /// wherever authenticated traffic is genuinely arriving from (roaming
+    /// requires successful decryption, so an off-path sender cannot move it),
+    /// and `api_get` emits it from `p.endpoint().addr`.
+    ///
+    /// `None` when the line is absent (boringtun omits it for a peer with no
+    /// endpoint at all) or when it does not parse as a `SocketAddr` — a value
+    /// that cannot be parsed must never become a durable pin, so it is
+    /// dropped rather than guessed at. Typed as `SocketAddr` rather than
+    /// `String` both for that validation and because `SocketAddr: Copy` keeps
+    /// this struct — and the public [`PeerLiveness`] it feeds — `Copy`.
+    pub endpoint: Option<SocketAddr>,
 }
 
 /// Parse a `get=1` UAPI response body into `{pubkey_hex -> PeerGetInfo}`.
@@ -363,6 +448,19 @@ pub(crate) fn parse_get_response(resp: &str) -> HashMap<String, PeerGetInfo> {
             info.rx_bytes = v.parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("tx_bytes=") {
             info.tx_bytes = v.parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("endpoint=") {
+            // Unparseable => `None` (see the field doc): the caller pins this
+            // value durably, and a garbled endpoint pin is strictly worse than
+            // no pin at all (no pin means "chase the advertised candidate").
+            // An IPv6 endpoint is garbled by that same definition — v1 is
+            // IPv4-only, so a v6 pin is one this gateway can never apply:
+            // `reconcile::device_config_pinned` renders the pin straight back
+            // into a UAPI config and `push_peer_block`'s
+            // `validate_ipv4_endpoint` refuses it. Dropping it here keeps that
+            // rejection at the boundary where it costs a single skipped pin,
+            // instead of persisting a pin whose only future is an apply-time
+            // failure.
+            info.endpoint = v.trim().parse().ok().filter(SocketAddr::is_ipv4);
         }
     }
     if let Some((key, info)) = current.take() {
@@ -423,6 +521,15 @@ pub struct PeerLiveness {
     pub latest_handshake: Option<SystemTime>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
+    /// The endpoint the device is ACTUALLY using for this peer right now —
+    /// see [`PeerGetInfo::endpoint`] for why this is roamed ground truth
+    /// rather than a read-back of what we configured. Carried on the same
+    /// snapshot as the liveness counters deliberately: the path tick's
+    /// endpoint read-through must only trust an endpoint for a peer it has
+    /// just judged LIVE from the very same fetch (see `run_path_ticks`'s
+    /// endpoint read-through), so the two must not come from two round-trips
+    /// that can disagree.
+    pub endpoint: Option<SocketAddr>,
 }
 
 /// Reduce parsed `get=1` peer info to `{pubkey_hex -> PeerLiveness}`.
@@ -451,6 +558,7 @@ pub(crate) fn peer_liveness_from(
                     latest_handshake: times.get(k).copied(),
                     rx_bytes: info.rx_bytes,
                     tx_bytes: info.tx_bytes,
+                    endpoint: info.endpoint,
                 },
             )
         })
@@ -723,6 +831,118 @@ errno=0\n\
         assert_eq!(b.latest_handshake, None, "never-handshaked peer still has no handshake time");
         assert_eq!(b.rx_bytes, 0, "never-handshaked peer's rx_bytes preserved (0)");
         assert_eq!(b.tx_bytes, 0, "never-handshaked peer's tx_bytes preserved (0)");
+    }
+
+    /// One-peer `get=1` response carrying an arbitrary `endpoint=` value —
+    /// the same wire shape as [`GET_RESPONSE_FIXTURE`], parameterized so the
+    /// endpoint-validation cases below all read the identical block and can
+    /// only differ in the value under test.
+    fn get_response_with_endpoint(ep: &str) -> String {
+        format!(
+            "private_key=1111111111111111111111111111111111111111111111111111111111111111\n\
+             listen_port=51820\n\
+             public_key={PEER_A}\n\
+             endpoint={ep}\n\
+             last_handshake_time_sec=1700000000\n\
+             last_handshake_time_nsec=500000000\n\
+             rx_bytes=12345\n\
+             tx_bytes=6789\n\
+             persistent_keepalive_interval=15\n\
+             allowed_ip=10.10.2.5/32\n\
+             errno=0\n\
+             \n"
+        )
+    }
+
+    const PEER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn endpoint_of(resp: &str) -> Option<SocketAddr> {
+        parse_get_response(resp).get(PEER_A).expect("peer a present").endpoint
+    }
+
+    /// POSITIVE CONTROL for the IPv6-rejection pins below: a normal IPv4
+    /// endpoint must still parse to `Some(..)` with the exact addr AND port.
+    /// Without this, "reject IPv6" could be satisfied by a parser that
+    /// returns `None` for everything — which would silently destroy the
+    /// port-authority read-through this field exists for.
+    #[test]
+    fn parse_get_response_keeps_ipv4_endpoint() {
+        assert_eq!(
+            endpoint_of(&get_response_with_endpoint("192.0.2.10:51820")),
+            Some("192.0.2.10:51820".parse::<SocketAddr>().unwrap()),
+            "an IPv4 endpoint must survive parsing as a pinnable value"
+        );
+        // Second, distinct IPv4 value so the assertion cannot pass on a
+        // hard-coded constant, and the PORT specifically is carried through.
+        assert_eq!(
+            endpoint_of(&get_response_with_endpoint("198.51.100.7:1234")),
+            Some(SocketAddr::from(([198, 51, 100, 7], 1234))),
+            "the observed source port is the whole point of the read-through"
+        );
+    }
+
+    /// v1 is IPv4-only. An IPv6 `endpoint=` from the device is exactly the
+    /// "garbled pin" the field doc says must never be stored: the caller pins
+    /// this DURABLY, `reconcile::device_config_pinned` renders it back into a
+    /// UAPI config, and `push_peer_block`'s `validate_ipv4_endpoint` then
+    /// REJECTS it — so accepting it here defers a boundary rejection into an
+    /// apply-time failure of an already-persisted pin. It must be `None`.
+    #[test]
+    fn parse_get_response_rejects_ipv6_endpoint_as_unpinnable() {
+        // Collected rather than asserted per-iteration so a failure reports
+        // EVERY still-accepted literal, not just the first one.
+        let accepted: Vec<(&str, SocketAddr)> = [
+            "[fe80::1]:51820",                                 // link-local
+            "[::1]:51820",                                     // loopback, compressed
+            "[2001:0db8:0000:0000:0000:0000:0000:0001]:51820", // full-form literal
+            "[2001:db8::1]:51820",                             // compressed global
+        ]
+        .into_iter()
+        .filter_map(|ep| endpoint_of(&get_response_with_endpoint(ep)).map(|got| (ep, got)))
+        .collect();
+        assert!(
+            accepted.is_empty(),
+            "IPv6 endpoints must not become durable pins (v1 is IPv4-only), but these parsed: {accepted:?}"
+        );
+    }
+
+    /// Pre-existing behaviour, pinned so a future rewrite of the endpoint
+    /// branch cannot regress it: a value that is not a socket address at all
+    /// yields `None` rather than a partial/guessed pin.
+    #[test]
+    fn parse_get_response_drops_garbled_endpoint() {
+        for ep in ["not-an-address", "192.0.2.10", "192.0.2.10:", ":51820", "192.0.2.999:51820"] {
+            assert_eq!(
+                endpoint_of(&get_response_with_endpoint(ep)),
+                None,
+                "unparseable endpoint {ep:?} must yield no pin"
+            );
+        }
+    }
+
+    /// Rejecting the endpoint must reject ONLY the endpoint — the peer stays
+    /// in the map with its liveness/traffic fields intact, so an IPv6-reporting
+    /// device does not blind the path state machine.
+    #[test]
+    fn ipv6_endpoint_peer_keeps_its_other_fields() {
+        let resp = get_response_with_endpoint("[fe80::1]:51820");
+        let parsed = parse_get_response(&resp);
+        let a = parsed.get(PEER_A).expect("peer still parsed despite bad endpoint");
+        assert_eq!(a.endpoint, None, "endpoint dropped");
+        assert_eq!(a.last_handshake_sec, 1700000000, "handshake sec preserved");
+        assert_eq!(a.last_handshake_nsec, 500000000, "handshake nsec preserved");
+        assert_eq!(a.rx_bytes, 12345, "rx_bytes preserved");
+        assert_eq!(a.tx_bytes, 6789, "tx_bytes preserved");
+
+        // And the same through the reducer the path tick actually consumes.
+        let live = peer_liveness_from(&parsed);
+        let a = live.get(PEER_A).expect("peer present in liveness snapshot");
+        assert_eq!(a.endpoint, None, "no IPv6 endpoint reaches PeerLiveness either");
+        assert_eq!(a.rx_bytes, 12345);
+        assert_eq!(
+            a.latest_handshake,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000) + Duration::from_nanos(500000000))
+        );
     }
 
     #[test]

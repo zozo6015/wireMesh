@@ -675,6 +675,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
         relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
         endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
+        endpoint_commit_gen: Arc::new(AtomicU64::new(0)),
         wg0_pins: wg0_pins.clone(),
         // Shared with the policy-apply worker (created above), which pokes it
         // after a successful install so the loop re-reports the freshly
@@ -863,6 +864,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         wg0_pins: wg0_pins.clone(),
         desired: ctx.desired.clone(),
         live_endpoints: live_endpoints.clone(),
+        relay_transports: ctx.relay_transports.clone(),
         retire_ready: Arc::new(std::sync::Mutex::new(None)),
         epoch_keys: epoch_keys.clone(),
         applied_version: applied_version.clone(),
@@ -898,7 +900,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     // signalled (every peer cut over to the new tun and the
                     // grace elapsed). Done HERE in the run task because it owns
                     // the non-`Send` `tunnels`/`enforcers`.
-                    service_retire(&mut tunnels, &enforcers, &rot).await;
+                    service_retire(&mut tunnels, &enforcers, &rot, &ctx).await;
                     // Likewise any completed Role-B collapse (a rotated PEER's
                     // overlap Device whose reverse make-before-break finished).
                     service_role_b_collapse(&mut tunnels, &enforcers, &rot).await;
@@ -1345,6 +1347,31 @@ struct PathCtx {
     /// BEFORE it spawns `ensure_relay_transport`, so `state != Connecting` is
     /// the earliest signal a relay install is in play.
     endpoint_commit: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic counter of [`set_peer_endpoint`] pin mutations, bumped inside
+    /// the [`PathCtx::endpoint_commit`] critical section on every
+    /// `live_endpoints` write that function performs.
+    ///
+    /// This is what subordinates the path tick's ENDPOINT READ-THROUGH (the
+    /// port-authority fix, piece 1) to the explicit punch/relay writers rather
+    /// than letting the two race. The tick reads the device's roamed
+    /// `endpoint=` OUTSIDE the commit lock (it is one leg of the same
+    /// once-per-second `get_peer_liveness` fetch that drives the state
+    /// machine), so without a guard this interleaving reverts a just-installed
+    /// endpoint:
+    ///
+    /// 1. tick reads the device and sees peer `g` at the OLD endpoint `E1`;
+    /// 2. `set_peer_endpoint` pins `E2` (punch success, or a relay install)
+    ///    and writes it to the device;
+    /// 3. the tick's read-through writes `E1` back over the pin — the device
+    ///    still holds `E2`, but the next full `apply_state` rebuild renders
+    ///    `E1` and clobbers the live path.
+    ///
+    /// The tick therefore snapshots this counter BEFORE its UAPI read and,
+    /// holding `endpoint_commit`, re-reads it before writing: any intervening
+    /// commit means the snapshot is stale, and the whole read-through is
+    /// skipped for that tick (the next tick's read is fresh, and — since the
+    /// device and the pin then agree — resolves to a no-op).
+    endpoint_commit_gen: Arc<AtomicU64>,
     /// Shared Role-B `wg0` pin map (peer `gateway_id` -> old-epoch pubkey) — so
     /// `set_peer_endpoint` builds the same pinned config `apply_state` does and
     /// a punch during a rotation overlap can't rekey `wg0` off the pin.
@@ -1360,6 +1387,18 @@ struct PathCtx {
     /// re-point at fresh candidates — and passed by every steady-state
     /// device rebuild to `reconcile::device_config_pinned`. The same `Arc`
     /// the boot loop and `RotationShared` hold.
+    ///
+    /// SECOND WRITER, deliberately subordinate (port-authority fix, piece 1):
+    /// `run_path_ticks`'s endpoint READ-THROUGH also refreshes this map, from
+    /// the device's own roamed `endpoint=`, for peers it has just judged
+    /// `Direct`/`Relayed`. That covers every endpoint boringtun chose for
+    /// itself — which `set_peer_endpoint` by construction never sees — so a
+    /// full `replace_peers` apply can no longer rewrite a live roamed peer
+    /// back to its static base-port candidate and destroy the session. The
+    /// two writers are ordered, not racing: the read-through runs under the
+    /// same `endpoint_commit` lock and drops its whole batch if
+    /// `endpoint_commit_gen` moved during its device read, so an explicit
+    /// commit always beats a stale observation.
     live_endpoints: Arc<std::sync::Mutex<HashMap<u64, String>>>,
     /// Per-peer punch back-off state (fix T3, finding §3: an undialable
     /// pair's punch directives re-fired every few seconds indefinitely, and
@@ -2183,19 +2222,31 @@ async fn set_peer_endpoint(
     endpoint: SocketAddr,
     is_relay: bool,
 ) -> anyhow::Result<bool> {
-    // Resolve the ACTIVE tun (ifname + priv key + port), captured together so
-    // the device we build and the ifname we apply it to are consistent even if
-    // a cutover flips `active` concurrently.
-    let (ifname, priv_key, wg_port) = {
-        let a = ctx.active.lock().unwrap();
-        (a.ifname.clone(), a.priv_key.clone(), a.wg_port)
-    };
-
     // MAJOR-1: hold the endpoint-commit lock across the ENTIRE guard+write, so
     // the direct-punch and relay-install endpoint writes are mutually exclusive
     // and cannot interleave. A `tokio::sync::Mutex`, so it is safe to hold
     // across the `spawn_blocking` UAPI write inside `apply_peer_endpoint_scoped`.
     let _commit = ctx.endpoint_commit.lock().await;
+
+    // Resolve the ACTIVE tun (ifname + priv key + port), captured together so
+    // the device we build and the ifname we apply it to are consistent even if
+    // a cutover flips `active` concurrently.
+    //
+    // Read INSIDE the commit section, deliberately (port-authority review F1).
+    // This lock is held across UAPI round-trips, so waiters really do queue:
+    // read before acquiring and a `renormalize_active_listen_port` that takes
+    // the lock ahead of us — it moves the device to the base port, sets
+    // `a.wg_port`, and rewrites `applied_config`'s header — would leave us
+    // building `dev` from a stale OFFSET `wg_port`. `apply_peer_endpoint_scoped`
+    // re-derives `applied_config` from `dev`'s header, so the guard would then
+    // describe a `listen_port` the device is not on, and the next `apply_state`
+    // would see `header_matches == false` and take the full `replace_peers`
+    // apply — destroying EVERY peer's noise session seconds after a retire.
+    // Reading here makes the snapshot as new as the lock we hold.
+    let (ifname, priv_key, wg_port) = {
+        let a = ctx.active.lock().unwrap();
+        (a.ifname.clone(), a.priv_key.clone(), a.wg_port)
+    };
 
     // MAJOR-1 atomic guard (DIRECT path only): abort — WITHOUT touching the
     // device or any pin — the moment the peer has left `Connecting` or a relay
@@ -2231,6 +2282,16 @@ async fn set_peer_endpoint(
     // a yielded direct punch must NOT leave a stale direct pin behind, or a
     // later `apply_state` rebuild would use it to clobber the relay endpoint.
     ctx.live_endpoints.lock().unwrap().insert(gid, endpoint.to_string());
+    // Publish the pin mutation to the path tick's endpoint read-through
+    // (port-authority fix, piece 1): bumped HERE — under `endpoint_commit`,
+    // immediately after the pin write and BEFORE the device write — so a tick
+    // that read the device before this commit can detect that its snapshot is
+    // stale and decline to write `E1` back over this `E2`. See
+    // `PathCtx::endpoint_commit_gen`. Bumped on the pin write rather than on
+    // apply success because the pin is inserted unconditionally above: a
+    // failing apply still leaves the pin mutated, and the read-through must
+    // not race that either.
+    ctx.endpoint_commit_gen.fetch_add(1, Ordering::SeqCst);
     // Build the full pinned desired device (for the change-guard and the
     // `applied_peers` bookkeeping `apply_state` diffs against) AND resolve the
     // TARGET peer's pubkey — the one peer whose block the scoped apply pushes.
@@ -2675,6 +2736,11 @@ async fn run_path_ticks(ctx: PathCtx) {
         tokio::time::sleep(PATH_TICK_PERIOD).await;
 
         let ifname = ctx.active.lock().unwrap().ifname.clone();
+        // Snapshot the endpoint-commit generation BEFORE the device read, so
+        // the endpoint read-through below can tell whether a punch/relay
+        // commit landed while this fetch was in flight (see
+        // `PathCtx::endpoint_commit_gen` for the interleaving this closes).
+        let commit_gen_at_read = ctx.endpoint_commit_gen.load(Ordering::SeqCst);
         let liveness = match tokio::task::spawn_blocking(move || {
             uapi::get_peer_liveness(&ifname)
         })
@@ -2779,6 +2845,11 @@ async fn run_path_ticks(ctx: PathCtx) {
         let mut to_sweep_pin: Vec<u64> = Vec::new();
         // Peers due a liveness probe this tick (keepalive-invisibility fix).
         let mut to_probe: Vec<u64> = Vec::new();
+        // Endpoint read-through candidates (port-authority fix, piece 1):
+        // `(gid, the endpoint the DEVICE says it is using)` for every peer
+        // this tick judged live. Collected here and reconciled against the
+        // pin map after the `paths` guard drops — see the ACT phase.
+        let mut to_pin_endpoint: Vec<(u64, SocketAddr)> = Vec::new();
         {
             let mut paths = ctx.paths.lock().unwrap();
             for peer in &ds.peers {
@@ -2787,6 +2858,13 @@ async fn run_path_ticks(ctx: PathCtx) {
                 let gid = peer.gateway_id;
                 let path = paths.entry(gid).or_insert_with(|| Path::new(now));
                 let before = path.state;
+                // The endpoint the DEVICE is actually using for this peer,
+                // taken off the SAME fetch the state machine is about to act
+                // on (endpoint read-through, port-authority fix piece 1 — see
+                // the COLLECT block further down). Captured up here because
+                // `info` is scoped to the liveness block below while the
+                // read-through needs the POST-`tick` path state.
+                let dev_endpoint = liveness.get(&hex).and_then(|i| i.endpoint);
 
                 if let Some(info) = liveness.get(&hex).copied() {
                     // Publish this peer's snapshot for the metrics scrape
@@ -2989,6 +3067,64 @@ async fn run_path_ticks(ctx: PathCtx) {
                     }
                 }
 
+                // ENDPOINT READ-THROUGH — COLLECT phase (port-authority fix,
+                // piece 1; see
+                // docs/research/port-authority-verification-the-shape-was-wrong.md).
+                //
+                // WHY: `device_config_pinned` PREFERS `live_endpoints` over
+                // `primary_endpoint()`, and until now the only writer was
+                // `set_peer_endpoint` — so the map only ever learned endpoints
+                // this gateway CHOSE (a punch candidate, or a relay socket).
+                // Anything boringtun ROAMED to on its own was invisible to
+                // every rebuild, and the next full apply (`replace_peers`)
+                // rewrote the peer back to its static base-port candidate AND
+                // destroyed the session. That is what makes the key-rotation
+                // collapse arm destroy a working roamed session: the collapse
+                // unpins, the key change forces `NeedsFullApply`, and the
+                // roamed endpoint is lost — so `all_live` never holds and
+                // `service_retire` never fires.
+                //
+                // WHAT: for a peer this tick judged LIVE (`Direct`/`Relayed`),
+                // adopt the device's own `endpoint=` as the pin. This is a
+                // CONTINUOUS read-through, not a one-shot seed at the rotation
+                // cutover: the only roamed value available at the cutover is
+                // the peer's transient Role-B overlap socket, which is
+                // destroyed when that overlap collapses, so seeding from it
+                // would durably pin a dead address.
+                //
+                // The existing semantics are preserved exactly — live peers
+                // keep the endpoint their tunnel is really using, dead peers
+                // chase candidates (the pin is still cleared the moment the
+                // path leaves `Direct`/`Relayed`, in the `to_record` loop
+                // below). This does not add a competing writer: it is
+                // subordinate to `set_peer_endpoint`, which still decides
+                // where a NON-live peer gets pointed, and whose commits win
+                // over a stale read via `endpoint_commit_gen`.
+                //
+                // RELAY: for a `Relayed` peer the device's endpoint IS the
+                // loopback relay socket — `RelayTransport` serves both pump
+                // directions from the ONE socket it bound at `127.0.0.1:0`,
+                // so relayed inbound reaches boringtun sourced from exactly
+                // the `local_addr` `set_peer_endpoint` installed, and the
+                // read-through resolves to a no-op. (If a relayed peer's
+                // device did roam off-loopback, an authenticated datagram
+                // genuinely arrived direct and boringtun is ALREADY sending
+                // there — the pin then just stops a later rebuild from
+                // disagreeing with the device.)
+                //
+                // Rejected values: a port-0 or unspecified-IP endpoint is
+                // undialable, so it must never be made durable — better no
+                // pin (chase the candidate) than a black hole. Unparseable
+                // endpoints are already dropped in `uapi::parse_get_response`.
+                if matches!(path.state, PathState::Direct | PathState::Relayed) {
+                    match dev_endpoint {
+                        Some(ep) if !ep.ip().is_unspecified() && ep.port() != 0 => {
+                            to_pin_endpoint.push((gid, ep));
+                        }
+                        _ => {}
+                    }
+                }
+
                 if before != path.state {
                     to_record.push((gid, before, path.state));
                     if path.state == PathState::Direct {
@@ -3005,6 +3141,52 @@ async fn run_path_ticks(ctx: PathCtx) {
         // (fix T5). Whole-map replacement: peers dropped from desired state
         // vanish from the scrape body the same tick.
         *ctx.peer_stats.lock().unwrap() = stats_snapshot;
+
+        // ENDPOINT READ-THROUGH — ACT phase (port-authority fix, piece 1; see
+        // the COLLECT block above for the full rationale). Two steps, both
+        // outside the `paths` guard:
+        //
+        // 1. Diff against the current pins first, under a short
+        //    `live_endpoints` lock with nothing else held. In steady state the
+        //    device agrees with the pin, so this is empty and the tick costs
+        //    one uncontended lock — no `endpoint_commit` traffic, no log line.
+        // 2. Only a REAL change takes `endpoint_commit` and re-checks the
+        //    commit generation snapshotted before this tick's device read. A
+        //    mismatch means `set_peer_endpoint` committed a newer endpoint
+        //    while our read was in flight, so what we observed is stale and
+        //    the whole batch is dropped — the explicit writer always wins.
+        //    See `PathCtx::endpoint_commit_gen`.
+        let endpoint_changes: Vec<(u64, String)> = {
+            let live = ctx.live_endpoints.lock().unwrap();
+            to_pin_endpoint
+                .into_iter()
+                .filter_map(|(gid, ep)| {
+                    let ep = ep.to_string();
+                    (live.get(&gid) != Some(&ep)).then_some((gid, ep))
+                })
+                .collect()
+        };
+        if !endpoint_changes.is_empty() {
+            let _commit = ctx.endpoint_commit.lock().await;
+            if ctx.endpoint_commit_gen.load(Ordering::SeqCst) == commit_gen_at_read {
+                let mut live = ctx.live_endpoints.lock().unwrap();
+                for (gid, ep) in endpoint_changes {
+                    eprintln!(
+                        "wiremesh-gateway: peer={gid} endpoint read-through: pinning {ep} \
+                         (the endpoint the device is actually using)"
+                    );
+                    live.insert(gid, ep);
+                }
+            } else {
+                // A punch/relay commit landed mid-read; its endpoint is newer
+                // than anything this fetch could have seen. Skip — the next
+                // tick reads the post-commit device and agrees with the pin.
+                eprintln!(
+                    "wiremesh-gateway: endpoint read-through skipped: an endpoint commit \
+                     landed during the device read"
+                );
+            }
+        }
 
         // Fire this tick's due liveness probes (keepalive-invisibility fix).
         // Spawned, not awaited, so a slow send never delays the tick loop; the
@@ -3286,6 +3468,22 @@ fn device_header(encoded: &str) -> &str {
 /// the UAPI device apply and the route diff are fast AND must stay ordered
 /// with peer events, so deferring them would trade a stall for a
 /// correctness problem.
+///
+/// # Do not call this from a spawned task
+///
+/// This reads `active`'s `wg_port` and builds `dev` from it WITHOUT holding
+/// `endpoint_commit`, then writes the change-guard from that `dev` — the exact
+/// shape that was bug F1 in `set_peer_endpoint` (see the comment there). It is
+/// safe here only because of WHERE it is called from: boot, before the run
+/// loop exists, and the run-task loop, which is the same loop that owns
+/// `service_retire` — so it can never interleave with the
+/// `renormalize_active_listen_port` that would invalidate the snapshot. That
+/// is a STRUCTURAL guarantee, not a locked one. Calling this from a spawned
+/// task reintroduces F1 verbatim: a stale offset `wg_port` reaches the guard,
+/// `header_matches` goes false, and the next apply takes the full
+/// `replace_peers` path, destroying every peer's noise session. If this ever
+/// needs to move off that loop, take `endpoint_commit` first and read `active`
+/// under it.
 async fn apply_state(
     prev: Option<&DesiredState>,
     ds: &DesiredState,
@@ -3406,6 +3604,230 @@ async fn apply_state(
     Ok(())
 }
 
+/// Rewrite the `listen_port=` line in an encoded UAPI `set` string's device
+/// HEADER, leaving every other byte — the private key, `replace_peers`, and
+/// every peer block — byte-identical. `None` if the header carries no
+/// `listen_port=` line at all.
+///
+/// This is how the active tun's change-guard is re-seeded after
+/// [`renormalize_active_listen_port`] moves the port (port-authority fix,
+/// piece 2). Deliberately a TEXTUAL rewrite of the recorded config rather than
+/// a fresh `device_config_pinned` render: `applied_config` means "the last
+/// config actually pushed to this device", and the port is the ONLY thing the
+/// renormalization pushed. Re-rendering from the current desired state would
+/// instead record config that was never applied, silently swallowing any peer
+/// delta that accumulated since the last apply.
+///
+/// Only the header is scanned. `push_peer_block` never emits a `listen_port=`
+/// line, so the restriction is belt-and-braces rather than load-bearing — but
+/// it means a peer field that ever gained that prefix could not be corrupted
+/// by this.
+fn rewrite_listen_port(encoded: &str, port: u16) -> Option<String> {
+    let split = encoded.find("public_key=").unwrap_or(encoded.len());
+    let (header, peers) = encoded.split_at(split);
+    let mut out = String::with_capacity(encoded.len() + 8);
+    let mut replaced = false;
+    for line in header.split_inclusive('\n') {
+        if line.starts_with("listen_port=") {
+            out.push_str(&format!("listen_port={port}\n"));
+            replaced = true;
+        } else {
+            out.push_str(line);
+        }
+    }
+    if !replaced {
+        return None;
+    }
+    out.push_str(peers);
+    Some(out)
+}
+
+/// Point every LIVE relay transport's downlink at `127.0.0.1:<wg_port>`.
+///
+/// `RelayTransport` delivers relayed inbound to the local address it last saw
+/// sending — seeded at `start` from the then-current active listen port. Any
+/// move of that port (a Role-A cutover, or the retire-time renormalization)
+/// therefore leaves every existing transport delivering to a port boringtun no
+/// longer listens on, and every relayed peer black-holes until boringtun's next
+/// outbound datagram re-teaches the pump. Calling this immediately after the
+/// port moves closes that window; see `RelayTransport::set_local_peer`.
+///
+/// Best-effort and non-destructive by construction: it mutates one address per
+/// live transport and touches neither the QUIC connection nor WireGuard, so
+/// there is nothing here to fail or to unwind. A gateway with no relayed peers
+/// (the common case) does nothing and logs nothing.
+async fn retarget_relay_transports(
+    relay_transports: &Arc<Mutex<HashMap<u64, PeerRelay>>>,
+    wg_port: u16,
+    why: &str,
+) {
+    let local = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, wg_port));
+    let map = relay_transports.lock().await;
+    for (gid, pr) in map.iter() {
+        pr.transport.set_local_peer(local).await;
+        eprintln!(
+            "wiremesh-gateway: peer={gid} relay={} downlink re-pointed at {local} ({why})",
+            pr.relay_id
+        );
+    }
+}
+
+/// Put the surviving active tun back on the BASE WireGuard listen port after a
+/// rotation's old epoch has been torn down — the renormalization at the heart
+/// of the port-authority fix, piece 2
+/// (`docs/research/port-authority-verification-the-shape-was-wrong.md`).
+///
+/// # The invariant this restores
+///
+/// A Role-A cutover moves the active key onto a rotation offset port and, until
+/// now, NOTHING ever moved it back except a reboot (OD-1, see `run`'s boot
+/// comment). Everything durable that addresses this gateway is base-port by
+/// construction — the controller-observed candidate (the observe socket is
+/// bound to `cfg.wg_listen_port` for process life), reported locals, punch
+/// candidates, `live_endpoints` — so after one cutover none of them can reach
+/// the active key, and after a SECOND rotation the free-list allocation drifts
+/// one port further out with no side able to predict it. Both are the same
+/// invariant violated twice, which is why neither is fixable alone.
+///
+/// # Ordering: this can only run once the old Device is GONE
+///
+/// The old epoch's Device holds the base port until it is dropped, so this must
+/// follow `TunnelSet::tear_down`, never precede it. That is also why this hangs
+/// off the retire rather than the cutover: at the cutover the base port is
+/// still in use by the very key peers are still talking to.
+///
+/// # Failure posture
+///
+/// Everything is ordered so a failure leaves a COHERENT *bookkeeping* state
+/// rather than a half-moved one. The UAPI write + the `TunnelSet` record go
+/// first (`TunnelSet::set_listen_port` does both, or neither); only once the
+/// device has really moved are `ActiveTunInfo::wg_port` and the change-guard
+/// published. So a failed move never leaves us ADVERTISING a port the device
+/// is not on.
+///
+/// It does **not** mean the gateway is left where it was. Read from boringtun
+/// 0.6.0 (`device/mod.rs`, `open_listen_socket`): the old `udp4` **and** `udp6`
+/// are closed and `shutdown_endpoint()` is called on every peer BEFORE either
+/// new bind is attempted, and `self.udp4`/`self.udp6` are only assigned at the
+/// very end. Any error in between — `Socket::new(Domain::IPV6, ..)` on a host
+/// with IPv6 disabled, an `EADDRINUSE` from a v4 or v6 conflict, `ENFILE` —
+/// returns to the UAPI caller with the Device holding `udp4 = None,
+/// udp6 = None`: **deaf and mute on every port**, not sitting on the offset
+/// one. `TunnelSet::set_listen_port` then correctly declines to update its
+/// record, `a.wg_port` stays on the offset, nothing here retries, and the next
+/// rotation additionally hard-fails on the still-reserved port. That is a full
+/// data-plane outage requiring a process restart, which is why the failure log
+/// below says so. (Retry/recovery is deliberately NOT attempted here.)
+///
+/// The one failure mode specifically ruled out is a conflict with the observe
+/// probe: `observe::reuseport_udp` sets both `SO_REUSEADDR` and `SO_REUSEPORT`,
+/// boringtun sets `set_reuse_address(true)` on both of its sockets, and Linux
+/// skips the UDP bind conflict check when both sockets carry `sk_reuse` — so an
+/// in-flight probe cannot make this fail. See [`uapi::set_listen_port`].
+///
+/// # Why the change-guard MUST be re-seeded here
+///
+/// `apply_state` compares the non-peer device header (`private_key` +
+/// `listen_port`) of the freshly built config against `applied_config`, and a
+/// mismatch forces the full `replace_peers` apply — which with this boringtun
+/// is session-destructive for EVERY peer (`uapi::apply`'s caveat). Moving the
+/// port without re-seeding the guard would therefore trade the port fix for a
+/// torn-down data plane on the very next Sync `State` event. The guard is a
+/// textual rewrite of the recorded config (see [`rewrite_listen_port`]), so it
+/// keeps describing what was actually pushed; if the rewrite cannot be made,
+/// the guard is CLEARED rather than left lying — `None` forces one full apply,
+/// which is the same cost as the mismatch but without a stale record.
+///
+/// The move and the publish (and only those — see the inline lock-order note)
+/// run under `PathCtx::endpoint_commit`, the lock a concurrent
+/// `set_peer_endpoint` (punch or relay install) already holds across its own
+/// guard read-modify-write. Without it the two interleave on `ActiveTunInfo`:
+/// `set_peer_endpoint` snapshots `wg_port`, we publish, and it then writes back
+/// a guard rendered at the OLD port — reintroducing the very header mismatch
+/// this re-seed exists to prevent.
+async fn renormalize_active_listen_port(
+    tunnels: &mut TunnelSet,
+    ctx: &PathCtx,
+    base_wg_port: u16,
+) {
+    let (id, ifname, from) = {
+        let a = ctx.active.lock().unwrap();
+        (TunnelId::Own { epoch: a.epoch }, a.ifname.clone(), a.wg_port)
+    };
+    if from == base_wg_port {
+        return; // never left the base port (no cutover happened) — nothing to do
+    }
+    // Serialize the move + publish against `set_peer_endpoint`'s guard
+    // read-modify-write; see this function's doc. Scoped to exactly that, and
+    // deliberately NOT held across the relay/poke work below: every existing
+    // site takes the `relay_transports` mutex ALONE (never while holding
+    // `endpoint_commit`), and this must not be the one call that introduces the
+    // opposite lock order.
+    {
+        let _commit = ctx.endpoint_commit.lock().await;
+        if let Err(e) = tunnels.set_listen_port(id, base_wg_port) {
+            eprintln!(
+                "wiremesh-gateway: CRITICAL: could not renormalize {ifname} from listen port \
+                 {from} back to the base port {base_wg_port}: {e:#} — RESTART THE GATEWAY. \
+                 boringtun closes its old UDP sockets BEFORE it rebinds, so a failed move can \
+                 leave {ifname} bound to NO port at all: deaf and mute on every port, all peers \
+                 dead, and nothing here retries. Even in the milder case where the device is \
+                 still on {from}, that port is advertised by NO durable candidate \
+                 (controller-observed endpoint, reported locals, punch candidates), so peers \
+                 that lose their live pin cannot re-address this gateway — and the next rotation \
+                 will additionally fail to allocate {base_wg_port}. Both outcomes need a restart"
+            );
+            return;
+        }
+        // The device really moved: publish it. Both fields under one guard so
+        // no reader can observe a port/guard pair that never existed.
+        let mut a = ctx.active.lock().unwrap();
+        a.wg_port = base_wg_port;
+        a.applied_config = match a.applied_config.as_deref() {
+            Some(cfg) => match rewrite_listen_port(cfg, base_wg_port) {
+                Some(rewritten) => Some(rewritten),
+                None => {
+                    eprintln!(
+                        "wiremesh-gateway: change-guard for {ifname} carried no listen_port line; \
+                         clearing it so the next apply rebuilds rather than mismatching"
+                    );
+                    a.applied_peers.clear();
+                    None
+                }
+            },
+            // Nothing has been applied through the guard since the cutover, so
+            // there is nothing to correct: the next apply is a full one either
+            // way.
+            None => None,
+        };
+    }
+    // Relayed peers: the downlink's delivery address is the port we just left.
+    retarget_relay_transports(&ctx.relay_transports, base_wg_port, "listen port renormalized")
+        .await;
+    eprintln!(
+        "wiremesh-gateway: renormalized {ifname} from listen port {from} back to the base port \
+         {base_wg_port} — the active key is addressable at its advertised port again"
+    );
+    // Our SOURCE port changed, so every peer's boringtun is still sending to
+    // {from} until it authenticates a datagram from {base_wg_port} and roams.
+    // It will (the endpoint address we send TO is untouched by the rebind — see
+    // `uapi::set_listen_port`), but on nothing faster than the 25s keepalive,
+    // which is uncomfortably close to the degrade threshold. Poke each peer so
+    // boringtun emits now and the roam happens immediately. Best-effort and
+    // spawned: this must not hold the run task.
+    let peers: Vec<u64> = ctx
+        .desired
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|ds| ds.peers.iter().map(|p| p.gateway_id).collect())
+        .unwrap_or_default();
+    for gid in peers {
+        let ctx = ctx.clone();
+        tokio::spawn(async move { poke_peer_overlay(&ctx, gid).await });
+    }
+}
+
 /// Service a pending old-epoch retire the rotation tick has signalled via
 /// [`RotationShared::retire_ready`]. Runs in the run task, which owns the
 /// non-`Send` `tunnels` (and drives the shared `enforcers`). Idempotent and a
@@ -3414,10 +3836,17 @@ async fn apply_state(
 /// already `Idle`. Tears the old epoch's Device down (drops the boringtun
 /// Device — its private key gone from any live Device — and `ip link del`s the
 /// tun) and evicts its enforcer (closing the map's per-epoch entry).
+///
+/// Then RENORMALIZES the surviving active tun back onto the base WireGuard
+/// listen port (port-authority fix, piece 2 — see
+/// [`renormalize_active_listen_port`] for the invariant it restores, and for
+/// why this is the only place it can happen: the base port is not free until
+/// the teardown above drops the old Device).
 async fn service_retire(
     tunnels: &mut TunnelSet,
     enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
     rot: &RotationShared,
+    ctx: &PathCtx,
 ) {
     let Some(old_epoch) = rot.retire_ready.lock().unwrap().take() else {
         return;
@@ -3441,6 +3870,12 @@ async fn service_retire(
         eprintln!("wiremesh-gateway: tearing down retired epoch {epoch} Device failed: {e}");
     }
     enforcers.lock().await.remove(&id);
+    // The base port is free again as of the teardown above — put the surviving
+    // active key back on it (port-authority fix, piece 2). Best-effort and
+    // self-contained: it publishes nothing unless the device really moved, so a
+    // failure here leaves the pre-existing (offset-port) behaviour and must not
+    // hold up the key scrub below, which is the security half of the retire.
+    renormalize_active_listen_port(tunnels, ctx, rot.base_wg_port).await;
     // Durable retire (Backlog 3 Task 1 — the SECURITY half): tearing the
     // Device down only destroys the live in-process copy of the old private
     // key; `retire` REMOVES the epoch's store entry and `persist` rewrites
@@ -3584,6 +4019,16 @@ struct RotationShared {
     /// this map), or the change-guard would mismatch and the next apply would
     /// needlessly rebuild the new tun's live session.
     live_endpoints: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    /// Live relay transports (same `Arc` [`PathCtx`] holds). Needed at the
+    /// Role-A cutover for exactly one reason: the cutover MOVES the active
+    /// tun's listen port, and a `RelayTransport` delivers relayed inbound to
+    /// the local address it last saw sending — seeded from the port the active
+    /// tun had when that transport was started. Left alone, every relayed peer
+    /// black-holes across the cutover until boringtun's next outbound datagram
+    /// re-teaches the pump. See [`retarget_relay_transports`], called from both
+    /// port-moving sites: the cutover below and the retire-time
+    /// renormalization.
+    relay_transports: Arc<Mutex<HashMap<u64, PeerRelay>>>,
     /// Signal from the rotation tick to the run task: the OLD epoch to retire
     /// (tear its Device down + evict its enforcer) once every peer has cut over
     /// to the new tun and the retire grace has elapsed. The run task owns the
@@ -3782,9 +4227,18 @@ async fn handle_rotate(
     // the old `base + (n - active_epoch)` was derived from the epoch number
     // alone, and a Role-B overlap toward a peer's identically-numbered pending
     // epoch derived the very same value — guaranteed, not incidental, because
-    // the controller rotates the whole fabric off one timer. The planner hands
-    // back a port free of the boot tun, of any previous rotation tun, and of
-    // every overlap we hold.
+    // the controller rotates the whole fabric off one timer.
+    //
+    // Since piece 3 this is a RESERVATION, not an allocation: an own-epoch tun
+    // always gets `base + tunnelset::OWN_TUN_PORT_OFFSET`, which no overlap can
+    // ever be handed, because our rotating peers compute exactly that value to
+    // dial our new epoch (`reconcile::pending_peer_configs`) and cannot be told
+    // any other. `plan_tunnel` therefore ERRORS rather than falling back if the
+    // reserved port is held — which aborts the rotation here, with the mint
+    // already persisted and the SM left mid-flight. That is the intended
+    // posture: the alternative is a new epoch listening where no peer will ever
+    // knock, which is bug 5 itself. The realistic cause is a previous retire
+    // whose renormalization failed (it logs CRITICAL when it does).
     let plan = plan_tunnel(
         TunnelId::Own { epoch: n },
         &rot.base_tun,
@@ -3969,7 +4423,10 @@ async fn maybe_start_role_b(
         // collision aborted the loop. Overlaps now live in their own
         // `{base}o{slot}` namespace, and the planner sees the boot tun, our
         // own rotation tun and every other peer's overlap in
-        // `tunnels.plans()`, so the port is free of all of them too.
+        // `tunnels.plans()`, so the port is free of all of them too — and
+        // since piece 3 an overlap free-lists from `base +
+        // OWN_TUN_PORT_OFFSET + 1`, so it cannot land on the slot reserved for
+        // OUR own new-epoch tun even at the instant we hold no such tun.
         let id = TunnelId::Overlap { gateway_id: aid, epoch: pending_epoch };
         let plan = match plan_tunnel(id, &rot.base_tun, rot.base_wg_port, &tunnels.plans()) {
             Ok(p) => p,
@@ -4567,14 +5024,28 @@ async fn run_rotation_ticks(rot: RotationShared) {
                             // SEED the new tun's change-guard with the exact
                             // config `apply_state`/`set_peer_endpoint` will
                             // recompute for it (`device_config_pinned` at the
-                            // new key/port). `handle_rotate` already brought the
-                            // new tun up with the CORRECT offset-port peer
-                            // endpoints out-of-band; a subsequent apply through
-                            // the guard would otherwise rebuild it with base-port
-                            // endpoints (`primary_endpoint`) and tear the live
-                            // session down. Seeding makes those recomputes a
-                            // no-op on the data plane while the enforcer-policy
-                            // loop (unguarded) still reaches the new tun.
+                            // new key/port). `handle_rotate` brought the new tun
+                            // up out-of-band via `device_config_at_port`, whose
+                            // peers carry NO endpoint at all (piece 3: that
+                            // Device is a receiver, roamed onto by the peer's
+                            // overlap); a subsequent apply through the guard
+                            // would rebuild it with `primary_endpoint`'s static
+                            // candidates and tear the roamed session down.
+                            // Seeding makes those recomputes a no-op on the data
+                            // plane while the enforcer-policy loop (unguarded)
+                            // still reaches the new tun.
+                            //
+                            // The seed therefore describes what the RECOMPUTES
+                            // will produce, not byte-for-byte what is on the
+                            // device — which is the same relationship it has
+                            // always had (before piece 3 the device carried
+                            // rewritten offset-port endpoints and the seed
+                            // carried base candidates), and is the only thing
+                            // that makes the guard do its job. Piece 1's
+                            // endpoint read-through then converges the two: once
+                            // this tun is the active one, the roamed endpoint is
+                            // pinned into `live_endpoints` and the next render
+                            // agrees with the device.
                             let (applied_config, applied_peers) = {
                                 let ds_guard = rot.desired.lock().unwrap();
                                 ds_guard
@@ -4653,6 +5124,23 @@ async fn run_rotation_ticks(rot: RotationShared) {
                                     ),
                                 }
                             }
+                            // The active tun's listen port just MOVED (base ->
+                            // `a.new_port`). Every live relay transport is
+                            // still delivering relayed inbound to the port we
+                            // left, where the OLD Device — holding the OLD
+                            // private key — cannot decrypt what the peer now
+                            // sends. Re-teach them before anything else gets a
+                            // chance to notice the silence. Pre-existing bug
+                            // (every rotation has always black-holed relayed
+                            // peers this way); handled here because piece 2
+                            // adds a SECOND port move and must not make it more
+                            // frequent while leaving it unfixed.
+                            retarget_relay_transports(
+                                &rot.relay_transports,
+                                a.new_port,
+                                "Role A cutover",
+                            )
+                            .await;
                             eprintln!(
                                 "wiremesh-gateway: Role A cutover — peer routes re-derived against \
                                  {} (epoch {epoch})",
@@ -4664,6 +5152,22 @@ async fn run_rotation_ticks(rot: RotationShared) {
                         // won't initiate from keepalive alone). The `ping -W1`
                         // timeout naturally rate-limits this to ~once/sec while
                         // the peer's Device isn't up yet.
+                        //
+                        // INERT BY DESIGN since piece 3, and left in place
+                        // deliberately. `device_config_at_port` gives this tun's
+                        // peers no endpoint, so boringtun has nowhere to send
+                        // the probe packet and drops it: OUR side cannot open
+                        // the new epoch's session, and never could have — the
+                        // only Device that answers our new static key is the
+                        // peer's Role-B overlap, at a port that peer allocated
+                        // locally (see `device_config_at_port`). The cutover is
+                        // driven entirely by the PEER's identical kick on its
+                        // overlap, which does have a computable endpoint
+                        // (`pending_peer_configs`). Do NOT "repair" this by
+                        // handing the peers an endpoint — a guessed port is
+                        // exactly the bug piece 3 removed; repairing it properly
+                        // means the peer telling us where its overlap is, which
+                        // is a proto change and is not in this fix.
                         let cidrs: Vec<String> =
                             a.peers.iter().flat_map(|p| p.cidrs.clone()).collect();
                         kick_overlap(a.new_tun.clone(), cidrs, rot.base_wg_port).await;
@@ -5020,6 +5524,7 @@ mod tests {
             relay_next_idx: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_pointed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             endpoint_commit: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint_commit_gen: Arc::new(AtomicU64::new(0)),
             wg0_pins: Arc::new(std::sync::Mutex::new(HashMap::new())),
             path_report_notify: Arc::new(tokio::sync::Notify::new()),
             peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),

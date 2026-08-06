@@ -2336,3 +2336,929 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     drop(lab);
     eprintln!("\nDONE-BAR PASSED: a whole-fabric in-step rotation — both gateways to epoch 1 at once — stands up every own-epoch and overlap tun without collision, every one of them armed with its own enforcer, traffic survives both cutovers, and all the transient state is reclaimed.");
 }
+
+// --- rotate-twice (bug 5): the port-authority probes -------------------------
+
+/// The controller's placeholder pubkey for a freshly-minted epoch, before the
+/// gateway has submitted its real one over `Sync.SubmitEpochKey`
+/// (`db.rs`'s `AWAITING_SUBMISSION_SENTINEL`, duplicated here because it is
+/// `pub(crate)`). Every port probe below keys off the epoch's REAL pubkey, so
+/// they must not start looking until the sentinel is gone.
+const AWAITING_SUBMISSION: &str = "awaiting-submission";
+
+/// One WireGuard Device's `get=1` state, reduced to exactly what the
+/// port-authority question needs: what this Device LISTENS on, whose key it
+/// holds, and — per peer — which key that peer entry is for and where it
+/// DIALS that peer.
+///
+/// This is deliberately a *Device*-level view rather than
+/// `uapi::parse_get_response`'s peer map: the whole point of the rotate-twice
+/// case is that a gateway can hold several Devices at once (base tun, own
+/// new-epoch tun, overlap tuns) and the question is which of THOSE the peer's
+/// configured endpoint actually points at.
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
+struct DevSnap {
+    ifname: String,
+    listen_port: Option<u16>,
+    /// boringtun 0.6.0 reports the device's own identity as a non-standard
+    /// `own_public_key=<hex>` line (Task-6 divergence, see `uapi_get_device`).
+    own_pub_hex: Option<String>,
+    /// `(peer public key hex, configured endpoint)` in wire order.
+    peers: Vec<(String, Option<String>)>,
+}
+
+/// Splits one `get=1` response into a [`DevSnap`]. Device-level fields are the
+/// ones that appear BEFORE the first `public_key=` line (boringtun emits the
+/// device header first) — the `peers.is_empty()` guards below encode exactly
+/// that, so a peer's own `endpoint=`/port fields can never be mistaken for the
+/// device's.
+fn parse_dev_snap(ifname: &str, resp: &str) -> DevSnap {
+    let mut d = DevSnap { ifname: ifname.to_string(), ..Default::default() };
+    for line in resp.lines() {
+        if let Some(hex) = line.strip_prefix("public_key=") {
+            d.peers.push((hex.to_string(), None));
+        } else if let Some(v) = line.strip_prefix("endpoint=") {
+            if let Some(last) = d.peers.last_mut() {
+                last.1 = Some(v.to_string());
+            }
+        } else if let Some(v) = line.strip_prefix("listen_port=") {
+            if d.peers.is_empty() {
+                d.listen_port = v.parse().ok();
+            }
+        } else if let Some(v) = line.strip_prefix("own_public_key=") {
+            if d.peers.is_empty() {
+                d.own_pub_hex = Some(v.to_string());
+            }
+        }
+    }
+    d
+}
+
+/// One python3 invocation that `get=1`s EVERY live UAPI socket in `ns`.
+///
+/// Deliberately not a loop of [`uapi_get_device`] calls: the sampling loop
+/// below runs on a 500ms tick against a gateway that can hold four Devices,
+/// and one `nsenter` + interpreter start per Device per tick would cost more
+/// than the window being sampled. Sockets that refuse a connection (a Device
+/// torn down between the glob and the connect) are skipped, not fatal.
+const UAPI_DUMP_ALL_PY: &str = r#"
+import socket, glob, os, sys
+for p in sorted(glob.glob("/var/run/wireguard/*.sock")):
+    name = os.path.basename(p)[:-5]
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(3)
+        s.connect(p)
+        s.sendall(b"get=1\n\n")
+        buf = b""
+        while b"\n\n" not in buf:
+            d = s.recv(4096)
+            if not d:
+                break
+            buf += d
+        s.close()
+    except Exception:
+        continue
+    sys.stdout.write("===DEV %s\n" % name)
+    sys.stdout.write(buf.decode())
+"#;
+
+/// Every WireGuard Device currently answering UAPI in `ns`, sorted by ifname.
+/// An empty vec on any harness failure — callers run this inside a sampling
+/// loop where a dropped sample must not abort the run (and, as with
+/// `link_names`, a dropped sample can only ever make the assertions harder to
+/// satisfy, never easier).
+fn uapi_dump_all(ns: &Ns) -> Vec<DevSnap> {
+    require_python3(ns);
+    let Ok(out) = ns.exec(&["python3", "-c", UAPI_DUMP_ALL_PY]) else {
+        return Vec::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut snaps: Vec<DevSnap> = text
+        .split("===DEV ")
+        .skip(1)
+        .filter_map(|chunk| {
+            let (name, body) = chunk.split_once('\n')?;
+            let name = name.trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(parse_dev_snap(name, body))
+        })
+        .collect();
+    snaps.sort();
+    snaps
+}
+
+/// First 12 hex chars of a key — enough to identify it in a dump, short enough
+/// that a multi-device diagnostic stays readable.
+fn short_key(hex: &str) -> String {
+    hex.chars().take(12).collect()
+}
+
+fn fmt_snaps(snaps: &[DevSnap]) -> String {
+    if snaps.is_empty() {
+        return "  (no UAPI devices answered)\n".to_string();
+    }
+    let mut s = String::new();
+    for d in snaps {
+        s.push_str(&format!(
+            "  {} listen_port={} own_pub={}\n",
+            d.ifname,
+            d.listen_port.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
+            d.own_pub_hex.as_deref().map(short_key).unwrap_or_else(|| "?".into()),
+        ));
+        for (k, ep) in &d.peers {
+            s.push_str(&format!(
+                "      peer {} endpoint={}\n",
+                short_key(k),
+                ep.as_deref().unwrap_or("(none)"),
+            ));
+        }
+    }
+    s
+}
+
+/// Port half of an `ip:port` UAPI endpoint value.
+fn endpoint_port(ep: &str) -> Option<u16> {
+    ep.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
+}
+
+/// Diagnostics for a gateway that may hold ANY number of rotation Devices —
+/// `dump_diag`'s fixed `wg0`/`wg0e1` pair cannot see a second rotation's
+/// `wg0e2`, and it is precisely the *set* of devices and their ports that has
+/// to be readable here. Enumerates every `wg*` link, prints `wg show` for each
+/// (listening port, peer key, endpoint, latest handshake), the parsed UAPI
+/// view, `ip route`, `ip -br addr`, and each process's stderr tail.
+fn dump_rot_diag(label: &str, gws: &[(&str, &Ns)], procs: &[(&str, &GwProc)]) {
+    eprintln!("\n========== DIAGNOSTICS: {label} ==========");
+    for (name, ns) in gws {
+        let devs: Vec<String> =
+            link_names(ns).into_iter().filter(|n| n.starts_with("wg")).collect();
+        eprintln!("--- {name} wireguard devices: {devs:?} ---");
+        for d in &devs {
+            match ns.exec(&["wg", "show", d]) {
+                Ok(o) => eprintln!(
+                    "--- {name} wg show {d} ---\n{}",
+                    String::from_utf8_lossy(&o.stdout)
+                ),
+                Err(e) => eprintln!("--- {name} wg show {d} ERR: {e} ---"),
+            }
+        }
+        eprintln!("--- {name} UAPI get=1 (all devices) ---\n{}", fmt_snaps(&uapi_dump_all(ns)));
+        for cmd in [vec!["ip", "route"], vec!["ip", "-br", "addr"]] {
+            match ns.exec(&cmd) {
+                Ok(o) => eprintln!(
+                    "--- {name} {cmd:?} ---\n{}",
+                    String::from_utf8_lossy(&o.stdout)
+                ),
+                Err(e) => eprintln!("--- {name} {cmd:?} ERR: {e} ---"),
+            }
+        }
+    }
+    for (name, p) in procs {
+        eprintln!("--- {name} stderr tail ---\n{}", p.stderr_tail());
+    }
+    eprintln!("========== END DIAGNOSTICS ==========\n");
+}
+
+/// [`poll_rotation_complete`] generalised to an arbitrary target epoch: the
+/// rotation to `epoch` has completed when `epoch` is `active` AND no EARLIER
+/// epoch is still `active` (retired away, or demoted to `"retiring"`).
+/// A separate function rather than a widened `poll_rotation_complete` so the
+/// four green single-rotation cases keep the exact predicate they were written
+/// against.
+async fn poll_rotation_to_epoch(
+    h: &TestController,
+    gateway_id: u64,
+    epoch: u32,
+    timeout: Duration,
+) -> (bool, Vec<(u32, String, String)>) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let states = h.debug_key_states(gateway_id).await;
+        let target_active = states.iter().any(|(e, _, s)| *e == epoch && s == "active");
+        let earlier_not_active = !states.iter().any(|(e, _, s)| *e < epoch && s == "active");
+        if target_active && earlier_not_active {
+            return (true, states);
+        }
+        if Instant::now() >= deadline {
+            return (false, states);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The REAL base64 pubkey the gateway submitted for `epoch`, once the
+/// controller's `awaiting-submission` sentinel has been overwritten. `None` on
+/// timeout. Every port probe keys off this, so it must be resolved before the
+/// sampling loop can recognise anything.
+async fn poll_epoch_pubkey(
+    h: &TestController,
+    gateway_id: u64,
+    epoch: u32,
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let states = h.debug_key_states(gateway_id).await;
+        if let Some((_, pk, _)) = states.iter().find(|(e, _, _)| *e == epoch) {
+            if pk != AWAITING_SUBMISSION && !pk.is_empty() {
+                return Some(pk.clone());
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Everything the rotate-twice sampling loop accumulates about WHERE gwA's
+/// epoch-2 identity lives and WHERE gwB thinks it lives.
+///
+/// Sets, not last-values: both Devices are transient and either side may be
+/// re-rendered mid-rotation, so "the port each side chose at some point during
+/// the window" is the honest observation. Two disjoint sets is the two port
+/// models disagreeing, stated in the smallest possible form.
+#[derive(Default)]
+struct PortObs {
+    /// gwA: `(ifname, listen_port)` of every Device seen holding the epoch-2
+    /// private key (i.e. whose `own_public_key` is the epoch-2 pubkey).
+    a_listen: BTreeSet<(String, u16)>,
+    /// gwB: `(ifname, endpoint)` of every peer entry seen keyed by gwA's
+    /// epoch-2 pubkey — i.e. every place gwB DIALS gwA's new epoch.
+    b_dial: BTreeSet<(String, String)>,
+    /// Diagnostics only: the richest device snapshot seen on each side.
+    a_devs: Vec<DevSnap>,
+    b_devs: Vec<DevSnap>,
+}
+
+impl PortObs {
+    fn listen_ports(&self) -> BTreeSet<u16> {
+        self.a_listen.iter().map(|(_, p)| *p).collect()
+    }
+    fn dial_ports(&self) -> BTreeSet<u16> {
+        self.b_dial.iter().filter_map(|(_, ep)| endpoint_port(ep)).collect()
+    }
+    fn summary(&self) -> String {
+        format!(
+            "gwA LISTENED for epoch 2 on {:?} (ports {:?})\n\
+             gwB DIALED gwA's epoch-2 key at {:?} (ports {:?})",
+            self.a_listen,
+            self.listen_ports(),
+            self.b_dial,
+            self.dial_ports(),
+        )
+    }
+}
+
+/// One paired tick: read both gateways' full UAPI device sets and fold in any
+/// sighting of gwA's epoch-2 key.
+fn sample_ports(gwa: &Ns, gwb: &Ns, epoch2_hex: &str, obs: &mut PortObs) {
+    let a = uapi_dump_all(gwa);
+    for d in &a {
+        if d.own_pub_hex.as_deref() == Some(epoch2_hex) {
+            if let Some(port) = d.listen_port {
+                obs.a_listen.insert((d.ifname.clone(), port));
+            }
+        }
+    }
+    if a.len() >= obs.a_devs.len() {
+        obs.a_devs = a;
+    }
+
+    let b = uapi_dump_all(gwb);
+    for d in &b {
+        for (k, ep) in &d.peers {
+            if k == epoch2_hex {
+                if let Some(ep) = ep {
+                    obs.b_dial.insert((d.ifname.clone(), ep.clone()));
+                }
+            }
+        }
+    }
+    if b.len() >= obs.b_devs.len() {
+        obs.b_devs = b;
+    }
+}
+
+/// **BUG 5 DONE BAR — rotate the SAME gateway TWICE.**
+///
+/// Every other case in this file rotates a gateway exactly once, 0 -> 1, from
+/// a clean tree. Nobody has ever rotated twice, and the verification pass
+/// recorded in `docs/research/rotation-endpoint-and-port-model-is-broken.md`
+/// (bug 5) predicts that the SECOND rotation of any gateway cannot complete at
+/// all. On the controller's 30-day timer that is a fabric-wide outage on the
+/// *second* fire, hidden behind — and not fixed by — any fix for the first.
+///
+/// # The mechanism this test is built to photograph
+///
+/// A gateway never returns to its base port after a cutover: `rot.base_wg_port`
+/// / `rot.base_tun` stay at the CONFIGURED values (`main.rs:854-855`) and only
+/// a reboot re-normalizes (OD-1, `main.rs:463-467`). So on rotation 1 -> 2:
+///
+///  - `plan_tunnel(Own{2}, "wg0", 51820, live)` sees `Own{1}` still live at
+///    51821 and `plan_port`'s free-list (`tunnelset.rs:249-254`) hands out the
+///    lowest free port, **51822**.
+///  - gwA's new tun dials the peer at *its own* port —
+///    `device_config_at_port` (`reconcile.rs:166-187`) retargets peers at the
+///    port THIS side chose, on the stated assumption that the peer's
+///    identically-numbered epoch listens on the identical offset.
+///  - gwB's overlap toward gwA dials `base + (2 - 1)` = **51821** —
+///    `pending_peer_configs` (`reconcile.rs:44-52`), base plus epoch delta —
+///    which is gwA's *retiring* epoch-1 tun, not its epoch-2 one.
+///
+/// Two mutually incompatible port models, and T3's free-list allocator
+/// invalidated both. Unlike rotation 0 -> 1, there is no correctly-dialing
+/// side for boringtun to roam from.
+///
+/// # What is asserted, in order
+///
+///  1. **Rotation 0 -> 1 genuinely completes and settles.** Not just "epoch 1
+///     is active": gwA's epoch-0 Device `wg0` must be torn down (the same
+///     bounded wait `old_epoch_device_is_torn_down_after_rotation` uses), gwA's
+///     `wiremesh_gateway_live_enforcers` gauge must be back to its
+///     steady-state 1, and ICMP must still cross. Anything less and rotation
+///     1 -> 2 would be starting from a half-finished rotation 1 and this test
+///     would be measuring something else. Every failure here is labelled
+///     `PRE-CONDITION` — it is NOT the bug-5 finding.
+///  2. **Rotate again, 1 -> 2, sampling both sides' ports throughout.** The
+///     epoch-2 Devices are transient, so the ports are sampled on a 500ms tick
+///     across the whole window rather than read once at the end.
+///  3. **The two sides must agree on a port.** Every port gwB dials gwA's
+///     epoch-2 key at must be a port gwA actually listened on for that key.
+///     Predicted red: `{51821}` vs `{51822}`, disjoint.
+///  4. **Real traffic, both ways, after the second rotation.** ICMP across the
+///     fabric — the same bar every other case in this file holds.
+///
+/// # gwB's enforcer gauge is recorded, not gated on
+///
+/// The pre-condition gate in (1) is on **gwA**, the rotating side. gwB's gauge
+/// is printed but not asserted, deliberately: bug 5's second half (same
+/// research doc) is that gwB's Role-B collapse can never complete after ANY
+/// Role-A cutover — it waits for an rx-corroborated session on the ACTIVE tun
+/// toward the peer's new key, and that tun's peer entry points at the peer's
+/// base port, which after gwA's retire is nothing. So gwB is expected to leak
+/// its overlap Device permanently (the F9 leak shape) on the CURRENTLY-GREEN
+/// one-sided path. Gating on it would make this test die of that already-known
+/// defect before it ever reached rotation 2, which is the subject.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
+    // Topology: IDENTICAL to `direct_rotation_is_zero_drop` — see that test
+    // for the per-step rationale (bridge, netem, veths, identities).
+    setup_bridge();
+    let _root_guard = RootNetGuard;
+
+    let h = TestController::start_on(CTRL_IP.parse().unwrap()).await;
+
+    let diff = h.apply(FABRIC_ICMP).await;
+    assert!(diff.policy_updated, "fabric apply must compile a real policy, got: {diff:?}");
+
+    let (a_priv, a_pub) = wg_keypair();
+    let (b_priv, b_pub) = wg_keypair();
+    let ga = enroll_into(&h, "10.10.1.0/24", &a_pub).await;
+    let gb = enroll_into(&h, "10.10.2.0/24", &b_pub).await;
+
+    let mut lab = Lab::new("gwtwice").expect("lab");
+    let gwa = lab.ns("a").expect("gwA netns");
+    let gwb = lab.ns("b").expect("gwB netns");
+    let wla = lab.ns("wa").expect("wlA netns");
+    let wlb = lab.ns("wb").expect("wlB netns");
+
+    attach_underlay(&gwa, "a", "10.9.0.1");
+    attach_underlay(&gwb, "b", "10.9.0.2");
+    apply_netem(&gwa, "und", 20).expect("netem on gwA underlay");
+    apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
+
+    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
+        .expect("seg-a veth");
+    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
+        .expect("seg-b veth");
+    wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
+        .expect("wlA default route");
+    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
+        .expect("wlB default route");
+
+    let sda = tempfile::tempdir().unwrap();
+    let sdb = tempfile::tempdir().unwrap();
+    write_identity(&ga, &a_priv, sda.path());
+    write_identity(&gb, &b_priv, sdb.path());
+    let logdir = tempfile::tempdir().unwrap();
+
+    let sync_addr = h.sync_tcp_addr().to_string();
+    let observe_addr = h.observe_addr().to_string();
+    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
+    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+
+    let metrics_a = format!("10.9.0.1:{METRICS_PORT}");
+    let metrics_b = format!("10.9.0.2:{METRICS_PORT}");
+
+    // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
+    let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
+    if !up {
+        dump_rot_diag("mesh-not-up", &[("gwA", &gwa), ("gwB", &gwb)], &[("gwA", &pa), ("gwB", &pb)]);
+        pa.kill();
+        pb.kill();
+        panic!("SETUP FAILED: workload A -> workload B ICMP (policy-permitted) never passed over the direct tunnel before any rotation");
+    }
+    let base_enf_a = scrape_live_enforcers(&metrics_a);
+    assert_eq!(
+        base_enf_a,
+        Some(1),
+        "SETUP FAILED: at steady state gwA must report exactly one live enforcer (the base \
+         tun's); got {base_enf_a:?}. A `None` means the `wiremesh_gateway_live_enforcers` \
+         series never reached the scrape body, which would make the settle gate below vacuous."
+    );
+    eprintln!("SETUP PASS: direct mesh is up (ICMP crosses wlA -> wlB), gwA live_enforcers=1");
+    eprintln!("SETUP devices:\n{}", fmt_snaps(&uapi_dump_all(&gwa)));
+
+    // =====================================================================
+    // ROTATION 1 (epoch 0 -> 1) — the PRE-CONDITION, not the subject.
+    // =====================================================================
+    h.admin_client()
+        .await
+        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .await
+        .expect("Admin.RotateKey #1");
+    eprintln!("Admin.RotateKey #1 submitted for gwA (epoch 0 -> 1)");
+
+    let (done1, states1) = poll_rotation_to_epoch(&h, ga.id(), 1, Duration::from_secs(90)).await;
+    if !done1 {
+        dump_rot_diag(
+            "rotation-1-timeout",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "PRE-CONDITION FAILED: gwA's FIRST rotation (epoch 0 -> 1) did not complete within \
+             90s. This test needs a genuinely finished first rotation before it can rotate \
+             again; a red here is NOT the rotate-twice finding. Last debug_key_states: {states1:?}"
+        );
+    }
+    eprintln!("ROTATION 1 COMPLETE: {states1:?}");
+
+    // The epoch-0 Device must be gone before rotation 2 is issued: with `wg0`
+    // still up, `plan_port` would be allocating against a different live set
+    // and the second rotation would not be the production shape (which is a
+    // fully-retired previous epoch and an active offset tun).
+    let teardown_deadline = Instant::now() + Duration::from_secs(30);
+    let mut torn_down = false;
+    loop {
+        let wg0_gone = gwa.exec(&["ip", "link", "show", "wg0"]).is_err();
+        let wg0e1_present = gwa.exec(&["ip", "link", "show", "wg0e1"]).is_ok();
+        if wg0_gone && wg0e1_present {
+            torn_down = true;
+            break;
+        }
+        if Instant::now() >= teardown_deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    if !torn_down {
+        dump_rot_diag(
+            "rotation-1-not-retired",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "PRE-CONDITION FAILED: gwA's epoch-0 Device wg0 was not torn down within 30s of the \
+             first rotation completing (wg0e1 present). Rotating again from a half-retired first \
+             rotation would not be the production shape; a red here is NOT the rotate-twice \
+             finding — it is `old_epoch_device_is_torn_down_after_rotation`'s territory"
+        );
+    }
+
+    // ... and gwA's enforcer gauge must be back to its steady-state 1: exactly
+    // one Device, exactly one policy hook. (gwB's is recorded below but not
+    // gated on — see this test's doc comment.)
+    let settle_deadline = Instant::now() + Duration::from_secs(45);
+    let settled_a = loop {
+        let v = scrape_live_enforcers(&metrics_a);
+        if v == Some(1) || Instant::now() >= settle_deadline {
+            break v;
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    };
+    let settled_b = scrape_live_enforcers(&metrics_b);
+    eprintln!("POST-ROTATION-1 live_enforcers: gwA={settled_a:?} gwB={settled_b:?} (only gwA is gated)");
+    if settled_a != Some(1) {
+        let links_a = link_names(&gwa);
+        dump_rot_diag(
+            "rotation-1-enforcers-did-not-settle",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "PRE-CONDITION FAILED: 45s after gwA's FIRST rotation completed its live-enforcer \
+             gauge is {settled_a:?}, not 1 (links: {links_a:?}). The first rotation has not fully \
+             settled, so rotating again would not be testing the second rotation. NOT the \
+             rotate-twice finding."
+        );
+    }
+
+    // ... and traffic still crosses. If THIS is red the blocker is bug 4 (the
+    // post-cutover endpoint), which is a separate, already-documented defect.
+    let alive_after_1 = wait_until(Duration::from_secs(20), || ping_ok(&wla, "10.10.2.2"));
+    if !alive_after_1 {
+        dump_rot_diag(
+            "rotation-1-traffic-dead",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "PRE-CONDITION FAILED: ICMP wlA -> wlB stopped passing after the FIRST rotation. \
+             That is bug 4 (the Role-A cutover leaves nothing durable able to address the active \
+             tun), not the rotate-twice finding this test exists for — see \
+             docs/research/rotation-endpoint-and-port-model-is-broken.md"
+        );
+    }
+    let devs_a_after_1 = uapi_dump_all(&gwa);
+    let devs_b_after_1 = uapi_dump_all(&gwb);
+    eprintln!(
+        "PRE-CONDITION PASS: rotation 1 complete, wg0 retired, gwA back to 1 enforcer, ICMP alive.\n\
+         gwA devices after rotation 1:\n{}gwB devices after rotation 1:\n{}",
+        fmt_snaps(&devs_a_after_1),
+        fmt_snaps(&devs_b_after_1),
+    );
+
+    // =====================================================================
+    // ROTATION 2 (epoch 1 -> 2) — THE SUBJECT.
+    // =====================================================================
+    h.admin_client()
+        .await
+        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .await
+        .expect("Admin.RotateKey #2");
+    eprintln!("Admin.RotateKey #2 submitted for gwA (epoch 1 -> 2) — THE SUBJECT OF THIS TEST");
+
+    // The epoch-2 pubkey is the join key for both port probes, so resolve it
+    // (past the controller's `awaiting-submission` sentinel) before sampling.
+    let Some(epoch2_pub_b64) = poll_epoch_pubkey(&h, ga.id(), 2, Duration::from_secs(30)).await
+    else {
+        let states = h.debug_key_states(ga.id()).await;
+        dump_rot_diag(
+            "rotation-2-no-epoch2-pubkey",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SECOND ROTATION: gwA never submitted a real epoch-2 pubkey within 30s of \
+             Admin.RotateKey #2 — the second rotation did not even reach key submission. \
+             debug_key_states: {states:?}"
+        );
+    };
+    let epoch2_hex = base64_pub_to_hex(&epoch2_pub_b64);
+    eprintln!("epoch-2 pubkey submitted: {epoch2_pub_b64} (hex {})", short_key(&epoch2_hex));
+
+    // Sample both sides' ports for the whole rotation-2 window while driving
+    // it to completion. 500ms cadence: the epoch-2 own tun and gwB's overlap
+    // toward it are transient, so a single end-of-window read could miss both.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let mut obs = PortObs::default();
+    let states2 = loop {
+        sample_ports(&gwa, &gwb, &epoch2_hex, &mut obs);
+        let s = h.debug_key_states(ga.id()).await;
+        let done = s.iter().any(|(e, _, st)| *e == 2 && st == "active")
+            && !s.iter().any(|(e, _, st)| *e < 2 && st == "active");
+        if done || Instant::now() >= deadline {
+            break s;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    };
+    let done2 = states2.iter().any(|(e, _, st)| *e == 2 && st == "active")
+        && !states2.iter().any(|(e, _, st)| *e < 2 && st == "active");
+
+    // The port evidence is printed unconditionally: it is most of this test's
+    // value, and it must be readable whichever assertion below goes red.
+    eprintln!(
+        "\n===== ROTATION-2 PORT EVIDENCE =====\n{}\n\
+         gwA devices (richest sample seen):\n{}\
+         gwB devices (richest sample seen):\n{}\
+         ====================================\n",
+        obs.summary(),
+        fmt_snaps(&obs.a_devs),
+        fmt_snaps(&obs.b_devs),
+    );
+
+    if !done2 {
+        dump_rot_diag(
+            "second-rotation-did-not-complete",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SECOND ROTATION DID NOT COMPLETE within 120s (epoch 2 active, no earlier epoch \
+             active). Last debug_key_states: {states2:?}\n{}\n\
+             If the two port sets above are disjoint, this is bug 5 exactly as predicted: \
+             `device_config_at_port` retargets peers at the port THIS side chose while \
+             `pending_peer_configs` computes base + epoch delta, and T3's free-list `plan_port` \
+             invalidated both. See docs/research/rotation-endpoint-and-port-model-is-broken.md",
+            obs.summary(),
+        );
+    }
+    eprintln!("ROTATION 2 COMPLETE: {states2:?}");
+
+    // ===== THE TRAFFIC BAR: real ICMP across the fabric, both ways =====
+    // Asserted BEFORE the port assertion, deliberately: connectivity is the
+    // product bar, and if it is dead that is the headline. Both directions,
+    // because a one-way check can pass on the residual state of a session that
+    // predates the second rotation.
+    for (from, dst, label) in
+        [(&wla, "10.10.2.2", "wlA -> wlB"), (&wlb, "10.10.1.2", "wlB -> wlA")]
+    {
+        if !wait_until(Duration::from_secs(30), || ping_ok(from, dst)) {
+            dump_rot_diag(
+                "post-second-rotation-traffic-dead",
+                &[("gwA", &gwa), ("gwB", &gwb)],
+                &[("gwA", &pa), ("gwB", &pb)],
+            );
+            pa.kill();
+            pb.kill();
+            panic!(
+                "SECOND ROTATION FAILED: ICMP {label} no longer passes after gwA rotated a \
+                 SECOND time (epoch 1 -> 2), even though the controller promoted epoch 2.\n{}",
+                obs.summary(),
+            );
+        }
+        eprintln!("POST-ROTATION-2 PASS: ICMP still crosses {label} on epoch 2");
+    }
+
+    // ===== SETTLE GATE: gwA's retire + renormalization has actually landed ===
+    //
+    // The port-authority assertion below is a *data-plane* fact about the
+    // steady state after rotation 2. The loop that drove rotation 2 broke on a
+    // *controller roster* fact (epoch 2 active, nothing earlier active) — i.e.
+    // at PROMOTE. Those are different instants, and the data-plane one is
+    // strictly later: gwA only tears down its epoch-1 Device and renormalizes
+    // the epoch-2 Device's listen port back to the base after `RETIRE_GRACE`
+    // (`main.rs`: 2 x ROTATION_KEEPALIVE) of continuous rx-corroborated
+    // liveness following the cutover, polled on a 500ms tick — and the first
+    // grace attempt is routinely aborted once, so the real distance from
+    // promote is ~10s, not 6s. Reading ~1.5-2s after promote evaluates the
+    // invariant at an instant that structurally precedes it becoming
+    // satisfiable.
+    //
+    // This gate moves the moment of evaluation — and ONLY the moment — to when
+    // the system claims to provide the invariant. It does not relax anything:
+    // the port comparison below is unchanged, and the gate is itself an
+    // assertion (gwA's epoch-2 Device must end up ON THE BASE PORT, which is
+    // the renormalization's whole observable result).
+    //
+    // # Why the wait is on gwA alone, and why it has a stability window
+    //
+    // The obvious second clause — "gwB has finished its Role-B collapse, no
+    // `wg0o<n>` overlap Device left" — is UNSATISFIABLE and must not be added.
+    // gwB's collapse waits for a live session on the ACTIVE tun toward the
+    // peer's new key and never gets one, so the overlap Device leaks
+    // permanently (the F9 leak shape). This test's doc comment above
+    // deliberately declines to gate on it for exactly that reason: gating
+    // there kills the test on an already-known defect instead of measuring its
+    // subject. Verified empirically on this branch — a gwB clause times out
+    // while gwA's retire demonstrably fires.
+    //
+    // But gwB *is* the source of a real second race, via a different
+    // mechanism than device teardown. The leaked overlap's peer entry toward
+    // gwA's epoch-2 key initially dials the OFFSET port (51821); it is
+    // corrected to the base port only by boringtun's rx-driven endpoint
+    // roaming, once gwA's renormalized `wg0e2` sends from 51820 — which the 3s
+    // persistent keepalive guarantees, but not instantly. Since gwA's
+    // condition flips true the moment renormalization lands, a single-sample
+    // gate can return up to ~3s before gwB has roamed.
+    //
+    // Hence the stability window: gwA must hold the post-retire state across
+    // successive samples for `RENORM_STABLE_FOR` — one keepalive round-trip
+    // past renormalization. This is OBSERVED, not slept: every intervening
+    // sample must also satisfy the condition, so a state that flaps restarts
+    // the clock instead of passing. Note this is deliberately NOT "gwB dials a
+    // port gwA listens on" — that would be the assertion restating itself as
+    // its own precondition, and would be unfalsifiable.
+    //
+    // A timeout here is its own, LOUDER finding than a port mismatch: it means
+    // the retire never fired at all. That failure is currently invisible —
+    // nothing else in this test observes it — so it gets its own panic
+    // message, deliberately distinct from the port-authority one.
+    //
+    // 60s: room for one full grace (6s), one aborted-and-restarted grace, and
+    // the stability window, with margin — bounded so this fails rather than
+    // hangs.
+    const BASE_WG_PORT: u16 = 51820; // must match `spawn_gw`'s `--wg-port`
+    /// How long gwA's post-retire state must hold CONTINUOUSLY before the port
+    /// state is read. One 3s keepalive round-trip past renormalization, plus
+    /// margin — see the roaming rationale above.
+    const RENORM_STABLE_FOR: Duration = Duration::from_secs(4);
+
+    let mut gate_a: Vec<DevSnap> = Vec::new();
+    let mut gate_b: Vec<DevSnap> = Vec::new();
+    let mut stable_since: Option<Instant> = None;
+    let mut reached_base = false;
+    // Set iff `wg0e2` was seen PRESENT on a non-base port *after* having been
+    // seen at the base port — renormalization coming undone, a genuine defect
+    // that must surface as itself rather than as a timeout.
+    //
+    // Deliberately not "the condition went false": `uapi_dump_all` returns an
+    // empty vec on a dropped sample (documented on that fn), and an absent
+    // `wg0e2` is indistinguishable from a dropped sample. A dropped sample
+    // therefore only resets the stability clock — it can never manufacture
+    // this failure. Only a Device that is *there*, on the *wrong* port, does.
+    let mut regressed: Option<(String, Option<u16>)> = None;
+
+    let retire_settled = wait_until(Duration::from_secs(60), || {
+        let a = uapi_dump_all(&gwa);
+        let b = uapi_dump_all(&gwb);
+        // gwA: epoch-1 Device retired, epoch-2 Device present AND renormalized
+        // back to the base port. `listen_port == BASE_WG_PORT` is the
+        // observable RESULT of the renormalization.
+        let a_e1_retired = !a.iter().any(|d| d.ifname == "wg0e1");
+        let e2 = a.iter().find(|d| d.ifname == "wg0e2");
+        let a_e2_at_base = e2.is_some_and(|d| d.listen_port == Some(BASE_WG_PORT));
+
+        if a_e2_at_base {
+            reached_base = true;
+        } else if reached_base && regressed.is_none() {
+            if let Some(d) = e2 {
+                regressed = Some((d.ifname.clone(), d.listen_port));
+            }
+        }
+        // The stability clock: started by the first satisfying sample, kept
+        // alive only by every sample after it, cleared by any that isn't.
+        if a_e1_retired && a_e2_at_base {
+            stable_since.get_or_insert_with(Instant::now);
+        } else {
+            stable_since = None;
+        }
+
+        gate_a = a;
+        gate_b = b;
+        // Break out immediately on a regression so it panics as a regression
+        // rather than idling until the 60s bound and reading as a timeout.
+        regressed.is_some() || stable_since.is_some_and(|t| t.elapsed() >= RENORM_STABLE_FOR)
+    });
+
+    if let Some((ifname, port)) = regressed {
+        dump_rot_diag(
+            "second-rotation-renormalization-came-undone",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SECOND ROTATION: THE RENORMALIZATION CAME UNDONE. gwA's epoch-2 Device reached the \
+             base port {BASE_WG_PORT} and then LEFT it — {ifname} was observed listening on \
+             {port:?}. This is neither a timeout nor the port-authority failure: the retire ran, \
+             put the active key back on its advertised port, and something moved it off again. \
+             Every peer's durable endpoint for this gateway points at the base port, so the \
+             active key is no longer addressable where the fabric expects it.\n\
+             gwA devices:\n{}gwB devices:\n{}\
+             Sampled across the whole rotation-2 window:\n{}",
+            fmt_snaps(&gate_a),
+            fmt_snaps(&gate_b),
+            obs.summary(),
+        );
+    }
+    if !retire_settled {
+        dump_rot_diag(
+            "second-rotation-retire-never-completed",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SECOND ROTATION: THE RETIRE/RENORMALIZATION NEVER COMPLETED. 60s after the \
+             controller promoted epoch 2, gwA never held its post-retire steady state \
+             continuously for {RENORM_STABLE_FOR:?}. This is NOT the port-authority failure — \
+             the port comparison below was never reached. It means the gateway-side teardown \
+             that is supposed to follow every cutover did not fire at all, which leaves the \
+             fabric permanently holding rotation scaffolding and the active key parked on an \
+             offset port no peer addresses.\n\
+             Required, and last observed:\n\
+             \x20 gwA wg0e1 retired: {}\n\
+             \x20 gwA wg0e2 present and renormalized to base port {BASE_WG_PORT}: {}\n\
+             \x20 ... and held continuously for {RENORM_STABLE_FOR:?}: false\n\
+             \x20 (gwA reached the base port at least once during the wait: {reached_base})\n\
+             gwA devices:\n{}gwB devices:\n{}\
+             Sampled across the whole rotation-2 window:\n{}",
+            !gate_a.iter().any(|d| d.ifname == "wg0e1"),
+            gate_a
+                .iter()
+                .find(|d| d.ifname == "wg0e2")
+                .is_some_and(|d| d.listen_port == Some(BASE_WG_PORT)),
+            fmt_snaps(&gate_a),
+            fmt_snaps(&gate_b),
+            obs.summary(),
+        );
+    }
+    eprintln!(
+        "RETIRE SETTLE PASS: gwA retired wg0e1 and renormalized wg0e2 to the base port \
+         {BASE_WG_PORT}, and held that state continuously for {RENORM_STABLE_FOR:?}. \
+         Reading the settled port state now."
+    );
+
+    // ===== THE PORT-AUTHORITY ASSERTION =====
+    // Not "did it ping" — WHICH PORT each side settled on. A future reader has
+    // to be able to see the two models disagreeing, not just "ping failed".
+    //
+    // Judged on a FRESH read of both sides *now*, once everything has settled,
+    // rather than on the sampled sets above. Make-before-break legitimately
+    // re-renders a peer entry mid-rotation, so "no sample in the whole window
+    // ever showed a wrong port" would be a stricter bar than the design owes —
+    // and one no fix could clear. The sampled sets stay printed above as the
+    // evidence of HOW the two models diverged; this is the assertion.
+    let final_a = uapi_dump_all(&gwa);
+    let final_b = uapi_dump_all(&gwb);
+    let settled_listen: BTreeSet<(String, u16)> = final_a
+        .iter()
+        .filter(|d| d.own_pub_hex.as_deref() == Some(epoch2_hex.as_str()))
+        .filter_map(|d| d.listen_port.map(|p| (d.ifname.clone(), p)))
+        .collect();
+    let mut settled_dial: BTreeSet<(String, String)> = BTreeSet::new();
+    for d in &final_b {
+        for (k, ep) in &d.peers {
+            if k == &epoch2_hex {
+                if let Some(ep) = ep {
+                    settled_dial.insert((d.ifname.clone(), ep.clone()));
+                }
+            }
+        }
+    }
+    let listen_ports: BTreeSet<u16> = settled_listen.iter().map(|(_, p)| *p).collect();
+    let dial_ports: BTreeSet<u16> =
+        settled_dial.iter().filter_map(|(_, ep)| endpoint_port(ep)).collect();
+    eprintln!(
+        "\n===== SETTLED PORT STATE (after rotation 2) =====\n\
+         gwA listens for epoch 2 on {settled_listen:?} (ports {listen_ports:?})\n\
+         gwB dials gwA's epoch-2 key at {settled_dial:?} (ports {dial_ports:?})\n\
+         gwA devices:\n{}gwB devices:\n{}\
+         =================================================\n",
+        fmt_snaps(&final_a),
+        fmt_snaps(&final_b),
+    );
+
+    if listen_ports.is_empty() || dial_ports.is_empty() {
+        dump_rot_diag(
+            "second-rotation-port-evidence-missing",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SECOND ROTATION: could not observe both sides of the port question once settled — \
+             gwA shows no Device holding the epoch-2 key ({listen_ports:?}) and/or gwB shows no \
+             peer entry dialing it ({dial_ports:?}). Sampled during the window:\n{}",
+            obs.summary(),
+        );
+    }
+    if !dial_ports.is_subset(&listen_ports) {
+        dump_rot_diag(
+            "second-rotation-port-models-disagree",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "PORT AUTHORITY (bug 5): once gwA's SECOND rotation settled, the two sides still \
+             disagree about where gwA's epoch-2 key listens. gwA listens on {listen_ports:?} \
+             ({settled_listen:?}); gwB dials that same key at {dial_ports:?} ({settled_dial:?}). \
+             Every dialed port must be one gwA is actually listening on for that key.\n\
+             Sampled across the whole rotation-2 window:\n{}\n\
+             Mechanism: gwA never returned to its base port after rotation 1, so \
+             `plan_tunnel(Own{{2}})` allocated the next FREE port above the base (51822, with \
+             Own{{1}} still holding 51821), while `pending_peer_configs` computes base + \
+             (2 - 1) = 51821 — gwA's RETIRING epoch-1 tun — and `device_config_pinned` can only \
+             ever emit the BASE port 51820, where nothing listens at all. Three answers, no \
+             authority. See docs/research/rotation-endpoint-and-port-model-is-broken.md",
+            obs.summary(),
+        );
+    }
+    eprintln!(
+        "PORT PASS: gwA listens for epoch 2 on {listen_ports:?} and gwB dials it at \
+         {dial_ports:?} — one port authority."
+    );
+
+    pa.kill();
+    pb.kill();
+    drop(lab);
+    eprintln!(
+        "\nDONE-BAR PASSED: the same gateway rotated TWICE (0 -> 1 -> 2), the first rotation \
+         fully retired and settled before the second was issued, both sides agree on the port \
+         the second epoch listens on, and real traffic crosses the fabric in both directions \
+         afterwards."
+    );
+}
