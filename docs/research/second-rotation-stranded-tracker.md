@@ -188,10 +188,16 @@ Verified against `e4eb07e` by an investigator briefed to refute rather than conf
 
 The driving gap is real, and every bullet holds: `sweep_rotations`'s pending-only branch,
 step 3's `has_tracker` guard, `report`'s empty-`epoch_acks` short circuit, and the gateway's
-exactly-once Role-B ack. One nuance to add: on a **3+ gateway fabric** a straggler ack landing
-after a rule-4 grace promote *does* drive the retire. The gap bites deterministically only
-when the promote is caused by the LAST ack (rule 3) — always in the two-gateway case, and
-normally in the in-step case.
+exactly-once Role-B ack.
+
+> **This paragraph originally added a mitigation, and it was overstated.** It said that on a
+> **3+ gateway fabric** a straggler ack landing after a rule-4 grace promote "does drive the
+> retire", so the gap bit deterministically only when the promote came from the LAST ack.
+> A straggler drives a `decide` call, but rule 1 returns `Retire` only once `RETIRE_GRACE`
+> has elapsed since the promote — so a straggler arriving seconds after a 90s grace promote
+> yields `Wait`, and the row stays stranded exactly as before. The mitigation is real only
+> for a straggler that happens to arrive more than 30s after the promote, which is not the
+> common case. **The gap is closer to universal than this note first claimed.**
 
 ### What it got wrong
 

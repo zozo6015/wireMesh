@@ -899,8 +899,12 @@ pub(crate) async fn sweep_rotations(
         drive_rotation_for(db, change_tx, broker, rotations, gateway_id).await;
 
         // Step 3: any `retiring` row(s) with NO in-memory tracker are
-        // orphaned — re-read keys fresh (step 2 above may have just changed
-        // them) before deciding what's still `retiring`.
+        // orphaned — re-read keys fresh before deciding what's still
+        // `retiring`. The re-read is load-bearing, not defensive: step 2b just
+        // above may have retired a row AND removed its tracker in this same
+        // iteration, and that is exactly how two stranded rows converge in one
+        // tick (2b takes the newest, step 3 then sees the older one with no
+        // tracker held).
         let keys = match db.all_keys_for_gateway(gateway_id).await {
             Ok(k) => k,
             Err(e) => {
@@ -1758,11 +1762,12 @@ mod tests {
     //! `crates/wiremesh-gateway/tests/overlap_write_back.rs` for the precedent,
     //! including its "each axis alone" discipline, followed below).
     //!
-    //! # These will not compile until the extraction lands
+    //! # The two decisions under test
     //!
-    //! Nothing named below exists yet. The implementer is expected to lift the
-    //! logic currently inlined in `drive_rotation_for` (and duplicated in
-    //! `sweep_rotations`' step 2) into:
+    //! These were written before the extraction existed, against the signatures
+    //! below, and were red until it landed. Both lift logic that was previously
+    //! inlined in `drive_rotation_for` and duplicated in `sweep_rotations`'
+    //! step 2:
     //!
     //! ```ignore
     //! /// May the held tracker be evicted, given a keys snapshot read at `read_at`?
