@@ -28,7 +28,7 @@
 //!
 //! Nothing here asserts a naming scheme or a port formula — only that a plan
 //! never collides with the reserved set, and that exhaustion is an `Err`.
-use wiremesh_gateway::tunnelset::{plan_tunnel, TunnelId, TunnelPlan};
+use wiremesh_gateway::tunnelset::{plan_tunnel, TunnelId, TunnelPlan, OWN_TUN_PORT_OFFSET};
 
 const BASE_TUN: &str = "wg0";
 const BASE_PORT: u16 = 51820;
@@ -282,6 +282,25 @@ fn a_port_window_that_overflows_u16_fails_rather_than_wrapping() {
 /// A base port near the top of `u16`: the few ports that DO fit are usable, and
 /// the ones that would overflow are simply skipped — a truncated window, not a
 /// wrapped one.
+///
+/// # Three ports exist; TWO are overlaps and one is the reserved own slot
+///
+/// `base = 65532`, so `65533..=65535` is the entire window. `65533` is
+/// `base + OWN_TUN_PORT_OFFSET`, which the allocator RESERVES for this
+/// gateway's own new-epoch tun and never free-lists (piece 3 — a rotating peer
+/// computes that port as `candidate_port + OWN_TUN_PORT_OFFSET` and cannot be
+/// told any other value). So the overlap free list here is exactly
+/// `{65534, 65535}`.
+///
+/// This test allocated three overlaps before the reservation existed. The one
+/// it lost is the reservation's exact cost — one overlap port — and at the top
+/// of `u16` there is no slack to hide it, which is why this is the single test
+/// the change legitimately breaks rather than a sign the change is wrong. What
+/// the test is FOR is unchanged and is still asserted below: a truncated window
+/// hands out what fits and then fails cleanly rather than wrapping onto a low,
+/// in-use port. The reserved slot is claimed explicitly here too, so "only two
+/// overlaps fit" is pinned as a CONSEQUENCE of the reservation rather than as a
+/// bare number that could drift back.
 #[test]
 fn a_truncated_port_window_allocates_only_what_fits() {
     let base: u16 = u16::MAX - 3; // 65532: only 65533..=65535 exist
@@ -290,15 +309,40 @@ fn a_truncated_port_window_allocates_only_what_fits() {
         ifname: BASE_TUN.to_string(),
         listen_port: base,
     }];
-    for n in 0..3u64 {
-        let plan = plan_tunnel(overlap(n), BASE_TUN, base, &reserved)
-            .unwrap_or_else(|e| panic!("port {} of the truncated window must be usable: {e:#}", n + 1));
-        assert!(plan.listen_port > base, "planned port must be above the base");
+
+    // The reserved own slot: the first of the three, and not part of what the
+    // overlaps below are allowed to draw from.
+    let own = plan_tunnel(TunnelId::Own { epoch: 1 }, BASE_TUN, base, &reserved)
+        .expect("the reserved own-epoch port fits inside even this truncated window");
+    assert_eq!(
+        own.listen_port,
+        base + OWN_TUN_PORT_OFFSET,
+        "the own-epoch tun is RESERVED at base + OWN_TUN_PORT_OFFSET, never free-listed"
+    );
+    assert_disjoint_from_reserved(&own, &reserved, "truncated window, own slot");
+    reserved.push(own);
+
+    // ...leaving exactly two overlap ports, 65534 and 65535.
+    for n in 0..2u64 {
+        let plan = plan_tunnel(overlap(n), BASE_TUN, base, &reserved).unwrap_or_else(|e| {
+            panic!("overlap {} of the truncated window must be usable: {e:#}", n + 1)
+        });
+        assert!(
+            plan.listen_port > base + OWN_TUN_PORT_OFFSET,
+            "an overlap must land above the reserved own slot, not on or below it; got {}",
+            plan.listen_port
+        );
         assert_disjoint_from_reserved(&plan, &reserved, "truncated window");
         reserved.push(plan);
     }
+
     assert!(
         plan_tunnel(overlap(99), BASE_TUN, base, &reserved).is_err(),
-        "the fourth allocation has no port left and must fail rather than wrap"
+        "the third overlap has no port left and must fail rather than wrap"
+    );
+    assert!(
+        plan_tunnel(TunnelId::Own { epoch: 2 }, BASE_TUN, base, &reserved).is_err(),
+        "and a second own-epoch tun must fail too — the reserved port is already held, and \
+         falling back to a free-listed port is the very fallback piece 3 removed"
     );
 }
