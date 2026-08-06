@@ -178,3 +178,78 @@ Navigate by SYMBOL, not by line:
 Lesson worth keeping beyond this file: **a research note that cites line numbers starts
 decaying the moment the fix it describes is written**, because the fix moves the very lines
 it cites. Cite symbols.
+
+
+## CORRECTION 2026-08-06 — the consequence recorded above is wrong
+
+Verified against `e4eb07e` by an investigator briefed to refute rather than confirm.
+
+### What this note got right
+
+The driving gap is real, and every bullet holds: `sweep_rotations`'s pending-only branch,
+step 3's `has_tracker` guard, `report`'s empty-`epoch_acks` short circuit, and the gateway's
+exactly-once Role-B ack. One nuance to add: on a **3+ gateway fabric** a straggler ack landing
+after a rule-4 grace promote *does* drive the retire. The gap bites deterministically only
+when the promote is caused by the LAST ack (rule 3) — always in the two-gateway case, and
+normally in the in-step case.
+
+### What it got wrong
+
+> §"What the sweep gap actually costs" says `routes.rs` feeds every key row into the peer
+> roster, so "peers hold a Device for a key the rotating gateway has already destroyed", and
+> "on a fabric that rotates once and then idles, that is forever."
+
+**The premise is true and the conclusion does not follow.** `PeerRoute::keys` does carry
+`retiring` rows into the gateway's `PeerState::keys` — but **no gateway code ever reads a
+`retiring` entry.** The only consumers are `active_key()` (`state == "active"`),
+`pending_key()` (`state == "pending"`), and `active_pubkey_b64`, checked across every use in
+`reconcile.rs`, `rotation.rs` and `main.rs`.
+
+A retiring key therefore produces **no `PeerConfig`, no peer entry on any device, and no
+Role-B overlap Device.** Peers carry a dead string in a roster and in `state.json`. The data
+plane is untouched, and the gateway destroys the retired *private* key on its own 6s clock
+regardless (`epochkeys.rs::retire`).
+
+The error was mine, and it propagated: this note, task #24, a memory file, and PR #51's
+description and review replies all asserted it. It came from reading what the roster
+*contains* and never checking what a peer *does* with it.
+
+### The real consequence — worse, and on the controller
+
+**Automatic rotation wedges permanently, per gateway, after its first rotation.**
+`Db::gateways_with_rotation_state` selects `state IN ('pending','retiring')`, and
+`initiate_due_rotations` skips every id in that set. A stranded `retiring` row therefore
+excludes that gateway from the 30-day timer **forever** — keys silently stop rotating, with
+nothing reporting it.
+
+`Admin.RotateKey` has no mid-rotation guard, so manual rotation still works. That is the only
+reason the rotate-twice done-bar could reproduce anything at all.
+
+Retiring rows also **accumulate, one per rotation**: post-v0.7.2 the eviction installs a fresh
+tracker with `promoted_at: None`, so rotation 2 strands its own while epoch 0 stays shielded
+by the `has_tracker` guard. They are cleared only by a controller restart or an `Abort`.
+
+So the classification changes from "key-lifetime exposure" to "**security-posture failure**":
+rotation quietly stops happening. It remains the next thing to fix — arguably more urgently,
+since it means automatic rotation is self-disabling after one round and would not have
+survived re-enabling the timer even with everything else on this branch correct.
+
+### Two smaller corrections from the same pass
+
+- The §"Smallest fix" note's follow-on claim that a stale eviction snapshot could promote an
+  already-active epoch is **wrong**. `promote_epoch`, `retire_epoch` and `drop_pending_epoch`
+  are state-guarded CAS that bail on mismatch, so a stale decision logs an error rather than
+  writing. The surviving damage is in-memory only — a newer tracker evicted and rebuilt at an
+  older epoch, losing accumulated acks and restarting the 90s clock — and it self-heals within
+  one ≤5s sweep tick.
+- "Read the pending epoch fresh inside the lock" is **impossible**, not merely awkward: that
+  read is `spawn_blocking`-awaited, so performing it under the guard *is* the held-across-I/O
+  problem. The workable shape is an `installed_at`/generation token — never evict a tracker
+  installed after your snapshot was taken — mirroring `overlap_write_back` in the gateway
+  crate, which solves the identical bug class.
+
+### Method note
+
+This is the second time on this work that a mechanism was right and the consequence attached
+to it was invented. **Trace the consumer, not the container.** "X appears in the roster" says
+nothing until you have found the code that reads X.
