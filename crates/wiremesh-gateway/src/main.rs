@@ -4176,9 +4176,18 @@ async fn handle_rotate(
     // the old `base + (n - active_epoch)` was derived from the epoch number
     // alone, and a Role-B overlap toward a peer's identically-numbered pending
     // epoch derived the very same value — guaranteed, not incidental, because
-    // the controller rotates the whole fabric off one timer. The planner hands
-    // back a port free of the boot tun, of any previous rotation tun, and of
-    // every overlap we hold.
+    // the controller rotates the whole fabric off one timer.
+    //
+    // Since piece 3 this is a RESERVATION, not an allocation: an own-epoch tun
+    // always gets `base + tunnelset::OWN_TUN_PORT_OFFSET`, which no overlap can
+    // ever be handed, because our rotating peers compute exactly that value to
+    // dial our new epoch (`reconcile::pending_peer_configs`) and cannot be told
+    // any other. `plan_tunnel` therefore ERRORS rather than falling back if the
+    // reserved port is held — which aborts the rotation here, with the mint
+    // already persisted and the SM left mid-flight. That is the intended
+    // posture: the alternative is a new epoch listening where no peer will ever
+    // knock, which is bug 5 itself. The realistic cause is a previous retire
+    // whose renormalization failed (it logs CRITICAL when it does).
     let plan = plan_tunnel(
         TunnelId::Own { epoch: n },
         &rot.base_tun,
@@ -4363,7 +4372,10 @@ async fn maybe_start_role_b(
         // collision aborted the loop. Overlaps now live in their own
         // `{base}o{slot}` namespace, and the planner sees the boot tun, our
         // own rotation tun and every other peer's overlap in
-        // `tunnels.plans()`, so the port is free of all of them too.
+        // `tunnels.plans()`, so the port is free of all of them too — and
+        // since piece 3 an overlap free-lists from `base +
+        // OWN_TUN_PORT_OFFSET + 1`, so it cannot land on the slot reserved for
+        // OUR own new-epoch tun even at the instant we hold no such tun.
         let id = TunnelId::Overlap { gateway_id: aid, epoch: pending_epoch };
         let plan = match plan_tunnel(id, &rot.base_tun, rot.base_wg_port, &tunnels.plans()) {
             Ok(p) => p,
@@ -4961,14 +4973,28 @@ async fn run_rotation_ticks(rot: RotationShared) {
                             // SEED the new tun's change-guard with the exact
                             // config `apply_state`/`set_peer_endpoint` will
                             // recompute for it (`device_config_pinned` at the
-                            // new key/port). `handle_rotate` already brought the
-                            // new tun up with the CORRECT offset-port peer
-                            // endpoints out-of-band; a subsequent apply through
-                            // the guard would otherwise rebuild it with base-port
-                            // endpoints (`primary_endpoint`) and tear the live
-                            // session down. Seeding makes those recomputes a
-                            // no-op on the data plane while the enforcer-policy
-                            // loop (unguarded) still reaches the new tun.
+                            // new key/port). `handle_rotate` brought the new tun
+                            // up out-of-band via `device_config_at_port`, whose
+                            // peers carry NO endpoint at all (piece 3: that
+                            // Device is a receiver, roamed onto by the peer's
+                            // overlap); a subsequent apply through the guard
+                            // would rebuild it with `primary_endpoint`'s static
+                            // candidates and tear the roamed session down.
+                            // Seeding makes those recomputes a no-op on the data
+                            // plane while the enforcer-policy loop (unguarded)
+                            // still reaches the new tun.
+                            //
+                            // The seed therefore describes what the RECOMPUTES
+                            // will produce, not byte-for-byte what is on the
+                            // device — which is the same relationship it has
+                            // always had (before piece 3 the device carried
+                            // rewritten offset-port endpoints and the seed
+                            // carried base candidates), and is the only thing
+                            // that makes the guard do its job. Piece 1's
+                            // endpoint read-through then converges the two: once
+                            // this tun is the active one, the roamed endpoint is
+                            // pinned into `live_endpoints` and the next render
+                            // agrees with the device.
                             let (applied_config, applied_peers) = {
                                 let ds_guard = rot.desired.lock().unwrap();
                                 ds_guard
@@ -5075,6 +5101,22 @@ async fn run_rotation_ticks(rot: RotationShared) {
                         // won't initiate from keepalive alone). The `ping -W1`
                         // timeout naturally rate-limits this to ~once/sec while
                         // the peer's Device isn't up yet.
+                        //
+                        // INERT BY DESIGN since piece 3, and left in place
+                        // deliberately. `device_config_at_port` gives this tun's
+                        // peers no endpoint, so boringtun has nowhere to send
+                        // the probe packet and drops it: OUR side cannot open
+                        // the new epoch's session, and never could have — the
+                        // only Device that answers our new static key is the
+                        // peer's Role-B overlap, at a port that peer allocated
+                        // locally (see `device_config_at_port`). The cutover is
+                        // driven entirely by the PEER's identical kick on its
+                        // overlap, which does have a computable endpoint
+                        // (`pending_peer_configs`). Do NOT "repair" this by
+                        // handing the peers an endpoint — a guessed port is
+                        // exactly the bug piece 3 removed; repairing it properly
+                        // means the peer telling us where its overlap is, which
+                        // is a proto change and is not in this fix.
                         let cidrs: Vec<String> =
                             a.peers.iter().flat_map(|p| p.cidrs.clone()).collect();
                         kick_overlap(a.new_tun.clone(), cidrs, rot.base_wg_port).await;

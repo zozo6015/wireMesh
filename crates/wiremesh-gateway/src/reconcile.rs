@@ -1,6 +1,7 @@
 //! Pure reconciliation: turn desired state into a WG device config and a route
 //! add/remove diff, and decide when the enforcer needs re-`apply` (spec §5.2).
 use crate::state::DesiredState;
+use crate::tunnelset::OWN_TUN_PORT_OFFSET;
 use crate::uapi::{DeviceConfig, PeerConfig, PERSISTENT_KEEPALIVE_SECS};
 
 /// Steady-state peer builder. Every peer it emits carries
@@ -29,24 +30,53 @@ pub fn peer_configs(ds: &DesiredState) -> Vec<PeerConfig> {
         .collect()
 }
 
-/// Peer-configs targeting each peer's real-keyed PENDING epoch. The pending
-/// endpoint reuses the peer's active-candidate IP with the UDP port offset by
-/// `(pending_epoch - active_epoch)`, matching the `base_wg_port + epoch` port
-/// convention both gateways use for their per-epoch Devices (key-rotation
-/// Task 6). A peer with no real pending key (active-only, or a sentinel
-/// pending) contributes nothing.
+/// Peer-configs targeting each peer's real-keyed PENDING epoch — the peer set
+/// of a Role-B overlap Device. The pending endpoint reuses the peer's
+/// advertised candidate IP with the UDP port at
+/// [`OWN_TUN_PORT_OFFSET`] above the candidate's own port. A peer with no real
+/// pending key (active-only, or a sentinel pending) contributes nothing.
+///
+/// # Why `candidate_port + 1`, and why there is no epoch arithmetic left here
+///
+/// This used to compute `active_port + (pending_epoch - active_epoch)` on the
+/// theory that both gateways placed epoch `n`'s Device at `base_wg_port + n`.
+/// Nothing has placed a Device that way since T3 made the listen port an
+/// ALLOCATION (`tunnelset::plan_port`), and the formula survived only because
+/// its answer coincides with the allocator's on rotation 0 -> 1. On any later
+/// rotation the two diverged and the peer dialled a port the rotating gateway
+/// was not on — bug 5, i.e. "the second rotation of any gateway cannot
+/// complete" (`docs/research/port-authority-verification-the-shape-was-wrong.md`).
+///
+/// The formula is deleted rather than kept as a fallback, because a fallback
+/// would be an alternative answer to a question that admits exactly one:
+///
+///  - piece 2 puts the rotating gateway's ACTIVE key back on its base port at
+///    every retire, so the candidate this endpoint is derived from is the port
+///    the peer's active key is really on, at every rotation and not just the
+///    first; and
+///  - piece 3 RESERVES [`OWN_TUN_PORT_OFFSET`] for a gateway's own new-epoch
+///    tun, so its in-flight new epoch is at `base + 1` regardless of the epoch
+///    NUMBER and regardless of how many overlaps that gateway is carrying.
+///
+/// So the target is `candidate_port + OWN_TUN_PORT_OFFSET`, and the constant is
+/// imported from the allocator that enforces it rather than restated here:
+/// one definition, two readers, nothing to drift.
 pub fn pending_peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerConfig> {
     ds.peers
         .iter()
         .filter_map(|p| {
-            let active = p.active_key()?;
+            // Required but unused: a peer mid-make-before-break advertises BOTH
+            // rows, and `main.rs`'s `role_b_decisions` — the only consumer of
+            // this builder — demands both too. Keeping the guard keeps the two
+            // peer sets identical, so a malformed pending-without-active roster
+            // entry can never produce an overlap here that the decision layer
+            // would refuse to stand up.
+            p.active_key()?;
             let pending = p.pending_key()?;
             let endpoint = p.primary_endpoint()?;
             let (ip, port_str) = endpoint.rsplit_once(':')?;
-            let active_port: u16 = port_str.parse().ok()?;
-            let offset = pending.epoch.checked_sub(active.epoch)?;
-            let offset: u16 = offset.try_into().ok()?;
-            let pending_port = active_port.checked_add(offset)?;
+            let candidate_port: u16 = port_str.parse().ok()?;
+            let pending_port = candidate_port.checked_add(OWN_TUN_PORT_OFFSET)?;
             Some(PeerConfig {
                 public_key_b64: pending.pubkey_b64.clone(),
                 endpoint: Some(format!("{ip}:{pending_port}")),
@@ -146,23 +176,50 @@ pub fn device_config_pinned(
     DeviceConfig { private_key_b64: private_key_b64.to_string(), listen_port, peers }
 }
 
-/// Rewrite the UDP port of an `ip:port` endpoint string, preserving the host.
-/// `None` for a malformed endpoint (no `:port` suffix). Used by
-/// [`device_config_at_port`] to retarget peers at a rotation epoch's offset
-/// port (key-rotation Task 9).
-fn rewrite_endpoint_port(endpoint: &str, port: u16) -> Option<String> {
-    let (ip, _) = endpoint.rsplit_once(':')?;
-    Some(format!("{ip}:{port}"))
-}
-
 /// A device config for a NEW own-epoch Device (key-rotation Task 9, Role A):
 /// the gateway's own rotated private key on `port`, peering the SAME current
-/// peers by their ACTIVE keys, but with each peer's endpoint retargeted to
-/// `port` — the peer's own new-epoch Device listens on the identical offset
-/// port (`base_wg_port + (N - active_epoch)`), so both sides rendezvous on it
-/// during the make-before-break overlap while the old epoch keeps carrying
-/// traffic on the base port. A peer with no active key or no endpoint
-/// contributes nothing (it can't be reached on the new epoch yet).
+/// peers by their ACTIVE keys, **with no endpoint on any peer**. A peer with no
+/// active key contributes nothing (it can't be reached on the new epoch yet).
+///
+/// # This device is a RECEIVER. It is not supposed to dial anyone.
+///
+/// Until piece 3 this rewrote every peer's endpoint to `ip:port` — our OWN
+/// listen port on the peer's address — justified as "the peer's own new-epoch
+/// Device listens on the identical offset port". **That premise is false and
+/// cannot be made true**, so the rewrite is gone rather than corrected:
+///
+///  - The peers here are keyed by each peer's **active** public key, and a
+///    peer's active key lives on that peer's **active** Device, at its
+///    advertised candidate port. Dialling it would reach a Device that has
+///    never heard of the brand-new static key this one runs, so its handshake
+///    initiation is dropped as an unknown peer.
+///  - The only Device in the fabric that CAN answer this one is the peer's
+///    Role-B **overlap** toward our pending epoch — which runs the peer's
+///    active key (hence the key match) and lives at a port that peer's own
+///    `tunnelset::plan_port` allocated from its own free list. That port is
+///    genuinely unknowable from here: it depends on how many other peers that
+///    gateway is overlapping, and on nothing we are told.
+///  - The old rewrite appeared to work only on rotation 0 -> 1, where both
+///    sides' free lists happened to hand out `base + 1`. Piece 3's reserved
+///    own-epoch slot ends even that coincidence — the peer's overlaps now start
+///    at `base + 2` — so an emitted endpoint could not be right even by luck.
+///
+/// What actually brings this Device live is the peer's overlap initiating (its
+/// rotation tick kicks the handshake until the session is up), after which
+/// boringtun roams this peer entry onto the authenticated source address. An
+/// endpoint-less peer is exactly how WireGuard expresses "wait to be dialled",
+/// and it is honest: no value here is ever read back as authority, so there is
+/// nothing for a later apply to have to "restore".
+///
+/// **Known consequence, deliberately accepted:** with no endpoint, this Device
+/// emits nothing, so Role A's `kick_overlap` probe is inert for the whole
+/// overlap and a NAT in front of this gateway sees no outbound datagram from
+/// `port` and opens no mapping for it. Neither is a regression the endpoint
+/// could have avoided — a datagram aimed at the peer's active Device punches a
+/// hole for an address the peer's overlap does not send from — and rotation
+/// behind NAT is separately unsupported anyway: the observe socket is bound to
+/// the base port for process life, so an offset port is never observed,
+/// reported, or advertised as a candidate.
 pub fn device_config_at_port(
     ds: &DesiredState,
     private_key_b64: &str,
@@ -173,11 +230,10 @@ pub fn device_config_at_port(
         .peers
         .iter()
         .filter_map(|p| {
-            let public_key_b64 = p.active_pubkey_b64.clone()?;
-            let endpoint = p.primary_endpoint().and_then(|ep| rewrite_endpoint_port(ep, port));
             Some(PeerConfig {
-                public_key_b64,
-                endpoint,
+                public_key_b64: p.active_pubkey_b64.clone()?,
+                // See the doc above: receive-and-roam, never dial.
+                endpoint: None,
                 allowed_ips: p.allowed_ips.clone(),
                 keepalive_secs,
             })
