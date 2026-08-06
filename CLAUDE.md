@@ -127,13 +127,47 @@ gateway and relay Sync channels run HTTP/2 keepalive (15s/10s, while-idle)
 there: Sync session generation (below) and controller-side alerting on
 roster `applied_version` lag.
 
+**Key rotation (2026-08-05/06, v0.5.0 → v0.7.2).** Automatic rotation is
+DISABLED on the live fabric (`WIREMESH_ROTATION_INTERVAL=off`) and **must stay
+off**. Manual `fabricctl` rotation works. Two blockers remain before the timer
+can be re-enabled:
+
+1. **The in-step case is red.** The controller rotates every active gateway off
+   one timer, so the fabric rotates in step — a scenario nothing had tested. Its
+   done-bar is committed `#[ignore]`d as RED-by-design at
+   `crates/wiremesh-gateway/tests/key_rotation.rs`. **Un-ignoring it is the bar.**
+2. **The reserved-port handoff rests on kernel UDP hash ordering.** boringtun
+   leaks its old sockets on rebind, so the vacated port stays bound; the next
+   rotation binds a second `SO_REUSEADDR` socket on top and the kernel picks the
+   winner. Works today, not guaranteed. Confirm with `ss -lunp` in the netns
+   after a retire before trusting it.
+
+Shipped: v0.7.0 the `off` escape hatch (defused a fabric-wide outage dated
+2026-08-31); v0.7.1 four in-step fixes; **v0.7.2 the port authority** — a
+gateway's active key permanently left its base port at the first cutover and
+never returned, so every port formula was computing against a moving target and
+**the second rotation of any gateway could not complete**. Fixed by reading the
+endpoint back from the device, renormalizing to base at retire, and reserving
+the own-tun port (one authority, both sides). Then: a promoted rotation's retire
+was never driven, stranding a `retiring` row — and `initiate_due_rotations` skips
+`state IN ('pending','retiring')`, so **automatic rotation was self-disabling
+after one round per gateway, silently**.
+
+Rotation research notes live in `docs/research/`
+(`second-rotation-stranded-tracker.md`,
+`port-authority-verification-the-shape-was-wrong.md`,
+`flake-direct-rotation-zero-drop.md`). Two cautions carried forward:
+`direct_rotation_is_zero_drop` fails **~42% under host load**, so one red run in
+isolation is NOT evidence of a regression — run an interleaved A/B against the
+parent commit before believing your change caused it. And **`RETIRE_GRACE`
+collapsing to ~0 has been reachable by three independent routes**, each of which
+looks like a simplification; `evict_decision`'s `None`-means-keep is pinned by
+unit tests whose failure messages say so.
+
 Next action: the Cycle-4c fast-follows (make-before-break direct cutover;
-`relay_pair_id` width + per-relay connection multiplexing) and the
-key-rotation fast-follow (carried from 4a). Also pending: Cycle 2b fast-follow
-(OpenBao provider driver); Sync session generation (per-boot nonce in Watch+Report so a delayed
-pre-restart Report can't restore stale peer_paths/local_endpoints/
-relay_health — see `Broker::on_report`'s known-race note). Update this
-section as phases complete.
+`relay_pair_id` width + per-relay connection multiplexing). Also pending:
+Cycle 2b fast-follow (OpenBao provider driver). Update this section as phases
+complete.
 
 ## Agent workflow rules
 

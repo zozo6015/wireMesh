@@ -162,6 +162,179 @@ pub(crate) struct RotationTracker {
     started_at: Instant,
     promoted_at: Option<Instant>,
     live_acks: BTreeSet<u64>,
+    /// The instant THIS tracker instance was inserted into the shared map.
+    ///
+    /// Deliberately a separate field from `started_at` even though every
+    /// insertion site currently stamps both with the same `Instant::now()`.
+    /// They answer different questions and must be free to diverge:
+    /// `started_at` is the ROTATION's clock (what `rotation::decide`'s
+    /// `GRACE_PROMOTE`/`ABORT_AFTER` measure from, and something a future
+    /// change could legitimately seed from a persisted rotation start), while
+    /// `installed_at` is the identity/ordering stamp for THIS in-memory
+    /// instance. It is read by exactly two things, both of which would be
+    /// silently wrong if it ever tracked the rotation rather than the entry:
+    ///
+    ///  - [`evict_decision`], to refuse to evict a tracker that is NEWER than
+    ///    the DB snapshot the caller is arbitrating with;
+    ///  - [`TrackerToken`], to tell "the same tracker I read" apart from "a
+    ///    fresh tracker rebuilt toward the same epoch number while I was
+    ///    awaiting".
+    installed_at: Instant,
+}
+
+/// May a held [`RotationTracker`] be evicted, given a `gateway_key` snapshot
+/// that was read at `read_at`?
+///
+/// # Two independent reasons to KEEP, both load-bearing
+///
+/// **`db_pending == None` is an unconditional keep.** "Live tracker, no
+/// `pending` row" IS the stranded-post-promote state, and that tracker still
+/// owes a [`RotationDecision::Retire`] for its prior active epoch
+/// `RETIRE_GRACE` after the promote. A plain
+/// `Some(tracker_pending) != db_pending` evicts there, which hands the retire
+/// to [`sweep_rotations`]' step-3 orphan path — and that path deletes
+/// IMMEDIATELY, with no grace at all. The 30s `RETIRE_GRACE` would collapse to
+/// ~0 on every normal rotation, cutting off every peer still finishing a
+/// handshake on the old key. The `None`-means-keep asymmetry is the whole
+/// reason this is a named function rather than an inline `!=`.
+///
+/// **A tracker installed AFTER `read_at` is an unconditional keep.** The keys
+/// snapshot is read with the `rotations` guard RELEASED (it is an awaited
+/// `spawn_blocking` DB hop — see [`drive_rotation_for`]'s locking discipline),
+/// so a rotation can start, and install its tracker, while the caller is
+/// awaiting. That tracker is newer than the caller's knowledge of the DB, so
+/// the caller's `db_pending` cannot arbitrate it: evicting on that evidence
+/// tears down a rotation that has only just begun, discarding its acks (they
+/// fail the `ack.epoch == tracker.pending_epoch` test in [`SyncSvc::report`])
+/// and restarting its `started_at`.
+fn evict_decision(
+    tracker_pending: u32,
+    tracker_installed_at: Instant,
+    db_pending: Option<u32>,
+    read_at: Instant,
+) -> bool {
+    let Some(db_pending) = db_pending else {
+        // Stranded post-promote: this tracker still owes a Retire.
+        return false;
+    };
+    if tracker_installed_at > read_at {
+        // Newer than the snapshot that would be used to condemn it.
+        return false;
+    }
+    tracker_pending != db_pending
+}
+
+/// The full identity of ONE [`RotationTracker`] instance. The gateway id it is
+/// keyed by is NOT enough — see [`tracker_write_back`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TrackerToken {
+    pending_epoch: u32,
+    installed_at: Instant,
+}
+
+impl TrackerToken {
+    fn of(tracker: &RotationTracker) -> Self {
+        Self {
+            pending_epoch: tracker.pending_epoch,
+            installed_at: tracker.installed_at,
+        }
+    }
+}
+
+/// Whether a conclusion computed from a [`RotationTracker`] read under the
+/// guard, then `.await`ed on with the guard RELEASED, may still be written
+/// back onto the entry now under the guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteBack {
+    /// Same tracker instance — the write-back is about the thing it was
+    /// computed for.
+    Apply,
+    /// A DIFFERENT tracker instance now occupies the slot: a newer rotation
+    /// started (or a lazy rebuild ran) while the caller was awaiting.
+    Replaced,
+    /// The entry is gone entirely — the rotation was retired or aborted while
+    /// the caller was awaiting.
+    Vanished,
+}
+
+/// May a deferred write-back into `rotations[gateway_id]` still be applied?
+///
+/// # The bug this exists to prevent
+///
+/// [`drive_rotation_for`] executes its decision (a DB mutation plus
+/// `emit_key_rotated`) with the `rotations` guard RELEASED, then re-takes it to
+/// apply the in-memory effect. Matching on the gateway id alone, a blind
+/// `promoted_at = Some(..)` / `remove(..)` there lands on whatever entry
+/// happens to be in the slot — which, for a rotation that started during the
+/// gap, is a brand-new tracker. A blind `remove` would delete it (discarding
+/// the new rotation's acks and clock); a blind `promoted_at` would credit one
+/// rotation's promote to another, and `decide`'s rule 1 would then short-
+/// circuit the new rotation straight into a `Retire` of the wrong epoch.
+///
+/// Both axes of the token matter independently: the epoch alone misses a
+/// rebuild toward the SAME epoch number, and the install instant alone misses
+/// a same-instant replacement. This mirrors
+/// `wiremesh_gateway::rotation::overlap_write_back`, which solves the
+/// identical bug class one crate over.
+///
+/// On anything but [`WriteBack::Apply`] the correct action is to leave the
+/// entry alone and log: the next sweep tick re-reads it and drives it from
+/// scratch.
+fn tracker_write_back(taken: TrackerToken, current: Option<TrackerToken>) -> WriteBack {
+    match current {
+        None => WriteBack::Vanished,
+        Some(cur) if cur == taken => WriteBack::Apply,
+        Some(_) => WriteBack::Replaced,
+    }
+}
+
+/// The in-memory effect [`drive_rotation_for`] applies to a tracker AFTER its
+/// decision's DB mutation has committed — gated by [`tracker_write_back`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackerEffect {
+    /// The promote committed: stamp `promoted_at` so `decide`'s rule 1 starts
+    /// the `RETIRE_GRACE` clock.
+    Promoted,
+    /// The rotation is over (retired or aborted): drop the tracker, which also
+    /// hands any remaining `retiring` rows to [`sweep_rotations`]' orphan path.
+    Finished,
+}
+
+/// Re-takes the `rotations` guard and applies `effect` to `gateway_id`'s
+/// tracker IFF it is still the same instance `taken` names.
+///
+/// NO `.await` inside the guard — `clippy::await_holding_lock` does not fire
+/// for `tokio::sync::MutexGuard`, so this discipline is held by construction
+/// and by comment, not by the linter.
+async fn apply_tracker_effect(
+    rotations: &Arc<Mutex<HashMap<i64, RotationTracker>>>,
+    gateway_id: i64,
+    taken: TrackerToken,
+    effect: TrackerEffect,
+) {
+    let mut guard = rotations.lock().await;
+    let current = guard.get(&gateway_id).map(TrackerToken::of);
+    match tracker_write_back(taken, current) {
+        WriteBack::Apply => match effect {
+            TrackerEffect::Promoted => {
+                if let Some(t) = guard.get_mut(&gateway_id) {
+                    t.promoted_at = Some(Instant::now());
+                }
+            }
+            TrackerEffect::Finished => {
+                guard.remove(&gateway_id);
+            }
+        },
+        WriteBack::Replaced => eprintln!(
+            "wiremesh-controller: rotation tracker for gateway {gateway_id} was replaced while \
+             its {effect:?} decision was executing (a newer rotation started) — leaving the new \
+             tracker alone; the next sweep tick re-drives it"
+        ),
+        WriteBack::Vanished => eprintln!(
+            "wiremesh-controller: rotation tracker for gateway {gateway_id} vanished while its \
+             {effect:?} decision was executing — nothing to write back"
+        ),
+    }
 }
 
 impl SyncSvc {
@@ -375,6 +548,47 @@ impl SyncSvc {
 /// that method's (now much shorter) doc comment history in git blame for the
 /// full design rationale (lazy-rebuild, locking discipline, best-effort error
 /// handling) — none of it changed, only its home.
+///
+/// # Locking discipline (read before editing)
+///
+/// This function takes the `rotations` guard TWICE and holds NO `.await`
+/// inside either hold:
+///
+///  1. **Read the DB first, unlocked.** `all_keys_for_gateway` is a
+///     `spawn_blocking` hop. "Read the pending epoch fresh under the lock" is
+///     not merely awkward, it is the held-across-I/O problem itself — every
+///     concurrent `Report`, `SubmitEpochKey` and sweep tick for EVERY gateway
+///     would queue behind one gateway's DB read. `read_at` is stamped
+///     immediately before that read so [`evict_decision`] knows exactly how
+///     old the resulting snapshot is.
+///  2. **Guard held, purely synchronous:** evict-if-it-disagrees, lazily
+///     rebuild, build the [`RotationState`], call [`rotation::decide`], and
+///     take a [`TrackerToken`] naming the exact tracker instance the decision
+///     was computed from. Then drop the guard.
+///  3. **Execute the decision unlocked** — the DB mutation plus
+///     `emit_key_rotated`.
+///  4. **Re-take the guard** and apply the in-memory effect only if the token
+///     still matches ([`apply_tracker_effect`]).
+///
+/// `clippy::await_holding_lock` does NOT fire for `tokio::sync::MutexGuard`,
+/// so nothing mechanically enforces step 2 and step 4's "no `.await` inside" —
+/// it is held by construction and by this comment.
+///
+/// # Why executing unlocked is SAFE: the DB writes are compare-and-swap
+///
+/// Because the guard is released across the mutation, two drivers (a sweep
+/// tick and an ack-triggered `Report`, say) can reach the same decision
+/// concurrently. That is contained entirely by
+/// [`Db::promote_epoch`](crate::db::Db::promote_epoch),
+/// [`Db::retire_epoch`](crate::db::Db::retire_epoch) and
+/// [`Db::drop_pending_epoch`](crate::db::Db::drop_pending_epoch) being
+/// state-guarded CAS that BAIL (return `Err`) when the row is not in the state
+/// the decision assumed: the loser logs and writes nothing, and the in-memory
+/// effect is gated behind its `Ok`. **If anyone ever "simplifies" those three
+/// into unconditional `UPDATE`/`DELETE`s that silently affect zero rows, this
+/// whole design becomes unsafe** — a stale decision would then appear to
+/// succeed and the tracker would be mutated to match a DB state that never
+/// happened.
 pub(crate) async fn drive_rotation_for(
     db: &DbHandle,
     change_tx: &broadcast::Sender<ChangeEvent>,
@@ -382,6 +596,10 @@ pub(crate) async fn drive_rotation_for(
     rotations: &Arc<Mutex<HashMap<i64, RotationTracker>>>,
     rotating_gateway_id: i64,
 ) {
+    // Stamped BEFORE the read, not after: `evict_decision` needs the earliest
+    // instant at which `keys` could possibly be true, so that any tracker
+    // installed during the await is unambiguously newer than this snapshot.
+    let read_at = Instant::now();
     let keys = match db.all_keys_for_gateway(rotating_gateway_id).await {
         Ok(k) => k,
         Err(e) => {
@@ -401,92 +619,91 @@ pub(crate) async fn drive_rotation_for(
         .find(|(_, _, state)| state == "pending")
         .map(|(epoch, _, _)| *epoch as u32);
 
-    let mut rotations = rotations.lock().await;
+    // --- Critical section 1: decide. NO `.await` below until the drop. ---
+    let plan = {
+        let mut rotations = rotations.lock().await;
 
-    // (Second-rotation stranded tracker; see
-    // `docs/research/second-rotation-stranded-tracker.md`) Evict a tracker
-    // that is talking about a DIFFERENT rotation than the one the DB
-    // currently has pending. A promoted rotation's tracker is stranded with
-    // `promoted_at = Some` and nothing can drive it to its `Retire`, so when
-    // the NEXT rotation starts the lazy rebuild below would find that stale
-    // tracker present, keep it, and `rotation::decide`'s rule 1 would
-    // short-circuit on `promoted_at` — never looking at the new pending
-    // epoch. That both discards every peer ack for the new epoch (they fail
-    // the `ack.epoch == tracker.pending_epoch` test in `report`) and delays
-    // the new rotation's `started_at` by a full `RETIRE_GRACE`.
-    //
-    // Deliberately gated on the DB actually HAVING a pending epoch, rather
-    // than a plain `Some(t.pending_epoch) != db_pending_epoch`: "live tracker,
-    // no pending row" IS the stranded-post-promote state, and that tracker
-    // still owes a `RotationDecision::Retire` for its prior active epoch.
-    // Evicting there would hand the retire to `sweep_rotations`' step-3
-    // orphan path, which deletes immediately and so would collapse the 30s
-    // `RETIRE_GRACE` to zero. That gap (nothing drives a promoted rotation's
-    // retire) is left deliberately visible, not papered over here.
-    if let Some(db_pending_epoch) = db_pending_epoch {
+        // (Second-rotation stranded tracker; see
+        // `docs/research/second-rotation-stranded-tracker.md`) Evict a tracker
+        // that is talking about a DIFFERENT rotation than the one the DB
+        // currently has pending — the predicate, and the two reasons it is
+        // asymmetric rather than a plain `!=`, live in `evict_decision`.
         if rotations
             .get(&rotating_gateway_id)
-            .is_some_and(|t| t.pending_epoch != db_pending_epoch)
+            .is_some_and(|t| evict_decision(t.pending_epoch, t.installed_at, db_pending_epoch, read_at))
         {
             rotations.remove(&rotating_gateway_id);
         }
-    }
 
-    if !rotations.contains_key(&rotating_gateway_id) {
-        if let Some(pending_epoch) = db_pending_epoch {
-            let prior_active_epoch = keys
-                .iter()
-                .find(|(_, _, state)| state == "active")
-                .map(|(epoch, _, _)| *epoch as u32)
-                .unwrap_or(0);
-            rotations.insert(
-                rotating_gateway_id,
-                RotationTracker {
-                    pending_epoch,
-                    prior_active_epoch,
-                    started_at: Instant::now(),
-                    promoted_at: None,
-                    live_acks: BTreeSet::new(),
-                },
-            );
+        if !rotations.contains_key(&rotating_gateway_id) {
+            if let Some(pending_epoch) = db_pending_epoch {
+                let prior_active_epoch = keys
+                    .iter()
+                    .find(|(_, _, state)| state == "active")
+                    .map(|(epoch, _, _)| *epoch as u32)
+                    .unwrap_or(0);
+                let now = Instant::now();
+                rotations.insert(
+                    rotating_gateway_id,
+                    RotationTracker {
+                        pending_epoch,
+                        prior_active_epoch,
+                        started_at: now,
+                        promoted_at: None,
+                        live_acks: BTreeSet::new(),
+                        installed_at: now,
+                    },
+                );
+            }
         }
-    }
 
-    let Some(tracker) = rotations.get(&rotating_gateway_id) else {
         // No DB `pending` epoch and no tracker already in flight (e.g. a
         // stray ack about a gateway that isn't currently rotating, or a
-        // rotation whose retire already completed) — nothing to drive.
+        // rotation whose retire already completed) — nothing to drive, and in
+        // particular nothing here may touch a `retiring` row: that genuinely
+        // trackerless case belongs to `sweep_rotations`' orphan path.
+        rotations.get(&rotating_gateway_id).map(|tracker| {
+            let pending_has_real_key = keys.iter().any(|(epoch, pubkey, state)| {
+                *epoch as u32 == tracker.pending_epoch
+                    && state == "pending"
+                    && pubkey != "awaiting-submission"
+            });
+
+            let expected_peers: BTreeSet<u64> = broker
+                .connected_gateway_ids()
+                .into_iter()
+                .filter(|id| *id != rotating_gateway_id)
+                .map(|id| id as u64)
+                .collect();
+
+            let state = RotationState {
+                pending_epoch: tracker.pending_epoch,
+                pending_has_real_key,
+                prior_active_epoch: tracker.prior_active_epoch,
+                started_at: tracker.started_at,
+                promoted_at: tracker.promoted_at,
+                expected_peers,
+                live_acks: tracker.live_acks.clone(),
+            };
+
+            (
+                rotation::decide(&state, Instant::now()),
+                TrackerToken::of(tracker),
+            )
+        })
+        // The guard drops here, before any `.await` below.
+    };
+    let Some((decision, taken)) = plan else {
         return;
     };
 
-    let pending_has_real_key = keys.iter().any(|(epoch, pubkey, state)| {
-        *epoch as u32 == tracker.pending_epoch && state == "pending" && pubkey != "awaiting-submission"
-    });
-
-    let expected_peers: BTreeSet<u64> = broker
-        .connected_gateway_ids()
-        .into_iter()
-        .filter(|id| *id != rotating_gateway_id)
-        .map(|id| id as u64)
-        .collect();
-
-    let state = RotationState {
-        pending_epoch: tracker.pending_epoch,
-        pending_has_real_key,
-        prior_active_epoch: tracker.prior_active_epoch,
-        started_at: tracker.started_at,
-        promoted_at: tracker.promoted_at,
-        expected_peers,
-        live_acks: tracker.live_acks.clone(),
-    };
-
-    match rotation::decide(&state, Instant::now()) {
+    // --- Execute, guard RELEASED. ---
+    match decision {
         RotationDecision::Wait => {}
         RotationDecision::Promote { epoch } => match db.promote_epoch(rotating_gateway_id, epoch).await {
             Ok(()) => {
-                if let Some(t) = rotations.get_mut(&rotating_gateway_id) {
-                    t.promoted_at = Some(Instant::now());
-                }
+                apply_tracker_effect(rotations, rotating_gateway_id, taken, TrackerEffect::Promoted)
+                    .await;
                 if let Err(e) = projection::emit_key_rotated(db, change_tx, rotating_gateway_id).await {
                     eprintln!(
                         "wiremesh-controller: emit_key_rotated after promote({rotating_gateway_id}, \
@@ -500,7 +717,8 @@ pub(crate) async fn drive_rotation_for(
         },
         RotationDecision::Retire { epoch } => match db.retire_epoch(rotating_gateway_id, epoch).await {
             Ok(()) => {
-                rotations.remove(&rotating_gateway_id);
+                apply_tracker_effect(rotations, rotating_gateway_id, taken, TrackerEffect::Finished)
+                    .await;
                 if let Err(e) = projection::emit_key_rotated(db, change_tx, rotating_gateway_id).await {
                     eprintln!(
                         "wiremesh-controller: emit_key_rotated after retire({rotating_gateway_id}, \
@@ -508,6 +726,18 @@ pub(crate) async fn drive_rotation_for(
                     );
                 }
             }
+            // DO NOT "clean up" the tracker here. This `Err` cannot be told
+            // apart from a transient DB error at this call site (both arrive as
+            // `anyhow`), so reacting by removing the tracker would ALSO fire on
+            // a blip — and a removed tracker hands any live `retiring` row
+            // straight to `sweep_rotations`' step-3 orphan path, which deletes
+            // grace-free. That collapses `RETIRE_GRACE` from 30s to ~0 on a
+            // normal rotation. Leaving the tracker in place costs one retry on
+            // the next sweep tick; removing it costs make-before-break. See
+            // `evict_decision`, whose `None`-means-keep leg exists for the same
+            // reason and IS unit-pinned. If you need to distinguish a CAS bail
+            // from an error, make `retire_epoch` return that distinction —
+            // do not infer it here.
             Err(e) => eprintln!(
                 "wiremesh-controller: retire_epoch({rotating_gateway_id}, {epoch}) failed: {e}"
             ),
@@ -515,7 +745,13 @@ pub(crate) async fn drive_rotation_for(
         RotationDecision::Abort { epoch, reason } => {
             match db.drop_pending_epoch(rotating_gateway_id, epoch).await {
                 Ok(()) => {
-                    rotations.remove(&rotating_gateway_id);
+                    apply_tracker_effect(
+                        rotations,
+                        rotating_gateway_id,
+                        taken,
+                        TrackerEffect::Finished,
+                    )
+                    .await;
                     if let Err(e) = projection::emit_key_rotated(db, change_tx, rotating_gateway_id).await
                     {
                         eprintln!(
@@ -524,6 +760,13 @@ pub(crate) async fn drive_rotation_for(
                         );
                     }
                 }
+                // Same rule as the `Retire` arm above: do NOT remove the
+                // tracker on this `Err`. Indistinguishable from a transient DB
+                // error, and the removal is what reaches the grace-free orphan
+                // path. (An aborting tracker has `promoted_at == None` and so
+                // owns no live `retiring` row of its own — but a row from an
+                // EARLIER rotation may still be present, which is the one that
+                // would lose its grace.)
                 Err(e) => eprintln!(
                     "wiremesh-controller: drop_pending_epoch({rotating_gateway_id}, {epoch}) \
                      (reason: {reason}) failed: {e}"
@@ -548,9 +791,28 @@ pub(crate) async fn drive_rotation_for(
 ///      `docs/research/second-rotation-stranded-tracker.md`), then lazily
 ///      rebuild its `RotationTracker` (fresh `started_at`) if none is
 ///      currently held — the same check-and-evict plus crash-recovery
-///      rebuild `drive_rotation_for` itself does — then call
-///      `drive_rotation_for`, which fires grace-promote/abort/retire via
+///      rebuild `drive_rotation_for` itself does.
+///   2b. Then call `drive_rotation_for` for EVERY gateway in the step-1 set,
+///      `pending` row or not, which fires grace-promote/abort/retire via
 ///      `rotation::decide` exactly as an ack-triggered call would.
+///
+///      **This unconditional call is the fix for the stranded promoted
+///      tracker.** It used to live inside step 2's `if let Some(pending)`,
+///      which meant a tracker with `promoted_at = Some` — a rotation that has
+///      already promoted, so it has no `pending` row left, only a `retiring`
+///      one — was reachable by NOTHING: not by step 2 (no pending row), not by
+///      step 3 (it still holds a tracker), and not by `report` (the gateway
+///      acks exactly once per Role-B cutover, so no further Report carries a
+///      non-empty `epoch_acks`). `decide`'s rule 1 is the ONLY producer of
+///      `RotationDecision::Retire`, so the `retiring` row was stranded on disk
+///      forever — and because `Db::gateways_with_rotation_state` selects
+///      `state IN ('pending','retiring')` and `initiate_due_rotations` skips
+///      every id it returns, that one row excluded its gateway from the
+///      rotation timer PERMANENTLY. Automatic rotation was self-disabling
+///      after a single round. Running the driver for the whole step-1 set
+///      costs one extra `all_keys_for_gateway` per mid-rotation gateway per
+///      tick and closes it; for a gateway with neither tracker nor pending row
+///      `drive_rotation_for` returns immediately, leaving step 3 untouched.
 ///   3. For a gateway with a `retiring` row but NO in-memory tracker: this is
 ///      an ORPHANED row — the promote already committed and the tracker was
 ///      lost (e.g. a controller crash/restart in the 30s `RETIRE_GRACE`
@@ -565,9 +827,16 @@ pub(crate) async fn drive_rotation_for(
 ///      here — that one is `decide`'s (`RotationDecision::Retire`'s) job via
 ///      step 2 above, not this direct path's.
 ///
-/// Keys are re-read fresh between steps 2 and 3 for a given gateway (rather
-/// than reusing the step-1 snapshot) since step 2's `drive_rotation_for` call
-/// may itself have just mutated this gateway's `gateway_key` rows.
+/// Keys are re-read fresh between steps 2b and 3 for a given gateway (rather
+/// than reusing the step-1 snapshot) since step 2b's `drive_rotation_for` call
+/// may itself have just mutated this gateway's `gateway_key` rows. That
+/// re-read is also what makes the multi-`retiring`-row case CONVERGE in a
+/// single tick: after two rotations a gateway can hold two `retiring` rows
+/// (epoch 0 from rotation 1, epoch 1 from rotation 2) while the surviving
+/// tracker knows only epoch 1 as its `prior_active_epoch`. Step 2b drives that
+/// tracker to `Retire { epoch: 1 }` and removes it; the re-read then sees
+/// epoch 0 still `retiring` with NO tracker held, so step 3's orphan path
+/// takes it in the very same iteration.
 pub(crate) async fn sweep_rotations(
     db: &DbHandle,
     change_tx: &broadcast::Sender<ChangeEvent>,
@@ -583,6 +852,11 @@ pub(crate) async fn sweep_rotations(
     };
 
     for gateway_id in gateway_ids {
+        // Stamped before the read for the same reason as in
+        // `drive_rotation_for`: `evict_decision` must be able to tell a
+        // tracker installed DURING this await apart from one that predates
+        // the snapshot it would be condemned by.
+        let read_at = Instant::now();
         let keys = match db.all_keys_for_gateway(gateway_id).await {
             Ok(k) => k,
             Err(e) => {
@@ -593,50 +867,63 @@ pub(crate) async fn sweep_rotations(
             }
         };
 
-        // Step 2: a `pending` row — ensure a tracker exists, then drive the
-        // real decision (grace-promote/abort).
+        // Step 2: a `pending` row — ensure a tracker exists. (`drive_rotation_for`
+        // does the identical evict-and-rebuild from its own fresher read, but
+        // doing it here too is what keeps a gateway holding BOTH a `pending`
+        // and a `retiring` row shielded from step 3's immediate, grace-free
+        // orphan path if that call's DB read happens to fail.)
         if let Some((pending_epoch, _, _)) = keys.iter().find(|(_, _, state)| state == "pending") {
             let pending_epoch = *pending_epoch as u32;
-            {
-                let mut guard = rotations.lock().await;
-                // (Second-rotation stranded tracker) Same check-and-evict as
-                // `drive_rotation_for`, for the same reason and with the same
-                // `None`-means-keep-it asymmetry — held under the SAME guard
-                // as the rebuild immediately below so no concurrent `report`
-                // can observe (or re-ack into) the evicted-but-not-yet-
-                // rebuilt window. `pending_epoch` here is the DB's pending
-                // row from this tick's `keys` snapshot, so this costs no
-                // extra query either.
-                if guard
-                    .get(&gateway_id)
-                    .is_some_and(|t| t.pending_epoch != pending_epoch)
-                {
-                    guard.remove(&gateway_id);
-                }
-                if !guard.contains_key(&gateway_id) {
-                    let prior_active_epoch = keys
-                        .iter()
-                        .find(|(_, _, state)| state == "active")
-                        .map(|(epoch, _, _)| *epoch as u32)
-                        .unwrap_or(0);
-                    guard.insert(
-                        gateway_id,
-                        RotationTracker {
-                            pending_epoch,
-                            prior_active_epoch,
-                            started_at: Instant::now(),
-                            promoted_at: None,
-                            live_acks: BTreeSet::new(),
-                        },
-                    );
-                }
+            let mut guard = rotations.lock().await;
+            // (Second-rotation stranded tracker) Same check-and-evict as
+            // `drive_rotation_for`, through the same `evict_decision` — same
+            // reason, same `None`-means-keep-it asymmetry, same
+            // installed-after-the-read protection. Held under the SAME guard
+            // as the rebuild immediately below so no concurrent `report` can
+            // observe (or re-ack into) the evicted-but-not-yet-rebuilt
+            // window, and with NO `.await` anywhere inside the hold.
+            if guard.get(&gateway_id).is_some_and(|t| {
+                evict_decision(t.pending_epoch, t.installed_at, Some(pending_epoch), read_at)
+            }) {
+                guard.remove(&gateway_id);
             }
-            drive_rotation_for(db, change_tx, broker, rotations, gateway_id).await;
+            if !guard.contains_key(&gateway_id) {
+                let prior_active_epoch = keys
+                    .iter()
+                    .find(|(_, _, state)| state == "active")
+                    .map(|(epoch, _, _)| *epoch as u32)
+                    .unwrap_or(0);
+                let now = Instant::now();
+                guard.insert(
+                    gateway_id,
+                    RotationTracker {
+                        pending_epoch,
+                        prior_active_epoch,
+                        started_at: now,
+                        promoted_at: None,
+                        live_acks: BTreeSet::new(),
+                        installed_at: now,
+                    },
+                );
+            }
         }
 
+        // Step 2b: drive the real decision for EVERY gateway in the step-1
+        // set — deliberately NOT nested inside the `pending`-row branch
+        // above. A promoted rotation has no `pending` row and its tracker's
+        // `Retire` is produced by nothing else; see this function's doc
+        // comment. `tokio::sync::Mutex` is not reentrant, so this must run
+        // with the step-2 guard already dropped (it is — the `if let` block
+        // above ends first).
+        drive_rotation_for(db, change_tx, broker, rotations, gateway_id).await;
+
         // Step 3: any `retiring` row(s) with NO in-memory tracker are
-        // orphaned — re-read keys fresh (step 2 above may have just changed
-        // them) before deciding what's still `retiring`.
+        // orphaned — re-read keys fresh before deciding what's still
+        // `retiring`. The re-read is load-bearing, not defensive: step 2b just
+        // above may have retired a row AND removed its tracker in this same
+        // iteration, and that is exactly how two stranded rows converge in one
+        // tick (2b takes the newest, step 3 then sees the older one with no
+        // tracker held).
         let keys = match db.all_keys_for_gateway(gateway_id).await {
             Ok(k) => k,
             Err(e) => {
@@ -661,6 +948,22 @@ pub(crate) async fn sweep_rotations(
             // `decide`'s RETIRE_GRACE — not this sweep's direct path.
             continue;
         }
+        // This path is INTENTIONALLY grace-free, and must stay that way.
+        //
+        // It is reached only when no tracker exists, which means one of:
+        // a controller restart lost the in-memory tracker (crash recovery — the
+        // row is arbitrarily old and its grace expired long ago), or step 2b
+        // just retired a newer epoch and removed its tracker, leaving an OLDER
+        // row behind (whose grace also elapsed, by construction, since it was
+        // stranded by a promote that happened before the one 2b just handled).
+        //
+        // Adding a grace here looks like the obvious fix if you arrive from a
+        // failing two-row convergence test, and it is wrong twice over: it
+        // delays crash recovery for no benefit, and it silently converts a
+        // deterministic single-tick convergence into a timing-dependent one.
+        // The grace that matters is enforced by `decide` rule 1 while a tracker
+        // is alive; by the time control reaches here, there is no tracker whose
+        // clock could still be running.
         for epoch in retiring_epochs {
             match db.retire_epoch(gateway_id, epoch).await {
                 Ok(()) => {
@@ -1245,53 +1548,88 @@ impl Sync for SyncSvc {
         // so the ack advances `peer_gateway_id`'s tracker, recording that
         // `gw.id` has acked, not the other way around.
         //
-        // The `rotations` guard is held across this whole ack-recording
-        // loop (one critical section: read tracker-or-lazily-create-it,
-        // then mutate `live_acks`) so two concurrent `Report` calls acking
-        // the same rotating gateway can't interleave their inserts. It is
-        // then released BEFORE calling `drive_rotation` per touched
-        // rotating gateway below — see `drive_rotation`'s doc comment for
-        // why a single reusable helper can't also be called while this
-        // block still holds the same non-reentrant lock.
+        // The `rotations` guard is held across the whole ack-recording pass
+        // (ONE critical section: tracker-or-lazily-create-it, then mutate
+        // `live_acks`) so two concurrent `Report` calls acking the same
+        // rotating gateway can't interleave their inserts. It is then
+        // released BEFORE calling `drive_rotation` per touched rotating
+        // gateway below — see `drive_rotation`'s doc comment for why a single
+        // reusable helper can't also be called while this block still holds
+        // the same non-reentrant lock.
+        //
+        // The DB read the lazy create needs is deliberately hoisted OUT of
+        // that critical section and out of the per-ack loop. It used to sit
+        // inside both: `all_keys_for_gateway` is a `spawn_blocking` hop, so
+        // the guard — shared by every gateway's rotation, the sweep tick and
+        // every concurrent Report — was parked across one gateway's DB read,
+        // once per ack. Hoisting it also dedupes the read per distinct
+        // rotating gateway rather than repeating it per ack. The record pass
+        // itself is NOT split: both the create and the `live_acks.insert`
+        // still happen under one continuous hold.
         if !req.epoch_acks.is_empty() {
+            // Distinct rotating gateway ids, in first-seen order.
             let mut touched_rotating_gateways: Vec<i64> = Vec::new();
+            for ack in &req.epoch_acks {
+                let rotating_id = ack.peer_gateway_id as i64;
+                if !touched_rotating_gateways.contains(&rotating_id) {
+                    touched_rotating_gateways.push(rotating_id);
+                }
+            }
+
+            // Unlocked: one read per distinct rotating gateway, reduced to
+            // the `(pending_epoch, prior_active_epoch)` seed a lazy create
+            // needs. `None` — no `pending` row, or the read failed — means
+            // "do not create a tracker for this one", exactly as before.
+            let mut seeds: Vec<(i64, Option<(u32, u32)>)> =
+                Vec::with_capacity(touched_rotating_gateways.len());
+            for &rotating_id in &touched_rotating_gateways {
+                let seed = match self.db.all_keys_for_gateway(rotating_id).await {
+                    Ok(keys) => keys
+                        .iter()
+                        .find(|(_, _, state)| state == "pending")
+                        .map(|(pending_epoch, _, _)| {
+                            let prior_active_epoch = keys
+                                .iter()
+                                .find(|(_, _, state)| state == "active")
+                                .map(|(epoch, _, _)| *epoch as u32)
+                                .unwrap_or(0);
+                            (*pending_epoch as u32, prior_active_epoch)
+                        }),
+                    Err(_) => None,
+                };
+                seeds.push((rotating_id, seed));
+            }
+
             {
+                // ONE critical section, NO `.await` inside it.
                 let mut rotations = self.rotations.lock().await;
+
+                for (rotating_id, seed) in &seeds {
+                    if rotations.contains_key(rotating_id) {
+                        continue;
+                    }
+                    if let Some((pending_epoch, prior_active_epoch)) = *seed {
+                        let now = Instant::now();
+                        rotations.insert(
+                            *rotating_id,
+                            RotationTracker {
+                                pending_epoch,
+                                prior_active_epoch,
+                                started_at: now,
+                                promoted_at: None,
+                                live_acks: BTreeSet::new(),
+                                installed_at: now,
+                            },
+                        );
+                    }
+                }
+
                 for ack in &req.epoch_acks {
                     let rotating_id = ack.peer_gateway_id as i64;
-
-                    if !rotations.contains_key(&rotating_id) {
-                        if let Ok(keys) = self.db.all_keys_for_gateway(rotating_id).await {
-                            if let Some((pending_epoch, _, _)) =
-                                keys.iter().find(|(_, _, state)| state == "pending")
-                            {
-                                let prior_active_epoch = keys
-                                    .iter()
-                                    .find(|(_, _, state)| state == "active")
-                                    .map(|(epoch, _, _)| *epoch as u32)
-                                    .unwrap_or(0);
-                                rotations.insert(
-                                    rotating_id,
-                                    RotationTracker {
-                                        pending_epoch: *pending_epoch as u32,
-                                        prior_active_epoch,
-                                        started_at: Instant::now(),
-                                        promoted_at: None,
-                                        live_acks: BTreeSet::new(),
-                                    },
-                                );
-                            }
-                        }
-                    }
-
                     if let Some(tracker) = rotations.get_mut(&rotating_id) {
                         if ack.epoch == tracker.pending_epoch && ack.live {
                             tracker.live_acks.insert(gw.id as u64);
                         }
-                    }
-
-                    if !touched_rotating_gateways.contains(&rotating_id) {
-                        touched_rotating_gateways.push(rotating_id);
                     }
                 }
                 // `rotations` (the guard) drops here.
@@ -1438,4 +1776,392 @@ fn der_to_pem(der: &[u8]) -> String {
     }
     pem.push_str("-----END CERTIFICATE-----\n");
     pem
+}
+
+#[cfg(test)]
+mod tests {
+    //! Deterministic coverage for the two pure decisions the rotation-tracker
+    //! eviction turns on.
+    //!
+    //! # Why these live here and not in `tests/`
+    //!
+    //! The eviction interleaving cannot be pinned through tonic. Everything it
+    //! turns on — the instant a `RotationTracker` was installed relative to the
+    //! instant `all_keys_for_gateway` returned, and whether the entry under the
+    //! lock at write-back time is still the one the caller read — is in-process,
+    //! sub-millisecond, and unaddressable from an RPC client. An integration
+    //! test that "usually" loses the race is worse than no test. So the decision
+    //! is extracted into pure functions and exercised directly, the same way
+    //! `wiremesh_gateway::rotation`'s `overlap_write_back` /
+    //! `new_epoch_watch_keys` are (see
+    //! `crates/wiremesh-gateway/tests/overlap_write_back.rs` for the precedent,
+    //! including its "each axis alone" discipline, followed below).
+    //!
+    //! # The two decisions under test
+    //!
+    //! These were written before the extraction existed, against the signatures
+    //! below, and were red until it landed. Both lift logic that was previously
+    //! inlined in `drive_rotation_for` and duplicated in `sweep_rotations`'
+    //! step 2:
+    //!
+    //! ```ignore
+    //! /// May the held tracker be evicted, given a keys snapshot read at `read_at`?
+    //! fn evict_decision(
+    //!     tracker_pending: u32,
+    //!     tracker_installed_at: Instant,
+    //!     db_pending: Option<u32>,
+    //!     read_at: Instant,
+    //! ) -> bool;
+    //!
+    //! /// The full identity of ONE tracker — the peer id alone is not enough.
+    //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    //! struct TrackerToken { pending_epoch: u32, installed_at: Instant }
+    //!
+    //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    //! enum WriteBack { Apply, Replaced, Vanished }
+    //!
+    //! fn tracker_write_back(taken: TrackerToken, current: Option<TrackerToken>) -> WriteBack;
+    //! ```
+    //!
+    //! The NAMES here are this test author's proposal and the implementer may
+    //! change them; the CASES and their verdicts are the contract and must not
+    //! be weakened to fit whatever gets built.
+    //!
+    //! # And what the verdicts DO
+    //!
+    //! A verdict is only half the contract — `Replaced` and `Vanished` differ
+    //! today only in a log string, so pinning the labels alone would be close
+    //! to restating a derived `PartialEq`. The final group drives the real
+    //! [`apply_tracker_effect`] against a hand-built `rotations` map and
+    //! asserts the resulting map state: a stale promote must not stamp a newer
+    //! tracker, a stale finish must not remove one, and a vanished entry must
+    //! not be resurrected. Those are the branches an integration test cannot
+    //! reach (see that group's comment), and they need no test-only production
+    //! hook because `apply_tracker_effect` depends on nothing but the map.
+
+    use super::*;
+    use std::time::Duration;
+
+    /// A reference "the DB snapshot was read at this instant" clock, plus the
+    /// two relative instants every case below needs.
+    fn read_at() -> Instant {
+        // A fixed base far enough into this process's monotonic clock that
+        // `before()` cannot underflow.
+        Instant::now() + Duration::from_secs(3600)
+    }
+    /// An instant strictly BEFORE the snapshot read — a tracker that was
+    /// already installed when the keys were fetched, so the snapshot is
+    /// authoritative about it.
+    fn before(t: Instant) -> Instant {
+        t - Duration::from_secs(5)
+    }
+    /// An instant strictly AFTER the snapshot read — a tracker installed while
+    /// the caller was awaiting its DB read, which the snapshot therefore knows
+    /// nothing about.
+    fn after(t: Instant) -> Instant {
+        t + Duration::from_millis(1)
+    }
+
+    // --- evict_decision --------------------------------------------------
+
+    /// THE #28 FIX. A tracker installed AFTER the keys snapshot was taken
+    /// describes a rotation that snapshot predates, so the snapshot's
+    /// `db_pending` is stale with respect to it and can say nothing about
+    /// whether it is stale. Evicting on that evidence destroys a rotation that
+    /// has just started — its acks are then discarded (they fail the
+    /// `ack.epoch == tracker.pending_epoch` test in `report`) and its
+    /// `started_at` restarts.
+    #[test]
+    fn tracker_installed_after_the_snapshot_read_is_never_evicted() {
+        let t = read_at();
+        assert!(
+            !evict_decision(7, after(t), Some(9), t),
+            "the tracker was installed AFTER the keys snapshot was read, so the snapshot's \
+             pending epoch is older than the tracker and cannot prove it stale — evicting \
+             here tears down a rotation that started during the caller's own await"
+        );
+    }
+
+    /// The tracker predates the snapshot AND names a different pending epoch
+    /// than the DB currently holds: a previous rotation's tracker left behind
+    /// while a newer rotation is genuinely in flight. This is the case the
+    /// eviction exists for, so it must be reachable — an implementation that
+    /// never evicts lets `decide`'s rule 1 short-circuit on the old tracker's
+    /// `promoted_at` and the new rotation never sees an ack.
+    #[test]
+    fn stale_tracker_disagreeing_with_the_db_pending_row_is_evicted() {
+        let t = read_at();
+        assert!(
+            evict_decision(7, before(t), Some(9), t),
+            "a tracker installed before the snapshot that names epoch 7 while the DB's \
+             pending row is epoch 9 is a previous rotation's leftover and must be evicted"
+        );
+    }
+
+    /// Agreement is not eviction. The ordinary steady state of an in-flight
+    /// rotation.
+    #[test]
+    fn tracker_agreeing_with_the_db_pending_row_is_kept() {
+        let t = read_at();
+        assert!(
+            !evict_decision(7, before(t), Some(7), t),
+            "the tracker names the same epoch as the DB's pending row — this is the ordinary \
+             in-flight rotation and evicting it would reset started_at and drop every ack \
+             already recorded"
+        );
+    }
+
+    /// LOAD-BEARING. `db_pending == None` is the STRANDED-POST-PROMOTE state:
+    /// the promote already committed (so there is no `pending` row left) and
+    /// the tracker still owes a `RotationDecision::Retire` for its prior
+    /// active epoch, `RETIRE_GRACE` after the promote.
+    ///
+    /// A plain inequality (`Some(tracker_pending) != db_pending`) evicts here,
+    /// which does NOT merely lose bookkeeping: with no tracker held,
+    /// `sweep_rotations`' step-3 orphan path stops skipping the gateway, and
+    /// that path deletes `retiring` rows IMMEDIATELY with no grace at all. The
+    /// 30s `RETIRE_GRACE` collapses to ~0 on every normal rotation, and every
+    /// peer still finishing its handshake on the old key loses it — a
+    /// make-before-break violation on the fabric's most routine operation.
+    #[test]
+    fn no_db_pending_epoch_never_evicts() {
+        let t = read_at();
+        assert!(
+            !evict_decision(7, before(t), None, t),
+            "COLLAPSED RETIRE_GRACE: the DB has no pending epoch, which IS the \
+             stranded-post-promote state — that tracker still owes its prior epoch's Retire \
+             30s after the promote. Evicting it hands the retire to sweep_rotations' orphan \
+             path, which deletes immediately, so RETIRE_GRACE goes from 30s to ~0 on every \
+             normal rotation and peers still on the old key are cut off mid-handshake. \
+             `db_pending == None` must be an unconditional keep"
+        );
+    }
+
+    /// The same rule with the OTHER input axis varied, so an implementation
+    /// that happens to keep the case above for an unrelated reason (e.g. by
+    /// treating `None` as equal to the tracker's own epoch) still has to get
+    /// it right in general: no `db_pending`, no eviction, whatever the
+    /// tracker's epoch is.
+    #[test]
+    fn no_db_pending_epoch_never_evicts_for_any_tracker_epoch() {
+        let t = read_at();
+        for tracker_pending in [0u32, 1, 7, 4242] {
+            assert!(
+                !evict_decision(tracker_pending, before(t), None, t),
+                "no pending row in the DB must mean no eviction regardless of the tracker's \
+                 own pending epoch ({tracker_pending}) — see \
+                 `no_db_pending_epoch_never_evicts` for what evicting here costs"
+            );
+        }
+    }
+
+    /// And with the timing axis varied too: a tracker installed after the read
+    /// with no DB pending row is doubly protected, and must stay kept.
+    #[test]
+    fn no_db_pending_epoch_never_evicts_even_for_a_freshly_installed_tracker() {
+        let t = read_at();
+        assert!(
+            !evict_decision(7, after(t), None, t),
+            "neither of the two reasons to keep a tracker (installed after the read; no DB \
+             pending row) may be turned into a reason to evict by the presence of the other"
+        );
+    }
+
+    // --- tracker_write_back ----------------------------------------------
+
+    fn token(pending_epoch: u32, installed_at: Instant) -> TrackerToken {
+        TrackerToken { pending_epoch, installed_at }
+    }
+
+    /// The ordinary case: nothing moved while the caller was awaiting, so the
+    /// conclusion it computed is about the entry that is still there. `Apply`
+    /// has to be reachable — a gate that never applies would be "safe" and
+    /// would also mean no tracker ever records a promote or an ack.
+    #[test]
+    fn unchanged_entry_applies() {
+        let t = read_at();
+        let taken = token(7, before(t));
+        assert_eq!(
+            tracker_write_back(taken, Some(taken)),
+            WriteBack::Apply,
+            "the entry under the lock is the same tracker the caller read; refusing the \
+             write-back here would stall every rotation"
+        );
+    }
+
+    /// THE EPOCH AXIS, ALONE. Same install instant, different pending epoch —
+    /// the gateway re-rotated and a new tracker was inserted while the caller
+    /// awaited. An implementation comparing only `installed_at` returns
+    /// `Apply` here and writes the old rotation's `promoted_at`/`live_acks`
+    /// onto the new one.
+    #[test]
+    fn different_epoch_same_install_instant_is_replaced() {
+        let t = read_at();
+        let installed = before(t);
+        assert_eq!(
+            tracker_write_back(token(7, installed), Some(token(9, installed))),
+            WriteBack::Replaced,
+            "the entry under the lock tracks a DIFFERENT pending epoch — applying the \
+             caller's conclusions to it would credit one rotation's acks (or its promote) to \
+             another"
+        );
+    }
+
+    /// THE INSTANT AXIS, ALONE. Same pending epoch, different install instant
+    /// — the tracker was evicted and rebuilt toward the SAME epoch number
+    /// while the caller awaited (a lazy rebuild in `sweep_rotations`, or a
+    /// controller whose epoch numbering repeats). An implementation comparing
+    /// only `pending_epoch` returns `Apply` here and writes a
+    /// `promoted_at`/ack set belonging to the torn-down tracker onto the fresh
+    /// one, which then either retires early or never retires at all.
+    #[test]
+    fn same_epoch_different_install_instant_is_replaced() {
+        let t = read_at();
+        assert_eq!(
+            tracker_write_back(token(7, before(t)), Some(token(7, after(t)))),
+            WriteBack::Replaced,
+            "the epoch number matches but this is a DIFFERENT tracker instance — a rebuild \
+             toward the same epoch must not inherit the previous instance's promoted_at or \
+             live_acks"
+        );
+    }
+
+    /// The entry is gone: the rotation completed (retired/aborted) while the
+    /// caller was awaiting.
+    #[test]
+    fn missing_entry_vanished() {
+        let t = read_at();
+        assert_eq!(
+            tracker_write_back(token(7, before(t)), None),
+            WriteBack::Vanished,
+            "no entry under the lock at all — the write-back must not resurrect a tracker \
+             for a rotation that has already finished"
+        );
+    }
+
+    // --- apply_tracker_effect: the verdicts AS ACTED ON --------------------
+    //
+    // The four cases above pin the verdict; these pin what the caller does
+    // with it, which is where the damage would actually land. They matter
+    // because `apply_tracker_effect` is the only consumer, and its `Replaced`
+    // and `Vanished` arms are unreachable from any integration test: the
+    // window they cover is between `drive_rotation_for` releasing the guard
+    // and re-taking it, spanned only by one `spawn_blocking` SQLite CAS. No
+    // RPC client can land a competing mutation inside it.
+    //
+    // `apply_tracker_effect` needs nothing but the shared map — no DB, no
+    // broker, no controller — so these drive the real function directly rather
+    // than restating it.
+
+    fn tracker(pending_epoch: u32, installed_at: Instant) -> RotationTracker {
+        RotationTracker {
+            pending_epoch,
+            prior_active_epoch: 0,
+            started_at: installed_at,
+            promoted_at: None,
+            live_acks: BTreeSet::new(),
+            installed_at,
+        }
+    }
+
+    fn map_with(entries: Vec<(i64, RotationTracker)>) -> Arc<Mutex<HashMap<i64, RotationTracker>>> {
+        Arc::new(Mutex::new(entries.into_iter().collect()))
+    }
+
+    const GW: i64 = 42;
+
+    /// `Apply`, acted on: the promote stamp lands. Without this, the tests
+    /// below are all satisfied by an `apply_tracker_effect` that does nothing
+    /// at all — which would leave `promoted_at` permanently `None`, so
+    /// `decide`'s rule 1 never fires and the retire this whole branch exists
+    /// to drive never happens.
+    #[tokio::test]
+    async fn apply_stamps_promoted_at_on_the_same_tracker() {
+        let t = read_at();
+        let rotations = map_with(vec![(GW, tracker(7, before(t)))]);
+        let taken = token(7, before(t));
+
+        apply_tracker_effect(&rotations, GW, taken, TrackerEffect::Promoted).await;
+
+        let guard = rotations.lock().await;
+        assert!(
+            guard
+                .get(&GW)
+                .expect("the tracker must still be present after a Promoted effect")
+                .promoted_at
+                .is_some(),
+            "the entry is the same instance the decision was computed from, so the promote \
+             stamp must land — otherwise RETIRE_GRACE never starts and no rotation ever retires"
+        );
+    }
+
+    /// `Replaced`, acted on — THE PROMOTE CASE. A newer rotation's tracker now
+    /// occupies the slot. Stamping ITS `promoted_at` from the old rotation's
+    /// decision would make `decide`'s rule 1 short-circuit the new rotation
+    /// immediately into a `Retire` of the wrong epoch, and its pending epoch
+    /// would never promote.
+    #[tokio::test]
+    async fn replaced_promote_does_not_stamp_the_newer_tracker() {
+        let t = read_at();
+        let rotations = map_with(vec![(GW, tracker(9, after(t)))]);
+        let stale = token(7, before(t));
+
+        apply_tracker_effect(&rotations, GW, stale, TrackerEffect::Promoted).await;
+
+        let guard = rotations.lock().await;
+        let current = guard
+            .get(&GW)
+            .expect("a Replaced write-back must leave the newer tracker in place");
+        assert_eq!(
+            current.pending_epoch, 9,
+            "the newer rotation's tracker must survive untouched"
+        );
+        assert!(
+            current.promoted_at.is_none(),
+            "the newer rotation has NOT promoted — crediting it with the previous rotation's \
+             promote sends decide()'s rule 1 straight to a Retire of the wrong epoch and the \
+             new pending epoch never promotes"
+        );
+    }
+
+    /// `Replaced`, acted on — THE FINISHED CASE. The blind `remove` this gate
+    /// replaced would delete a live rotation's tracker, discarding its
+    /// accumulated acks and restarting its 90s clock.
+    #[tokio::test]
+    async fn replaced_finish_does_not_remove_the_newer_tracker() {
+        let t = read_at();
+        let rotations = map_with(vec![(GW, tracker(9, after(t)))]);
+        let stale = token(7, before(t));
+
+        apply_tracker_effect(&rotations, GW, stale, TrackerEffect::Finished).await;
+
+        let guard = rotations.lock().await;
+        assert_eq!(
+            guard.get(&GW).map(|t| t.pending_epoch),
+            Some(9),
+            "a finished OLD rotation must not evict the tracker of the NEW one that replaced \
+             it — doing so discards the new rotation's live_acks and restarts its clock"
+        );
+    }
+
+    /// `Vanished`, acted on: nothing is created. Both effects go through the
+    /// same arm, and `Promoted`'s `get_mut` would be a silent no-op anyway —
+    /// so this is really a guard against a future `insert`/`entry().or_*`
+    /// rewrite resurrecting a tracker for a rotation that is already over,
+    /// which would then wedge the gateway in `gateways_with_rotation_state`.
+    #[tokio::test]
+    async fn vanished_write_back_creates_nothing() {
+        let t = read_at();
+        let taken = token(7, before(t));
+
+        for effect in [TrackerEffect::Promoted, TrackerEffect::Finished] {
+            let rotations = map_with(vec![]);
+            apply_tracker_effect(&rotations, GW, taken, effect).await;
+            assert!(
+                rotations.lock().await.is_empty(),
+                "the entry was already gone when the {effect:?} write-back arrived — it must \
+                 not be resurrected"
+            );
+        }
+    }
 }
