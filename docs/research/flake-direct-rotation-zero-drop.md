@@ -81,3 +81,27 @@ one uncaptured `key_rotation` failure (2026-08-04, item-2 verification).
 
 Only the clean-HEAD rows characterise the flake. The sabotage rows are recorded so nobody
 re-derives them as new sightings, not as evidence about the margin.
+
+
+## 2026-08-06 — three consecutive clean-HEAD runs on `fix/rotation-port-authority`
+
+Three back-to-back full-suite runs at `79447e9`, deliberately repeated to check the newly
+green rotate-twice case for flakiness (it was identical all three times):
+
+| run | result | margin |
+|---|---|---|
+| 3.1 | `transmitted=13 received=11 (gap 2 <= 3)` | 1 to spare |
+| 3.2 | `transmitted=13 received=11 (gap 2 <= 3)` | 1 to spare |
+| 3.3 | `transmitted=13 received=10 (gap 3 <= 3)` | **exactly at the limit** |
+
+**3.3 is the thinnest clean-HEAD margin recorded so far** — one further dropped echo would
+have failed it. Nothing on that branch touches this case's path; the three runs differ only
+in generated keys and RTT jitter. Recorded as a data point, not acted on: the standing owner
+decision is to **characterise this flake, not widen the tolerance**, and widening it now —
+while the branch it appeared on is being merged — would be exactly the move that decision
+exists to prevent.
+
+Worth noting the branch *does* change rotation timing generally (renormalization adds a port
+move at retire; the first post-cutover grace is usually aborted once, see task #25), so a
+future sighting should check whether the distribution has shifted rather than assuming this
+is the same flake.
