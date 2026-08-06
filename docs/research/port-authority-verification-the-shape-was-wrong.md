@@ -62,6 +62,12 @@ The moment that actually clobbers is not the cutover. It is the **collapse-arm a
     is open. A bad roam is transient today; pinning it durably would amplify it.
 - **Parsing is trivial**; the cost is that `PeerGetInfo` and the public `PeerLiveness` lose
   `Copy`, so `main.rs:2791`'s `.copied()` and friends become `.cloned()`. ~1 hour.
+  - > **CORRECTED 2026-08-06, while building piece 1.** No `Copy` was lost, and the
+    > predicted call-site churn was zero. The endpoint is parsed into
+    > `Option<SocketAddr>`, not `Option<String>` — which both validates the value at the
+    > boundary (an unparsable endpoint must never become a durable pin) and keeps the
+    > structs `Copy`, since `SocketAddr` is itself `Copy`. `run_path_ticks` still reads
+    > `liveness.get(&hex).copied()`; not one `.copied()` became a `.cloned()`.
 - **No proto change is required** — *provided* renormalization lands. boringtun's `api_set`
   handles `listen_port` by rebinding the socket; it calls `peer.shutdown_endpoint()` but
   **does not reset noise sessions** the way `set_key` does, and both boringtun

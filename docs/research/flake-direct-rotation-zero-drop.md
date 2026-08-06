@@ -94,8 +94,9 @@ green rotate-twice case for flakiness (it was identical all three times):
 | 3.2 | `transmitted=13 received=11 (gap 2 <= 3)` | 1 to spare |
 | 3.3 | `transmitted=13 received=10 (gap 3 <= 3)` | **exactly at the limit** |
 
-**3.3 is the thinnest clean-HEAD margin recorded so far** — one further dropped echo would
-have failed it. Nothing on that branch touches this case's path; the three runs differ only
+**3.3 ties the thinnest clean-HEAD margin recorded so far** — gap 3, the same as the
+full-suite run at `ca218cf` (see the table above and the gap-2/3/2/2 sequence). One further
+dropped echo would have failed it. It is a second sighting at the limit, not a new low. Nothing on that branch touches this case's path; the three runs differ only
 in generated keys and RTT jitter. Recorded as a data point, not acted on: the standing owner
 decision is to **characterise this flake, not widen the tolerance**, and widening it now —
 while the branch it appeared on is being merged — would be exactly the move that decision
