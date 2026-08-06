@@ -9,7 +9,7 @@ using it: what is committed, and the merge driver you have to install yourself.
 
 ## What is committed, and why
 
-```
+```text
 graphify-out/cache/semantic/    TRACKED — the LLM extraction pass (~718K tokens to rebuild)
 graphify-out/manifest.json      TRACKED — drives incremental `graphify update`
 graphify-out/*                  ignored — regenerable at no cost
@@ -27,7 +27,7 @@ diff is large and mechanical, and mixing it with a real change buries the change
 
 `.gitattributes` contains:
 
-```
+```text
 graphify-out/graph.json merge=graphify
 ```
 
@@ -55,6 +55,11 @@ git config merge.graphify.driver \
 
 If graphify was installed with `uv tool`, point at that interpreter instead — `uv tool run
 --from graphifyy python -c 'import sys; print(sys.executable)'` prints the right path.
+
+> `graphifyy` with two y's is **correct** and is not a typo: the PyPI distribution is
+> `graphifyy`, and the executable it installs is `graphify`. `uv tool list` shows
+> `graphifyy v0.9.x` providing `graphify`. Automated reviewers flag this as a misspelling;
+> "fixing" it breaks the command, because there is no `graphify` package to install from.
 
 Verify with `git config --get merge.graphify.driver`. Empty output means the driver is not
 installed and you will get the fallback described above.
