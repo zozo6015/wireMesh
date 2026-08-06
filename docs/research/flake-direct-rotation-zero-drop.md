@@ -106,3 +106,97 @@ Worth noting the branch *does* change rotation timing generally (renormalization
 move at retire; the first post-cutover grace is usually aborted once, see task #25), so a
 future sighting should check whether the distribution has shifted rather than assuming this
 is the same flake.
+
+
+## 2026-08-06 — the prediction came true, and a controlled A/B rewrote the distribution
+
+The §"Why it matters" line above — *"a CI flake waiting to happen on a busier machine, and
+it will look like a rotation regression when it fires"* — is exactly what happened, right
+down to the misattribution.
+
+### How it presented
+
+A verification run of `82d5355` (the F1 lock-ordering fix on `fix/rotation-port-authority`)
+came back **2 failures in 4 runs, at gap 9 and gap 6** — wildly outside the 2/2/3 the same
+suite had produced three runs earlier at `910182d`. The only behavioural change in that
+commit is moving one `ctx.active` read inside the `endpoint_commit` critical section, in the
+endpoint-install hot path. It looked like a regression in exactly the way this document
+warned it would.
+
+Two things stopped it being recorded as one. `relay_matrix`'s `case4` — unrelated to the
+change — also failed once and passed twice in the same batch, and the relay suite took 305s
+on the red run versus 228s on a green one. That is a load signature, not a code signature.
+
+### The experiment
+
+12 runs of the single test, **strictly interleaved** control/treatment (B,A,B,A,…), starting
+with the control so any warm-up cost landed on the control rather than flattering the
+treatment. Interleaving is the whole point: running all of one arm then all of the other
+lets load drift masquerade as an effect.
+
+- **A (treatment)** = `93b899b`, contains F1.
+- **B (control)** = `910182d`, identical but for the lock ordering (everything else in the
+  delta is doc comments and one `eprintln!` string).
+
+| # | arm | verdict | tx | rx | gap | window | in-suite |
+|---|---|---|---|---|---|---|---|
+| 1 | B | PASS | 13 | 11 | 2 | 2425 ms | 5.73s |
+| 2 | A | **FAIL** | 23 | 19 | 4 | 5213 ms | 8.40s |
+| 3 | B | **FAIL** | 19 | 13 | 6 | 3689 ms | 6.69s |
+| 4 | A | PASS | 16 | 13 | 3 | 3073 ms | 5.67s |
+| 5 | B | **FAIL** | 13 | 9 | 4 | 2447 ms | 5.12s |
+| 6 | A | PASS | 13 | 11 | 2 | 2436 ms | 5.35s |
+| 7 | B | **FAIL** | 16 | 11 | 5 | 3056 ms | 6.66s |
+| 8 | A | PASS | 13 | 10 | 3 | 2443 ms | 5.43s |
+| 9 | B | PASS | 13 | 10 | 3 | 2436 ms | 5.93s |
+| 10 | A | **FAIL** | 13 | 9 | 4 | 2435 ms | 5.08s |
+| 11 | B | PASS | 13 | 11 | 2 | 2432 ms | 5.15s |
+| 12 | A | PASS | 13 | 10 | 3 | 2436 ms | 5.14s |
+
+Host load was constant and high throughout: load average 8.49 → 7.67, 15-minute average
+9.8–12.1, with three kind k8s nodes and three buildkit containers resident for two days.
+
+### Result: F1 exonerated
+
+- **A: 4 pass / 2 fail.** Gaps 4, 3, 2, 3, 4, 3 (mean 3.17, max 4).
+- **B: 3 pass / 3 fail.** Gaps 2, 6, 4, 5, 3, 2 (mean 3.67, max 6).
+
+The **control failed more often and produced the single worst gap in the experiment.**
+Excluding the two control runs that carried residual compile load (1 and 3) leaves B at 2
+fails of 4 — same direction. There is no detectable difference between the arms.
+
+### What the distribution actually is
+
+This is the part that supersedes the earlier framing. **Under load this test fails ~42% of
+the time** (5 of 12), at `910182d` as much as on the branch. Every prior characterisation in
+this document was taken on a quieter machine; "the margin is one packet" understated it. The
+honest statement is: *on a loaded host this assertion is close to a coin flip, and a green
+run is not evidence of anything.*
+
+Two structural facts, both new:
+
+1. **The flood window is not an independent variable.** It is essentially `tx × ~190 ms`
+   (2425/13, 3056/16, 3689/19 all land at 187–194 ms/packet). A "long window" just means the
+   rotation took longer and the flood emitted more packets. So correlating gap against window
+   is close to correlating gap against rotation duration.
+2. **Long rotations skew high, but failure also fires at the floor.** Of the 4 runs with a
+   window >2.5s, 3 failed. But among the 8 runs pinned at the ~2435 ms floor (`tx=13`), gaps
+   still spread 2–4 and **two failed** — one in each arm. Pooled Pearson r ≈ +0.49, and
+   largely carried by two points.
+
+Fact 2 matters for diagnosis: **any hypothesis that only explains a stretched rotation
+window is incomplete.** That specifically weakens (does not kill) the idea that the blocking
+UAPI write inside `endpoint_commit` at `main.rs:3768` is the cause — see task #29. It would
+lengthen the window; it does not obviously produce gap 4 at the minimum window.
+
+### Still not fixed, still do not widen the tolerance
+
+Nothing here is a reason to touch the assertion. What changed is the evidence available to
+whoever does fix it: there is now a 12-run interleaved dataset with load recorded, a
+measured per-packet cadence, and a live constraint (must explain floor-window failures) that
+any proposed mechanism has to satisfy.
+
+Operational consequence in the meantime: **a single green `key_rotation` run means little on
+a loaded host.** Judge this case over several runs, and treat one red in isolation as
+uninformative rather than as a regression — which is the mistake this document exists to
+prevent, and which it very nearly failed to prevent today.
