@@ -326,6 +326,28 @@ pub fn apply(ifname: &str, cfg: &DeviceConfig) -> anyhow::Result<()> {
 /// reset: our datagrams now leave from `port`, and each peer's boringtun roams
 /// its endpoint for us on the first one it authenticates. The caller is
 /// expected to prompt that rather than wait for the 25s keepalive.
+///
+/// # Failure posture: an `Err` here is a DATA-PLANE OUTAGE, not a no-op
+///
+/// `open_listen_socket` is **not** atomic. It closes `udp4` **and** `udp6` and
+/// calls `shutdown_endpoint()` on every peer BEFORE attempting either bind, and
+/// assigns `self.udp4`/`self.udp6` only at the very end (boringtun 0.6.0,
+/// `device/mod.rs`). Any error in between — `Socket::new(Domain::IPV6, ..)` on
+/// a host with IPv6 disabled, an `EADDRINUSE` from a v4 or v6 conflict,
+/// `ENFILE` — surfaces here while leaving the Device with `udp4 = None,
+/// udp6 = None`: **deaf and mute on every port**, receiving nothing and able to
+/// send nothing, for every peer.
+///
+/// So an `Err` from this call does NOT mean "the device stayed on its old
+/// port". It means the device may hold no port at all, and only a process
+/// restart recovers it — there is no in-process retry. Callers must report it
+/// that way; `TunnelSet::set_listen_port` correctly declines to update its
+/// recorded port on an error, but that record is then describing a port the
+/// Device is not necessarily listening on either.
+///
+/// The specific `EADDRINUSE`-against-the-observe-probe case IS ruled out, by
+/// the `SO_REUSEADDR` reasoning above; it is every OTHER error that is
+/// unsurvivable.
 pub fn set_listen_port(ifname: &str, port: u16) -> anyhow::Result<()> {
     // Trailing blank line terminates the request (see `send_set`).
     send_set(ifname, &format!("listen_port={port}\n\n"))

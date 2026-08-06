@@ -2222,19 +2222,31 @@ async fn set_peer_endpoint(
     endpoint: SocketAddr,
     is_relay: bool,
 ) -> anyhow::Result<bool> {
-    // Resolve the ACTIVE tun (ifname + priv key + port), captured together so
-    // the device we build and the ifname we apply it to are consistent even if
-    // a cutover flips `active` concurrently.
-    let (ifname, priv_key, wg_port) = {
-        let a = ctx.active.lock().unwrap();
-        (a.ifname.clone(), a.priv_key.clone(), a.wg_port)
-    };
-
     // MAJOR-1: hold the endpoint-commit lock across the ENTIRE guard+write, so
     // the direct-punch and relay-install endpoint writes are mutually exclusive
     // and cannot interleave. A `tokio::sync::Mutex`, so it is safe to hold
     // across the `spawn_blocking` UAPI write inside `apply_peer_endpoint_scoped`.
     let _commit = ctx.endpoint_commit.lock().await;
+
+    // Resolve the ACTIVE tun (ifname + priv key + port), captured together so
+    // the device we build and the ifname we apply it to are consistent even if
+    // a cutover flips `active` concurrently.
+    //
+    // Read INSIDE the commit section, deliberately (port-authority review F1).
+    // This lock is held across UAPI round-trips, so waiters really do queue:
+    // read before acquiring and a `renormalize_active_listen_port` that takes
+    // the lock ahead of us — it moves the device to the base port, sets
+    // `a.wg_port`, and rewrites `applied_config`'s header — would leave us
+    // building `dev` from a stale OFFSET `wg_port`. `apply_peer_endpoint_scoped`
+    // re-derives `applied_config` from `dev`'s header, so the guard would then
+    // describe a `listen_port` the device is not on, and the next `apply_state`
+    // would see `header_matches == false` and take the full `replace_peers`
+    // apply — destroying EVERY peer's noise session seconds after a retire.
+    // Reading here makes the snapshot as new as the lock we hold.
+    let (ifname, priv_key, wg_port) = {
+        let a = ctx.active.lock().unwrap();
+        (a.ifname.clone(), a.priv_key.clone(), a.wg_port)
+    };
 
     // MAJOR-1 atomic guard (DIRECT path only): abort — WITHOUT touching the
     // device or any pin — the moment the peer has left `Connecting` or a relay
@@ -3456,6 +3468,22 @@ fn device_header(encoded: &str) -> &str {
 /// the UAPI device apply and the route diff are fast AND must stay ordered
 /// with peer events, so deferring them would trade a stall for a
 /// correctness problem.
+///
+/// # Do not call this from a spawned task
+///
+/// This reads `active`'s `wg_port` and builds `dev` from it WITHOUT holding
+/// `endpoint_commit`, then writes the change-guard from that `dev` — the exact
+/// shape that was bug F1 in `set_peer_endpoint` (see the comment there). It is
+/// safe here only because of WHERE it is called from: boot, before the run
+/// loop exists, and the run-task loop, which is the same loop that owns
+/// `service_retire` — so it can never interleave with the
+/// `renormalize_active_listen_port` that would invalidate the snapshot. That
+/// is a STRUCTURAL guarantee, not a locked one. Calling this from a spawned
+/// task reintroduces F1 verbatim: a stale offset `wg_port` reaches the guard,
+/// `header_matches` goes false, and the next apply takes the full
+/// `replace_peers` path, destroying every peer's noise session. If this ever
+/// needs to move off that loop, take `endpoint_commit` first and read `active`
+/// under it.
 async fn apply_state(
     prev: Option<&DesiredState>,
     ds: &DesiredState,
@@ -3670,13 +3698,32 @@ async fn retarget_relay_transports(
 ///
 /// # Failure posture
 ///
-/// Everything is ordered so a failure leaves a COHERENT state rather than a
-/// half-moved one. The UAPI write + the `TunnelSet` record go first
-/// (`TunnelSet::set_listen_port` does both, or neither); only once the device
-/// has really moved are `ActiveTunInfo::wg_port` and the change-guard
-/// published. A failed move therefore leaves the gateway exactly where it was —
-/// on the offset port, i.e. today's behaviour — instead of advertising a port
-/// it is not on.
+/// Everything is ordered so a failure leaves a COHERENT *bookkeeping* state
+/// rather than a half-moved one. The UAPI write + the `TunnelSet` record go
+/// first (`TunnelSet::set_listen_port` does both, or neither); only once the
+/// device has really moved are `ActiveTunInfo::wg_port` and the change-guard
+/// published. So a failed move never leaves us ADVERTISING a port the device
+/// is not on.
+///
+/// It does **not** mean the gateway is left where it was. Read from boringtun
+/// 0.6.0 (`device/mod.rs`, `open_listen_socket`): the old `udp4` **and** `udp6`
+/// are closed and `shutdown_endpoint()` is called on every peer BEFORE either
+/// new bind is attempted, and `self.udp4`/`self.udp6` are only assigned at the
+/// very end. Any error in between — `Socket::new(Domain::IPV6, ..)` on a host
+/// with IPv6 disabled, an `EADDRINUSE` from a v4 or v6 conflict, `ENFILE` —
+/// returns to the UAPI caller with the Device holding `udp4 = None,
+/// udp6 = None`: **deaf and mute on every port**, not sitting on the offset
+/// one. `TunnelSet::set_listen_port` then correctly declines to update its
+/// record, `a.wg_port` stays on the offset, nothing here retries, and the next
+/// rotation additionally hard-fails on the still-reserved port. That is a full
+/// data-plane outage requiring a process restart, which is why the failure log
+/// below says so. (Retry/recovery is deliberately NOT attempted here.)
+///
+/// The one failure mode specifically ruled out is a conflict with the observe
+/// probe: `observe::reuseport_udp` sets both `SO_REUSEADDR` and `SO_REUSEPORT`,
+/// boringtun sets `set_reuse_address(true)` on both of its sockets, and Linux
+/// skips the UDP bind conflict check when both sockets carry `sk_reuse` — so an
+/// in-flight probe cannot make this fail. See [`uapi::set_listen_port`].
 ///
 /// # Why the change-guard MUST be re-seeded here
 ///
@@ -3721,10 +3768,14 @@ async fn renormalize_active_listen_port(
         if let Err(e) = tunnels.set_listen_port(id, base_wg_port) {
             eprintln!(
                 "wiremesh-gateway: CRITICAL: could not renormalize {ifname} from listen port \
-                 {from} back to the base port {base_wg_port}: {e:#} — the active key stays on \
-                 {from}, which NO durable candidate (controller-observed endpoint, reported \
-                 locals, punch candidates) advertises, so peers that lose their live pin cannot \
-                 re-address this gateway without a restart"
+                 {from} back to the base port {base_wg_port}: {e:#} — RESTART THE GATEWAY. \
+                 boringtun closes its old UDP sockets BEFORE it rebinds, so a failed move can \
+                 leave {ifname} bound to NO port at all: deaf and mute on every port, all peers \
+                 dead, and nothing here retries. Even in the milder case where the device is \
+                 still on {from}, that port is advertised by NO durable candidate \
+                 (controller-observed endpoint, reported locals, punch candidates), so peers \
+                 that lose their live pin cannot re-address this gateway — and the next rotation \
+                 will additionally fail to allocate {base_wg_port}. Both outcomes need a restart"
             );
             return;
         }

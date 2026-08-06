@@ -519,11 +519,15 @@ impl TunnelSet {
     /// both misdirect the next rotation's allocation and arm a rebuild that
     /// silently moves the Device back.
     ///
-    /// The device write goes first: if it fails, the record still describes
-    /// reality and the caller can decline to publish the new port anywhere
-    /// else. A no-op when the Device is already on `port`; an error (with the
-    /// record untouched) when `id` is absent or a DIFFERENT live entry already
-    /// holds `port` — this never silently evicts another Device from a port.
+    /// The device write goes first: if it fails, the record is left untouched
+    /// and the caller can decline to publish the new port anywhere else. Note
+    /// that "untouched" is a bookkeeping guarantee only — a failed
+    /// [`uapi::set_listen_port`] can leave the Device bound to NO port at all
+    /// (see its failure-posture section), so the retained record is not a
+    /// promise the Device is still reachable on it. A no-op when the Device is
+    /// already on `port`; an error (with the record untouched) when `id` is
+    /// absent or a DIFFERENT live entry already holds `port` — this never
+    /// silently evicts another Device from a port.
     pub fn set_listen_port(&mut self, id: TunnelId, port: u16) -> anyhow::Result<()> {
         let (ifname, current) = {
             let tunnel = self.tunnels.get(&id).ok_or_else(|| {
