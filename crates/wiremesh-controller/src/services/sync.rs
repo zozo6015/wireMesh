@@ -726,6 +726,18 @@ pub(crate) async fn drive_rotation_for(
                     );
                 }
             }
+            // DO NOT "clean up" the tracker here. This `Err` cannot be told
+            // apart from a transient DB error at this call site (both arrive as
+            // `anyhow`), so reacting by removing the tracker would ALSO fire on
+            // a blip — and a removed tracker hands any live `retiring` row
+            // straight to `sweep_rotations`' step-3 orphan path, which deletes
+            // grace-free. That collapses `RETIRE_GRACE` from 30s to ~0 on a
+            // normal rotation. Leaving the tracker in place costs one retry on
+            // the next sweep tick; removing it costs make-before-break. See
+            // `evict_decision`, whose `None`-means-keep leg exists for the same
+            // reason and IS unit-pinned. If you need to distinguish a CAS bail
+            // from an error, make `retire_epoch` return that distinction —
+            // do not infer it here.
             Err(e) => eprintln!(
                 "wiremesh-controller: retire_epoch({rotating_gateway_id}, {epoch}) failed: {e}"
             ),
@@ -748,6 +760,13 @@ pub(crate) async fn drive_rotation_for(
                         );
                     }
                 }
+                // Same rule as the `Retire` arm above: do NOT remove the
+                // tracker on this `Err`. Indistinguishable from a transient DB
+                // error, and the removal is what reaches the grace-free orphan
+                // path. (An aborting tracker has `promoted_at == None` and so
+                // owns no live `retiring` row of its own — but a row from an
+                // EARLIER rotation may still be present, which is the one that
+                // would lose its grace.)
                 Err(e) => eprintln!(
                     "wiremesh-controller: drop_pending_epoch({rotating_gateway_id}, {epoch}) \
                      (reason: {reason}) failed: {e}"
@@ -929,6 +948,22 @@ pub(crate) async fn sweep_rotations(
             // `decide`'s RETIRE_GRACE — not this sweep's direct path.
             continue;
         }
+        // This path is INTENTIONALLY grace-free, and must stay that way.
+        //
+        // It is reached only when no tracker exists, which means one of:
+        // a controller restart lost the in-memory tracker (crash recovery — the
+        // row is arbitrarily old and its grace expired long ago), or step 2b
+        // just retired a newer epoch and removed its tracker, leaving an OLDER
+        // row behind (whose grace also elapsed, by construction, since it was
+        // stranded by a promote that happened before the one 2b just handled).
+        //
+        // Adding a grace here looks like the obvious fix if you arrive from a
+        // failing two-row convergence test, and it is wrong twice over: it
+        // delays crash recovery for no benefit, and it silently converts a
+        // deterministic single-tick convergence into a timing-dependent one.
+        // The grace that matters is enforced by `decide` rule 1 while a tracker
+        // is alive; by the time control reaches here, there is no tracker whose
+        // clock could still be running.
         for epoch in retiring_epochs {
             match db.retire_epoch(gateway_id, epoch).await {
                 Ok(()) => {
