@@ -167,12 +167,31 @@ Seven direct `device_config_pinned` call sites, not six — the doc missed
 **`tests/epoch_watch_keys.rs:312`**, which pins `new_epoch_watch_keys` against
 `device_config_pinned`'s *actual output*.
 
-And a collision worth naming: `reconcile.rs`'s `pending_peer_configs_builds_offset_endpoint`
-(`:274`) and `pending_peer_configs_offset_survives_nonzero_active_epoch` (`:321`) **encode
-the wrong formula**. "Tests must always pass" and "never arrange the tests to match the
-code" collide here, and the resolution is that **the formula is the bug**, so the tests
-encoding it must be deleted rather than kept green. Flagged explicitly so nobody reads that
-as weakening a test to fit an implementation.
+> **CORRECTED 2026-08-06 while building piece 3.** This note claimed
+> `pending_peer_configs_builds_offset_endpoint` (`:274`) and
+> `pending_peer_configs_offset_survives_nonzero_active_epoch` (`:321`) "encode the wrong
+> formula", and framed it as a collision between *tests must always pass* and *never
+> arrange the tests to match the code*. **Both claims are wrong. There is no collision.**
+>
+> Both tests use `pending == active + 1`, where the epoch-delta formula and
+> `candidate_port + 1` produce the **same answer**. They never discriminated between the
+> two models, so they pass unchanged after the formula is deleted.
+>
+> The real problem is worse than the one I described: **they pin the exact coincidence that
+> hid bug 5** — the `k → k+1` case where two unrelated functions happen to agree. And
+> `..._offset_survives_nonzero_active_epoch` is now actively misleading, because it names an
+> epoch-independence-via-delta property that no longer exists and **would pass against an
+> implementation with the bug restored.**
+>
+> Remedy: replace them with a `pending == active + 2` case whose expected port is still
+> `candidate + 1`, plus one pinning that an overlap can never be planned onto
+> `base + OWN_TUN_PORT_OFFSET`. Rewrite because they test the wrong thing — not, as this
+> note originally said, delete because they encode a falsehood.
+
+The one test that genuinely breaks is
+`rotation_slot_quarantine.rs::a_truncated_port_window_allocates_only_what_fits`: it
+allocates three overlaps at base `u16::MAX-3`, and reserving `base+1` costs exactly one
+overlap port. Unavoidable by construction.
 
 ## No smaller safe step exists
 
@@ -192,3 +211,29 @@ Role-B collapse liveness read is `main.rs:4913-4915` (doc: 4784-4788); the colla
 `main.rs:4258` (doc: 4252). Also, on rotation 1→2 the device the peer's overlap dials at
 `base+1` is our **active** epoch-1 tun, not the "retiring" one — the conclusion (MAC1
 mismatch, dropped) is unchanged.
+
+
+## Found while building piece 3 — two things this plan never mentioned
+
+**`candidate_port + 1` inherits a NAT hazard, and the plan's framing hides it.**
+`primary_endpoint()` is `candidates.first()`, i.e. the controller-*observed public*
+endpoint. Behind a port-translating NAT that is a mapping for G's **base-port socket**, and
+`+1` on it is meaningless. This is **not a regression** — `active_port + delta` had the
+identical defect, and rotation behind NAT is already unsupported because the offset port is
+never observed, reported or punched, so nothing can reach it regardless. But "epoch-
+independent, both sides agree" is only true on the un-translated path, and the plan should
+say so rather than implying generality.
+
+**Role A's `kick_overlap` is now provably inert and still runs.** With
+`device_config_at_port` emitting `endpoint: None`, Role A's new tun cannot send, so the
+kick costs up to `1s × peers` of `ping -W1` per rotation tick for the whole overlap window
+and briefly routes a `/32` of the peer's segment onto a device that cannot answer. Left in
+place with a comment saying it is inert **by design** and must not be "repaired" by
+guessing another port. The real options are to delete the Role-A arm's kick, or to make
+Role A's new tun addressable properly — which means the peer telling us where its overlap
+is, i.e. a proto change.
+
+**And one limitation that survives all three pieces unchanged:** piece 1's transient-
+overlap pin. Post-cutover the roamed endpoint written into `live_endpoints` is the peer's
+*overlap* socket, which dies at that peer's Role-B collapse, leaving up to 45s of Degraded.
+Pieces 2 and 3 neither worsen nor fix it; this note previously implied they might.
