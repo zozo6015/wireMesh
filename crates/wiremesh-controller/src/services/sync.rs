@@ -1791,6 +1791,18 @@ mod tests {
     //! The NAMES here are this test author's proposal and the implementer may
     //! change them; the CASES and their verdicts are the contract and must not
     //! be weakened to fit whatever gets built.
+    //!
+    //! # And what the verdicts DO
+    //!
+    //! A verdict is only half the contract — `Replaced` and `Vanished` differ
+    //! today only in a log string, so pinning the labels alone would be close
+    //! to restating a derived `PartialEq`. The final group drives the real
+    //! [`apply_tracker_effect`] against a hand-built `rotations` map and
+    //! asserts the resulting map state: a stale promote must not stamp a newer
+    //! tracker, a stale finish must not remove one, and a vanished entry must
+    //! not be resurrected. Those are the branches an integration test cannot
+    //! reach (see that group's comment), and they need no test-only production
+    //! hook because `apply_tracker_effect` depends on nothing but the map.
 
     use super::*;
     use std::time::Duration;
@@ -1980,9 +1992,7 @@ mod tests {
     }
 
     /// The entry is gone: the rotation completed (retired/aborted) while the
-    /// caller was awaiting. Distinct from `Replaced` because the correct
-    /// reaction differs — there is nothing to leave alone for a later tick to
-    /// re-read.
+    /// caller was awaiting.
     #[test]
     fn missing_entry_vanished() {
         let t = read_at();
@@ -1994,19 +2004,129 @@ mod tests {
         );
     }
 
-    /// `Replaced` and `Vanished` must be distinguishable. A gate that folded
-    /// them into one "not Apply" value would pass every case above
-    /// individually while making the two situations indistinguishable to the
-    /// caller.
-    #[test]
-    fn replaced_and_vanished_are_distinct_verdicts() {
+    // --- apply_tracker_effect: the verdicts AS ACTED ON --------------------
+    //
+    // The four cases above pin the verdict; these pin what the caller does
+    // with it, which is where the damage would actually land. They matter
+    // because `apply_tracker_effect` is the only consumer, and its `Replaced`
+    // and `Vanished` arms are unreachable from any integration test: the
+    // window they cover is between `drive_rotation_for` releasing the guard
+    // and re-taking it, spanned only by one `spawn_blocking` SQLite CAS. No
+    // RPC client can land a competing mutation inside it.
+    //
+    // `apply_tracker_effect` needs nothing but the shared map — no DB, no
+    // broker, no controller — so these drive the real function directly rather
+    // than restating it.
+
+    fn tracker(pending_epoch: u32, installed_at: Instant) -> RotationTracker {
+        RotationTracker {
+            pending_epoch,
+            prior_active_epoch: 0,
+            started_at: installed_at,
+            promoted_at: None,
+            live_acks: BTreeSet::new(),
+            installed_at,
+        }
+    }
+
+    fn map_with(entries: Vec<(i64, RotationTracker)>) -> Arc<Mutex<HashMap<i64, RotationTracker>>> {
+        Arc::new(Mutex::new(entries.into_iter().collect()))
+    }
+
+    const GW: i64 = 42;
+
+    /// `Apply`, acted on: the promote stamp lands. Without this, the tests
+    /// below are all satisfied by an `apply_tracker_effect` that does nothing
+    /// at all — which would leave `promoted_at` permanently `None`, so
+    /// `decide`'s rule 1 never fires and the retire this whole branch exists
+    /// to drive never happens.
+    #[tokio::test]
+    async fn apply_stamps_promoted_at_on_the_same_tracker() {
+        let t = read_at();
+        let rotations = map_with(vec![(GW, tracker(7, before(t)))]);
+        let taken = token(7, before(t));
+
+        apply_tracker_effect(&rotations, GW, taken, TrackerEffect::Promoted).await;
+
+        let guard = rotations.lock().await;
+        assert!(
+            guard
+                .get(&GW)
+                .expect("the tracker must still be present after a Promoted effect")
+                .promoted_at
+                .is_some(),
+            "the entry is the same instance the decision was computed from, so the promote \
+             stamp must land — otherwise RETIRE_GRACE never starts and no rotation ever retires"
+        );
+    }
+
+    /// `Replaced`, acted on — THE PROMOTE CASE. A newer rotation's tracker now
+    /// occupies the slot. Stamping ITS `promoted_at` from the old rotation's
+    /// decision would make `decide`'s rule 1 short-circuit the new rotation
+    /// immediately into a `Retire` of the wrong epoch, and its pending epoch
+    /// would never promote.
+    #[tokio::test]
+    async fn replaced_promote_does_not_stamp_the_newer_tracker() {
+        let t = read_at();
+        let rotations = map_with(vec![(GW, tracker(9, after(t)))]);
+        let stale = token(7, before(t));
+
+        apply_tracker_effect(&rotations, GW, stale, TrackerEffect::Promoted).await;
+
+        let guard = rotations.lock().await;
+        let current = guard
+            .get(&GW)
+            .expect("a Replaced write-back must leave the newer tracker in place");
+        assert_eq!(
+            current.pending_epoch, 9,
+            "the newer rotation's tracker must survive untouched"
+        );
+        assert!(
+            current.promoted_at.is_none(),
+            "the newer rotation has NOT promoted — crediting it with the previous rotation's \
+             promote sends decide()'s rule 1 straight to a Retire of the wrong epoch and the \
+             new pending epoch never promotes"
+        );
+    }
+
+    /// `Replaced`, acted on — THE FINISHED CASE. The blind `remove` this gate
+    /// replaced would delete a live rotation's tracker, discarding its
+    /// accumulated acks and restarting its 90s clock.
+    #[tokio::test]
+    async fn replaced_finish_does_not_remove_the_newer_tracker() {
+        let t = read_at();
+        let rotations = map_with(vec![(GW, tracker(9, after(t)))]);
+        let stale = token(7, before(t));
+
+        apply_tracker_effect(&rotations, GW, stale, TrackerEffect::Finished).await;
+
+        let guard = rotations.lock().await;
+        assert_eq!(
+            guard.get(&GW).map(|t| t.pending_epoch),
+            Some(9),
+            "a finished OLD rotation must not evict the tracker of the NEW one that replaced \
+             it — doing so discards the new rotation's live_acks and restarts its clock"
+        );
+    }
+
+    /// `Vanished`, acted on: nothing is created. Both effects go through the
+    /// same arm, and `Promoted`'s `get_mut` would be a silent no-op anyway —
+    /// so this is really a guard against a future `insert`/`entry().or_*`
+    /// rewrite resurrecting a tracker for a rotation that is already over,
+    /// which would then wedge the gateway in `gateways_with_rotation_state`.
+    #[tokio::test]
+    async fn vanished_write_back_creates_nothing() {
         let t = read_at();
         let taken = token(7, before(t));
-        assert_ne!(
-            tracker_write_back(taken, Some(token(9, before(t)))),
-            tracker_write_back(taken, None),
-            "a replaced entry and a missing entry are different situations and must not \
-             collapse to the same verdict"
-        );
+
+        for effect in [TrackerEffect::Promoted, TrackerEffect::Finished] {
+            let rotations = map_with(vec![]);
+            apply_tracker_effect(&rotations, GW, taken, effect).await;
+            assert!(
+                rotations.lock().await.is_empty(),
+                "the entry was already gone when the {effect:?} write-back arrived — it must \
+                 not be resurrected"
+            );
+        }
     }
 }

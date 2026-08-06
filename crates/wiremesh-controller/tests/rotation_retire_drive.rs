@@ -149,22 +149,54 @@ fn pending_epoch(states: &[(u32, String, String)]) -> Option<u32> {
         .max()
 }
 
+/// A BRACKET around the controller's own promote instant, which a test can
+/// never observe directly.
+///
+/// Both bounds are needed and they are not interchangeable — picking the wrong
+/// one silently eats the margin of whatever is being asserted, which is exactly
+/// the mistake this type exists to make impossible to repeat:
+///
+///   * a "the grace has NOT elapsed yet" check must be computed from
+///     [`at_or_before`](Self::at_or_before), so measurement lag can only make
+///     the check land EARLIER in the true grace window;
+///   * a "wait long enough for the grace to elapse" budget must be computed
+///     from [`at_or_after`](Self::at_or_after), so lag can only make the wait
+///     LONGER than required.
+#[derive(Debug, Clone, Copy)]
+struct PromoteWindow {
+    /// An instant at or before the controller's real promote — captured
+    /// immediately before the acking `Sync.Report` is sent, which is the last
+    /// moment at which the promote provably cannot have happened yet (see
+    /// [`promote_pending_epoch`]).
+    at_or_before: tokio::time::Instant,
+    /// An instant at or after the controller's real promote — captured once
+    /// `debug_key_states` has actually shown the new epoch `active`.
+    at_or_after: tokio::time::Instant,
+}
+
 /// Drives an already-`pending` epoch `n` all the way to `active`: `a` submits
-/// its real key for it, `b` (a connected peer) acks it live, and the promote
-/// is polled for. Returns the instant the promote was first OBSERVED — always
-/// at or after the controller's own promote instant, so a later "not yet
-/// `RETIRE_GRACE`" check computed from it is conservative in the safe
-/// direction.
+/// its real key for it, `b` (a connected peer) acks it live, and the promote is
+/// polled for. Returns a [`PromoteWindow`] bracketing the promote.
+///
+/// The lower bound is stamped immediately before `b`'s acking report, and that
+/// is genuinely a lower bound rather than a convenient guess: with `b` the only
+/// connected peer, `rotation::decide` cannot promote epoch `n` until `b`'s ack
+/// lands. Rule 3 needs every expected peer acked (`live_acks` is empty until
+/// this call), and rule 4 needs `GRACE_PROMOTE` (90s), far beyond
+/// `PROMOTE_BUDGET`. `submit_epoch_key`'s own `drive_rotation` therefore cannot
+/// promote either, so no earlier stamp is required.
 async fn promote_pending_epoch(
     h: &TestController,
     a: &StubGateway,
     b: &StubGateway,
     n: u32,
     pubkey: &str,
-) -> tokio::time::Instant {
+) -> PromoteWindow {
     a.submit_epoch_key(n, pubkey)
         .await
         .expect("Sync.SubmitEpochKey must succeed for gateway A's pending epoch");
+
+    let at_or_before = tokio::time::Instant::now();
     b.report_epoch_acks(0, &[(a.id(), n, true)])
         .await
         .expect("StubGateway::report_epoch_acks must succeed for B acking A's new epoch");
@@ -175,7 +207,7 @@ async fn promote_pending_epoch(
             .any(|(epoch, _, state)| *epoch == n && state == "active")
     })
     .await;
-    let observed_at = tokio::time::Instant::now();
+    let at_or_after = tokio::time::Instant::now();
     assert!(
         states
             .iter()
@@ -184,17 +216,17 @@ async fn promote_pending_epoch(
          live ack — this file's tests all build on a COMPLETED rotation, so nothing below is \
          meaningful without it; last observed: {states:?}"
     );
-    observed_at
+    PromoteWindow { at_or_before, at_or_after }
 }
 
 /// Runs one complete rotation of `a` (admin-initiated, real key submitted,
-/// acked live by `b`, promoted) and returns `(new_epoch, promote_observed_at)`.
+/// acked live by `b`, promoted) and returns `(new_epoch, promote_window)`.
 async fn complete_one_rotation(
     h: &TestController,
     a: &StubGateway,
     b: &StubGateway,
     pubkey: &str,
-) -> (u32, tokio::time::Instant) {
+) -> (u32, PromoteWindow) {
     h.admin_client()
         .await
         .rotate_key(RotateKeyRequest { gateway_id: a.id() })
@@ -206,8 +238,8 @@ async fn complete_one_rotation(
         panic!("expected a 'pending' GATEWAY_KEY row for gateway A right after Admin.RotateKey, got: {states:?}")
     });
 
-    let promoted_at = promote_pending_epoch(h, a, b, n, pubkey).await;
-    (n, promoted_at)
+    let promoted = promote_pending_epoch(h, a, b, n, pubkey).await;
+    (n, promoted)
 }
 
 /// ONE completed rotation must leave gateway A with EXACTLY ONE key row.
@@ -236,7 +268,7 @@ async fn one_completed_rotation_leaves_exactly_one_key_row() {
          already wrong the rest of this test proves nothing; got: {pre:?}"
     );
 
-    let (n1, _promoted_at) = complete_one_rotation(&h, &a, &b, "REALKEYA==").await;
+    let (n1, _promote_window) = complete_one_rotation(&h, &a, &b, "REALKEYA==").await;
 
     let states = poll_key_states(&h, a.id(), RETIRE_BUDGET, |states| states.len() == 1).await;
 
@@ -278,7 +310,7 @@ async fn promoted_rotation_retires_prior_epoch_with_no_second_rotation_and_no_re
     let b = wiremesh_testkit::enroll_one(&h, "gcp", "10.1.0.0/16").await;
     let _b_stream = open_watch(&b).await;
 
-    let (n1, _promoted_at) = complete_one_rotation(&h, &a, &b, "REALKEYA==").await;
+    let (n1, _promote_window) = complete_one_rotation(&h, &a, &b, "REALKEYA==").await;
 
     // Immediately after the promote the prior epoch is legitimately still
     // present as 'retiring' — RETIRE_GRACE has not elapsed. Pin that, so the
@@ -425,10 +457,10 @@ async fn second_rotation_inside_retire_grace_keeps_the_grace_and_leaves_one_row(
     let b = wiremesh_testkit::enroll_one(&h, "gcp", "10.1.0.0/16").await;
     let _b_stream = open_watch(&b).await;
 
-    let (n1, promote1_at) = complete_one_rotation(&h, &a, &b, "REALKEYA1==").await;
+    let (n1, promote1) = complete_one_rotation(&h, &a, &b, "REALKEYA1==").await;
 
     // Second rotation, immediately — comfortably inside epoch 0's 30s grace.
-    let (n2, promote2_at) = complete_one_rotation(&h, &a, &b, "REALKEYA2==").await;
+    let (n2, promote2) = complete_one_rotation(&h, &a, &b, "REALKEYA2==").await;
     assert!(
         n2 > n1,
         "the second Admin.RotateKey must open a strictly higher epoch than {n1}, got {n2}"
@@ -436,13 +468,17 @@ async fn second_rotation_inside_retire_grace_keeps_the_grace_and_leaves_one_row(
 
     // (a) The whole point of the eviction: n2 promoted off B's ack, not off
     // the 90s GRACE_PROMOTE path. `complete_one_rotation` polls with a 10s
-    // budget, so reaching here at all already bounds it, but state the
-    // timing explicitly so a regression reads as "promotion got slow" rather
-    // than an opaque timeout.
-    let promote2_delay = promote2_at.saturating_duration_since(promote1_at);
+    // budget, so reaching here at all already bounds it, but state the timing
+    // explicitly so a regression reads as "promotion got slow" rather than an
+    // opaque timeout. Bounds chosen to OVERSTATE the delay (latest possible
+    // promote-2 minus earliest possible promote-1), so this can only fire on a
+    // gap that is genuinely there.
+    let promote2_delay = promote2
+        .at_or_after
+        .saturating_duration_since(promote1.at_or_before);
     assert!(
         promote2_delay < Duration::from_secs(15),
-        "epoch {n2} took {promote2_delay:?} after epoch {n1}'s promote to go active — a \
+        "epoch {n2} took at most {promote2_delay:?} after epoch {n1}'s promote to go active — a \
          second rotation started inside RETIRE_GRACE must promote off its peer acks within \
          seconds. Taking ~30-40s means the previous rotation's stranded tracker was NOT \
          evicted, so decide()'s rule 1 short-circuited on its promoted_at and every ack for \
@@ -450,10 +486,20 @@ async fn second_rotation_inside_retire_grace_keeps_the_grace_and_leaves_one_row(
     );
 
     // (b) Epoch 0 must still be there well inside its own 30s from promote-1.
-    // `promote1_at` is the instant the promote was OBSERVED (>= the real
-    // one), so this check lands strictly earlier than 18s of true grace —
-    // conservative in the safe direction.
-    let check_at = promote1_at + Duration::from_secs(18);
+    //
+    // Measured from `at_or_before` — the instant stamped just BEFORE B's
+    // acking report, which the controller's real promote can only follow. So
+    // `check_at <= real_promote1 + 18s`: measurement lag moves this check
+    // EARLIER in the true grace window, leaving at least 12s of headroom to
+    // the 30s deadline.
+    //
+    // Using the observed-promote instant instead would inverse that — the
+    // check would land at `real_promote1 + 18s + lag`, and every millisecond
+    // of lag (poll step, RPC round trip) would eat the 12s margin rather than
+    // widen it. That is not a hypothetical nit: it is precisely the reasoning
+    // that would later authorize raising 18 to 25, or slowing the poll, on a
+    // belief in headroom that does not exist in that direction.
+    let check_at = promote1.at_or_before + Duration::from_secs(18);
     let now = tokio::time::Instant::now();
     if check_at > now {
         tokio::time::sleep(check_at - now).await;
@@ -474,8 +520,10 @@ async fn second_rotation_inside_retire_grace_keeps_the_grace_and_leaves_one_row(
 
     // (c) Both retiring rows must eventually go. Epoch 0's own grace expires
     // at promote1 + 30s and epoch n1's at promote2 + 30s, so measure the
-    // budget from the later promote.
-    let deadline = promote2_at + RETIRE_BUDGET;
+    // budget from the later promote — and from its `at_or_after` bound, the
+    // opposite choice to (b): here measurement lag must only make the wait
+    // LONGER than the 30s+ this needs, never shorter.
+    let deadline = promote2.at_or_after + RETIRE_BUDGET;
     let states = poll_key_states(
         &h,
         a.id(),
