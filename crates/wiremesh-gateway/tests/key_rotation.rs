@@ -2997,6 +2997,178 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
         eprintln!("POST-ROTATION-2 PASS: ICMP still crosses {label} on epoch 2");
     }
 
+    // ===== SETTLE GATE: gwA's retire + renormalization has actually landed ===
+    //
+    // The port-authority assertion below is a *data-plane* fact about the
+    // steady state after rotation 2. The loop that drove rotation 2 broke on a
+    // *controller roster* fact (epoch 2 active, nothing earlier active) — i.e.
+    // at PROMOTE. Those are different instants, and the data-plane one is
+    // strictly later: gwA only tears down its epoch-1 Device and renormalizes
+    // the epoch-2 Device's listen port back to the base after `RETIRE_GRACE`
+    // (`main.rs`: 2 x ROTATION_KEEPALIVE) of continuous rx-corroborated
+    // liveness following the cutover, polled on a 500ms tick — and the first
+    // grace attempt is routinely aborted once, so the real distance from
+    // promote is ~10s, not 6s. Reading ~1.5-2s after promote evaluates the
+    // invariant at an instant that structurally precedes it becoming
+    // satisfiable.
+    //
+    // This gate moves the moment of evaluation — and ONLY the moment — to when
+    // the system claims to provide the invariant. It does not relax anything:
+    // the port comparison below is unchanged, and the gate is itself an
+    // assertion (gwA's epoch-2 Device must end up ON THE BASE PORT, which is
+    // the renormalization's whole observable result).
+    //
+    // # Why the wait is on gwA alone, and why it has a stability window
+    //
+    // The obvious second clause — "gwB has finished its Role-B collapse, no
+    // `wg0o<n>` overlap Device left" — is UNSATISFIABLE and must not be added.
+    // gwB's collapse waits for a live session on the ACTIVE tun toward the
+    // peer's new key and never gets one, so the overlap Device leaks
+    // permanently (the F9 leak shape). This test's doc comment above
+    // deliberately declines to gate on it for exactly that reason: gating
+    // there kills the test on an already-known defect instead of measuring its
+    // subject. Verified empirically on this branch — a gwB clause times out
+    // while gwA's retire demonstrably fires.
+    //
+    // But gwB *is* the source of a real second race, via a different
+    // mechanism than device teardown. The leaked overlap's peer entry toward
+    // gwA's epoch-2 key initially dials the OFFSET port (51821); it is
+    // corrected to the base port only by boringtun's rx-driven endpoint
+    // roaming, once gwA's renormalized `wg0e2` sends from 51820 — which the 3s
+    // persistent keepalive guarantees, but not instantly. Since gwA's
+    // condition flips true the moment renormalization lands, a single-sample
+    // gate can return up to ~3s before gwB has roamed.
+    //
+    // Hence the stability window: gwA must hold the post-retire state across
+    // successive samples for `RENORM_STABLE_FOR` — one keepalive round-trip
+    // past renormalization. This is OBSERVED, not slept: every intervening
+    // sample must also satisfy the condition, so a state that flaps restarts
+    // the clock instead of passing. Note this is deliberately NOT "gwB dials a
+    // port gwA listens on" — that would be the assertion restating itself as
+    // its own precondition, and would be unfalsifiable.
+    //
+    // A timeout here is its own, LOUDER finding than a port mismatch: it means
+    // the retire never fired at all. That failure is currently invisible —
+    // nothing else in this test observes it — so it gets its own panic
+    // message, deliberately distinct from the port-authority one.
+    //
+    // 60s: room for one full grace (6s), one aborted-and-restarted grace, and
+    // the stability window, with margin — bounded so this fails rather than
+    // hangs.
+    const BASE_WG_PORT: u16 = 51820; // must match `spawn_gw`'s `--wg-port`
+    /// How long gwA's post-retire state must hold CONTINUOUSLY before the port
+    /// state is read. One 3s keepalive round-trip past renormalization, plus
+    /// margin — see the roaming rationale above.
+    const RENORM_STABLE_FOR: Duration = Duration::from_secs(4);
+
+    let mut gate_a: Vec<DevSnap> = Vec::new();
+    let mut gate_b: Vec<DevSnap> = Vec::new();
+    let mut stable_since: Option<Instant> = None;
+    let mut reached_base = false;
+    // Set iff `wg0e2` was seen PRESENT on a non-base port *after* having been
+    // seen at the base port — renormalization coming undone, a genuine defect
+    // that must surface as itself rather than as a timeout.
+    //
+    // Deliberately not "the condition went false": `uapi_dump_all` returns an
+    // empty vec on a dropped sample (documented on that fn), and an absent
+    // `wg0e2` is indistinguishable from a dropped sample. A dropped sample
+    // therefore only resets the stability clock — it can never manufacture
+    // this failure. Only a Device that is *there*, on the *wrong* port, does.
+    let mut regressed: Option<(String, Option<u16>)> = None;
+
+    let retire_settled = wait_until(Duration::from_secs(60), || {
+        let a = uapi_dump_all(&gwa);
+        let b = uapi_dump_all(&gwb);
+        // gwA: epoch-1 Device retired, epoch-2 Device present AND renormalized
+        // back to the base port. `listen_port == BASE_WG_PORT` is the
+        // observable RESULT of the renormalization.
+        let a_e1_retired = !a.iter().any(|d| d.ifname == "wg0e1");
+        let e2 = a.iter().find(|d| d.ifname == "wg0e2");
+        let a_e2_at_base = e2.is_some_and(|d| d.listen_port == Some(BASE_WG_PORT));
+
+        if a_e2_at_base {
+            reached_base = true;
+        } else if reached_base && regressed.is_none() {
+            if let Some(d) = e2 {
+                regressed = Some((d.ifname.clone(), d.listen_port));
+            }
+        }
+        // The stability clock: started by the first satisfying sample, kept
+        // alive only by every sample after it, cleared by any that isn't.
+        if a_e1_retired && a_e2_at_base {
+            stable_since.get_or_insert_with(Instant::now);
+        } else {
+            stable_since = None;
+        }
+
+        gate_a = a;
+        gate_b = b;
+        // Break out immediately on a regression so it panics as a regression
+        // rather than idling until the 60s bound and reading as a timeout.
+        regressed.is_some() || stable_since.is_some_and(|t| t.elapsed() >= RENORM_STABLE_FOR)
+    });
+
+    if let Some((ifname, port)) = regressed {
+        dump_rot_diag(
+            "second-rotation-renormalization-came-undone",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SECOND ROTATION: THE RENORMALIZATION CAME UNDONE. gwA's epoch-2 Device reached the \
+             base port {BASE_WG_PORT} and then LEFT it — {ifname} was observed listening on \
+             {port:?}. This is neither a timeout nor the port-authority failure: the retire ran, \
+             put the active key back on its advertised port, and something moved it off again. \
+             Every peer's durable endpoint for this gateway points at the base port, so the \
+             active key is no longer addressable where the fabric expects it.\n\
+             gwA devices:\n{}gwB devices:\n{}\
+             Sampled across the whole rotation-2 window:\n{}",
+            fmt_snaps(&gate_a),
+            fmt_snaps(&gate_b),
+            obs.summary(),
+        );
+    }
+    if !retire_settled {
+        dump_rot_diag(
+            "second-rotation-retire-never-completed",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SECOND ROTATION: THE RETIRE/RENORMALIZATION NEVER COMPLETED. 60s after the \
+             controller promoted epoch 2, gwA never held its post-retire steady state \
+             continuously for {RENORM_STABLE_FOR:?}. This is NOT the port-authority failure — \
+             the port comparison below was never reached. It means the gateway-side teardown \
+             that is supposed to follow every cutover did not fire at all, which leaves the \
+             fabric permanently holding rotation scaffolding and the active key parked on an \
+             offset port no peer addresses.\n\
+             Required, and last observed:\n\
+             \x20 gwA wg0e1 retired: {}\n\
+             \x20 gwA wg0e2 present and renormalized to base port {BASE_WG_PORT}: {}\n\
+             \x20 ... and held continuously for {RENORM_STABLE_FOR:?}: false\n\
+             \x20 (gwA reached the base port at least once during the wait: {reached_base})\n\
+             gwA devices:\n{}gwB devices:\n{}\
+             Sampled across the whole rotation-2 window:\n{}",
+            !gate_a.iter().any(|d| d.ifname == "wg0e1"),
+            gate_a
+                .iter()
+                .find(|d| d.ifname == "wg0e2")
+                .is_some_and(|d| d.listen_port == Some(BASE_WG_PORT)),
+            fmt_snaps(&gate_a),
+            fmt_snaps(&gate_b),
+            obs.summary(),
+        );
+    }
+    eprintln!(
+        "RETIRE SETTLE PASS: gwA retired wg0e1 and renormalized wg0e2 to the base port \
+         {BASE_WG_PORT}, and held that state continuously for {RENORM_STABLE_FOR:?}. \
+         Reading the settled port state now."
+    );
+
     // ===== THE PORT-AUTHORITY ASSERTION =====
     // Not "did it ping" — WHICH PORT each side settled on. A future reader has
     // to be able to see the two models disagreeing, not just "ping failed".
