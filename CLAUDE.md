@@ -5,6 +5,10 @@ fabric in Rust. Connects network *segments* (VPCs, VLANs, subnets) via one gatew
 segment — WireGuard data plane, default-deny L4 policy, no agents on workloads.
 The project ships binaries and docs, never hosted infrastructure.
 
+## Working model
+
+The main session (Fable) is the ORCHESTRATOR. Implementation work is delegated to Opus subagents acting as Senior/Principal-level engineers, each with a focused brief: the exact PLAN/CONTRACTS sections that apply, the files to touch, and a definition of done. The orchestrator reviews all worker output before integrating.
+
 ## Document map (authority order)
 
 1. `docs/superpowers/specs/2026-07-15-wiremesh-engineering-design.md` — **approved
