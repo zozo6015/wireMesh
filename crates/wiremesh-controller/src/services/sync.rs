@@ -393,10 +393,47 @@ pub(crate) async fn drive_rotation_for(
         }
     };
 
+    // The DB's current `pending` epoch for this gateway, if any — read off
+    // the `keys` snapshot already in hand, so the staleness check below
+    // costs no extra query.
+    let db_pending_epoch: Option<u32> = keys
+        .iter()
+        .find(|(_, _, state)| state == "pending")
+        .map(|(epoch, _, _)| *epoch as u32);
+
     let mut rotations = rotations.lock().await;
 
+    // (Second-rotation stranded tracker; see
+    // `docs/research/second-rotation-stranded-tracker.md`) Evict a tracker
+    // that is talking about a DIFFERENT rotation than the one the DB
+    // currently has pending. A promoted rotation's tracker is stranded with
+    // `promoted_at = Some` and nothing can drive it to its `Retire`, so when
+    // the NEXT rotation starts the lazy rebuild below would find that stale
+    // tracker present, keep it, and `rotation::decide`'s rule 1 would
+    // short-circuit on `promoted_at` — never looking at the new pending
+    // epoch. That both discards every peer ack for the new epoch (they fail
+    // the `ack.epoch == tracker.pending_epoch` test in `report`) and delays
+    // the new rotation's `started_at` by a full `RETIRE_GRACE`.
+    //
+    // Deliberately gated on the DB actually HAVING a pending epoch, rather
+    // than a plain `Some(t.pending_epoch) != db_pending_epoch`: "live tracker,
+    // no pending row" IS the stranded-post-promote state, and that tracker
+    // still owes a `RotationDecision::Retire` for its prior active epoch.
+    // Evicting there would hand the retire to `sweep_rotations`' step-3
+    // orphan path, which deletes immediately and so would collapse the 30s
+    // `RETIRE_GRACE` to zero. That gap (nothing drives a promoted rotation's
+    // retire) is left deliberately visible, not papered over here.
+    if let Some(db_pending_epoch) = db_pending_epoch {
+        if rotations
+            .get(&rotating_gateway_id)
+            .is_some_and(|t| t.pending_epoch != db_pending_epoch)
+        {
+            rotations.remove(&rotating_gateway_id);
+        }
+    }
+
     if !rotations.contains_key(&rotating_gateway_id) {
-        if let Some((pending_epoch, _, _)) = keys.iter().find(|(_, _, state)| state == "pending") {
+        if let Some(pending_epoch) = db_pending_epoch {
             let prior_active_epoch = keys
                 .iter()
                 .find(|(_, _, state)| state == "active")
@@ -405,7 +442,7 @@ pub(crate) async fn drive_rotation_for(
             rotations.insert(
                 rotating_gateway_id,
                 RotationTracker {
-                    pending_epoch: *pending_epoch as u32,
+                    pending_epoch,
                     prior_active_epoch,
                     started_at: Instant::now(),
                     promoted_at: None,
@@ -505,11 +542,15 @@ pub(crate) async fn drive_rotation_for(
 ///   1. `db.gateways_with_rotation_state()` finds every gateway with a
 ///      `pending` or `retiring` `gateway_key` row — the population this
 ///      sweep needs to look at at all.
-///   2. For a gateway with a `pending` row: lazily rebuild its
-///      `RotationTracker` (fresh `started_at`) if none is currently held —
-///      the same crash-recovery rebuild `drive_rotation_for` itself does —
-///      then call `drive_rotation_for`, which fires grace-promote/abort/
-///      retire via `rotation::decide` exactly as an ack-triggered call would.
+///   2. For a gateway with a `pending` row: first evict any held
+///      `RotationTracker` whose `pending_epoch` disagrees with that row (a
+///      previous rotation's stranded tracker — see
+///      `docs/research/second-rotation-stranded-tracker.md`), then lazily
+///      rebuild its `RotationTracker` (fresh `started_at`) if none is
+///      currently held — the same check-and-evict plus crash-recovery
+///      rebuild `drive_rotation_for` itself does — then call
+///      `drive_rotation_for`, which fires grace-promote/abort/retire via
+///      `rotation::decide` exactly as an ack-triggered call would.
 ///   3. For a gateway with a `retiring` row but NO in-memory tracker: this is
 ///      an ORPHANED row — the promote already committed and the tracker was
 ///      lost (e.g. a controller crash/restart in the 30s `RETIRE_GRACE`
@@ -558,6 +599,20 @@ pub(crate) async fn sweep_rotations(
             let pending_epoch = *pending_epoch as u32;
             {
                 let mut guard = rotations.lock().await;
+                // (Second-rotation stranded tracker) Same check-and-evict as
+                // `drive_rotation_for`, for the same reason and with the same
+                // `None`-means-keep-it asymmetry — held under the SAME guard
+                // as the rebuild immediately below so no concurrent `report`
+                // can observe (or re-ack into) the evicted-but-not-yet-
+                // rebuilt window. `pending_epoch` here is the DB's pending
+                // row from this tick's `keys` snapshot, so this costs no
+                // extra query either.
+                if guard
+                    .get(&gateway_id)
+                    .is_some_and(|t| t.pending_epoch != pending_epoch)
+                {
+                    guard.remove(&gateway_id);
+                }
                 if !guard.contains_key(&gateway_id) {
                     let prior_active_epoch = keys
                         .iter()

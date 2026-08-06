@@ -38,7 +38,16 @@ Two consequences, both fatal:
 
 The failing run's final state is `[(1, active), (2, pending)]` — **epoch 0 is gone.**
 Nothing could have deleted it before `RotateKey #2` (see the four blocked paths above), so
-its deletion *is* the stale tracker being evicted during rotation 2.
+its deletion happened *during* rotation 2.
+
+> **Wording corrected 2026-08-06.** This first said epoch 0's deletion "is the stale tracker
+> being **evicted**". Nothing evicts it in the current code — `sync.rs:561` *reuses* it.
+> Epoch 0 is deleted by that reused tracker firing rule 1's
+> `Retire{ prior_active_epoch = 0 }`, whose handler then calls `rotations.remove`. The
+> distinction is load-bearing for the timing claim, and it **supports** it: rule 1 `Wait`s
+> until `RETIRE_GRACE` elapses from *rotation 1's* promote, then retires and self-removes,
+> and only the following tick builds the epoch-2 tracker — which is exactly the
+> "30s + ≤5s sweep granularity" delay.
 
 ## Production impact
 
@@ -107,7 +116,39 @@ if rotations.get(&gid).is_some_and(|t| Some(t.pending_epoch) != db_pending_epoch
 Rotation 2's tracker — and gwB's ack — then land immediately, and rule 3 promotes within
 seconds.
 
+> **Predicate correction, found while implementing.** The sketch above uses plain
+> inequality. **That is wrong and would be a silent regression.** It also evicts on the
+> stranded-post-promote state itself (live tracker, *no* pending row) — a tracker that still
+> owes a `Retire`. Evicting there hands the retire to sweep step 3's orphan path, which
+> deletes **immediately with no grace**, collapsing `RETIRE_GRACE` from 30s to ~0 and
+> shrinking the make-before-break window on every normal rotation. The predicate must be
+> **"the DB has a pending epoch AND it disagrees"**.
+
 **This does not close the underlying hole:** a promoted rotation's retire is never driven,
 because no path exists for "gateway has a `retiring` row *and* a live tracker". The sweep
 should drive `decide` for that state too. The eviction is the minimal change that turns the
 done-bar green if the hypothesis holds; the sweep gap is the real fix.
+
+
+## What the sweep gap actually costs (traced while implementing the fix)
+
+After the eviction, rotation 1's promote still strands a tracker nothing drives to its
+`Retire`, and epoch 0's `retiring` row still survives step 3 (`has_tracker` → `continue`).
+Its lifetime becomes "until the next rotation completes" — rotation 2's promote returns
+`Retire{ prior_active_epoch = 1 }`, deletes epoch **1**, calls `rotations.remove`, and only
+then can the following tick orphan-retire epoch 0.
+
+That matters more than bookkeeping: **`routes.rs:48` feeds every key row — `retiring`
+included — into the peer roster** (`PeerRoute::keys`). So for that whole span, peers hold a
+Device for a key the rotating gateway has already destroyed. On a fabric that rotates once
+and then idles, that is forever.
+
+## Residual race the fix deliberately does not cover
+
+The `report` ack path has its own lazy rebuild (~`sync.rs:1244`) with the same
+`if !rotations.contains_key` shape and no eviction, so an ack arriving between `RotateKey #2`
+and the first eviction would still be discarded. It is closed by **ordering, not luck**:
+`submit_epoch_key` calls `drive_rotation` (~`:1327`), and a peer cannot have a live session
+with — hence cannot ack — an epoch whose real key has not been submitted yet, so site 1
+always evicts first. Adding the check there would cost an unconditional
+`all_keys_for_gateway` per ack rather than only on a tracker miss.
