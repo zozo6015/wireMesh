@@ -152,3 +152,29 @@ and the first eviction would still be discarded. It is closed by **ordering, not
 with — hence cannot ack — an epoch whose real key has not been submitted yet, so site 1
 always evicts first. Adding the check there would cost an unconditional
 `all_keys_for_gateway` per ack rather than only on a tracker miss.
+
+
+## Line references in this document are stale — use symbol names
+
+**Noted 2026-08-06** (CodeRabbit, PR #51). The `sync.rs:NNN` citations throughout were
+written against the pre-fix file and the code has since moved under them — `sync.rs:557` now
+lands before `sweep_rotations` rather than on its pending branch, `sync.rs:603-608` lands
+inside the new eviction comment, and `sync.rs:398` is part of the pending-epoch derivation
+rather than the eviction predicate. The same applies to the citations at lines 21-25, 43-50,
+107-109 and 148-154 of this file.
+
+The mechanisms described are unchanged and still correct; only the coordinates rotted.
+Navigate by SYMBOL, not by line:
+
+| What the text calls out | Find it by |
+|---|---|
+| "step 2 only drives a gateway with a pending row" | `sweep_rotations`, its pending-epoch branch |
+| "step 3's orphan retire is skipped when a tracker exists" | `sweep_rotations`, the `has_tracker` guard |
+| "`report` only drives when `epoch_acks` is non-empty" | `report`, the `epoch_acks` guard |
+| "the eviction predicate" | `drive_rotation_for`, the `db_pending_epoch` comparison |
+| "rule 1 short-circuits" | `rotation::decide` |
+| "every key row, `retiring` included, feeds the roster" | `routes.rs`, `PeerRoute::keys` |
+
+Lesson worth keeping beyond this file: **a research note that cites line numbers starts
+decaying the moment the fix it describes is written**, because the fix moves the very lines
+it cites. Cite symbols.
