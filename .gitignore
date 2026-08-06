@@ -1,2 +1,12 @@
 target/
 .DS_Store
+
+# graphify knowledge graph (docs/research/… is the source of truth; this is derived)
+# Tracked deliberately: cache/semantic (cost ~718K LLM tokens to rebuild) and
+# manifest.json (drives incremental --update). Everything else is regenerable —
+# AST extraction is deterministic and free, graph.json/html/report derive from cache.
+graphify-out/*
+!graphify-out/cache/
+graphify-out/cache/*
+!graphify-out/cache/semantic/
+!graphify-out/manifest.json

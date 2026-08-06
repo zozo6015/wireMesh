@@ -1,0 +1,1 @@
+{"nodes": [{"id": "crates_wiremesh_policy_tests_fixtures_duplicate_block_pair", "label": "Fixture: duplicate (from, to) block pair", "file_type": "code", "source_file": "crates/wiremesh-policy/tests/fixtures/duplicate_block_pair.yaml", "source_location": null, "source_url": null, "captured_at": null, "author": null, "contributor": null}], "edges": [], "hyperedges": []}
