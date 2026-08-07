@@ -136,11 +136,16 @@ can be re-enabled:
    one timer, so the fabric rotates in step — a scenario nothing had tested. Its
    done-bar is committed `#[ignore]`d as RED-by-design at
    `crates/wiremesh-gateway/tests/key_rotation.rs`. **Un-ignoring it is the bar.**
-2. **The reserved-port handoff rests on kernel UDP hash ordering.** boringtun
-   leaks its old sockets on rebind, so the vacated port stays bound; the next
-   rotation binds a second `SO_REUSEADDR` socket on top and the kernel picks the
-   winner. Works today, not guaranteed. Confirm with `ss -lunp` in the netns
-   after a retire before trusting it.
+2. ~~The reserved-port handoff rests on kernel UDP hash ordering.~~ **Checked
+   2026-08-07 and DOWNGRADED — no longer a blocker.** The boringtun socket leak
+   is real and larger than predicted (four sockets on the reserved port at the
+   rotation-2 peak, two of them the retiring epoch's), but Linux head-inserts
+   into the port hash and `udp4_lib_lookup2` uses a strict `>`, so newest-bound
+   wins deterministically — and the leaked socket could not be made to win even
+   warm and CPU-pinned. What remains is an undocumented dependency on kernel
+   behaviour plus an unbounded fd leak (2 per `open_listen_socket`, per rotation
+   AND per full apply). Task #26, evidence in
+   `docs/research/socket-leak-on-rebind.md`.
 
 Shipped: v0.7.0 the `off` escape hatch (defused a fabric-wide outage dated
 2026-08-31); v0.7.1 four in-step fixes; **v0.7.2 the port authority** — a
