@@ -3674,9 +3674,13 @@ mod cas_tests {
     //
     // These are written type-agnostically, as the round-1 cases were: the
     // outcome values are never spelled out, only compared. `assert_ne!` of the
-    // two answers is RED today (both are the one `CasOutcome::NoMatch`, hence
-    // equal) and green under any shape that separates them —
-    // `NoMatch { row_state: Option<String> }`, a third variant, anything.
+    // two answers was RED when authored (both were the one
+    // `CasOutcome::NoMatch`, hence equal); it is satisfied by any shape that
+    // separates them, and is satisfied today by `DropPendingOutcome`'s
+    // `RowAbsent` vs `RowSuperseded`. Deliberately NOT asserting that `active`
+    // and `retiring` differ from each other — collapsing both into one
+    // "superseded" answer is a valid implementation and the caller's rule is
+    // the same for both.
 
     /// THE DISCRIMINATION. A `drop_pending_epoch` that matched nothing because
     /// the row is GONE and one that matched nothing because a promote moved the
@@ -3688,7 +3692,6 @@ mod cas_tests {
     /// `services::sync`'s `a_promote_that_won_the_abort_cas_must_not_collapse_retire_grace`,
     /// which follows this distinction all the way to the deleted row).
     #[test]
-    #[allow(clippy::unit_cmp)]
     fn drop_pending_epoch_distinguishes_a_vanished_row_from_a_superseded_one() {
         // (a) The row is GONE — another aborter already dropped it. Nothing
         // this rotation created survives, so its tracker is safe to remove.
@@ -3734,7 +3737,6 @@ mod cas_tests {
     /// and 'retiring' differ from EACH OTHER — collapsing both into one
     /// "superseded" answer is a perfectly good implementation.
     #[test]
-    #[allow(clippy::unit_cmp)]
     fn drop_pending_epoch_distinguishes_a_vanished_row_from_a_retiring_one() {
         let gone = db_with_gateway();
         seed_key(&gone, 0, "EPOCH0==", "active");
@@ -3762,7 +3764,6 @@ mod cas_tests {
     /// the new discrimination cannot be bought by blurring the boundary the
     /// round-1 tests drew.
     #[test]
-    #[allow(clippy::unit_cmp)]
     fn neither_zero_row_answer_looks_like_a_committed_drop() {
         let applied_db = db_with_gateway();
         seed_key(&applied_db, 0, "EPOCH0==", "active");
