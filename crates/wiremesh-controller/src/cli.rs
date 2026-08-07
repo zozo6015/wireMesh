@@ -109,11 +109,24 @@ CONFIGURATION (environment variables — this binary takes NO flags):
 DEPLOYMENT:
     The packaged systemd unit reads these variables from /etc/wiremesh/
     controller.env. The Kubernetes operator sets them on the controller
-    Deployment — except WIREMESH_ROTATION_INTERVAL, which it does NOT yet
-    expose: there is no CRD field for it, and the operator force-applies the
-    Deployment's env, so hand-editing it is reverted on the next reconcile.
-    On Kubernetes this knob is currently reachable only by running the
-    controller outside the operator. This binary is Unix-only.
+    Deployment — except WIREMESH_ROTATION_INTERVAL, for which there is no CRD
+    field yet. Setting it by hand DOES work and DOES survive reconciles:
+
+        kubectl set env deployment/<name> WIREMESH_ROTATION_INTERVAL=off \\
+            -c controller
+
+    The operator force-applies the Deployment, but a container's `env` is a
+    server-side-apply list-map keyed by name, so force only overrides the keys
+    the operator itself sets. It never names this one, so your value is not
+    owned by it and is not reverted.
+
+    The one thing that does drop it is the Deployment being RECREATED — it is
+    owner-referenced to the WiremeshController CR, so deleting the CR (or the
+    Deployment) rebuilds it from the operator's env list alone, without your
+    variable, silently back on the 30d default. If you need it durable across
+    that, bake `ENV WIREMESH_ROTATION_INTERVAL=off` into the image named by
+    `spec.image`; the operator does not set the key, so the image value is not
+    shadowed. This binary is Unix-only.
 
 EXAMPLE:
     WIREMESH_DATA_DIR=/var/lib/wiremesh WIREMESH_BIND_IP=0.0.0.0 \\
