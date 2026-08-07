@@ -141,6 +141,97 @@ async fn submit_to_nonexistent_epoch_is_rejected() {
     );
 }
 
+/// (task #32) THE STRING-MATCH REGRESSION. `SyncSvc::submit_epoch_key`
+/// classifies `Db::set_epoch_pubkey`'s failure with
+/// `msg.contains("no pending epoch")`, and task #32 replaces that with a typed
+/// check on the CAS outcome. This pins the OBSERVABLE contract the retype must
+/// preserve — the gRPC status CODE, which
+/// [`submit_to_nonexistent_epoch_is_rejected`] above does not assert (it only
+/// checks `is_err`, so a retype that routed the same condition to `Internal`
+/// would slip past it).
+///
+/// Both directions matter:
+///
+///  - `FailedPrecondition` says "what you asked for isn't true right now" —
+///    the gateway's own client code can distinguish that from a controller
+///    fault and stop retrying a submission that will never land.
+///  - `Internal` is reserved for a genuine DB failure, which IS worth
+///    retrying. Collapsing the two is the exact ambiguity the typed outcome
+///    exists to remove; a string-match that silently reclassifies the moment
+///    anyone rewords a `bail!` is the reason it cannot stay.
+///
+/// Two ways to reach the CAS bail, because they are different rows:
+/// an epoch with no row at all, and a genuinely `pending` epoch whose sentinel
+/// has already been filled in (the production trigger — a stale in-flight
+/// submission arriving after a fresh one won the swap).
+#[tokio::test]
+async fn a_cas_bail_on_submit_stays_failed_precondition_not_internal() {
+    let h = TestController::start().await;
+    let a = enroll_one(&h, "aws", "10.0.0.0/16").await;
+
+    // `submit_epoch_key_raw` rather than the honest helper: only the raw form
+    // carries the `tonic::Status` UNSTRINGIFIED, and the CODE is the whole
+    // assertion here. The generation is this stub's own, so the
+    // session-generation gate passes and the CAS is genuinely what rejects.
+    let generation = a.session_generation();
+
+    // (a) No such epoch row at all.
+    let err = a
+        .submit_epoch_key_raw(SubmitEpochKeyRequest {
+            epoch: 999,
+            pubkey: "X==".to_string(),
+            session_generation: generation,
+        })
+        .await
+        .expect_err("Sync.SubmitEpochKey for an epoch that was never created must fail");
+    assert_eq!(
+        status_of(&err).code(),
+        tonic::Code::FailedPrecondition,
+        "submitting for a non-existent epoch is a PRECONDITION failure — the caller asked \
+         for something that isn't true, not a controller fault. Today the controller reaches \
+         that verdict by grepping the DB's error text for \"no pending epoch\"; once the CAS \
+         outcome is typed, the verdict must come from the outcome and must not drift to \
+         Internal (which tells a gateway to keep retrying a submission that can never land). \
+         Got: {:?}",
+        status_of(&err)
+    );
+
+    // (b) The production shape: a genuinely `pending` epoch whose sentinel has
+    // ALREADY been overwritten by a real key. The CAS matches zero rows for
+    // the second submission precisely because its WHERE clause still requires
+    // the sentinel — that guard is the only thing keeping a stale in-flight
+    // key from clobbering the one the gateway is actually serving.
+    let pending_epoch = rotate_and_pending_epoch(&h, a.id()).await;
+    a.submit_epoch_key(pending_epoch, FRESH_KEY)
+        .await
+        .expect("the first submission for a sentinel-holding pending epoch must succeed");
+
+    let err = a
+        .submit_epoch_key_raw(SubmitEpochKeyRequest {
+            epoch: pending_epoch,
+            pubkey: STALE_KEY.to_string(),
+            session_generation: generation,
+        })
+        .await
+        .expect_err(
+            "a SECOND submission for the same epoch must be rejected — the sentinel is gone, \
+             so set_epoch_pubkey's compare-and-swap matches nothing",
+        );
+    assert_eq!(
+        status_of(&err).code(),
+        tonic::Code::FailedPrecondition,
+        "the epoch is still 'pending', but its sentinel has already been filled in, so this \
+         is the same lost-CAS precondition failure as (a) and must carry the same code. \
+         Got: {:?}",
+        status_of(&err)
+    );
+    assert_eq!(
+        epoch_row(&h, a.id(), pending_epoch).await.0,
+        FRESH_KEY,
+        "and the rejected submission must not have clobbered the key already on file"
+    );
+}
+
 // --- Sync session generation on Sync.SubmitEpochKey -----------------------
 //
 // `SubmitEpochKey` was the one mutating gateway->controller RPC the

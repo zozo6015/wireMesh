@@ -11,8 +11,8 @@ use ipnet::Ipv4Net;
 
 use crate::db::Db;
 pub use crate::db::{
-    ApplyOutcome, DrainOutcome, EnrollError, EnrollOutcome, GatewayIdentity, GatewayKeyRow,
-    GatewayRow, PolicyVersionRow, RotateKeyOutcome,
+    ApplyOutcome, CasOutcome, DrainOutcome, EnrollError, EnrollOutcome, GatewayIdentity,
+    GatewayKeyRow, GatewayRow, PolicyVersionRow, RotateKeyOutcome,
 };
 
 /// Cheaply cloneable async handle to a [`Db`]. `Db` already serializes access
@@ -218,26 +218,35 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.rotate_key(gateway_id, &actor, &now)).await?
     }
 
-    /// See [`Db::set_epoch_pubkey`].
-    pub async fn set_epoch_pubkey(&self, gateway_id: i64, epoch: u32, pubkey: String) -> Result<()> {
+    /// See [`Db::set_epoch_pubkey`]. `Ok(CasOutcome::NoMatch)` is a lost
+    /// compare-and-swap, NOT a failure — see [`CasOutcome`].
+    pub async fn set_epoch_pubkey(
+        &self,
+        gateway_id: i64,
+        epoch: u32,
+        pubkey: String,
+    ) -> Result<CasOutcome> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.set_epoch_pubkey(gateway_id, epoch, &pubkey)).await?
     }
 
-    /// See [`Db::promote_epoch`].
-    pub async fn promote_epoch(&self, gateway_id: i64, epoch: u32) -> Result<()> {
+    /// See [`Db::promote_epoch`]. `Ok(CasOutcome::NoMatch)` is a lost
+    /// compare-and-swap, NOT a failure — see [`CasOutcome`].
+    pub async fn promote_epoch(&self, gateway_id: i64, epoch: u32) -> Result<CasOutcome> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.promote_epoch(gateway_id, epoch)).await?
     }
 
-    /// See [`Db::retire_epoch`].
-    pub async fn retire_epoch(&self, gateway_id: i64, epoch: u32) -> Result<()> {
+    /// See [`Db::retire_epoch`]. `Ok(CasOutcome::NoMatch)` is a lost
+    /// compare-and-swap, NOT a failure — see [`CasOutcome`].
+    pub async fn retire_epoch(&self, gateway_id: i64, epoch: u32) -> Result<CasOutcome> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.retire_epoch(gateway_id, epoch)).await?
     }
 
-    /// See [`Db::drop_pending_epoch`].
-    pub async fn drop_pending_epoch(&self, gateway_id: i64, epoch: u32) -> Result<()> {
+    /// See [`Db::drop_pending_epoch`]. `Ok(CasOutcome::NoMatch)` is a lost
+    /// compare-and-swap, NOT a failure — see [`CasOutcome`].
+    pub async fn drop_pending_epoch(&self, gateway_id: i64, epoch: u32) -> Result<CasOutcome> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.drop_pending_epoch(gateway_id, epoch)).await?
     }
