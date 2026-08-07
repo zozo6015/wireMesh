@@ -327,27 +327,44 @@ pub fn apply(ifname: &str, cfg: &DeviceConfig) -> anyhow::Result<()> {
 /// its endpoint for us on the first one it authenticates. The caller is
 /// expected to prompt that rather than wait for the 25s keepalive.
 ///
-/// # Failure posture: an `Err` here is a DATA-PLANE OUTAGE, not a no-op
+/// # Failure posture: an `Err` here leaves the device HALF-OPEN, not merely no-op
 ///
-/// `open_listen_socket` is **not** atomic. It closes `udp4` **and** `udp6` and
+/// `open_listen_socket` is **not** atomic. It drops `udp4` **and** `udp6` and
 /// calls `shutdown_endpoint()` on every peer BEFORE attempting either bind, and
 /// assigns `self.udp4`/`self.udp6` only at the very end (boringtun 0.6.0,
 /// `device/mod.rs`). Any error in between — `Socket::new(Domain::IPV6, ..)` on
 /// a host with IPv6 disabled, an `EADDRINUSE` from a v4 or v6 conflict,
-/// `ENFILE` — surfaces here while leaving the Device with `udp4 = None,
-/// udp6 = None`: **deaf and mute on every port**, receiving nothing and able to
-/// send nothing, for every peer.
+/// `ENFILE` — surfaces here while leaving the Device with
+/// `udp4 = None, udp6 = None`.
 ///
-/// So an `Err` from this call does NOT mean "the device stayed on its old
-/// port". It means the device may hold no port at all, and only a process
-/// restart recovers it — there is no in-process retry. Callers must report it
-/// that way; `TunnelSet::set_listen_port` correctly declines to update its
-/// recorded port on an error, but that record is then describing a port the
-/// Device is not necessarily listening on either.
+/// What that actually means is NOT "no sockets at all", and the difference is
+/// load-bearing. `register_udp_handler` registers the event against a
+/// `try_clone()` — a `dup()`, so a second fd on the SAME kernel socket — and
+/// `open_listen_socket` clears by the ORIGINAL's fd. Since `events[]` is indexed
+/// by fd, that clear is a no-op: the clone stays in the epoll set, still bound
+/// to the OLD port, its handler closure still owning the socket. Observed
+/// directly with `ss -lunpe` in a netns (see
+/// `docs/research/socket-leak-on-rebind.md`).
+///
+/// So after a failed rebind the Device keeps RECEIVING on the old port through
+/// the leaked clone, while `self.udp4 = None` leaves it unable to SEND. Peers
+/// see a gateway that acknowledges nothing. Recovery is a process restart —
+/// there is no in-process retry — and the state is arguably nastier than a
+/// clean death because it is not silent in the direction an operator watches.
+///
+/// `TunnelSet::set_listen_port` correctly declines to update its recorded port
+/// on an error, but that record then describes a port the Device is not
+/// sending from.
 ///
 /// The specific `EADDRINUSE`-against-the-observe-probe case IS ruled out, by
-/// the `SO_REUSEADDR` reasoning above; it is every OTHER error that is
-/// unsurvivable.
+/// the `SO_REUSEADDR` reasoning above; it is every OTHER error that leaves this
+/// state.
+///
+/// > **This paragraph has now been wrong twice.** It first claimed a failed
+/// > rebind "leaves the gateway exactly where it was — on the offset port". It
+/// > was then corrected to "deaf and mute on every port, receiving nothing".
+/// > Both were reasoned from boringtun's source without observing a running
+/// > device. The text above is the first version written from `ss` output.
 pub fn set_listen_port(ifname: &str, port: u16) -> anyhow::Result<()> {
     // Trailing blank line terminates the request (see `send_set`).
     send_set(ifname, &format!("listen_port={port}\n\n"))

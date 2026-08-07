@@ -43,11 +43,33 @@ hold as built. Verified 2026-08-05 against the live fabric and the operator sour
   inbound as much as outbound**, so remote access into the segment reaches only the
   gateway node itself.
 - **The operator cannot express what operators need.** It hardcodes the controller's env
-  list with no CRD field for `WIREMESH_ROTATION_INTERVAL`
-  (`workloads.rs:360-370`) and force-applies the Deployment
-  (`controllers/mod.rs:207-208`), so hand-edits revert on the next reconcile. Since the
-  control plane moved to px it also cannot perform fabric admin at all — its admin channel
-  was a kubectl-exec into a controller pod that no longer exists in that cluster.
+  list with no CRD field for `WIREMESH_ROTATION_INTERVAL` (`controller_deployment`,
+  `workloads.rs`). Since the control plane moved to px it also cannot perform fabric admin
+  at all — its admin channel was a kubectl-exec into a controller pod that no longer exists
+  in that cluster.
+
+  > **CORRECTED 2026-08-07.** This originally continued "…and force-applies the Deployment
+  > (`controllers/mod.rs:207-208`), so hand-edits revert on the next reconcile." **Both
+  > halves are wrong.** The cited lines are the *generic* `apply()`, not
+  > `apply_deployment()`, which is what the Deployment actually goes through. And the
+  > conclusion does not follow: a container's `env` is a server-side-apply **list-map keyed
+  > by `name`**, so `.force()` only overrides keys present in the applier's own body. The
+  > operator never names `WIREMESH_ROTATION_INTERVAL`, so a value set by `kubectl set env`
+  > is not in its ownership set and **survives every reconcile**. Verified against a live
+  > cluster's OpenAPI v3 schema (`env` → `x-kubernetes-list-type: map`).
+  >
+  > What IS force-clobbered, checked in the same pass: container **`args`** are
+  > `x-kubernetes-list-type: atomic`, so any hand-added flag is wiped on the next reconcile
+  > and there is no CRD surface for extra flags; and **`replicas: Some(1)`** is force-set on
+  > all three workloads, so `kubectl scale --replicas=0` is reverted *immediately* (each
+  > reconciler `.owns(Deployment)`, so the scale event re-enqueues rather than waiting out
+  > the requeue). See task #33.
+  >
+  > The trap this creates for the obvious fix: adding `WIREMESH_ROTATION_INTERVAL` to the
+  > hardcoded list with a default would make the operator **own** the key, at which point
+  > `.force()` really would overwrite a human's `off` with the default — silently
+  > re-enabling rotation on exactly the clusters that had mitigated it. Emit the key only
+  > when the CRD field is `Some`.
 
 To be fair to the record: the operator *does* deploy a working gateway, and pinning is
 supported — `WiremeshGatewaySpec` has `node_name` and `node_selector` (`crd.rs:144`),

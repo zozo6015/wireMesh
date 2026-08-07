@@ -3712,8 +3712,11 @@ async fn retarget_relay_transports(
 /// very end. Any error in between — `Socket::new(Domain::IPV6, ..)` on a host
 /// with IPv6 disabled, an `EADDRINUSE` from a v4 or v6 conflict, `ENFILE` —
 /// returns to the UAPI caller with the Device holding `udp4 = None,
-/// udp6 = None`: **deaf and mute on every port**, not sitting on the offset
-/// one. `TunnelSet::set_listen_port` then correctly declines to update its
+/// udp6 = None` — which leaves it **half-open, not dead**: boringtun's epoll
+/// clone of the OLD socket is never actually deregistered (it clears by the
+/// original's fd, and `events[]` is fd-indexed), so the Device keeps RECEIVING
+/// on the old port while being unable to SEND. Observed with `ss -lunpe`; see
+/// `docs/research/socket-leak-on-rebind.md`. `TunnelSet::set_listen_port` then correctly declines to update its
 /// record, `a.wg_port` stays on the offset, nothing here retries, and the next
 /// rotation additionally hard-fails on the still-reserved port. That is a full
 /// data-plane outage requiring a process restart, which is why the failure log
@@ -3770,8 +3773,9 @@ async fn renormalize_active_listen_port(
                 "wiremesh-gateway: CRITICAL: could not renormalize {ifname} from listen port \
                  {from} back to the base port {base_wg_port}: {e:#} — RESTART THE GATEWAY. \
                  boringtun closes its old UDP sockets BEFORE it rebinds, so a failed move can \
-                 leave {ifname} bound to NO port at all: deaf and mute on every port, all peers \
-                 dead, and nothing here retries. Even in the milder case where the device is \
+                 leave {ifname} HALF-OPEN: boringtun never deregisters its epoll clone of the \
+                 old socket, so the interface keeps RECEIVING on the old port but can no longer \
+                 SEND at all, and nothing here retries. Even in the milder case where the device is \
                  still on {from}, that port is advertised by NO durable candidate \
                  (controller-observed endpoint, reported locals, punch candidates), so peers \
                  that lose their live pin cannot re-address this gateway — and the next rotation \
