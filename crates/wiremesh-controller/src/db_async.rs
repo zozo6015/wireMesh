@@ -11,8 +11,8 @@ use ipnet::Ipv4Net;
 
 use crate::db::Db;
 pub use crate::db::{
-    ApplyOutcome, CasOutcome, DrainOutcome, EnrollError, EnrollOutcome, GatewayIdentity,
-    GatewayKeyRow, GatewayRow, PolicyVersionRow, RotateKeyOutcome,
+    ApplyOutcome, CasOutcome, DrainOutcome, DropPendingOutcome, EnrollError, EnrollOutcome,
+    GatewayIdentity, GatewayKeyRow, GatewayRow, PolicyVersionRow, RotateKeyOutcome,
 };
 
 /// Cheaply cloneable async handle to a [`Db`]. `Db` already serializes access
@@ -244,9 +244,13 @@ impl DbHandle {
         tokio::task::spawn_blocking(move || db.retire_epoch(gateway_id, epoch)).await?
     }
 
-    /// See [`Db::drop_pending_epoch`]. `Ok(CasOutcome::NoMatch)` is a lost
-    /// compare-and-swap, NOT a failure — see [`CasOutcome`].
-    pub async fn drop_pending_epoch(&self, gateway_id: i64, epoch: u32) -> Result<CasOutcome> {
+    /// See [`Db::drop_pending_epoch`]. Neither zero-row outcome is a failure,
+    /// and the two are not interchangeable — see [`DropPendingOutcome`].
+    pub async fn drop_pending_epoch(
+        &self,
+        gateway_id: i64,
+        epoch: u32,
+    ) -> Result<DropPendingOutcome> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.drop_pending_epoch(gateway_id, epoch)).await?
     }

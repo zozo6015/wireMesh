@@ -75,6 +75,51 @@ pub enum CasOutcome {
     NoMatch,
 }
 
+/// (task #32, round 2) WHY [`Db::drop_pending_epoch`]'s compare-and-swap
+/// matched nothing — the distinction [`CasOutcome::NoMatch`] is too coarse to
+/// carry, and the only one of the four rotation CAS whose caller must react
+/// differently to the two causes.
+///
+/// # The 30s-to-~0 collapse this exists to prevent
+///
+/// `services::sync::drive_rotation_for`'s `Abort` arm removes its rotation
+/// tracker on a confirmed bail, because a `pending` row that is already gone
+/// means the rotation is over and the tracker is wedged. But "the DELETE
+/// matched nothing" has a SECOND cause with the opposite meaning:
+///
+///  - the row is **absent** — another aborter won. The rotation is over and it
+///    created no `retiring` row, so the tracker can go.
+///  - the row is **present, in another state** — a concurrent PROMOTE won.
+///    It flipped this epoch to `active` and demoted the prior active epoch to
+///    `retiring` in the same transaction, so there is now a SECONDS-OLD
+///    `retiring` row owed the full [`RETIRE_GRACE`](crate::rotation::RETIRE_GRACE).
+///    Removing the tracker hands that row to `sweep_rotations`' step-3 orphan
+///    path, which deletes grace-free.
+///
+/// The caller cannot infer which from in-memory state. The promoter COMMITS to
+/// SQLite (across a `spawn_blocking` hop) before it re-takes the `rotations`
+/// guard, so an aborter that wins the guard in between reads `promoted_at ==
+/// None` and sees an unpromoted tracker either way —
+/// `TrackerEffect::FinishedIfUnpromoted` closes the narrower window where the
+/// promoter's WRITE-BACK already landed, not this one. Durable state can tell
+/// them apart, and the failed DELETE's own transaction is the only place it can
+/// be read without introducing a fresh race.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DropPendingOutcome {
+    /// The row was `pending` and has been deleted; the revision was bumped.
+    Dropped,
+    /// Zero rows matched and `(gateway_id, epoch)` has NO row at all. The
+    /// rotation this epoch names is over and left nothing behind.
+    RowAbsent,
+    /// Zero rows matched because the row is still on file in some other state
+    /// (`active` — the promote this abort just lost to; `retiring` — a whole
+    /// later rotation has since promoted over it). Carries that state purely
+    /// so the loser's log says which; the CALLER's rule is the same for both,
+    /// and deliberately so: any surviving row means a `retiring` row may exist
+    /// that this rotation's tracker is the only thing shielding.
+    RowSuperseded { state: String },
+}
+
 fn bump_revision_tx(tx: &Transaction<'_>) -> rusqlite::Result<u64> {
     tx.execute(
         "UPDATE state_revision SET revision = revision + 1 WHERE id = 0",
@@ -2036,15 +2081,30 @@ impl Db {
     /// only the `pending` sentinel row is deleted, the prior `active` epoch
     /// is untouched (it was never demoted, since `promote_epoch` never ran
     /// for this epoch). ONE transaction: deletes the `(gateway_id, epoch)`
-    /// row IFF it's currently `state = 'pending'` ([`CasOutcome::NoMatch`] if
-    /// zero rows matched), then bumps the persisted revision.
+    /// row IFF it's currently `state = 'pending'`, then bumps the persisted
+    /// revision.
     ///
-    /// (task #32) That `NoMatch` is the one this whole enum was introduced
-    /// for: it is the CONFIRMED evidence `drive_rotation_for`'s `Abort` arm
-    /// needs to tell a wedged rotation tracker — one naming a `pending` epoch
-    /// whose row is already gone, which can therefore never satisfy its own
-    /// abort — apart from a transient database failure it must not react to.
-    pub fn drop_pending_epoch(&self, gateway_id: i64, epoch: u32) -> Result<CasOutcome> {
+    /// (task #32) A zero-row match is NOT an error — it is the CONFIRMED
+    /// evidence `drive_rotation_for`'s `Abort` arm needs to tell a wedged
+    /// rotation tracker (one naming a `pending` epoch whose row is already
+    /// gone, which can therefore never satisfy its own abort) apart from a
+    /// transient database failure it must not react to.
+    ///
+    /// (task #32, round 2) And it reports WHY it matched nothing — see
+    /// [`DropPendingOutcome`], whose two zero-row variants demand OPPOSITE
+    /// reactions from that caller. The row state is read INSIDE the failed
+    /// DELETE's own transaction: reading it afterwards would be a fresh race
+    /// against the very promote this is trying to observe, and reading it
+    /// beforehand would be a check-then-act. This is a rolled-back read-only
+    /// path — no row is touched and the revision must not move, which
+    /// `a_drop_that_lost_to_a_promote_changes_nothing` pins.
+    ///
+    /// A row that reads back as `'pending'` here is not reachable (the DELETE
+    /// would have matched it), and is classified as
+    /// [`DropPendingOutcome::RowSuperseded`] anyway — the conservative side,
+    /// since "some row still exists" is the condition that makes keeping the
+    /// tracker correct.
+    pub fn drop_pending_epoch(&self, gateway_id: i64, epoch: u32) -> Result<DropPendingOutcome> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -2053,13 +2113,25 @@ impl Db {
             params![gateway_id, epoch],
         )?;
         if changed == 0 {
+            let row_state: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM gateway_key WHERE gateway_id = ?1 AND epoch = ?2",
+                    params![gateway_id, epoch],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // Roll back rather than falling through: nothing was mutated, so
+            // the revision must not advance (see `set_epoch_pubkey`).
             tx.rollback()?;
-            return Ok(CasOutcome::NoMatch);
+            return Ok(match row_state {
+                None => DropPendingOutcome::RowAbsent,
+                Some(state) => DropPendingOutcome::RowSuperseded { state },
+            });
         }
 
         bump_revision_tx(&tx)?;
         tx.commit()?;
-        Ok(CasOutcome::Applied)
+        Ok(DropPendingOutcome::Dropped)
     }
 
     /// (Key-rotation Task 3) Atomic combination of [`Db::all_keys_for_gateway`]
@@ -3089,61 +3161,51 @@ mod cas_tests {
     //! **"Zero rows matched" and "the database failed" are DIFFERENT
     //! outcomes, and only the second is an error.**
     //!
-    //! Today all four `anyhow::bail!` when their `WHERE` clause matches
-    //! nothing, so a caller holding the `Err` cannot tell a lost CAS race
+    //! All four used to `anyhow::bail!` when their `WHERE` clause matched
+    //! nothing, so a caller holding the `Err` could not tell a lost CAS race
     //! from a broken disk. `services::sync::drive_rotation_for` is that
     //! caller, and the difference is load-bearing for it in both directions:
     //!
     //!  - It must be able to react to a CONFIRMED bail (the `Abort` arm's
-    //!    tracker is wedged and has to go — see
-    //!    `services::sync`'s `should_remove_tracker` tests), and
+    //!    tracker is wedged and has to go — the caller-side half of this
+    //!    contract is the final group of `services::sync`'s tests, whose
+    //!    module doc carries the full verdict table), and
     //!  - it must NOT react the same way to a transient DB error, because
     //!    removing a tracker hands any live `retiring` row to
     //!    `sweep_rotations`' step-3 orphan path, which deletes grace-free.
     //!    `RETIRE_GRACE` collapsing from 30s to ~0 has been reachable by
-    //!    three independent routes on this codebase already.
+    //!    three independent routes on this codebase already — and the
+    //!    round-2 group at the bottom of this module is about a FOURTH.
     //!
-    //! There is precedent in this very file for the shape being asked for:
-    //! [`Db::revoke_api_token`] returns `Ok(false)` — not an error — when no
-    //! row matched, and [`Db::set_local_candidates`] returns `Ok(None)` for
-    //! "nothing changed". And there is precedent for why the string-matching
-    //! alternative is not acceptable: `SyncSvc::submit_epoch_key` currently
-    //! classifies [`Db::set_epoch_pubkey`]'s failure with
-    //! `msg.contains("no pending epoch")`.
+    //! There is precedent in this very file for the shape: [`Db::revoke_api_token`]
+    //! returns `Ok(false)` — not an error — when no row matched, and
+    //! [`Db::set_local_candidates`] returns `Ok(None)` for "nothing changed".
+    //! And there is precedent for why the string-matching alternative is not
+    //! acceptable: `SyncSvc::submit_epoch_key` used to classify
+    //! [`Db::set_epoch_pubkey`]'s failure with
+    //! `msg.contains("no pending epoch")`, which would silently reclassify
+    //! the RPC the moment anyone reworded the `bail!`.
     //!
-    //! # The signature these were written against
+    //! # The signatures these pin
     //!
     //! ```ignore
-    //! /// Did a state-guarded CAS actually match and commit?
-    //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    //! pub enum CasOutcome {
-    //!     /// The row was in the state the caller assumed; the mutation committed.
-    //!     Applied,
-    //!     /// Zero rows matched the state guard. NOT an error — a concurrent
-    //!     /// driver got there first, or the row was already gone.
-    //!     NoMatch,
-    //! }
+    //! pub enum CasOutcome { Applied, NoMatch }
     //!
     //! pub fn promote_epoch(&self, gateway_id: i64, epoch: u32) -> Result<CasOutcome>;
     //! pub fn retire_epoch(&self, gateway_id: i64, epoch: u32) -> Result<CasOutcome>;
-    //! pub fn drop_pending_epoch(&self, gateway_id: i64, epoch: u32) -> Result<CasOutcome>;
     //! pub fn set_epoch_pubkey(&self, gateway_id: i64, epoch: u32, pubkey: &str) -> Result<CasOutcome>;
+    //!
+    //! pub enum DropPendingOutcome { Dropped, RowAbsent, RowSuperseded { state: String } }
+    //!
+    //! pub fn drop_pending_epoch(&self, gateway_id: i64, epoch: u32) -> Result<DropPendingOutcome>;
     //! ```
     //!
-    //! The NAME is a proposal and the implementer may change it. The cases
-    //! below are the contract. They are deliberately written so they COMPILE
-    //! against both the current `Result<()>` signature and any
-    //! `Result<T: Debug + PartialEq>` replacement — the "did not match" value
-    //! is never spelled out, only compared. That is why they can be, and are,
-    //! red TODAY rather than blocked on the extraction:
-    //!
-    //!  - `.expect(..)` on a zero-row call is red today (it bails) and green
-    //!    once "did not match" stops being an error;
-    //!  - `assert_ne!(applied, no_match)` is red today (both are `()`, hence
-    //!    equal) and green once the two outcomes are distinguishable.
-    //!
-    //! The `#[allow(clippy::unit_cmp)]` attributes exist only for that
-    //! transitional window and should be deleted with the extraction.
+    //! The cases below are the contract, and the NAMES are not part of it:
+    //! every one of them is written so it compiles against any
+    //! `Result<T: Debug + PartialEq>` — the outcome values are never spelled
+    //! out, only compared. That is deliberate, so a later reshaping of these
+    //! types (as the round-2 group's [`DropPendingOutcome`] already was) has
+    //! to keep satisfying them rather than being able to edit them.
 
     use super::*;
 
@@ -3239,7 +3301,6 @@ mod cas_tests {
     ///     distinction, and `drive_rotation_for` would go on treating a
     ///     confirmed bail as a completed abort.
     #[test]
-    #[allow(clippy::unit_cmp)]
     fn drop_pending_epoch_that_matched_nothing_is_ok_and_distinguishable() {
         let db = db_with_gateway();
         seed_key(&db, 0, "EPOCH0==", "active");
@@ -3409,7 +3470,6 @@ mod cas_tests {
     /// distinction has to be available here too even though the fix's
     /// removal-on-bail is scoped to `Abort`.
     #[test]
-    #[allow(clippy::unit_cmp)]
     fn retire_epoch_that_matched_nothing_is_ok_and_distinguishable() {
         let db = db_with_gateway();
         seed_key(&db, 0, "EPOCH0==", "retiring");
@@ -3466,7 +3526,6 @@ mod cas_tests {
     /// for: the target epoch goes `active` and whatever was `active` is
     /// demoted to `retiring` (make-before-break's first half).
     #[test]
-    #[allow(clippy::unit_cmp)]
     fn promote_epoch_that_matched_nothing_is_ok_and_distinguishable() {
         let db = db_with_gateway();
         seed_key(&db, 0, "EPOCH0==", "active");
@@ -3531,7 +3590,6 @@ mod cas_tests {
     /// `services::sync`'s `submit_epoch_key_status` tests and by the existing
     /// `tests/epoch_key_submit.rs::submit_to_nonexistent_epoch_is_rejected`.)
     #[test]
-    #[allow(clippy::unit_cmp)]
     fn set_epoch_pubkey_that_matched_nothing_is_ok_and_distinguishable() {
         let db = db_with_gateway();
         seed_key(&db, 0, "EPOCH0==", "active");
@@ -3587,6 +3645,185 @@ mod cas_tests {
             vec![(0, "active".to_string()), (1, "pending".to_string())],
             "submitting an epoch key must NOT move the epoch out of 'pending' — promotion is \
              the rotation driver's job, gated on acks or the grace timeout"
+        );
+    }
+
+    // --- (task #32, round 2) WHY the abort CAS matched nothing --------------
+    //
+    // `Ok(NoMatch)` from `drop_pending_epoch` was treated as one fact. It is
+    // two, and they demand OPPOSITE reactions from the caller:
+    //
+    //   row ABSENT                  -> another aborter won. The rotation is
+    //                                  over and NO `retiring` row was created
+    //                                  by it. `drive_rotation_for` must REMOVE
+    //                                  the wedged tracker.
+    //   row PRESENT, not 'pending'  -> a concurrent PROMOTE won. It flipped
+    //                                  this epoch to 'active' and demoted the
+    //                                  prior active epoch to 'retiring' — a
+    //                                  SECONDS-OLD row owed the full 30s
+    //                                  RETIRE_GRACE. The tracker must be KEPT,
+    //                                  so the promoter's write-back can still
+    //                                  stamp `promoted_at` and the retire runs
+    //                                  under grace.
+    //
+    // The caller cannot infer which from in-memory state: the promoter commits
+    // its DB write BEFORE its `apply_tracker_effect`, so an aborter that wins
+    // the guard in between reads `promoted_at == None` and cannot tell the two
+    // apart. The durable state CAN tell them apart, and the failed DELETE's own
+    // transaction is the only place it can be read consistently.
+    //
+    // These are written type-agnostically, as the round-1 cases were: the
+    // outcome values are never spelled out, only compared. `assert_ne!` of the
+    // two answers is RED today (both are the one `CasOutcome::NoMatch`, hence
+    // equal) and green under any shape that separates them —
+    // `NoMatch { row_state: Option<String> }`, a third variant, anything.
+
+    /// THE DISCRIMINATION. A `drop_pending_epoch` that matched nothing because
+    /// the row is GONE and one that matched nothing because a promote moved the
+    /// row out of `pending` must be different answers.
+    ///
+    /// They are not interchangeable and they are not a detail: acting on the
+    /// wrong one collapses `RETIRE_GRACE` from 30s to ~0 on a row created
+    /// seconds ago (see
+    /// `services::sync`'s `a_promote_that_won_the_abort_cas_must_not_collapse_retire_grace`,
+    /// which follows this distinction all the way to the deleted row).
+    #[test]
+    #[allow(clippy::unit_cmp)]
+    fn drop_pending_epoch_distinguishes_a_vanished_row_from_a_superseded_one() {
+        // (a) The row is GONE — another aborter already dropped it. Nothing
+        // this rotation created survives, so its tracker is safe to remove.
+        let gone = db_with_gateway();
+        seed_key(&gone, 0, "EPOCH0==", "active");
+        let row_absent = gone
+            .drop_pending_epoch(GW, 1)
+            .expect("a zero-row CAS must not be an error");
+
+        // (b) The row is PRESENT as 'active' — a concurrent promote won,
+        // which also demoted epoch 0 to 'retiring'. That `retiring` row is
+        // seconds old and owed the full RETIRE_GRACE.
+        let promoted = db_with_gateway();
+        seed_key(&promoted, 0, "EPOCH0==", "retiring");
+        seed_key(&promoted, 1, REAL_KEY, "active");
+        let row_superseded = promoted
+            .drop_pending_epoch(GW, 1)
+            .expect("a zero-row CAS must not be an error");
+
+        assert_ne!(
+            row_absent, row_superseded,
+            "RETIRE_GRACE COLLAPSE (the fourth route): both of these matched zero rows, but \
+             they mean opposite things. (a) the pending row VANISHED — the rotation is over \
+             and left no retiring row, so drive_rotation_for must drop its wedged tracker. \
+             (b) a concurrent PROMOTE took the row to 'active' and demoted epoch 0 to \
+             'retiring' — a seconds-old row owed the full 30s grace, and dropping the \
+             tracker hands it to sweep_rotations' step-3 orphan path, which deletes \
+             grace-free. Returning ONE indistinguishable value forces the caller to guess, \
+             and the only in-memory signal it has (`promoted_at`) is still None at that \
+             instant because the promoter commits its DB write BEFORE its write-back. The \
+             durable row state is the only honest answer, and the failed DELETE's own \
+             transaction is where it must be read"
+        );
+    }
+
+    /// The same discrimination for a row that has moved on to `retiring`
+    /// rather than `active` — reachable once a later rotation has promoted
+    /// over this epoch.
+    ///
+    /// The contract is ABSENT versus PRESENT, not absent versus one specific
+    /// state: any surviving row means a `retiring` row may exist that this
+    /// tracker is still shielding. Deliberately NOT asserting that 'active'
+    /// and 'retiring' differ from EACH OTHER — collapsing both into one
+    /// "superseded" answer is a perfectly good implementation.
+    #[test]
+    #[allow(clippy::unit_cmp)]
+    fn drop_pending_epoch_distinguishes_a_vanished_row_from_a_retiring_one() {
+        let gone = db_with_gateway();
+        seed_key(&gone, 0, "EPOCH0==", "active");
+        let row_absent = gone
+            .drop_pending_epoch(GW, 1)
+            .expect("a zero-row CAS must not be an error");
+
+        let retiring = db_with_gateway();
+        seed_key(&retiring, 1, "EPOCH1==", "retiring");
+        seed_key(&retiring, 2, REAL_KEY, "active");
+        let row_superseded = retiring
+            .drop_pending_epoch(GW, 1)
+            .expect("a zero-row CAS must not be an error");
+
+        assert_ne!(
+            row_absent, row_superseded,
+            "a row that still EXISTS — in any state — is not the same fact as a row that is \
+             GONE. Only the second proves nothing of this rotation survives; the first leaves \
+             a retiring row that the tracker is the only thing shielding from the grace-free \
+             orphan path"
+        );
+    }
+
+    /// Both zero-row answers must still be distinct from the committed one, so
+    /// the new discrimination cannot be bought by blurring the boundary the
+    /// round-1 tests drew.
+    #[test]
+    #[allow(clippy::unit_cmp)]
+    fn neither_zero_row_answer_looks_like_a_committed_drop() {
+        let applied_db = db_with_gateway();
+        seed_key(&applied_db, 0, "EPOCH0==", "active");
+        seed_key(&applied_db, 1, AWAITING_SUBMISSION_SENTINEL, "pending");
+        let applied = applied_db
+            .drop_pending_epoch(GW, 1)
+            .expect("dropping a genuinely 'pending' epoch must succeed");
+
+        let gone = db_with_gateway();
+        seed_key(&gone, 0, "EPOCH0==", "active");
+        let row_absent = gone
+            .drop_pending_epoch(GW, 1)
+            .expect("a zero-row CAS must not be an error");
+
+        let promoted = db_with_gateway();
+        seed_key(&promoted, 0, "EPOCH0==", "retiring");
+        seed_key(&promoted, 1, REAL_KEY, "active");
+        let row_superseded = promoted
+            .drop_pending_epoch(GW, 1)
+            .expect("a zero-row CAS must not be an error");
+
+        assert_ne!(
+            applied, row_absent,
+            "a committed drop and a drop whose row was already gone must stay distinct — \
+             `drive_rotation_for` publishes a KeyRotated delta on the first and not the second"
+        );
+        assert_ne!(
+            applied, row_superseded,
+            "a committed drop and a drop a promote beat must stay distinct — treating the \
+             second as success would let the aborter's decision mutate the tracker to match a \
+             DB state that never happened"
+        );
+    }
+
+    /// A CAS that lost to a promote must still leave the database exactly as it
+    /// found it. Pinned separately from the round-1 revision test because the
+    /// natural way to add the row-state read is a second statement inside the
+    /// transaction, and the natural way to get that wrong is to commit rather
+    /// than roll back.
+    #[test]
+    fn a_drop_that_lost_to_a_promote_changes_nothing() {
+        let db = db_with_gateway();
+        seed_key(&db, 0, "EPOCH0==", "retiring");
+        seed_key(&db, 1, REAL_KEY, "active");
+
+        let before = db.current_revision().expect("reading the revision");
+        db.drop_pending_epoch(GW, 1)
+            .expect("a zero-row CAS must not be an error");
+        let after = db.current_revision().expect("reading the revision");
+
+        assert_eq!(
+            states(&db),
+            vec![(0, "retiring".to_string()), (1, "active".to_string())],
+            "the abort lost the race to a promote, so it must not have touched a single row \
+             — least of all the freshly-demoted 'retiring' row it would otherwise be racing \
+             the grace timer for"
+        );
+        assert_eq!(
+            before, after,
+            "reading the row's state to explain the failed CAS must not turn a rolled-back \
+             transaction into a committed one: the revision must not move"
         );
     }
 }

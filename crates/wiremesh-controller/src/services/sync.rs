@@ -40,7 +40,7 @@ use wiremesh_proto::v1::{
 };
 
 use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
-use crate::db::{CasOutcome, GatewayIdentity};
+use crate::db::{CasOutcome, DropPendingOutcome, GatewayIdentity};
 use crate::db_async::DbHandle;
 use crate::projection::{self, ChangeEvent};
 use crate::rotation::{self, RotationDecision, RotationState};
@@ -298,26 +298,37 @@ enum TrackerEffect {
     /// The rotation is over (retired or aborted): drop the tracker, which also
     /// hands any remaining `retiring` rows to [`sweep_rotations`]' orphan path.
     Finished,
-    /// (task #32) The abort's CAS came back a CONFIRMED [`CasOutcome::NoMatch`]:
-    /// the `pending` row this tracker names is already gone, so the rotation it
-    /// describes is over and the tracker is WEDGED — it can never satisfy its
-    /// own abort, [`evict_decision`]'s `None`-means-keep leg will never clear
-    /// it, and the gateway has no `pending`/`retiring` row so
-    /// [`sweep_rotations`] cannot even see it. Drop it — but ONLY if it is
-    /// still unpromoted.
+    /// (task #32) The abort's CAS came back a confirmed
+    /// [`DropPendingOutcome::RowAbsent`]: the `pending` row this tracker names
+    /// does not exist, so the rotation it describes is over and the tracker is
+    /// WEDGED — it can never satisfy its own abort, [`evict_decision`]'s
+    /// `None`-means-keep leg will never clear it, and the gateway has no
+    /// `pending`/`retiring` row so [`sweep_rotations`] cannot even see it. Drop
+    /// it — but ONLY if it is still unpromoted.
     ///
     /// That extra condition is the whole safety argument for removing on a
     /// bail, and it must be re-checked HERE rather than assumed from the
     /// decision: `RotationDecision::Abort` is only produced for a tracker with
     /// `promoted_at == None` (`decide`'s rule 2), which is why such a tracker
     /// owns no live `retiring` row of its own — but the guard was RELEASED
-    /// across the CAS, and a concurrent driver's promote can commit and stamp
+    /// across the CAS, and a concurrent driver's promote can commit AND stamp
     /// `promoted_at` inside that window. Removing the tracker then discards a
     /// `RotationDecision::Retire` that is owed `RETIRE_GRACE` from now and
     /// hands a SECONDS-OLD `retiring` row to `sweep_rotations`' step-3 orphan
     /// path, which deletes grace-free. That is the same 30s-to-~0 collapse
     /// `evict_decision`'s `None` leg and both `Err` arms below exist to
     /// prevent; do not "simplify" this into a plain [`Self::Finished`].
+    ///
+    /// (task #32, round 2) Note precisely WHICH window this covers, because it
+    /// is the narrower of two and it is not the primary defence. It catches a
+    /// racing promote whose in-memory WRITE-BACK has already landed. It cannot
+    /// catch one whose DB COMMIT has landed but whose write-back has not — the
+    /// promote arm commits to SQLite across a `spawn_blocking` hop and only
+    /// then re-takes the guard, so `promoted_at` is genuinely still `None`
+    /// there. That wider window is closed one layer down, by
+    /// [`DropPendingOutcome`] reporting whether the row SURVIVED the failed
+    /// DELETE; this variant is only reached once that already said the row is
+    /// absent. Belt and braces — keep both.
     FinishedIfUnpromoted,
 }
 
@@ -617,39 +628,46 @@ impl SyncSvc {
 /// [`Db::promote_epoch`](crate::db::Db::promote_epoch),
 /// [`Db::retire_epoch`](crate::db::Db::retire_epoch) and
 /// [`Db::drop_pending_epoch`](crate::db::Db::drop_pending_epoch) being
-/// state-guarded CAS that report [`CasOutcome::NoMatch`] when the row is not in
-/// the state the decision assumed: the loser logs and writes nothing, and the
-/// in-memory effect is gated behind `Ok(CasOutcome::Applied)`. **If anyone ever
-/// "simplifies" those three into unconditional `UPDATE`/`DELETE`s that silently
-/// affect zero rows — or folds `NoMatch` in with `Applied` — this whole design
-/// becomes unsafe**: a stale decision would then appear to succeed and the
-/// tracker would be mutated to match a DB state that never happened.
+/// state-guarded CAS that report a zero-row match — [`CasOutcome::NoMatch`],
+/// or one of [`DropPendingOutcome`]'s two zero-row variants — when the row is
+/// not in the state the decision assumed: the loser logs and writes nothing,
+/// and the in-memory effect is gated behind the "it committed" variant. **If
+/// anyone ever "simplifies" those three into unconditional `UPDATE`/`DELETE`s
+/// that silently affect zero rows — or folds a zero-row match in with the
+/// committed case — this whole design becomes unsafe**: a stale decision would
+/// then appear to succeed and the tracker would be mutated to match a DB state
+/// that never happened.
 ///
 /// # (task #32) A confirmed bail is not a DB error, and the two differ per arm
 ///
-/// `NoMatch` and `Err` used to be the same value here (both an `anyhow` `Err`),
-/// which forced the conservative rule "never react". They are now distinct, and
-/// the tracker disposition is:
+/// A zero-row match and `Err` used to be the same value here (both an `anyhow`
+/// `Err`), which forced the conservative rule "never react". They are now
+/// distinct, and the tracker disposition is:
 ///
 /// ```text
-///            Ok(Applied)   Ok(NoMatch)   Err(_)
-/// Promote     stamp         keep          keep
-/// Retire      remove        keep          keep
-/// Abort       remove        remove*       keep
+///            committed   zero rows                      Err(_)
+/// Promote     stamp       keep                           keep
+/// Retire      remove      keep                           keep
+/// Abort       remove      remove* if the row is ABSENT   keep
+///                         keep    if the row SURVIVED
 /// ```
 ///
 /// The whole `Err` column stays `keep`: a transient DB error is evidence of
 /// nothing, and a removed tracker hands any live `retiring` row to
 /// [`sweep_rotations`]' grace-free step-3 orphan path.
 ///
-/// `Retire` x `NoMatch` also stays `keep`, deliberately: a `Retire` tracker HAS
-/// promoted, so it lacks `Abort`'s safety argument entirely, and a lost retire
-/// CAS self-heals anyway — the driver that WON it removes the tracker through
-/// its own [`TrackerToken`].
+/// `Retire`'s zero-row cell also stays `keep`, deliberately: a `Retire` tracker
+/// HAS promoted, so it lacks `Abort`'s safety argument entirely, and a lost
+/// retire CAS self-heals anyway — the driver that WON it removes the tracker
+/// through its own [`TrackerToken`].
 ///
-/// `Abort` x `NoMatch` is the fix, and `remove*` is conditional: see
-/// [`TrackerEffect::FinishedIfUnpromoted`] for the condition and why it is
-/// required.
+/// The `Abort` row is the fix, and it is the only cell that splits on WHY the
+/// CAS matched nothing. `RowAbsent` means the rotation is over and left no
+/// `retiring` row; `RowSuperseded` means a concurrent promote won and there is
+/// now a seconds-old `retiring` row this tracker is the only thing shielding.
+/// [`DropPendingOutcome`] carries that distinction because in-memory state
+/// cannot: the promoter commits before it re-takes the guard. `remove*` is
+/// conditional even then — see [`TrackerEffect::FinishedIfUnpromoted`].
 pub(crate) async fn drive_rotation_for(
     db: &DbHandle,
     change_tx: &broadcast::Sender<ChangeEvent>,
@@ -831,7 +849,7 @@ pub(crate) async fn drive_rotation_for(
         },
         RotationDecision::Abort { epoch, reason } => {
             match db.drop_pending_epoch(rotating_gateway_id, epoch).await {
-                Ok(CasOutcome::Applied) => {
+                Ok(DropPendingOutcome::Dropped) => {
                     apply_tracker_effect(
                         rotations,
                         rotating_gateway_id,
@@ -847,16 +865,17 @@ pub(crate) async fn drive_rotation_for(
                         );
                     }
                 }
-                // (task #32) THE FIX. A CONFIRMED bail: the `pending` row this
-                // tracker names is gone, so the rotation it describes is over
-                // and the tracker is WEDGED — `decide` hands it this same
-                // unsatisfiable `Abort` on every tick, `evict_decision`'s
-                // `None`-means-keep leg never clears it, and the gateway is
-                // invisible to `sweep_rotations` (no `pending`/`retiring`
-                // rows). The cost lands on the NEXT rotation, which loses its
-                // first — and, per Role-B cutover, only — ack to `report`'s
-                // `ack.epoch == tracker.pending_epoch` check and silently falls
-                // back to the 90s grace promote.
+                // (task #32) THE FIX. A CONFIRMED bail whose row is GONE: the
+                // `pending` row this tracker names does not exist, so the
+                // rotation it describes is over and the tracker is WEDGED —
+                // `decide` hands it this same unsatisfiable `Abort` on every
+                // tick, `evict_decision`'s `None`-means-keep leg never clears
+                // it, and the gateway is invisible to `sweep_rotations` (no
+                // `pending`/`retiring` rows). The cost lands on the NEXT
+                // rotation, which loses its first — and, per Role-B cutover,
+                // only — ack to `report`'s `ack.epoch ==
+                // tracker.pending_epoch` check and silently falls back to the
+                // 90s grace promote.
                 //
                 // Safe to remove because an aborting tracker has `promoted_at
                 // == None` (`decide`'s rule 2), so it owns no live `retiring`
@@ -865,13 +884,13 @@ pub(crate) async fn drive_rotation_for(
                 // have elapsed since `started_at`, and any such row predates
                 // that, so its 30s `RETIRE_GRACE` expired 10x over. The one
                 // window where that reasoning does NOT hold — a concurrent
-                // promote committing inside this arm's own await — is what
-                // `FinishedIfUnpromoted` re-checks under the guard.
-                Ok(CasOutcome::NoMatch) => {
+                // promote whose write-back lands inside this arm's own await —
+                // is what `FinishedIfUnpromoted` re-checks under the guard.
+                Ok(DropPendingOutcome::RowAbsent) => {
                     eprintln!(
                         "wiremesh-controller: drop_pending_epoch({rotating_gateway_id}, {epoch}) \
-                         (reason: {reason}) matched no row — the pending epoch is already gone, \
-                         so this rotation is over; dropping its wedged tracker"
+                         (reason: {reason}) matched no row and the row is GONE — this rotation \
+                         is over; dropping its wedged tracker"
                     );
                     apply_tracker_effect(
                         rotations,
@@ -881,6 +900,39 @@ pub(crate) async fn drive_rotation_for(
                     )
                     .await;
                 }
+                // (task #32, round 2) The SAME confirmed bail, the opposite
+                // meaning — and the reason `DropPendingOutcome` exists. The row
+                // is still on file, so a concurrent PROMOTE beat this abort:
+                // `promote_epoch` flipped this epoch to `active` and demoted
+                // the prior active epoch to `retiring` in one transaction. That
+                // `retiring` row is SECONDS old and owed the full
+                // `RETIRE_GRACE`, and this tracker is both the only thing that
+                // will ever retire it under grace (`decide` rule 1) and the
+                // only thing making `sweep_rotations` step 3 skip this gateway
+                // instead of taking its deliberately grace-free orphan delete.
+                // So: KEEP it.
+                //
+                // `FinishedIfUnpromoted` cannot catch this and is not a second
+                // line of defence for it — the promoter COMMITS to SQLite
+                // before it re-takes the guard, so `promoted_at` is genuinely
+                // still `None` at this instant. Only the durable row state,
+                // read inside the failed DELETE's own transaction, can see the
+                // committed promote regardless of write-back timing.
+                //
+                // Keeping is self-healing rather than merely cautious: a
+                // promote mutates neither `pending_epoch` nor `installed_at`,
+                // so the promoter's `TrackerToken` still matches this instance,
+                // its write-back returns `WriteBack::Apply` and stamps
+                // `promoted_at`, and `decide` rule 1 then yields `Wait` until
+                // the grace elapses and `Retire` after — never this
+                // unsatisfiable `Abort` again.
+                Ok(DropPendingOutcome::RowSuperseded { state }) => eprintln!(
+                    "wiremesh-controller: drop_pending_epoch({rotating_gateway_id}, {epoch}) \
+                     (reason: {reason}) matched no row, but the row is still on file as \
+                     '{state}' — a concurrent promote won this race, so the rotation \
+                     SUCCEEDED rather than ended; keeping the tracker so the retire it now \
+                     owes runs under RETIRE_GRACE"
+                ),
                 // Do NOT remove the tracker on this `Err`. A transient DB error
                 // is evidence of nothing — the rotation may well still be in
                 // flight — and the removal is what reaches the grace-free
@@ -1972,51 +2024,51 @@ mod tests {
     //! reach (see that group's comment), and they need no test-only production
     //! hook because `apply_tracker_effect` depends on nothing but the map.
     //!
-    //! # (task #32) The CAS-bail decision, and the shape proposed for it
+    //! # (task #32) The CAS-bail decision: when may a tracker be removed?
     //!
     //! The FINAL group drives the real [`drive_rotation_for`] and
     //! [`sweep_rotations`] against a real SQLite database. Unlike the eviction
     //! interleaving above, the wedge they cover is a STATE — "a tracker whose
     //! pending epoch has no row" — not a window, so it can simply be built,
-    //! and needs no race, no sleep and no timing budget. Those tests are
-    //! written against TODAY's signatures so they run and go red now; the
-    //! DB-layer half of the same contract lives in `crate::db`'s `cas_tests`,
-    //! written type-agnostically for the same reason.
+    //! and needs no race, no sleep and no timing budget. The DB-layer half of
+    //! the same contract lives in `crate::db`'s `cas_tests`.
     //!
-    //! What no test can pin before the extraction exists is the decision as a
-    //! NAMED thing. It is recorded here instead, in the same style as the two
-    //! signatures above:
-    //!
-    //! ```ignore
-    //! /// Did a state-guarded CAS actually match and commit? (`crate::db`)
-    //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    //! pub enum CasOutcome { Applied, NoMatch }
-    //!
-    //! /// Which arm of `drive_rotation_for` a CAS came back on. The tracker
-    //! /// disposition differs per arm, and that difference is load-bearing.
-    //! #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    //! enum CasArm { Promote, Retire, Abort }
-    //!
-    //! /// May `drive_rotation_for` remove this gateway's tracker?
-    //! fn should_remove_tracker(arm: CasArm, outcome: &anyhow::Result<CasOutcome>) -> bool;
-    //! ```
+    //! There is no `should_remove_tracker` predicate and no `CasArm` enum: the
+    //! disposition is not a function of the arm alone, so it lives inline in
+    //! [`drive_rotation_for`]'s three `match` arms, is named by
+    //! [`TrackerEffect`], and is pinned BEHAVIORALLY here rather than as a
+    //! pure function. The types it reads are [`crate::db::CasOutcome`]
+    //! (`Applied` / `NoMatch`, for promote and retire) and
+    //! [`crate::db::DropPendingOutcome`] (`Dropped` / `RowAbsent` /
+    //! `RowSuperseded`, for the abort — which is the one CAS whose two
+    //! zero-row causes demand opposite reactions).
     //!
     //! The verdict table IS the contract:
     //!
     //! ```text
-    //!            Ok(Applied)   Ok(NoMatch)   Err(_)
-    //! Promote    false         false         false
-    //! Retire     true          false         false
-    //! Abort      true          TRUE          false
+    //!            committed   zero rows                     Err(_)
+    //! Promote    false       false                         false
+    //! Retire     true        false                         false
+    //! Abort      true        TRUE  if the row is ABSENT     false
+    //!                        false if the row SURVIVED
     //! ```
     //!
-    //! Three cells carry the whole change, and each is pinned behaviorally in
+    //! Four cells carry the whole change, and each is pinned behaviorally in
     //! the final group:
     //!
-    //!  - **`Abort` x `Ok(NoMatch)` = true** — THE FIX. A confirmed bail is
-    //!    proof the rotation is over, and an aborting tracker has
-    //!    `promoted_at == None`, so it owns no live `retiring` row of its own.
-    //!    Pinned by `a_confirmed_cas_bail_removes_the_wedged_tracker`.
+    //!  - **`Abort` x zero rows x row ABSENT = true** — THE FIX. A confirmed
+    //!    bail with nothing left on file is proof the rotation is over, and an
+    //!    aborting tracker has `promoted_at == None`, so it owns no live
+    //!    `retiring` row of its own. Pinned by
+    //!    `a_confirmed_cas_bail_removes_the_wedged_tracker`.
+    //!  - **`Abort` x zero rows x row SURVIVED = false** — THE REGRESSION the
+    //!    round-2 group exists for. The same zero-row CAS, the opposite fact:
+    //!    a concurrent promote flipped this epoch to `active` and demoted the
+    //!    prior one to `retiring`, seconds ago. `promoted_at` cannot see it
+    //!    (the promoter commits before its write-back), so the durable row
+    //!    state has to. Pinned by
+    //!    `a_promote_that_won_the_abort_cas_keeps_the_tracker` and
+    //!    `a_promote_that_won_the_abort_cas_must_not_collapse_retire_grace`.
     //!  - **the entire `Err` column = false** — THE TRAP. A transient DB error
     //!    is evidence of nothing, and a removed tracker hands any live
     //!    `retiring` row to `sweep_rotations`' grace-free step-3 orphan path.
@@ -2509,6 +2561,20 @@ mod tests {
         let broker = Broker::new(db.clone(), crate::broker::new_registry());
         let rotations = map_with(vec![(GW, aborting_tracker(1, 0))]);
 
+        // (task #32, round 2) This is unambiguously the ROW-ABSENT leg, and
+        // the assertion below depends on it: a NoMatch whose row still EXISTS
+        // means a promote won and the tracker must be KEPT instead (see
+        // `a_promote_that_won_the_abort_cas_keeps_the_tracker`). Stated here so
+        // the two cases cannot be conflated by a future edit to this setup.
+        assert!(
+            !key_states(&db)
+                .await
+                .iter()
+                .any(|(epoch, _)| *epoch == 1),
+            "this test's premise is that epoch 1 has NO row at all — if a row exists in any \
+             state, this is the superseded-by-promote case and expects the opposite outcome"
+        );
+
         drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
 
         assert!(
@@ -2621,6 +2687,225 @@ mod tests {
             rotations.lock().await.contains_key(&GW),
             "and the tracker itself must still be held after the sweep — that is the thing \
              step 3 keys off"
+        );
+    }
+
+    // --- (task #32, round 2) TrackerEffect::FinishedIfUnpromoted ------------
+    //
+    // The variant had NO direct coverage. The only test reaching it
+    // (`a_confirmed_cas_bail_removes_the_wedged_tracker`) has `promoted_at:
+    // None`, so it exercises the remove leg only — and the whole suite passes
+    // identically if someone replaces the variant with a plain
+    // `TrackerEffect::Finished`, which its own doc comment tells them not to
+    // do. These two pin both legs directly, following the template the
+    // `apply_tracker_effect` group above already established.
+
+    /// The REMOVE leg, pinned directly rather than incidentally: an unpromoted
+    /// tracker whose abort CAS confirmed the rotation is over must go, or it
+    /// wedges and eats the next rotation's only ack.
+    #[tokio::test]
+    async fn finished_if_unpromoted_removes_an_unpromoted_tracker() {
+        let t = read_at();
+        let rotations = map_with(vec![(GW, tracker(7, before(t)))]);
+        let taken = token(7, before(t));
+
+        apply_tracker_effect(&rotations, GW, taken, TrackerEffect::FinishedIfUnpromoted).await;
+
+        assert!(
+            rotations.lock().await.is_empty(),
+            "the tracker never promoted (`promoted_at == None`), so it owns no live retiring \
+             row and its abort CAS confirmed the rotation is over — it must be removed. An \
+             implementation that keeps it here re-introduces the wedge task #32 fixed"
+        );
+    }
+
+    /// The KEEP leg — the entire reason this is not a plain
+    /// [`TrackerEffect::Finished`], and the leg nothing tested.
+    ///
+    /// The guard was RELEASED across the abort's CAS, so a concurrent
+    /// promoter's `promote_epoch` can commit AND its write-back land inside
+    /// that window. The tracker then holds `promoted_at == Some(_)` and owns a
+    /// live `retiring` row that is owed `RETIRE_GRACE` from the promote —
+    /// removing it hands that row to `sweep_rotations`' grace-free step-3
+    /// orphan path.
+    ///
+    /// Downgrade this call site to `TrackerEffect::Finished` and only this
+    /// assertion notices.
+    #[tokio::test]
+    async fn finished_if_unpromoted_keeps_a_tracker_that_promoted_during_the_abort() {
+        let t = read_at();
+        let mut promoted = tracker(7, before(t));
+        promoted.promoted_at = Some(Instant::now());
+        let rotations = map_with(vec![(GW, promoted)]);
+        let taken = token(7, before(t));
+
+        apply_tracker_effect(&rotations, GW, taken, TrackerEffect::FinishedIfUnpromoted).await;
+
+        let guard = rotations.lock().await;
+        assert!(
+            guard.get(&GW).is_some_and(|t| t.promoted_at.is_some()),
+            "RETIRE_GRACE COLLAPSE: a promote committed and stamped this tracker while the \
+             abort's CAS was in flight. The tracker now owns a live `retiring` row whose 30s \
+             grace started at that promote, and `decide`'s rule 1 is the ONLY thing that will \
+             ever retire it under grace. Removing it here drops that Retire and hands the \
+             seconds-old row to sweep_rotations' step-3 orphan path, which deletes \
+             grace-free. This is exactly the case `FinishedIfUnpromoted` exists for — a plain \
+             TrackerEffect::Finished passes every other test in this file"
+        );
+    }
+
+    // --- (task #32, round 2) THE REGRESSION ---------------------------------
+    //
+    // `FinishedIfUnpromoted` closes the window where the promoter's WRITE-BACK
+    // has already landed. It does not close the window where the promoter's DB
+    // COMMIT has landed but its write-back has not — and that window is the
+    // wider of the two, because the Promote arm commits to SQLite (a
+    // `spawn_blocking` hop) and only then re-takes the guard:
+    //
+    //   1. Aborter reads keys, sees the sentinel, decides Abort{E}.
+    //   2. The gateway's SubmitEpochKey lands; `set_epoch_pubkey` commits a
+    //      real key. A promoter (that RPC's own `drive_rotation`, or a sweep
+    //      tick) now reads a real-keyed pending epoch 301s old, so `decide`
+    //      rule 4 fires and `promote_epoch` COMMITS: E -> 'active', the prior
+    //      active epoch P -> 'retiring'.
+    //   3. The aborter's `drop_pending_epoch(E)` matches 0 rows: Ok(NoMatch).
+    //   4. The aborter wins the guard, reads `promoted_at == None` — the
+    //      promoter has not reached its write-back — and REMOVES the tracker.
+    //   5. The promoter's write-back gets `Vanished` and stamps nothing.
+    //   6. `sweep_rotations` step 3 finds `retiring = [P]` with no tracker and
+    //      takes the intentionally grace-free delete path.
+    //
+    // P was demoted SECONDS ago. Pre-retype this interleaving was safe: step 3
+    // returned `Err`, the aborter kept the tracker, the promoter stamped
+    // `promoted_at`, and the retire ran under the full 30s. So this is a
+    // REGRESSION introduced by the typed outcome, and the fourth independent
+    // route to a collapsed RETIRE_GRACE on this codebase.
+    //
+    // # Why these are deterministic and carry no sleeps
+    //
+    // As in round 1, the race is only how the state ARISES; the state itself is
+    // constructible. At the instant the aborter's CAS returns, the durable
+    // state is fully determined — E 'active', P 'retiring' — and so is the
+    // in-memory state — one unpromoted tracker naming E. Both are seeded
+    // directly, and the real `drive_rotation_for` is then run against them.
+    //
+    // The one thing that cannot be seeded is the promoter's write-back, which
+    // must land AFTER the aborter's. It is not faked: the Promote arm's entire
+    // in-memory effect is `apply_tracker_effect(rotations, id, taken,
+    // TrackerEffect::Promoted)`, so the test calls exactly that, with exactly
+    // the token the promoter would hold — a promote mutates neither
+    // `pending_epoch` nor `installed_at`, so the promoter's token and the
+    // aborter's are the same value, which is precisely why the write-back
+    // returns `Apply` and the keep path self-heals.
+
+    /// The DB state the moment a promote has won the abort's CAS: the aborting
+    /// tracker's epoch is now `active`, and the prior active epoch was demoted
+    /// to `retiring` in the same transaction.
+    fn post_promote_db() -> (tempfile::TempDir, DbHandle) {
+        seeded_db(&[(0, "EPOCH0==", "retiring"), (1, "REALKEY==", "active")])
+    }
+
+    /// THE REGRESSION, at the tracker. A confirmed `NoMatch` whose row is still
+    /// THERE — moved to `active` by a promote — is not evidence the rotation is
+    /// over. It is evidence the rotation SUCCEEDED, and the tracker still owes
+    /// the `Retire` of the row that promote just created.
+    #[tokio::test]
+    async fn a_promote_that_won_the_abort_cas_keeps_the_tracker() {
+        let (_dir, db) = post_promote_db();
+        let (change_tx, _change_rx) = broadcast::channel(16);
+        let broker = Broker::new(db.clone(), crate::broker::new_registry());
+        let rotations = map_with(vec![(GW, aborting_tracker(1, 0))]);
+
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+
+        assert!(
+            rotations.lock().await.contains_key(&GW),
+            "RETIRE_GRACE COLLAPSE (the fourth route). drop_pending_epoch matched zero rows, \
+             but epoch 1 is still THERE — a concurrent promote flipped it to 'active' and \
+             demoted epoch 0 to 'retiring' in the same transaction. That is the opposite of \
+             'the rotation is over': epoch 0 is a SECONDS-OLD retiring row owed the full 30s \
+             grace, and this tracker is the only thing that will ever retire it under grace \
+             (decide's rule 1) and the only thing making sweep_rotations step 3 skip the \
+             gateway. Re-checking `promoted_at` under the guard does not catch this — the \
+             promoter commits to SQLite BEFORE it re-takes the guard, so `promoted_at` is \
+             still None right now. The cause of the NoMatch has to come from the durable row \
+             state, read inside the failed DELETE's own transaction"
+        );
+        assert_eq!(
+            key_states(&db).await,
+            vec![(0, "retiring".to_string()), (1, "active".to_string())],
+            "and the losing abort must not have touched a row"
+        );
+    }
+
+    /// THE HARM, followed all the way to the deleted row.
+    ///
+    /// The test above pins the tracker; this one pins what losing it costs. It
+    /// runs the promoter's write-back and then a real `sweep_rotations`, and
+    /// asserts the seconds-old `retiring` row is still there.
+    ///
+    /// It also pins the SELF-HEALING property that makes the keep correct
+    /// rather than merely cautious: the promoter's token still matches, so its
+    /// write-back returns `Apply` and stamps `promoted_at`, which turns the
+    /// tracker's next decision from an unsatisfiable `Abort` into `Wait` and
+    /// then `Retire` under the full grace. Without that, keeping the tracker
+    /// would simply be a different wedge.
+    #[tokio::test]
+    async fn a_promote_that_won_the_abort_cas_must_not_collapse_retire_grace() {
+        let (_dir, db) = post_promote_db();
+        let (change_tx, _change_rx) = broadcast::channel(16);
+        let broker = Broker::new(db.clone(), crate::broker::new_registry());
+
+        let tracker = aborting_tracker(1, 0);
+        // The promoter read the tracker under the guard before its own CAS, so
+        // it holds a token naming this same instance. A promote changes neither
+        // field the token carries.
+        let promoter_token = TrackerToken::of(&tracker);
+        let rotations = map_with(vec![(GW, tracker)]);
+
+        // (1) The aborter: real driver, real CAS, real NoMatch.
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+
+        // (2) The promoter's write-back, arriving second — verbatim what the
+        // Promote arm does once its `promote_epoch` returned Applied.
+        apply_tracker_effect(&rotations, GW, promoter_token, TrackerEffect::Promoted).await;
+
+        assert!(
+            rotations
+                .lock()
+                .await
+                .get(&GW)
+                .is_some_and(|t| t.promoted_at.is_some()),
+            "SELF-HEALING BROKEN: keeping the tracker is only correct because the promoter's \
+             write-back can still land on it — same pending_epoch, same installed_at, so \
+             tracker_write_back returns Apply and stamps promoted_at, which is what turns the \
+             tracker's next decision from an unsatisfiable Abort into a Retire under full \
+             grace. If the tracker was removed at step (1), this write-back got `Vanished` \
+             and stamped nothing, and the tracker is now gone with a live retiring row on disk"
+        );
+
+        // (3) The very next sweep. In the broken ordering this is the SAME
+        // iteration that would have deleted the row: step 2b drives nothing
+        // (no tracker), and step 3 then finds `retiring = [0]` unshielded.
+        sweep_rotations(&db, &change_tx, &broker, &rotations).await;
+
+        assert_eq!(
+            key_states(&db).await,
+            vec![(0, "retiring".to_string()), (1, "active".to_string())],
+            "RETIRE_GRACE COLLAPSED TO ~0 ON A SECONDS-OLD ROW. Epoch 0 was demoted to \
+             'retiring' by a promote that committed moments ago; it is owed the full 30s so \
+             every peer still finishing a handshake on the old key keeps it. Dropping the \
+             tracker on a NoMatch whose row was merely SUPERSEDED (not gone) removes the only \
+             thing making sweep_rotations step 3 skip this gateway, and that path deletes \
+             immediately and deliberately. Pre-retype this same interleaving was safe — the \
+             CAS returned Err, the tracker stayed, the promoter stamped promoted_at, and the \
+             retire ran under grace — so this is a REGRESSION, not a pre-existing gap"
+        );
+        assert!(
+            rotations.lock().await.contains_key(&GW),
+            "and the tracker must survive the sweep too: decide's rule 1 sees promoted_at \
+             stamped moments ago, so it must return Wait, not Retire, until RETIRE_GRACE has \
+             actually elapsed"
         );
     }
 }
