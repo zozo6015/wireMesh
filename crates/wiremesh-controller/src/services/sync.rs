@@ -2505,6 +2505,35 @@ mod tests {
             .expect("installing the failure trigger");
     }
 
+    /// How far past [`rotation::ABORT_AFTER`] [`aborting_tracker`] backdates.
+    /// It only has to cover the gap between the `Instant::now()` that computes
+    /// `started_at` and the one `drive_rotation_for` later hands to
+    /// `rotation::decide`; a whole second is free and makes the intent plain.
+    const ABORT_MARGIN: Duration = Duration::from_secs(1);
+
+    /// `Instant::now() - d`, saturating at the present instead of panicking
+    /// when the monotonic clock cannot represent a point that far back.
+    ///
+    /// `Instant` is `CLOCK_MONOTONIC`, which counts from SYSTEM BOOT, not from
+    /// process start, and `Instant::checked_sub` only promises `Some` when the
+    /// result is representable — which a machine booted less than `d` ago
+    /// cannot guarantee on every platform. CI runners routinely start jobs
+    /// seconds after boot, so this is reachable, and an `.expect()` there fails
+    /// a *rotation* test with a message about clocks: a puzzle, not a
+    /// diagnosis. Saturating keeps the arithmetic total and hands the reporting
+    /// job to [`aborting_tracker`]'s postcondition, which can state the actual
+    /// consequence.
+    ///
+    /// The sibling helpers [`before`] and [`after`] do NOT need this: `read_at`
+    /// deliberately returns `Instant::now() + 3600s`, so subtracting from it
+    /// cannot underflow. That is the same hazard, already solved by
+    /// construction — but only for instants that never meet a real
+    /// `Instant::now()`. These trackers do, so they cannot use that trick.
+    fn saturating_ago(d: Duration) -> Instant {
+        let now = Instant::now();
+        now.checked_sub(d).unwrap_or(now)
+    }
+
     /// A tracker whose rotation started long enough ago that `rotation::decide`
     /// is already past [`rotation::ABORT_AFTER`] — i.e. whose very next
     /// decision is a `RotationDecision::Abort`. `promoted_at` is `None`, which
@@ -2512,18 +2541,61 @@ mod tests {
     /// otherwise), and is also the reviewer's safety argument for why removing
     /// THIS tracker on a confirmed bail cannot strand a live `retiring` row of
     /// its own.
+    ///
+    /// That promise is ASSERTED, not assumed — see the postcondition below.
     fn aborting_tracker(pending_epoch: u32, prior_active_epoch: u32) -> RotationTracker {
-        let started_at = Instant::now()
-            .checked_sub(rotation::ABORT_AFTER + Duration::from_secs(1))
-            .expect("this process's monotonic clock must be at least ABORT_AFTER past its origin");
-        RotationTracker {
+        let started_at = saturating_ago(rotation::ABORT_AFTER + ABORT_MARGIN);
+        let tracker = RotationTracker {
             pending_epoch,
             prior_active_epoch,
             started_at,
             promoted_at: None,
             live_acks: BTreeSet::new(),
             installed_at: started_at,
-        }
+        };
+
+        // POSTCONDITION — the helper's entire promise, checked against the real
+        // `rotation::decide` rather than inferred from the arithmetic above.
+        //
+        // Every caller needs `drive_rotation_for` to reach its `Abort` arm, and
+        // none of them assert that it did. A tracker that quietly decided
+        // `Wait` instead would never run the CAS at all, and the two "the
+        // tracker must survive" tests would then pass VACUOUSLY — green for the
+        // wrong reason, which is the worst outcome available here. This is also
+        // what turns a clock too young to express a 300s-old rotation into a
+        // diagnosis rather than a mystery.
+        //
+        // The probe mirrors exactly what `drive_rotation_for` builds for these
+        // fixtures: no real key (no call site seeds a real-keyed `pending` row)
+        // and no connected peers (the test broker has no registrations). The
+        // `Instant::now()` here is strictly EARLIER than the one the driver will
+        // pass to `decide`, and elapsed time only grows, so a pass here cannot
+        // turn into a failure there.
+        let probe = RotationState {
+            pending_epoch: tracker.pending_epoch,
+            pending_has_real_key: false,
+            prior_active_epoch: tracker.prior_active_epoch,
+            started_at: tracker.started_at,
+            promoted_at: tracker.promoted_at,
+            expected_peers: BTreeSet::new(),
+            live_acks: tracker.live_acks.clone(),
+        };
+        assert!(
+            matches!(
+                rotation::decide(&probe, Instant::now()),
+                RotationDecision::Abort { .. }
+            ),
+            "aborting_tracker did not produce a tracker that ABORTS. `started_at` was \
+             backdated by ABORT_AFTER + {ABORT_MARGIN:?}, yet `decide` declined to abort — \
+             which is what happens when this machine's monotonic clock (CLOCK_MONOTONIC, \
+             counted from SYSTEM BOOT, not process start) is younger than that, so the \
+             backdating saturated at the present. Every test using this helper needs \
+             drive_rotation_for to reach its Abort arm; without it the compare-and-swap \
+             never runs and the 'tracker must survive' assertions pass VACUOUSLY. The \
+             machine's uptime is the problem here, not the code under test"
+        );
+
+        tracker
     }
 
     /// `(epoch, state)` for every key row [`GW`] currently has, sorted.
