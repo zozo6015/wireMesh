@@ -10,3 +10,11 @@ graphify-out/*
 graphify-out/cache/*
 !graphify-out/cache/semantic/
 !graphify-out/manifest.json
+
+# Claude Code local state — none of it is shareable as-is:
+#   settings.json        hooks with absolute machine-specific paths
+#   settings.local.json  personal permission grants (home-dir paths)
+#   worktrees/           transient full-repo checkouts created per task
+# Nothing under .claude/ has ever been tracked; this makes that explicit so a
+# stray `git add -A` cannot commit a repo copy into the repo.
+.claude/
