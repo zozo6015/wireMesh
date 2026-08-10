@@ -73,21 +73,48 @@ use std::collections::BTreeSet;
 /// the controller without a single assertion here noticing.
 use wiremesh_controller::services::sync::MAX_LOCAL_CANDIDATES;
 
-/// Reads `gw_id`'s current merged candidate set straight off the controller's
-/// on-disk DB — the same "open a second connection to the same
-/// `controller.db` file" helper `tests/report_local_endpoints.rs` defines for
-/// the same purpose (each `tests/*.rs` is its own binary, so duplicating this
-/// small unwrap is the established convention here rather than a shared
-/// crate dependency).
-async fn candidates_for(h: &wiremesh_testkit::TestController, gw_id: u64) -> Vec<String> {
+/// Reads `gw_id`'s currently STORED `source = 'local'` rows straight off the
+/// controller's on-disk DB, over a second raw `rusqlite::Connection` onto the
+/// same `controller.db` file — the pattern `tests/candidates.rs`'s
+/// `raw_conn` helper establishes (each `tests/*.rs` is its own binary, so
+/// duplicating this small helper is the established convention here rather
+/// than a shared crate dependency).
+///
+/// Deliberately bypasses `Db::candidates_for` rather than calling it: that
+/// accessor grew its own read-side validity filter (the same predicate as
+/// `SyncSvc::usable_local_candidates` below, pinned separately by
+/// `tests/candidates.rs`), so observing through it here would pass whether
+/// or not THIS suite's actual target — the write-side ingest filter inside
+/// `Sync.Report` — still exists. Reading the raw table observes STORAGE,
+/// which only the ingest filter controls; `tests/candidates.rs` is what
+/// pins the read-side filter, and the two must not be able to mask each
+/// other.
+///
+/// Returns only the local rows, sorted — `candidates_for`'s prepended
+/// controller-observed slot (`gateway.candidate_endpoint`) is deliberately
+/// excluded. Nothing in this file ever populates that column (`Sync.Report`
+/// writes only `local_endpoints`), so every assertion below observes the
+/// same values it did when reading through `candidates_for`.
+async fn stored_local_candidates(h: &wiremesh_testkit::TestController, gw_id: u64) -> Vec<String> {
     let db_path = h.data_dir().join("controller.db");
     tokio::task::spawn_blocking(move || {
-        let db = wiremesh_controller::db::Db::open(&db_path)
-            .expect("opening controller DB for candidates_for");
-        db.candidates_for(gw_id as i64).expect("querying candidates_for")
+        let conn = rusqlite::Connection::open(&db_path)
+            .unwrap_or_else(|e| panic!("opening {} for raw read: {e}", db_path.display()));
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .expect("setting busy_timeout on the raw inspection connection");
+        let mut stmt = conn
+            .prepare(
+                "SELECT endpoint FROM gateway_candidate WHERE gateway_id = ?1 AND source = \
+                 'local' ORDER BY endpoint",
+            )
+            .expect("preparing raw local-candidate read");
+        stmt.query_map(rusqlite::params![gw_id as i64], |row| row.get::<_, String>(0))
+            .expect("querying raw local candidates")
+            .collect::<Result<Vec<String>, _>>()
+            .expect("collecting raw local candidate rows")
     })
     .await
-    .expect("candidates_for blocking task panicked")
+    .expect("stored_local_candidates blocking task panicked")
 }
 
 /// Every non-`SocketAddrV4` shape a compromised or version-skewed gateway
@@ -154,7 +181,7 @@ async fn mixed_valid_and_invalid_local_endpoints_keeps_exactly_the_valid_ones() 
     );
 
     assert_eq!(
-        candidates_for(&h, a.id()).await,
+        stored_local_candidates(&h, a.id()).await,
         vec!["10.0.0.5:51820".to_string(), "10.0.0.6:51820".to_string()],
         "the controller must persist exactly the two parseable IPv4 endpoints and drop \
          `!!! not an endpoint` and `abc:123`. Storing either one re-advertises it to every \
@@ -184,7 +211,7 @@ async fn every_non_ipv4_socket_form_is_rejected_without_losing_the_valid_sibling
         });
 
         assert_eq!(
-            candidates_for(&h, a.id()).await,
+            stored_local_candidates(&h, a.id()).await,
             vec![GOOD.to_string()],
             "{bad:?} must be dropped and {GOOD:?} must survive.\n  why it matters: {why}\n  \
              what happens if it is stored: the controller re-advertises it as a \
@@ -220,7 +247,7 @@ async fn valid_ipv4_socket_endpoints_survive_unchanged() {
     let mut expected: Vec<String> = valid.iter().map(|s| s.to_string()).collect();
     expected.sort();
     assert_eq!(
-        candidates_for(&h, a.id()).await,
+        stored_local_candidates(&h, a.id()).await,
         expected,
         "every endpoint that parses as an IPv4 socket address must be stored VERBATIM \
          (sorted by `Db::set_local_candidates`, deduped, otherwise untouched). Validation \
@@ -235,7 +262,7 @@ async fn a_report_of_only_invalid_endpoints_succeeds_and_clears_the_set() {
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
 
     a.report(0, &["10.0.0.5:51820"]).await.expect("baseline report");
-    assert_eq!(candidates_for(&h, a.id()).await, vec!["10.0.0.5:51820".to_string()]);
+    assert_eq!(stored_local_candidates(&h, a.id()).await, vec!["10.0.0.5:51820".to_string()]);
 
     a.report(1, &["abc:123", "[::1]:51820"]).await.expect(
         "an all-malformed report must still return Ok — the RPC also carries \
@@ -245,7 +272,7 @@ async fn a_report_of_only_invalid_endpoints_succeeds_and_clears_the_set() {
     );
 
     assert_eq!(
-        candidates_for(&h, a.id()).await,
+        stored_local_candidates(&h, a.id()).await,
         Vec::<String>::new(),
         "after filtering, the reported set is EMPTY, and `local_endpoints` is a full \
          REPLACE (cycle-4b Task 8: the gateway sends its complete current local-address \
@@ -268,7 +295,7 @@ async fn a_local_endpoint_list_at_the_cap_is_stored_in_full() {
 
     a.report(0, &refs).await.expect("a report exactly at the cap must succeed");
 
-    let stored: BTreeSet<String> = candidates_for(&h, a.id()).await.into_iter().collect();
+    let stored: BTreeSet<String> = stored_local_candidates(&h, a.id()).await.into_iter().collect();
     let submitted: BTreeSet<String> = owned.iter().cloned().collect();
     assert_eq!(
         stored, submitted,
@@ -294,7 +321,7 @@ async fn a_local_endpoint_list_over_the_cap_is_bounded() {
          posture as a malformed element.",
     );
 
-    let stored = candidates_for(&h, a.id()).await;
+    let stored = stored_local_candidates(&h, a.id()).await;
     assert_eq!(
         stored.len(),
         MAX_LOCAL_CANDIDATES,
@@ -339,7 +366,7 @@ async fn an_oversized_report_of_mixed_validity_keeps_only_valid_endpoints_within
 
     a.report(0, &refs).await.expect("a mixed oversized report must still succeed");
 
-    let stored = candidates_for(&h, a.id()).await;
+    let stored = stored_local_candidates(&h, a.id()).await;
     assert!(
         stored.len() <= MAX_LOCAL_CANDIDATES,
         "the cap must hold even when the list is mostly garbage: reported {} entries, \

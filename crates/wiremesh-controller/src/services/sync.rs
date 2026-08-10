@@ -40,7 +40,7 @@ use wiremesh_proto::v1::{
 };
 
 use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
-use crate::db::{CasOutcome, DropPendingOutcome, GatewayIdentity};
+use crate::db::{is_usable_candidate_endpoint, CasOutcome, DropPendingOutcome, GatewayIdentity};
 use crate::db_async::DbHandle;
 use crate::projection::{self, ChangeEvent};
 use crate::rotation::{self, RotationDecision, RotationState};
@@ -78,8 +78,8 @@ const REJECTED_SAMPLE_COUNT: usize = 3;
 const REJECTED_SAMPLE_BYTES: usize = 64;
 
 /// (Backlog item 1) Reduce one gateway's reported `local_endpoints` to the
-/// set the fabric can actually use: entries that parse as `SocketAddrV4`,
-/// deduplicated, bounded by [`MAX_LOCAL_CANDIDATES`].
+/// set the fabric can actually use: entries [`is_usable_candidate_endpoint`]
+/// accepts, deduplicated, bounded by [`MAX_LOCAL_CANDIDATES`].
 ///
 /// `SocketAddrV4` (not `SocketAddr`) is the same predicate the controller
 /// already applies to a relay's endpoint at both registration paths
@@ -113,7 +113,7 @@ fn usable_local_candidates(gateway_id: i64, gateway_name: &str, reported: Vec<St
     let mut over_cap = 0usize;
 
     for ep in reported {
-        if ep.parse::<std::net::SocketAddrV4>().is_err() {
+        if !is_usable_candidate_endpoint(&ep) {
             rejected += 1;
             if samples.len() < REJECTED_SAMPLE_COUNT {
                 let mut end = REJECTED_SAMPLE_BYTES.min(ep.len());

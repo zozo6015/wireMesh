@@ -90,12 +90,15 @@ pub struct PeerState {
 /// single UDP-observed `gateway.candidate_endpoint` slot (0 or 1 entry) plus
 /// its deduplicated `source = 'local'` rows, which `Sync.Report` ingest caps
 /// at `services::sync::MAX_LOCAL_CANDIDATES = 32`. The true ceiling is
-/// therefore 1 + 32 = 33. 64 is strictly above it with room for the
+/// therefore 1 + 32 = 33 — and because [`partition_dialable`]'s cap check
+/// (`kept.len() == MAX_PEER_CANDIDATES`) fires BEFORE the push, a cap set to
+/// exactly 33 would still keep a 33-entry honest advertisement whole;
+/// equality never drops anything. Only a cap set strictly BELOW 33 would
+/// truncate one. 64 is chosen well clear of that ceiling anyway, so the cap
+/// never sits exactly on the honest limit and there's room for the
 /// controller's cap to be raised (to anything through 63) before an honest
 /// advertisement would ever be truncated here — while still bounding what one
-/// peer costs us. Anything at or below 33 would make this gateway silently
-/// disagree with a correctly-behaving control plane, which is the one outcome
-/// a defensive cap must not produce.
+/// peer costs us.
 pub(crate) const MAX_PEER_CANDIDATES: usize = 64;
 
 /// How many dropped endpoints are quoted in the filter's log line, and how
@@ -1358,5 +1361,67 @@ mod tests {
         );
         assert_eq!(f.dropped, 3, "the three unusable entries are dropped and counted");
         assert_eq!(f.over_cap, 0, "six candidates is nowhere near MAX_PEER_CANDIDATES");
+    }
+
+    /// (CodeRabbit 🟡 Minor, PR #59) A manually-kept-in-sync COPY of
+    /// `wiremesh_controller::services::sync::MAX_LOCAL_CANDIDATES` (as of
+    /// this writing: 32). Not a live reference — this crate deliberately
+    /// does not depend on `wiremesh-controller`, and `MAX_PEER_CANDIDATES`
+    /// below is `pub(crate)` (invisible outside this crate regardless), so
+    /// no dependency edge would make a live cross-crate assertion possible
+    /// anyway. Full reasoning lives in
+    /// `crates/wiremesh-controller/tests/candidate_cap_gateway_relation.rs`,
+    /// which carries the mirror-image constant (a manually-synced copy of
+    /// `MAX_PEER_CANDIDATES`, the counterpart of this one). Keep the two in
+    /// sync by hand when either constant moves. That discipline covers any
+    /// SINGLE unmirrored edit on either side; it does not cover two
+    /// compounding ones made at different times (an unmirrored raise on the
+    /// controller side AND a separate unmirrored lower here) — each side's
+    /// own pin would independently still read green against its own stale
+    /// mirror while the real cross-crate relation had already broken.
+    const CONTROLLER_MAX_LOCAL_CANDIDATES_MIRROR: usize = 32;
+
+    /// Closes the direction that `candidate_cap_gateway_relation.rs`'s own
+    /// mirror cannot cover: that file's tests catch `MAX_LOCAL_CANDIDATES`
+    /// being raised on the controller side without a check here, but go
+    /// stale — silently — if `MAX_PEER_CANDIDATES` is instead LOWERED on
+    /// this side. This test is the other half of that pair.
+    ///
+    /// Breaks if: `MAX_PEER_CANDIDATES` drops to 33 or below.
+    /// `Db::candidates_for` (`crates/wiremesh-controller/src/db.rs`) yields
+    /// at most 1 controller-observed endpoint +
+    /// `MAX_LOCAL_CANDIDATES` (32, mirrored above) locally-reported ones =
+    /// 33 for an HONEST control plane — that IS the exact honest ceiling,
+    /// and a cap of exactly 33 would still fit it whole:
+    /// `partition_dialable` only starts dropping once `kept.len()` REACHES
+    /// the cap (checked before the push, `state.rs:176`), so equality is
+    /// safe and the first entry it would ever drop is the 34th, which an
+    /// honest control plane never sends. The assertion below requires `>`,
+    /// not `>=`, as deliberate MARGIN — so the cap is never left sitting
+    /// exactly on the ceiling, one future `MAX_LOCAL_CANDIDATES` bump away
+    /// from actually truncating a real advertisement. Currently green
+    /// (64 > 33): this is a tripwire against future drift, not a
+    /// reproduction of a live bug.
+    #[test]
+    fn max_peer_candidates_stays_above_the_honest_controller_ceiling() {
+        let honest_ceiling = 1 + CONTROLLER_MAX_LOCAL_CANDIDATES_MIRROR;
+        assert!(
+            MAX_PEER_CANDIDATES > honest_ceiling,
+            "MAX_PEER_CANDIDATES ({MAX_PEER_CANDIDATES}) must stay strictly greater than \
+             1 (controller-observed) + MAX_LOCAL_CANDIDATES \
+             ({CONTROLLER_MAX_LOCAL_CANDIDATES_MIRROR}) = {honest_ceiling} — the honest \
+             ceiling `Db::candidates_for` (crates/wiremesh-controller/src/db.rs) can ever \
+             produce for a correctly-behaving control plane. A cap of exactly \
+             {honest_ceiling} would still keep that whole advertisement — \
+             `partition_dialable` only drops once `kept.len()` reaches the cap, so equality \
+             is safe. Requiring strictly-greater here is deliberate MARGIN, so the cap is \
+             never left sitting exactly on the ceiling where the next \
+             MAX_LOCAL_CANDIDATES increase would truncate a real advertisement. If you \
+             lowered MAX_PEER_CANDIDATES on purpose, first confirm \
+             `wiremesh-controller/src/services/sync.rs`'s MAX_LOCAL_CANDIDATES (mirrored \
+             above) hasn't also moved, then update both mirrors — this one and the one in \
+             `crates/wiremesh-controller/tests/candidate_cap_gateway_relation.rs` — to \
+             match."
+        );
     }
 }

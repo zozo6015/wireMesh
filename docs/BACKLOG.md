@@ -93,7 +93,7 @@ today. Do not read a green item 1 as closing the family.
 
 Tests: all pure, no netns. Nothing covers this today.
 
-### 2. READY &mdash; Operator CRD surface (four items, one minor release)
+### 2. READY &mdash; Operator CRD surface (three items remain, one minor release &mdash; 2c shipped in PR #59)
 
 **Ship these together.** Every CRD change costs users a mandatory manual re-apply
 (Helm never upgrades CRDs), so splitting them means two re-applies for no reason.
@@ -199,60 +199,49 @@ maintenance.
   &mdash; the CR silently misreports a dead data plane. Shipping "you may now scale a
   gateway to 0" ships that misreport with it.
 
-**2c. Helm CRD bundle has drifted.** Three hunks, four missing properties, all removals
-from the Helm copy and nothing else: `WiremeshGateway.spec.observeEndpoint`,
-`WiremeshGateway.spec.syncEndpoint`, and the unfiled `WiremeshRelay.spec.storageClass` /
-`WiremeshRelay.spec.storageSize`.
+**2c. RESOLVED &mdash; Helm CRD bundle had drifted.** Fixed in PR #59 (commit `77ca6f7`):
+`render_crd_yaml()` was extracted out of `bin/crdgen.rs` into `crd.rs`, `crdgen.rs` is now a
+one-line wrapper over it, `crates/wiremesh-operator/tests/crd_manifest_freshness.rs`
+byte-compares both `deploy/operator/crds/wiremesh-crds.yaml` and
+`deploy/helm/wiremesh-operator/crds/wiremesh-crds.yaml` against it (2 tests, both green), and
+the Helm bundle was regenerated &mdash; the two files are byte-identical again. Kept below as
+a **historical regression guard**: the failure mode is subtle enough that whoever next
+touches either CRD file should still learn it.
 
-Root cause is now exact, and it is **one missed commit**: `crd.rs` and
+Three hunks, four missing properties, all removals from the Helm copy and nothing else:
+`WiremeshGateway.spec.observeEndpoint`, `WiremeshGateway.spec.syncEndpoint`, and the unfiled
+`WiremeshRelay.spec.storageClass` / `WiremeshRelay.spec.storageSize`.
+
+Root cause was exact, and it was **one missed commit**: `crd.rs` and
 `deploy/operator/crds/wiremesh-crds.yaml` share identical commit histories (`a694f04`,
-`4ffa006`, `f345cae`, `c7a4814`); the Helm copy has the first three and is missing exactly
-`c7a4814` ("wip(operator): hardening round", 2026-07-31). Structurally, `crdgen` prints to
+`4ffa006`, `f345cae`, `c7a4814`); the Helm copy had the first three and was missing exactly
+`c7a4814` ("wip(operator): hardening round", 2026-07-31). Structurally, `crdgen` printed to
 stdout only &mdash; no `build.rs`, no Makefile/CI/justfile reference &mdash; and the only
-related test, `crd::tests::crdgen_emits_five_cluster_scoped_crds`, counts kinds and asserts
+related test, `crd::tests::crdgen_emits_five_cluster_scoped_crds`, counted kinds and asserted
 scope while never opening either YAML.
 
-The broken path is a **first-time `helm install`** (unknown fields are *pruned*, not
-rejected; documented upgraders apply the fresh copy). The runbook casualty is worse than
-filed: §6.3 "gw-home (the payoff)" patches `observeEndpoint`/`syncEndpoint`, both absent
-from the Helm bundle, and with no `x-kubernetes-preserve-unknown-fields` a structural-schema
-apiserver **prunes them silently while `kubectl` still prints `patched`** &mdash; the pod is
-never re-rolled, the section's own success check fails with no error anywhere, and the
-documented rollback silently no-ops too.
+The broken path was a **first-time `helm install`** (unknown fields are *pruned*, not
+rejected; documented upgraders apply the fresh copy). The runbook casualty was worse than
+filed: `docs/runbooks/controller-migration-to-fi.md` §6.3 "gw-home (the payoff)" patches
+`observeEndpoint`/`syncEndpoint`, both absent from the Helm bundle, and with no
+`x-kubernetes-preserve-unknown-fields` a structural-schema apiserver **prunes them silently
+while `kubectl` still prints `patched`** &mdash; the pod is never re-rolled, the section's own
+success check fails with no error anywhere, and the documented rollback silently no-ops too.
+**This is the part to remember even with the bundle fixed:** a structural CRD schema does not
+reject an unknown field, it prunes it, so a `kubectl patch` printing `patched` is never
+evidence anything actually changed.
 
-**The operator copy is fresh; only the Helm copy is stale**, by exactly those four
-properties. A `crdgen` run in-container emits 12285 bytes and
-`diff -u deploy/operator/crds/wiremesh-crds.yaml <fresh>` exits 0, byte-identical. So the
-regeneration is one file.
+Fix shape that landed: extract the render into a shared `pub fn render_crd_yaml()` so
+`crdgen` and the test exercise the same code path, regenerate both files from it, then assert
+byte equality against **both** in ordinary `cargo test` &mdash; no cluster, no CI change. Two
+physical files stayed (a chart must be self-contained); patching the YAML alone would only
+have guaranteed a fifth drift.
 
-Fix: regenerate, then add a Rust freshness test asserting byte equality against **both**
-files &mdash; runs in ordinary `cargo test`, no cluster, no CI change. Write the test as the
-first commit regardless; its value is preventing drift five, not diagnosing drift four. Keep
-two physical files (a chart must be self-contained). Patching the YAML alone guarantees a
-fourth drift.
-
-**Run the discriminator before regenerating** &mdash; it is the guard against silently
-baking an unrelated schema change into a "regenerate to green":
-
-```sh
-./dev.sh run "cargo run -q -p wiremesh-operator --bin crdgen" > /tmp/fresh.yaml
-diff -u deploy/operator/crds/wiremesh-crds.yaml /tmp/fresh.yaml                 # expect: no output
-diff -u /tmp/fresh.yaml deploy/helm/wiremesh-operator/crds/wiremesh-crds.yaml   # expect: exactly the 3 known hunks
-```
-
-If check 1 emits anything, `crd.rs` changed since `c7a4814` and was never regenerated
-&mdash; **stop**, find the commit, and do not ship an unreviewed schema change riding along
-with the drift fix. If check 2 shows anything beyond the four known properties, same rule.
-The lockstep history is what makes check 1 meaningful.
-
-Structural precondition for the test: extract the render out of `bin/crdgen.rs`, which holds
-the loop inline in `main()`, into a `pub fn render_crd_yaml()` in `crd.rs`, so the test
-exercises **the same code path the binary uses**. A test that reimplements the loop can drift
-from the binary and would prove nothing &mdash; exactly the class of bug 2c exists to kill.
-Two unpinned assumptions worth a comment while in there: document order is deterministic only
-because `all_crds()` returns an explicit `vec![..]`, and property order is alphabetical only
-because `schemars` is built without `preserve_order`; changing either silently rewrites both
-YAML files.
+Two unpinned assumptions carry forward, now load-bearing precisely because
+`crd_manifest_freshness.rs` byte-compares the bundles &mdash; either one changing silently
+rewrites both YAML files, and this test is what would catch it: document order is
+deterministic only because `all_crds()` returns an explicit `vec![..]`, and property order is
+alphabetical only because `schemars` is built without `preserve_order`.
 
 **2d. Relay `--controller` has no CRD override.** Derived from the in-cluster ClusterIP.
 Since the control plane moved to the px host, an in-cluster relay cannot be pointed at it
@@ -274,12 +263,14 @@ existing `conditions[].type` string. All additive `Option` + `skip_serializing_i
 `v1alpha2`, no conversion webhook, no storage migration, and legacy CRs still deserialize:
 **minor bump**, with the mandatory manual CRD re-apply called out in the release notes.
 
-**Build order: 2c → 2d → 2a → 2b, as commits inside the one minor.** 2c first because it is
-pure regeneration plus a test, zero design risk, the only live casualty &mdash; and because
-every later sub-item adds a field that must land in *both* files, so without the freshness
-test each one is a fresh chance to drift a fifth time. 2d second (mechanical, proven shape),
-2a third (only the crate decision left), 2b last &mdash; it still carries the one real
-design question, now a third smaller.
+**Build order: 2d → 2a → 2b, as commits inside the one minor.** 2c shipped first (PR #59,
+commit `77ca6f7`) for the reason the original order gave it priority: pure regeneration plus
+a test, zero design risk, the only live casualty &mdash; and every later sub-item adds a field
+that must land in *both* files, so the freshness test it added now guards the rest from a
+fresh chance to drift a fifth time. That rationale does not transfer to what leads next: 2d
+is first among the remaining three because it is mechanical, a proven shape, not because of
+the drift guard. 2a second (only the crate decision left), 2b last &mdash; it still carries
+the one real design question, now a third smaller.
 
 ---
 
@@ -505,6 +496,32 @@ migration/backfill exists; `SCHEMA_V3` puts a `CHECK` on `source` but none on `e
 Non-fatal, because the new gateway-side filter absorbs it &mdash; hygiene, not a live crash
 path. **Worth a line in item 1's commit message** so nobody later assumes the store is
 clean.
+
+---
+
+### 28. MINOR (deferred) &mdash; `candidates_for`'s read filter covers shape but not SIZE
+
+`Db::candidates_for`'s read-side filter (PR #59 follow-up) drops malformed entries but does
+**not** enforce `MAX_LOCAL_CANDIDATES`. The justification for the read filter &mdash; a row
+written by a pre-fix binary sits in the table forever &mdash; applies verbatim to the cap,
+which shipped in the same commit (`77ca6f7`). So a row set written while a pre-cap binary
+was running is still returned in full: every row passes
+`is_usable_candidate_endpoint` individually, and the `Vec::contains` dedup pays its O(n²)
+cost against the whole oversized set on every projection build, for every peer. Peers are
+NOT exposed to the size (the gateway's `partition_dialable` caps at 64); the controller's
+own quadratic work is.
+
+**Do not "fix" this with a `LIMIT` in the SQL.** Two reasons, both checked: a hardcoded
+numeric limit in `db.rs` is a second copy of `MAX_LOCAL_CANDIDATES` free to drift from the
+real one &mdash; precisely the defect class this branch spent its length eliminating &mdash;
+and `LIMIT` over `ORDER BY endpoint` truncates *alphabetically*, not to "the 32 the gateway
+most recently reported", so it is a silent behaviour change rather than a bound.
+
+The real fix: relocate `MAX_LOCAL_CANDIDATES` out of `services::sync` to sit beside
+`is_usable_candidate_endpoint` (or into a module both can depend on), then enforce it on the
+read path. Importing it into `db.rs` as-is would invert the layering the read filter's own
+doc comment relies on (`services::sync` depends on `db`, never the reverse). Documented
+honestly in `candidates_for`'s doc comment in the meantime.
 
 ---
 
