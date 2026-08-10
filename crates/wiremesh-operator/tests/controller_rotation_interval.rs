@@ -1,56 +1,54 @@
-//! FAILING tests (test-author, Backlog 2a): CRD surface for
-//! `WIREMESH_ROTATION_INTERVAL`. **compile-RED** until `WiremeshControllerSpec`
-//! gains the field — mirrors the compile-RED convention established by
-//! `tests/gateway_endpoint_overrides.rs` for the observe/sync endpoint
-//! overrides.
+//! CRD surface for `WIREMESH_ROTATION_INTERVAL` (Backlog 2a).
 //!
-//! # The trap this file exists to catch
+//! # Contract INVERSION — owner-approved, 2026-08-10
 //!
-//! `WIREMESH_ROTATION_INTERVAL=off` is a LIVE production mitigation on this
-//! fabric (see `docs/BACKLOG.md` item 2a and the root `CLAUDE.md` "Key
-//! rotation" section) — automatic key rotation is disabled fabric-wide because
-//! the in-step rotation case is still red. Both operator apply paths
-//! (`controllers::apply`, `controllers::apply_deployment`) use
-//! `PatchParams::apply(FIELD_MANAGER).force()`, and `Container.env` carries
-//! `x-kubernetes-list-type: map` (`list-map-keys: [name]`) — so SSA force-owns
-//! **per key**. An operator that emits `WIREMESH_ROTATION_INTERVAL` with ANY
-//! default (even an empty string) OWNS that key from then on, and the next
-//! reconcile silently overwrites a human's hand-set `off`, one`kubectl set
-//! env` at a time, re-enabling the fabric-wide rotation outage on exactly the
-//! clusters that had mitigated it.
+//! This file previously pinned "omit the env entry when `rotation_interval`
+//! is `None`". That contract is now WRONG and has been inverted:
+//! `wiremesh_controller::rotation_interval_from_env` (`lib.rs:445`) treats an
+//! ABSENT `WIREMESH_ROTATION_INTERVAL` as **armed** — it falls back to
+//! `Config::default_rotation_interval()` (30 days), not to "off". So the old
+//! "omit when unset" behavior left every operator-managed controller with
+//! automatic key rotation silently enabled, in direct violation of the root
+//! `CLAUDE.md` "Key rotation" rule that automatic rotation must stay `off`
+//! until the in-step rotation done-bar passes (`key_rotation.rs`, currently
+//! `#[ignore]`d RED-by-design).
 //!
-//! The fix must emit the key ONLY when `spec.rotation_interval` is `Some` —
-//! never populate it, never default it. Pinned in
-//! [`Pinned surface`](#pinned-surface) below.
+//! **New contract:**
+//! - `rotation_interval: None` → emit `WIREMESH_ROTATION_INTERVAL=off`
+//!   **explicitly** (not omitted).
+//! - `rotation_interval: Some(v)` → emit `v` verbatim.
+//! - The env vec is therefore **always eight entries**, never seven.
 //!
-//! # Pinned surface
+//! The original "omit" rationale was that emitting *any* default would let
+//! SSA `.force()` (`Container.env` is `x-kubernetes-list-type: map`,
+//! `list-map-keys: [name]`) clobber a human's hand-set `off` on the next
+//! reconcile. That risk hasn't gone away — but the *direction* of the clobber
+//! has flipped: the default now emitted IS `off`, so the only reconcile this
+//! contract can silently perform is toward the safe state, never away from
+//! it. A hand-set `45m` being reconciled back to `off` is the intended
+//! behavior until the in-step done-bar passes and the timer can be
+//! re-enabled fabric-wide.
 //!
-//! `crd::WiremeshControllerSpec` gains one optional field (camelCase serde,
-//! omitted when unset — parity with every other optional spec field on this
-//! struct and the precedent at `tests/gateway_endpoint_overrides.rs`):
+//! Tests below marked "INVERTED" assert the literal opposite of what this
+//! file asserted before — that is deliberate, not drift.
+//!
+//! # Pinned surface (unchanged from before)
+//!
+//! `crd::WiremeshControllerSpec` carries one optional field (camelCase
+//! serde, omitted from the *serialized spec* when unset — only the emitted
+//! ENV changed, not the CRD's on-the-wire shape):
 //! ```ignore
 //! pub rotation_interval: Option<String>,  // serializes "rotationInterval"
 //! ```
-//! `workloads::controller_deployment` keeps its signature. The container's
-//! `env` vec (today `Some(vec![..7 entries..])`, see the doc comment on
-//! `controller_deployment` and `docs/BACKLOG.md` 2a) gets a conditional
-//! EIGHTH push: `WIREMESH_ROTATION_INTERVAL` appears iff
-//! `spec.rotation_interval` is `Some`, carrying that value verbatim (the
-//! operator does not parse/validate/trim it — grammar validation is tracked
-//! separately, see BACKLOG 2a "Validation").
-//!
-//! Grammar validation (`parse_rotation_interval`, planned to move from
-//! `wiremesh-controller` into `wiremesh-enroll` per BACKLOG 2a) and any
-//! reconcile-time fail-closed check are OUT OF SCOPE for this file — nothing
-//! here should be read as pinning that surface.
+//! Grammar validation (`parse_rotation_interval`) and any reconcile-time
+//! fail-closed check remain OUT OF SCOPE for this file.
 
 use wiremesh_operator::crd::WiremeshControllerSpec;
 use wiremesh_operator::workloads::controller_deployment;
 
 /// Every field of `WiremeshControllerSpec` spelled out (mirrors
 /// `workloads.rs`'s private `ctrl_spec()` test helper, which cannot be reused
-/// from an integration test) — the `rotation_interval` field below is the
-/// literal, single line that fails to compile against current `main`.
+/// from an integration test).
 fn ctrl_spec(rotation_interval: Option<String>) -> WiremeshControllerSpec {
     WiremeshControllerSpec {
         image: None,
@@ -63,8 +61,8 @@ fn ctrl_spec(rotation_interval: Option<String>) -> WiremeshControllerSpec {
     }
 }
 
-/// The seven `WIREMESH_*` entries `controller_deployment` emits today,
-/// independent of `rotation_interval` — name, then the value it takes under
+/// The seven `WIREMESH_*` entries `controller_deployment` emits regardless of
+/// `rotation_interval` — name, then the value it takes under
 /// `ctrl_spec(..)`'s all-`None` (default-port) inputs used throughout this
 /// file.
 const BASELINE_ENV: &[(&str, &str)] = &[
@@ -104,11 +102,6 @@ fn assert_baseline_present(env: &[(String, Option<String>)]) {
     }
 }
 
-/// **Expected failure today: compile error.** `ctrl_spec` above passes a
-/// `rotation_interval` field that does not exist on `WiremeshControllerSpec`
-/// on `main` — `cargo test -p wiremesh-operator` fails to build this file at
-/// all until the field is added. This is intentional: every test below is
-/// unreachable until that happens.
 #[test]
 fn field_compiles_and_round_trips_through_serde() {
     let v = serde_json::to_value(ctrl_spec(Some("45m".into()))).unwrap();
@@ -121,9 +114,12 @@ fn field_compiles_and_round_trips_through_serde() {
     let bare = serde_json::to_value(ctrl_spec(None)).unwrap();
     assert!(
         bare.get("rotationInterval").is_none(),
-        "rotationInterval must be OMITTED (not null, not present) when unset — \
-         skip_serializing_if = \"Option::is_none\", parity with every other \
-         optional field on WiremeshControllerSpec"
+        "rotationInterval must be OMITTED (not null, not present) from the \
+         SERIALIZED SPEC when unset — skip_serializing_if = \"Option::is_none\", \
+         parity with every other optional field on WiremeshControllerSpec. This \
+         is unchanged by the env-emission contract inversion: only the \
+         controller Deployment's emitted ENV defaults to `off` now, never the \
+         CRD's own on-the-wire shape."
     );
 
     // Round-trip back.
@@ -131,12 +127,10 @@ fn field_compiles_and_round_trips_through_serde() {
     assert_eq!(spec.rotation_interval.as_deref(), Some("45m"));
 }
 
-/// **Expected failure today: compile error** (same root cause as the test
-/// above). Once the field exists, this pins the specific literal this whole
-/// item is about: a CR that already carries `rotationInterval: off` — the
-/// live mitigation — must round-trip that value unchanged. A operator that
-/// silently normalized/dropped `off` would defeat the mitigation as surely as
-/// a wrongly-defaulted emit would.
+/// A CR that already carries `rotationInterval: off` — the live mitigation —
+/// must round-trip that value unchanged. An operator that silently
+/// normalized/dropped `off` would defeat the mitigation as surely as a
+/// wrongly-defaulted emit would.
 #[test]
 fn the_off_literal_round_trips_unchanged() {
     let v = serde_json::to_value(ctrl_spec(Some("off".into()))).unwrap();
@@ -145,11 +139,14 @@ fn the_off_literal_round_trips_unchanged() {
     assert_eq!(spec.rotation_interval.as_deref(), Some("off"));
 }
 
-/// **Expected failure today: compile error** (same root cause). Additive-CRD
-/// safety: a CR persisted before this field existed (no `rotationInterval`
-/// key in its stored JSON at all) must still deserialize — the precedent this
-/// mirrors is `override_fields_serialize_camel_case_and_omit_when_unset` in
-/// `tests/gateway_endpoint_overrides.rs`.
+/// Additive-CRD safety: a CR persisted before this field existed (no
+/// `rotationInterval` key in its stored JSON at all) must still deserialize
+/// — the precedent this mirrors is
+/// `override_fields_serialize_camel_case_and_omit_when_unset` in
+/// `tests/gateway_endpoint_overrides.rs`. Deserializing to `None` here is
+/// exactly what makes the env-emission fallback (test below) load-bearing:
+/// every pre-existing CR in the fleet is `None` today, and after this change
+/// each one starts emitting `off` on its next reconcile.
 #[test]
 fn legacy_controller_cr_without_the_field_still_deserializes() {
     let legacy: WiremeshControllerSpec = serde_json::from_value(serde_json::json!({}))
@@ -157,44 +154,56 @@ fn legacy_controller_cr_without_the_field_still_deserializes() {
     assert!(legacy.rotation_interval.is_none());
 }
 
-/// **THE central trap test. Expected failure today: compile error** (same
-/// root cause as the field-existence tests above) — but once the field
-/// compiles, this is the assertion that actually matters: it must keep
-/// failing for a DIFFERENT reason if the implementation defaults the env
-/// entry instead of omitting it (e.g. `env("WIREMESH_ROTATION_INTERVAL",
-/// spec.rotation_interval.clone().unwrap_or_default())`, which would push an
-/// entry with an EMPTY STRING value when `None` — still present, still
-/// force-owned, still a landmine). This test asserts NO entry with that name
-/// exists at all, so a defaulted-empty-string implementation fails it just as
-/// hard as a defaulted-30d one would.
+/// **THE central trap test — INVERTED from the old contract.** The old
+/// version of this test asserted "no entry at all when unset"; that was
+/// exactly the bug. `None` must now produce EXACTLY ONE
+/// `WIREMESH_ROTATION_INTERVAL` entry, whose value is the literal `off` — not
+/// omitted, not empty, not the controller's 30-day default silently taking
+/// over.
 ///
-/// Why this matters: the moment the operator emits this key with any value —
-/// including `""` — SSA's per-key force-ownership (`Container.env` is
-/// `x-kubernetes-list-type: map`) means the operator OWNS it, and the next
-/// reconcile clobbers a human's hand-set `off`, silently re-enabling
-/// automatic key rotation on exactly the clusters that disabled it to escape
-/// the fabric-wide rotation outage (see root `CLAUDE.md`, "Key rotation").
+/// Why this matters: `wiremesh_controller::rotation_interval_from_env`
+/// (`crates/wiremesh-controller/src/lib.rs:445`) treats an ABSENT env var as
+/// **armed** — it falls back to `Config::default_rotation_interval()` (30
+/// days), not to "off". Omitting the key therefore does not mean "leave
+/// rotation alone"; it means "arm automatic rotation at the controller's
+/// 30-day default". The root `CLAUDE.md` "Key rotation" section requires
+/// automatic rotation to stay OFF fabric-wide until the in-step rotation
+/// done-bar passes (`crates/wiremesh-gateway/tests/key_rotation.rs`,
+/// currently committed `#[ignore]`d RED-by-design) — so every
+/// operator-managed controller that omitted this key was silently
+/// non-compliant with that guideline. Emitting `off` explicitly is the fix.
 #[test]
-fn no_rotation_env_entry_when_field_is_unset() {
+fn none_emits_off_explicitly_not_omitted() {
     let env = controller_container_env(&ctrl_spec(None));
-    assert!(
-        env.iter().find(|(n, _)| n == "WIREMESH_ROTATION_INTERVAL").is_none(),
-        "spec.rotation_interval == None must emit NO WIREMESH_ROTATION_INTERVAL \
-         env entry at all (not an empty one, not a defaulted one) — emitting \
-         any value here makes the operator OWN the key under SSA force-apply, \
-         and the next reconcile would silently clobber a human's hand-set \
-         `off`, re-enabling the fabric-wide rotation outage this field exists \
-         to let operators mitigate: {env:?}"
+    let matches: Vec<&(String, Option<String>)> =
+        env.iter().filter(|(n, _)| n == "WIREMESH_ROTATION_INTERVAL").collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "spec.rotation_interval == None must emit EXACTLY ONE \
+         WIREMESH_ROTATION_INTERVAL entry (never zero, never duplicated). \
+         Omitting it entirely leaves automatic key rotation ARMED at the \
+         controller's 30-day default (rotation_interval_from_env, lib.rs:445 \
+         treats absence as \"use the default\", not \"off\") — which violates \
+         the root CLAUDE.md guideline that automatic rotation must stay off \
+         fabric-wide until the in-step rotation done-bar passes: {env:?}"
     );
-    assert_eq!(env.len(), 7, "no eighth entry should appear when unset: {env:?}");
+    assert_eq!(
+        matches[0].1.as_deref(),
+        Some("off"),
+        "the None-case entry's value must be the literal `off`, not empty and \
+         not any other default — anything else either leaves rotation armed or \
+         fails closed for the wrong reason: {env:?}"
+    );
+    assert_eq!(env.len(), 8, "the env vec is always eight entries now, never seven: {env:?}");
     assert_baseline_present(&env);
 }
 
-/// **Expected failure today: compile error** (same root cause). The mirror
-/// case: when the field IS set, exactly one entry with that value appears —
-/// not zero, not duplicated, and the other seven entries are untouched.
+/// The mirror case: when the field IS explicitly set, exactly one entry with
+/// that value appears — not zero, not duplicated, and the other seven
+/// entries are untouched.
 #[test]
-fn exactly_one_rotation_env_entry_when_field_is_set() {
+fn some_emits_exactly_one_entry_with_the_value_verbatim() {
     let env = controller_container_env(&ctrl_spec(Some("12h".into())));
     let matches: Vec<&(String, Option<String>)> =
         env.iter().filter(|(n, _)| n == "WIREMESH_ROTATION_INTERVAL").collect();
@@ -209,8 +218,24 @@ fn exactly_one_rotation_env_entry_when_field_is_set() {
     assert_baseline_present(&env);
 }
 
-/// **Expected failure today: compile error** (same root cause). Explicit
-/// belt-and-suspenders for the `off` literal specifically, since that is the
+/// `Some("off")` must be indistinguishable, at the env level, from the `None`
+/// case — that IS the point of the inversion: a human who hand-sets
+/// `rotationInterval: off` and an operator that defaults to it because the
+/// field was never set both converge on the exact same rendered
+/// `WIREMESH_ROTATION_INTERVAL=off` entry.
+#[test]
+fn explicit_off_is_indistinguishable_from_unset() {
+    let explicit = controller_container_env(&ctrl_spec(Some("off".into())));
+    let unset = controller_container_env(&ctrl_spec(None));
+    assert_eq!(
+        explicit, unset,
+        "Some(\"off\") and None must render byte-identical env vecs — that is \
+         the entire point of defaulting None to the off literal rather than to \
+         some other sentinel: {explicit:?} vs {unset:?}"
+    );
+}
+
+/// Belt-and-suspenders for the `off` literal specifically, since that is the
 /// value actually deployed as a live mitigation today (BACKLOG 2a, root
 /// `CLAUDE.md`) — passed through into the env value verbatim, not normalized
 /// or rejected by the operator (grammar validation is out of scope here).
@@ -222,4 +247,26 @@ fn rotation_env_entry_carries_the_off_literal_verbatim() {
         .find(|(n, _)| n == "WIREMESH_ROTATION_INTERVAL")
         .expect("WIREMESH_ROTATION_INTERVAL entry must be present when Some(\"off\")");
     assert_eq!(entry.1.as_deref(), Some("off"));
+}
+
+/// The other seven entries must stay byte-identical to `BASELINE_ENV` across
+/// every case this file exercises (`None`, `Some("off")`, `Some("45m")`) —
+/// the rotation-interval contract inversion must not perturb anything else
+/// in the container's env, in either name or value, in either order.
+#[test]
+fn the_other_seven_entries_are_byte_identical_across_every_case() {
+    for spec in [ctrl_spec(None), ctrl_spec(Some("off".into())), ctrl_spec(Some("45m".into()))] {
+        let env = controller_container_env(&spec);
+        let non_rotation: Vec<&(String, Option<String>)> =
+            env.iter().filter(|(n, _)| n != "WIREMESH_ROTATION_INTERVAL").collect();
+        assert_eq!(non_rotation.len(), 7, "seven non-rotation entries expected: {env:?}");
+        for (name, value) in BASELINE_ENV {
+            let found = non_rotation.iter().find(|(n, _)| n == name);
+            assert_eq!(
+                found.and_then(|(_, v)| v.as_deref()),
+                Some(*value),
+                "entry {name} must be byte-identical regardless of rotation_interval: {env:?}"
+            );
+        }
+    }
 }

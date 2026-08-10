@@ -1,6 +1,8 @@
-//! FAILING tests (test-author) — Backlog 2d: `WiremeshRelay` gains a CRD
-//! override for the relay's `--controller` (sync) dial target. **compile-RED**
-//! until `crd::WiremeshRelaySpec` gains the field.
+//! Backlog 2d: `WiremeshRelay` gains a CRD override for the relay's
+//! `--controller` (sync) dial target. **Landed** —
+//! `crd::WiremeshRelaySpec::controller_endpoint` exists and
+//! `workloads::relay_deployment` wires it in; all 5 tests below pin that
+//! surface and pass on current `main`.
 //!
 //! # Why
 //!
@@ -12,16 +14,16 @@
 //! (`tests/gateway_endpoint_overrides.rs`, which this file mirrors as a
 //! matched pair).
 //!
-//! # Pinned implementer surface
+//! # Pinned surface
 //!
-//! `crd::WiremeshRelaySpec` gains one optional override (camelCase serde,
+//! `crd::WiremeshRelaySpec` carries one optional override (camelCase serde,
 //! omitted when unset — parity with every other optional spec field):
 //! ```ignore
 //! pub controller_endpoint: Option<String>,  // serializes "controllerEndpoint"
 //! ```
 //! `workloads::relay_deployment` keeps its signature (the reconciler still
-//! passes the ClusterIP-derived `controller_sync` default) but the MAIN
-//! container's `--controller` arg must carry
+//! passes the ClusterIP-derived `controller_sync` default); the MAIN
+//! container's `--controller` arg carries
 //! `spec.controller_endpoint.as_deref().unwrap_or(controller_sync)`.
 //!
 //! The ENROLL init-container is deliberately NOT overridable here — it stays

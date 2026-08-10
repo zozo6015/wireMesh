@@ -60,15 +60,17 @@ pub struct WiremeshControllerSpec {
     #[schemars(range(max = 65535))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observe_udp_port: Option<u16>,
-    /// `WIREMESH_ROTATION_INTERVAL` passthrough, verbatim — grammar validation
+    /// `WIREMESH_ROTATION_INTERVAL` passthrough. Unset (`None`) does NOT
+    /// disable rotation by omission — the operator emits `off` explicitly,
+    /// keeping automatic key rotation disabled per the project-wide rule
+    /// (root `CLAUDE.md`, "Key rotation") until the in-step rotation done-bar
+    /// passes. Set (`Some`) is passed through verbatim; grammar validation
     /// (`off`/`<n>d`/`<n>h`/...) lives on the controller boot path, not here.
-    /// MUST stay `None`-omits-the-env-var: `.force()` on both apply paths
-    /// (`controllers::apply`/`apply_deployment`) means naming this key at all
-    /// makes the operator own it under SSA, and the next reconcile would
-    /// clobber a human's hand-set `off` — a live fabric-wide rotation-outage
-    /// mitigation (see root `CLAUDE.md`, "Key rotation"). Removing this field
-    /// from a CR re-enables rotation (SSA deletes the entry on unset); document
-    /// that on any UI built over this field.
+    /// The operator owns this env key under SSA force-apply
+    /// (`controllers::apply`/`apply_deployment`, `.force()` on both), so a
+    /// hand-set value on the Deployment IS reconciled back to match this
+    /// field on every pass — that's deliberate while the done-bar is
+    /// outstanding, not a bug to route around.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rotation_interval: Option<String>,
 }
