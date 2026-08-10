@@ -773,7 +773,11 @@ pub fn relay_deployment(
         bind_port != 0,
         "WiremeshRelay endpoint {endpoint:?} must specify a non-zero port"
     );
-    let sync = controller_sync.to_string();
+    // `controllerEndpoint` override flows verbatim into argv — NOT validated
+    // here. Validation lives solely in the reconciler's `validate_dial_target`
+    // gate (mirroring the gateway's observe/sync overrides); duplicating it in
+    // the builder would give this one value two validation call sites.
+    let sync = r.spec.controller_endpoint.as_deref().unwrap_or(controller_sync).to_string();
 
     // enroll init-container: `--token-file` (no shell), invoked directly so the
     // CRD-supplied `endpoint` reaches the binary as one argv element (never
@@ -1225,6 +1229,7 @@ mod tests {
                 image: None,
                 storage_class: None,
                 storage_size: None,
+                controller_endpoint: None,
             },
         );
         let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
@@ -1256,7 +1261,7 @@ mod tests {
     fn relay_enrolls_and_binds_endpoint_port() {
         let r = WiremeshRelay::new(
             "relay-eu",
-            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None },
+            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None },
         );
         let d = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "relay-eu-token").unwrap();
         let pod = d.spec.unwrap().template.spec.unwrap();
@@ -1273,7 +1278,7 @@ mod tests {
         for bad in ["not-an-endpoint", "203.0.113.9", "example.com:4443", "[::1]:4443", "203.0.113.9:4443; rm -rf /", "203.0.113.9:0"] {
             let r = WiremeshRelay::new(
                 "r",
-                WiremeshRelaySpec { endpoint: bad.into(), node_name: None, image: None, storage_class: None, storage_size: None },
+                WiremeshRelaySpec { endpoint: bad.into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None },
             );
             assert!(
                 relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").is_err(),
@@ -1368,7 +1373,7 @@ mod tests {
         let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
         let r = WiremeshRelay::new(
             "r",
-            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None },
+            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None },
         );
         let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
 

@@ -409,17 +409,31 @@ so cross-node failover is explicitly out of scope as built. On a cluster with a 
 autoscaler this is *worse* than a single box: the node can be reclaimed and the pod cannot
 reschedule.
 
-### 22. Two source comments claim a `kind` e2e harness proves the reconcile loops
+### 22. RESOLVED &mdash; Two source comments claimed a `kind` e2e harness proves the reconcile loops
 
-**It does not exist.** No kind config, no script, no workflow, no test that creates a
-cluster. The operator's real automated coverage is pure-builder only; end-to-end validation
-has been manual. This is a false assurance sitting exactly where someone looks before
-deciding how much to test a change &mdash; same class as the `--help` text corrected in
-v0.7.4.
+**Confirmed exactly two, both corrected (doc comments only, no code/behaviour change):**
+`crates/wiremesh-operator/src/controllers/mod.rs` (the module's "Validation status"
+paragraph) and `crates/wiremesh-operator/tests/finalizer_best_effort.rs` (its "Wiring"
+section). A full sweep of `crates/wiremesh-operator/src/` and `crates/wiremesh-operator/tests/`
+for every plausible wording (`e2e`, `kind`, `Task 9`, `cluster-tested`, `proven by`, `covered
+by`, `integration harness`) plus a repo-wide search for any `kind`/e2e CI config or script
+turned up nothing else claiming automated cluster coverage. Two other hits looked similar but
+are accurate and were left alone: `workloads.rs`/`controllers/gateway.rs`'s `zolab e2e` bug
+comments record real bugs found during *manual* testing (true history, not a false claim about
+automation), and `tests/reconcile_guards.rs` correctly says its property "cannot be proven by a
+unit test" and calls it REVIEW-VERIFIED instead of claiming an e2e proves it.
 
-Either correct the comments, or build the harness. The operator crate has no
-aya/boringtun/netns dependency, so unlike the rest of the workspace it *could* run kind on a
-plain runner.
+Both comments now state plainly: the pure helpers/builders **are** unit-tested in-container;
+the reconcile loops (apiserver I/O, finalizers, requeue) are **not** covered by any automated
+test anywhere in this repo — they compile, and their only validation to date has been MANUAL,
+against real clusters. The `kind` e2e harness remains pointed at as intended-but-unbuilt (plan
+Task 9) rather than deleted, so the gap stays visible instead of reverting to silence. This was
+a false assurance sitting exactly where someone looks before deciding how much to test a
+change &mdash; same class as the `--help` text corrected in v0.7.4.
+
+Building the harness itself remains open and unfiled as future work &mdash; the operator crate
+has no aya/boringtun/netns dependency, so unlike the rest of the workspace it *could* run kind
+on a plain runner.
 
 ---
 

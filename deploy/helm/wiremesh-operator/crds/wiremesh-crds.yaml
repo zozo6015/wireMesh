@@ -366,6 +366,10 @@ spec:
         properties:
           spec:
             properties:
+              controllerEndpoint:
+                description: Override for the relay's `--controller` (sync) target (`host:port`; DNS hostnames accepted). For controllers reached through an external LB / DDNS name. Absent → the controller Service ClusterIP (today's default). The enroll init-container is NEVER affected by this override — parity with `WiremeshGatewaySpec::sync_endpoint`.
+                nullable: true
+                type: string
               endpoint:
                 description: Publicly reachable `ip:port` the relay advertises.
                 type: string

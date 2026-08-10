@@ -224,6 +224,13 @@ pub struct WiremeshRelaySpec {
     /// enrolled certs are a few KB). Parity with `WiremeshGatewaySpec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_size: Option<String>,
+    /// Override for the relay's `--controller` (sync) target (`host:port`; DNS
+    /// hostnames accepted). For controllers reached through an external LB /
+    /// DDNS name. Absent → the controller Service ClusterIP (today's default).
+    /// The enroll init-container is NEVER affected by this override — parity
+    /// with `WiremeshGatewaySpec::sync_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_endpoint: Option<String>,
 }
 
 /// All five CRDs, for the `crdgen` binary and for the operator's install/verify.
@@ -282,7 +289,7 @@ mod tests {
         let _ = WiremeshSegment::new("s", WiremeshSegmentSpec { segment_name: "s".into(), cidrs: vec![] });
         let _ = WiremeshPolicy::new("p", WiremeshPolicySpec { from: "a".into(), to: "b".into(), rules: vec![] });
         let _ = WiremeshGateway::new("g", WiremeshGatewaySpec { segment_ref: "s".into(), node_name: None, node_selector: None, wg_port: None, tun: None, image: None, storage_class: None, storage_size: None, observe_endpoint: None, sync_endpoint: None });
-        let _ = WiremeshRelay::new("r", WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None });
+        let _ = WiremeshRelay::new("r", WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None });
         // Kind names are what the apiserver registers.
         assert_eq!(WiremeshSegment::kind(&()), "WiremeshSegment");
     }

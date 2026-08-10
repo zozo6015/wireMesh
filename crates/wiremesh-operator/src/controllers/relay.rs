@@ -91,6 +91,21 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
     let deployments = Api::<Deployment>::namespaced(client.clone(), &ns);
     let token_secret = token_secret_name(&name);
 
+    // FAIL CLOSED on a malformed `controllerEndpoint` override (mirrors the
+    // gateway's `apply_gateway` loop exactly): it flows verbatim into the
+    // relay's argv, and the binary rejects a bad `host:port` at boot —
+    // deploying it anyway would just CrashLoopBackOff a pod. Erroring here
+    // surfaces the reason on the CR's reconcile instead. Validated BEFORE any
+    // mint/PVC/Deployment side effect — first thing in the function, ahead of
+    // even the roster/PVC observation reads below.
+    for (field, value) in [("controllerEndpoint", relay.spec.controller_endpoint.as_deref())] {
+        if let Some(v) = value {
+            workloads::validate_dial_target(v).map_err(|e| {
+                Error::Admin(anyhow::anyhow!("WiremeshRelay {name}: spec.{field}: {e}"))
+            })?;
+        }
+    }
+
     // Observe the identity PVC's PRE-reconcile state BEFORE we create it (the
     // same pattern as the gateway): its existence feeds both the mint decision
     // and the create-only guard. The PVC is `<name>-relay-data`
