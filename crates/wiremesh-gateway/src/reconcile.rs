@@ -73,6 +73,19 @@ pub fn pending_peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerC
             // would refuse to stand up.
             p.active_key()?;
             let pending = p.pending_key()?;
+            // (Backlog item 23, the `keys[]` door) `pending_key()` only
+            // screens the controller's `"awaiting-submission"` sentinel (see
+            // its doc comment) — an advertised REAL pending pubkey that
+            // fails to decode reaches here unfiltered. Checked here, not by
+            // filtering `PeerState::keys` at ingestion, because
+            // `rotation::decide_role_b` needs to tell "unusable pending key"
+            // (`RoleBDecision::Unusable`) apart from "no pending key at all"
+            // (`Skip`) using this SAME `pubkey_b64_to_hex` check — dropping
+            // the entry earlier would collapse that distinction. This
+            // builder has no such distinction to preserve: an unusable key
+            // drops the peer from the overlap device exactly like a missing
+            // one.
+            crate::uapi::pubkey_b64_to_hex(&pending.pubkey_b64)?;
             let endpoint = p.primary_endpoint()?;
             let (ip, port_str) = endpoint.rsplit_once(':')?;
             let candidate_port: u16 = port_str.parse().ok()?;
@@ -270,6 +283,18 @@ mod tests {
     use super::*;
     use crate::state::{DesiredState, PeerKeyInfo, PeerState};
 
+    /// Real WG-shaped key material (base64 of 32 bytes of 0xDD), decodable by
+    /// `uapi::pubkey_b64_to_hex` — replaces this suite's old placeholder
+    /// PENDING pubkey ("KP"), which `pending_peer_configs`'s backlog-item-23
+    /// check now (correctly) rejects: an advertised pending epoch with an
+    /// undecodable pubkey has nothing valid to build an overlap Device with,
+    /// so the peer contributes nothing (see the check's doc comment above).
+    /// These port/endpoint-derivation tests are about the PENDING epoch
+    /// existing and being real-keyed, not about key content, so a valid key
+    /// is a strictly more realistic fixture — the placeholder was fixture
+    /// rot, not evidence the check belongs somewhere else.
+    const VALID_PENDING_KEY: &str = "3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0=";
+
     fn ds_with(peers: Vec<PeerState>, ver: u64) -> DesiredState {
         DesiredState { peers, policy_version: ver, ..Default::default() }
     }
@@ -389,7 +414,7 @@ mod tests {
                     },
                     PeerKeyInfo {
                         epoch: pending_epoch,
-                        pubkey_b64: "KP".into(),
+                        pubkey_b64: VALID_PENDING_KEY.into(),
                         state: "pending".into(),
                     },
                 ],
@@ -412,7 +437,7 @@ mod tests {
             );
             // Plumbing the old `..._builds_offset_endpoint` also covered, kept
             // here so deleting it costs nothing.
-            assert_eq!(cfgs[0].public_key_b64, "KP", "the overlap peers the PENDING key");
+            assert_eq!(cfgs[0].public_key_b64, VALID_PENDING_KEY, "the overlap peers the PENDING key");
             assert_eq!(
                 cfgs[0].endpoint.as_deref().unwrap().rsplit_once(':').unwrap().0,
                 candidate.rsplit_once(':').unwrap().0,
@@ -437,7 +462,7 @@ mod tests {
             "10.9.0.6:51820",
             vec![
                 PeerKeyInfo { epoch: 9, pubkey_b64: "KA".into(), state: "active".into() },
-                PeerKeyInfo { epoch: 4, pubkey_b64: "KP".into(), state: "pending".into() },
+                PeerKeyInfo { epoch: 4, pubkey_b64: VALID_PENDING_KEY.into(), state: "pending".into() },
             ],
             "10.10.6.0/24",
         );
@@ -450,7 +475,7 @@ mod tests {
              the port from the candidate and a constant, so there is no subtraction left to \
              underflow and no peer to silently drop"
         );
-        assert_eq!(cfgs[0].public_key_b64, "KP");
+        assert_eq!(cfgs[0].public_key_b64, VALID_PENDING_KEY);
     }
 
     #[test]
@@ -540,7 +565,7 @@ mod tests {
                         },
                         PeerKeyInfo {
                             epoch: pending_epoch,
-                            pubkey_b64: "KP".into(),
+                            pubkey_b64: VALID_PENDING_KEY.into(),
                             state: "pending".into(),
                         },
                     ],

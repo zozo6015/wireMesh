@@ -124,6 +124,18 @@ fn validate_ipv4_cidr(cidr: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Can `cidr` be written to the UAPI as an `allowed_ip=` line at all?
+///
+/// (Backlog item 24) The predicate form of [`validate_ipv4_cidr`], exposed so
+/// the `allowed_ips` ingest filters in [`crate::state`] are the SAME
+/// predicate rather than a second opinion about it — same rationale as
+/// [`is_dialable_endpoint`]: a filter LOOSER than this function is a live
+/// crash-loop path, and one STRICTER silently strands a correctly-configured
+/// route.
+pub fn is_valid_ipv4_cidr(cidr: &str) -> bool {
+    validate_ipv4_cidr(cidr).is_ok()
+}
+
 /// Render one peer's `set` block (public_key + endpoint? + replace_allowed_ips
 /// + allowed_ip* + persistent_keepalive_interval). Shared by [`encode_set`]
 /// (full config) and [`encode_add_peers`] (incremental add-only). Fallible:

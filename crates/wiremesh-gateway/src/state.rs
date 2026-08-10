@@ -25,6 +25,21 @@ pub struct PeerKeyInfo {
 pub struct PeerState {
     pub gateway_id: u64,
     pub segment_name: String,
+    /// The peer's current active-epoch WireGuard public key, derived from
+    /// `keys` (the entry with `state == "active"`).
+    ///
+    /// **INVARIANT (backlog item 23): `Some` only for a key
+    /// [`uapi::pubkey_b64_to_hex`] can decode.** Unlike `allowed_ips` below,
+    /// an undecodable active key is PEER-fatal, not per-entry-fatal:
+    /// `PeerConfig.public_key_b64` is a `String`, not an `Option`, so there
+    /// is no "keyless" WG peer block to emit — filtering to `None` here
+    /// reuses the pre-existing "no active key" drop
+    /// (`reconcile::peer_configs`'s `p.active_pubkey_b64.clone()?`, pinned
+    /// by `peer_configs_skip_peers_without_active_key`) instead of adding a
+    /// second one. Enforced at the same two doors as `candidates`/
+    /// `allowed_ips`: [`PeerState::from_proto`] for anything the controller
+    /// advertises, and `deserialize_with` for anything read back off disk.
+    #[serde(default, deserialize_with = "deserialize_valid_active_pubkey")]
     pub active_pubkey_b64: Option<String>,
     /// The peer's full advertised key set (all epochs/states), as reported by
     /// the controller (`Peer.keys`). `#[serde(default)]` keeps
@@ -69,6 +84,22 @@ pub struct PeerState {
     /// with it, without limit instead.
     #[serde(default, deserialize_with = "deserialize_dialable_candidates")]
     pub candidates: Vec<String>,
+    /// The peer's advertised route set (`Peer.allowed_ips`), as reported by
+    /// the controller.
+    ///
+    /// **INVARIANT (backlog item 24): every entry is
+    /// [`uapi::is_valid_ipv4_cidr`].** Unlike `active_pubkey_b64` above, an
+    /// invalid entry costs only itself, not the whole peer: a peer with zero
+    /// usable routes is still a legal, dialable WireGuard peer
+    /// (`replace_allowed_ips=true` with no `allowed_ip=` lines), so
+    /// filtering is per-ENTRY here — the same shape as `candidates`, not the
+    /// peer-fatal shape of `active_pubkey_b64`. Enforced at the same two
+    /// doors: [`PeerState::from_proto`] and a field `deserialize_with` for
+    /// `state.json` (the latter is load-bearing for the same reason as
+    /// `candidates`' — `DesiredState::load` is a bare
+    /// `serde_json::from_slice`, and until this fix the field carried no
+    /// serde attribute at all).
+    #[serde(deserialize_with = "deserialize_valid_cidrs")]
     pub allowed_ips: Vec<String>,
 }
 
@@ -246,13 +277,120 @@ where
     Ok(retain_dialable(Vec::<String>::deserialize(d)?, "state.json"))
 }
 
+/// `#[serde(deserialize_with)]` shim for [`PeerState::active_pubkey_b64`] —
+/// see that field's invariant. A persisted active key that fails
+/// [`crate::uapi::pubkey_b64_to_hex`] loads as `None` (the existing "no
+/// active key" outcome), not straight through to `encode_set` at boot.
+fn deserialize_valid_active_pubkey<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Option::<String>::deserialize(d)?;
+    Ok(raw.filter(|k| crate::uapi::pubkey_b64_to_hex(k).is_some()))
+}
+
+/// Outcome of one filtering pass over a peer's advertised `allowed_ips` —
+/// mirrors [`CandidateFilter`] minus the per-peer cap: item 24 has no
+/// `MAX_PEER_CANDIDATES`-style bound, because there is no volume concern
+/// distinct from `candidates`' unbounded-`repeated string` one (allowed_ips
+/// is operator-defined, not gateway-reported — see the backlog item).
+pub(crate) struct CidrFilter {
+    /// The entries kept, in advertised order.
+    pub(crate) kept: Vec<String>,
+    /// How many entries failed [`uapi::is_valid_ipv4_cidr`].
+    pub(crate) dropped: usize,
+    /// Up to [`DROPPED_SAMPLE_COUNT`] of the invalid entries, same
+    /// truncation/quoting rule as [`CandidateFilter::samples`].
+    pub(crate) samples: Vec<String>,
+}
+
+/// Partition a peer's advertised `allowed_ips` into what this build can write
+/// to the WireGuard UAPI and what it cannot, collecting bounded samples of
+/// the rejects. Pure — no I/O, no logging.
+///
+/// The predicate is [`uapi::is_valid_ipv4_cidr`] — the encoder's own accept
+/// test, not a second opinion about it (same rationale as
+/// [`partition_dialable`]). Dropping is per-ENTRY and never drops the peer —
+/// see [`PeerState::allowed_ips`]'s invariant.
+pub(crate) fn partition_valid_cidrs(cidrs: Vec<String>) -> CidrFilter {
+    let mut f = CidrFilter { kept: Vec::new(), dropped: 0, samples: Vec::new() };
+
+    for c in cidrs {
+        if !crate::uapi::is_valid_ipv4_cidr(&c) {
+            f.dropped += 1;
+            if f.samples.len() < DROPPED_SAMPLE_COUNT {
+                // Same char-boundary backoff as `partition_dialable` — the
+                // string is attacker/operator-chosen and may be multi-byte
+                // UTF-8.
+                let mut end = DROPPED_SAMPLE_BYTES.min(c.len());
+                while end > 0 && !c.is_char_boundary(end) {
+                    end -= 1;
+                }
+                f.samples.push(format!("{:?}", &c[..end]));
+            }
+            continue;
+        }
+        f.kept.push(c);
+    }
+
+    f
+}
+
+/// Render one warning line for an `allowed_ips` filtering pass, or `None`
+/// when it dropped nothing — same one-line-per-pass rationale as
+/// [`format_drop_warning`].
+pub(crate) fn format_cidr_drop_warning(f: &CidrFilter, source: &str) -> Option<String> {
+    if f.dropped == 0 {
+        return None;
+    }
+    Some(format!(
+        "wiremesh-gateway: filtering peer allowed_ips from {source} — kept {}, DROPPED {} \
+         that are not an IPv4 CIDR (writing one to the WireGuard UAPI would fail the whole \
+         device apply and terminate this process); first {}: {}",
+        f.kept.len(),
+        f.dropped,
+        f.samples.len(),
+        f.samples.join(", ")
+    ))
+}
+
+/// Drop every `allowed_ips` entry this build cannot write to the WireGuard
+/// UAPI, warning once about what was dropped — the `allowed_ips` analogue of
+/// [`retain_dialable`].
+fn retain_valid_cidrs(cidrs: Vec<String>, source: &str) -> Vec<String> {
+    let f = partition_valid_cidrs(cidrs);
+    if let Some(msg) = format_cidr_drop_warning(&f, source) {
+        eprintln!("{msg}");
+    }
+    f.kept
+}
+
+/// `#[serde(deserialize_with)]` shim for [`PeerState::allowed_ips`] — see
+/// that field's invariant. Filters on the way IN, same rationale as
+/// [`deserialize_dialable_candidates`].
+fn deserialize_valid_cidrs<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(retain_valid_cidrs(Vec::<String>::deserialize(d)?, "state.json"))
+}
+
 impl PeerState {
     fn from_proto(p: &Peer) -> PeerState {
+        // (Backlog item 23) Same "undecodable == missing" collapse as the
+        // `deserialize_with` shim below, at the Sync-ingest door: an active
+        // key `uapi::pubkey_b64_to_hex` cannot decode becomes `None`, which
+        // every consumer (`reconcile::{peer_configs, device_config_pinned,
+        // device_config_at_port}`'s `p.active_pubkey_b64.clone()?`) already
+        // treats as "drop this peer" — see `PeerState::active_pubkey_b64`'s
+        // doc comment for why that reuse, rather than a second drop path, is
+        // the right shape.
         let active_pubkey_b64 = p
             .keys
             .iter()
             .find(|k| k.state == "active")
-            .map(|k| k.pubkey.clone());
+            .map(|k| k.pubkey.clone())
+            .filter(|pubkey| crate::uapi::pubkey_b64_to_hex(pubkey).is_some());
         let keys = p
             .keys
             .iter()
@@ -274,7 +412,10 @@ impl PeerState {
                 p.candidate_endpoints.clone(),
                 "a controller advertisement",
             ),
-            allowed_ips: p.allowed_ips.clone(),
+            // (Backlog item 24) The Sync-ingest door for allowed_ips — same
+            // per-entry filter as `candidates`, mirrored at `state.json` via
+            // `PeerState::allowed_ips`'s `deserialize_with`.
+            allowed_ips: retain_valid_cidrs(p.allowed_ips.clone(), "a controller advertisement"),
         }
     }
 
@@ -565,6 +706,19 @@ mod tests {
     use super::*;
     use wiremesh_proto::v1::{Delta, Peer, PeerKey, StateSnapshot};
 
+    /// Real WG-shaped key material (base64 of 32 bytes of a repeated byte),
+    /// decodable by `uapi::pubkey_b64_to_hex` — unlike this suite's old
+    /// placeholder active pubkeys ("PUBA"/"KA"/"PUBA2"), which
+    /// `PeerState::from_proto`'s backlog-item-23 filter correctly nulls out
+    /// (an undecodable ACTIVE key is peer-fatal at the UAPI, so ingest drops
+    /// it — see `PeerState::active_pubkey_b64`'s invariant doc). These tests
+    /// are about snapshot/delta plumbing, not key content, so a valid key is
+    /// a strictly more realistic fixture; the placeholders were fixture rot,
+    /// not evidence the filter belongs somewhere else.
+    const VALID_KEY_AA: &str = "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqo=";
+    const VALID_KEY_BB: &str = "u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7s=";
+    const VALID_KEY_CC: &str = "zMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMw=";
+
     fn peer(id: u64, pubkey: &str, ep: &str) -> Peer {
         Peer {
             gateway_id: id,
@@ -583,7 +737,7 @@ mod tests {
         let snap = StateSnapshot {
             revision: 5,
             self_cert_pem: "C".into(),
-            peers: vec![peer(2, "PUBA", "203.0.113.2:51820")],
+            peers: vec![peer(2, VALID_KEY_AA, "203.0.113.2:51820")],
             deprecated_relays: vec![],
             relay_infos: vec![],
             policy_ir: b"{\"schema\":1}".to_vec(),
@@ -594,7 +748,7 @@ mod tests {
         assert_eq!(ds.revision, 5);
         assert_eq!(ds.policy_version, 3);
         assert_eq!(ds.peers.len(), 1);
-        assert_eq!(ds.peers[0].active_pubkey_b64.as_deref(), Some("PUBA"));
+        assert_eq!(ds.peers[0].active_pubkey_b64.as_deref(), Some(VALID_KEY_AA));
         assert_eq!(ds.peers[0].candidates, vec!["203.0.113.2:51820".to_string()]);
         assert_eq!(ds.peers[0].primary_endpoint().map(String::as_str), Some("203.0.113.2:51820"));
     }
@@ -671,15 +825,15 @@ mod tests {
             gateway_id: 13,
             segment_name: "seg13".into(),
             keys: vec![
-                PeerKey { epoch: 0, pubkey: "KA".into(), state: "active".into() },
+                PeerKey { epoch: 0, pubkey: VALID_KEY_BB.into(), state: "active".into() },
                 PeerKey { epoch: 1, pubkey: "KP".into(), state: "pending".into() },
             ],
             candidate_endpoints: vec!["203.0.113.13:51820".into()],
             allowed_ips: vec!["10.10.13.0/24".into()],
         };
         let ps = PeerState::from_proto(&p);
-        assert_eq!(ps.active_pubkey_b64.as_deref(), Some("KA"));
-        assert_eq!(ps.active_key().map(|k| k.pubkey_b64.as_str()), Some("KA"));
+        assert_eq!(ps.active_pubkey_b64.as_deref(), Some(VALID_KEY_BB));
+        assert_eq!(ps.active_key().map(|k| k.pubkey_b64.as_str()), Some(VALID_KEY_BB));
     }
 
     #[test]
@@ -691,7 +845,7 @@ mod tests {
         });
         let delta = Delta {
             revision: 2,
-            upserted_peers: vec![peer(2, "PUBA2", "a:9")],
+            upserted_peers: vec![peer(2, VALID_KEY_CC, "a:9")],
             removed_peer_ids: vec![3],
             deprecated_relays: vec![], relay_infos: vec![], relays_updated: false, policy_ir: b"NEW".to_vec(), policy_version: 4, revoked_serials: vec![],
         };
@@ -699,7 +853,7 @@ mod tests {
         assert_eq!(ds.revision, 2);
         assert_eq!(ds.peers.len(), 1);
         assert_eq!(ds.peers[0].gateway_id, 2);
-        assert_eq!(ds.peers[0].active_pubkey_b64.as_deref(), Some("PUBA2"));
+        assert_eq!(ds.peers[0].active_pubkey_b64.as_deref(), Some(VALID_KEY_CC));
         assert_eq!(ds.policy_version, 4);
         assert_eq!(ds.policy_ir, b"NEW");
     }

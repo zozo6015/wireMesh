@@ -15,6 +15,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration as StdDuration;
 
+use base64::Engine as _;
 use ipnet::Ipv4Net;
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
@@ -243,6 +244,32 @@ impl Enrollment for EnrollmentSvc {
 
         if cidrs.is_empty() {
             return Err(Status::invalid_argument("cidrs must not be empty"));
+        }
+
+        // (Backlog item 23, controller half) Reject an unusable `wg_pubkey`
+        // up front, before signing or touching the DB — mirrors the relay
+        // `endpoint` check above (Cycle-4c Task 5), the precedent this was
+        // never applied to. `Db::enroll_gateway` stores whatever is passed
+        // here verbatim and every peer advertises it as-is; an undecodable
+        // key reaching a peer's `apply_state` fails
+        // `wiremesh_gateway::uapi::key_b64_to_hex` and exits that peer's
+        // process — for every peer this gateway has, at once (see
+        // `crates/wiremesh-gateway/tests/peer_key_and_allowedips_validation.rs`
+        // for the gateway-side half, which now survives a bad key it is
+        // ADVERTISED; this is the other end, stopping the fabric from ever
+        // advertising one). An EMPTY `wg_pubkey` stays legal — it is the
+        // pre-Task-11b "no real key yet" caller shape, and `enroll_gateway`
+        // below substitutes its own placeholder for it, unchanged.
+        // Deliberately does NOT cover `Sync.SubmitEpochKey`
+        // (`services/sync.rs`) — an unrelated, owner-deferred door; see
+        // `tests/enroll_wg_pubkey_validation.rs`'s module doc for why.
+        let wg_pubkey_valid = base64::engine::general_purpose::STANDARD
+            .decode(&req.wg_pubkey)
+            .is_ok_and(|raw| raw.len() == 32);
+        if !req.wg_pubkey.is_empty() && !wg_pubkey_valid {
+            return Err(Status::invalid_argument(
+                "wg_pubkey must be base64 of exactly 32 bytes",
+            ));
         }
 
         // The gateway's name/CN is derived from the token's secret hash
