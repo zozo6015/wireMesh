@@ -228,6 +228,68 @@ pub async fn apply_deployment(api: &Api<Deployment>, dep: &Deployment) -> Result
     Ok(())
 }
 
+/// What a workload Deployment's replica counts mean, once `spec.replicas` is a
+/// field the operator releases rather than force-applies
+/// (`workloads::released_replicas`).
+///
+/// Before that change, `available_replicas >= 1` was a complete readiness test:
+/// desired was always 1, so "no available replica" could only ever mean
+/// *starting*. Now that `kubectl scale --replicas=0` sticks, a deliberately
+/// scaled-down workload is bit-for-bit indistinguishable from a permanently
+/// stuck one under that expression — both report `available_replicas: 0`.
+/// Reported as "starting" it would be a false alarm that never clears, and it
+/// would requeue on the fast not-ready cadence forever: a hot loop with nothing
+/// to wait for. So every reader must consult the DESIRED count too.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Readiness {
+    /// At least one replica is available and the workload is meant to be up.
+    Available,
+    /// Someone scaled the workload to 0 on purpose. Not an error, not a stall —
+    /// there is nothing to wait for and nothing to alarm about.
+    ScaledDown,
+    /// Meant to be up, but no replica is available yet (or any more). This is
+    /// the genuine wait-and-retry case.
+    Starting,
+}
+
+/// Classify a Deployment from its desired (`spec.replicas`) and available
+/// (`status.availableReplicas`) counts.
+///
+/// `desired == None` means the field is unset, which the API-server defaulter
+/// resolves to 1 — the steady state once the operator stops force-applying it.
+/// It therefore means "up", never "scaled down"; **only an explicit `Some(0)`
+/// is a scale-down**, which is exactly the distinction `spec.replicas` being a
+/// nullable int32 exists to express.
+///
+/// `Some(0)` is checked BEFORE the available count on purpose: mid-scale-down
+/// the old pod can still be counted available for a moment, and the operator
+/// should report the intent (off) rather than flip to `Available` for one pass.
+pub fn workload_readiness(desired: Option<i32>, available: i32) -> Readiness {
+    if desired == Some(0) {
+        return Readiness::ScaledDown;
+    }
+    if available >= 1 {
+        Readiness::Available
+    } else {
+        Readiness::Starting
+    }
+}
+
+/// `workload_readiness` applied to a live Deployment read back from the API.
+pub fn deployment_readiness(live: &Deployment) -> Readiness {
+    workload_readiness(
+        live.spec.as_ref().and_then(|s| s.replicas),
+        live.status.as_ref().and_then(|s| s.available_replicas).unwrap_or(0),
+    )
+}
+
+/// Requeue delay for a reconcile that has nothing left to poll for — both the
+/// happy steady state and a deliberate scale-down. All three reconcilers
+/// `.owns(Api::<Deployment>)`, so a `kubectl scale` back up enqueues the CR
+/// immediately through the watch; this interval is only the safety-net resync,
+/// never the thing that notices a change.
+pub const SETTLED_REQUEUE_SECS: u64 = 300;
+
 /// The controller's control-plane endpoints gateways/relays dial, as **numeric
 /// `IP:port`** (the controller Service's ClusterIP). Numeric — because the
 /// gateway/relay binaries parse these flags into `std::net::SocketAddr` (no DNS

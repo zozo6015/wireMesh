@@ -2,7 +2,7 @@
 //! store it in a Secret, deploy the privileged hostNetwork gateway, and report
 //! `status.enrolled`/`gateway_id`. Finalizer drains the gateway on delete.
 
-use super::{apply, apply_deployment, owner_ref, Context, Error};
+use super::{apply, apply_deployment, owner_ref, Context, Error, Readiness};
 use crate::admin_exec::GatewayRow;
 use crate::crd::{Condition, WiremeshGateway, WiremeshGatewayStatus, WiremeshSegment};
 use crate::workloads;
@@ -296,20 +296,29 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     let secrets = Api::<Secret>::namespaced(client.clone(), &ns);
     let token_secret = token_secret_name(&name);
 
-    // FAIL CLOSED on a malformed endpoint override (mirrors the relay's
+    // FAIL CLOSED on a malformed endpoint/bind override (mirrors the relay's
     // `endpoint` validation): these flow verbatim into the gateway's argv, and
-    // the binary rejects a bad `host:port` at boot — deploying it anyway would
-    // just CrashLoopBackOff a pod. Erroring here surfaces the reason on the CR's
+    // the binary rejects a bad value at boot — deploying it anyway would just
+    // CrashLoopBackOff a pod. Erroring here surfaces the reason on the CR's
     // reconcile instead. Validated BEFORE any mint/PVC/Deployment side effect.
-    for (field, value) in [
+    // `metricsBind` uses `validate_bind_target`, NOT `validate_dial_target` —
+    // it's a local bind address, not a fabric dial target (see that
+    // function's doc comment for the three-way divergence).
+    let dial_fields: [(&str, Option<&str>); 2] = [
         ("observeEndpoint", gw.spec.observe_endpoint.as_deref()),
         ("syncEndpoint", gw.spec.sync_endpoint.as_deref()),
-    ] {
+    ];
+    for (field, value) in dial_fields {
         if let Some(v) = value {
             workloads::validate_dial_target(v).map_err(|e| {
                 Error::Admin(anyhow::anyhow!("WiremeshGateway {name}: spec.{field}: {e}"))
             })?;
         }
+    }
+    if let Some(v) = gw.spec.metrics_bind.as_deref() {
+        workloads::validate_bind_target(v).map_err(|e| {
+            Error::Admin(anyhow::anyhow!("WiremeshGateway {name}: spec.metricsBind: {e}"))
+        })?;
     }
 
     // Resolve the segment's CIDRs (the token is bound to them).
@@ -621,7 +630,32 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // Route through deployment_apply_body so the Recreate strategy explicitly
     // nulls the defaulter's rollingUpdate (avoids the 422 on apply-over-existing;
     // ops-finding-pvc-adoption-migration.md bug 1).
-    apply_deployment(&Api::<Deployment>::namespaced(client.clone(), &ns), &dep).await?;
+    let deployments = Api::<Deployment>::namespaced(client.clone(), &ns);
+    apply_deployment(&deployments, &dep).await?;
+
+    // Is the gateway workload deliberately scaled to 0?
+    //
+    // This reconciler reports LIVENESS nowhere else: `enrolled` below is derived
+    // purely from the controller's roster, a control-plane fact, and no
+    // Deployment status is consulted. That was harmless while the operator
+    // force-applied `replicas: 1` — the pod was always meant to be up. Now that
+    // `spec.replicas` is released (`workloads::released_replicas`) and
+    // `kubectl scale --replicas=0` sticks, a gateway a human took down would
+    // keep reporting `Enrolled: True` off a still-active roster row: the CR
+    // would claim a live data plane that is dead. Shipping the scale-down
+    // without this signal ships a known lie.
+    //
+    // `get_opt` so a MISSING Deployment (the read racing the apply above, or a
+    // GC in flight) reads as "cannot prove a scale-down" → False, rather than
+    // erroring the reconcile out before `Enrolled` — the load-bearing status
+    // here — is ever written. Other API errors still propagate to the requeue,
+    // exactly like every other call in this reconcile; the apply immediately
+    // above would already have failed on them. The signal only ever fires on a
+    // `spec.replicas` we actually read as 0.
+    let scaled_down = matches!(
+        deployments.get_opt(&name).await?.as_ref().map(super::deployment_readiness),
+        Some(Readiness::ScaledDown)
+    );
 
     // Status from the controller's gateway roster (reuse `seg_row` from above).
     let row = seg_row;
@@ -630,15 +664,42 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
         enrolled,
         gateway_id: row.map(|g| g.id),
         path_state: row.map(|g| g.status.clone()),
-        conditions: vec![Condition {
-            type_: "Enrolled".into(),
-            status: if enrolled { "True" } else { "False" }.into(),
-            reason: if enrolled { "GatewayRegistered" } else { "AwaitingEnrollment" }.into(),
-            message: if enrolled { "gateway registered with the controller".into() } else { "gateway not yet enrolled".into() },
-        }],
+        // `Enrolled` is UNCHANGED, deliberately: the gateway genuinely IS
+        // enrolled while scaled down — the roster row is real, the certs are
+        // real, and folding liveness into it would corrupt a signal that is
+        // currently trustworthy. `ScaledDown` goes ALONGSIDE it so the CR states
+        // both true things at once: enrolled, and not running.
+        conditions: vec![
+            Condition {
+                type_: "Enrolled".into(),
+                status: if enrolled { "True" } else { "False" }.into(),
+                reason: if enrolled { "GatewayRegistered" } else { "AwaitingEnrollment" }.into(),
+                message: if enrolled { "gateway registered with the controller".into() } else { "gateway not yet enrolled".into() },
+            },
+            Condition {
+                type_: "ScaledDown".into(),
+                status: if scaled_down { "True" } else { "False" }.into(),
+                reason: if scaled_down { "ReplicasZero" } else { "ReplicasNonZero" }.into(),
+                message: if scaled_down {
+                    "gateway Deployment is scaled to 0 replicas — the enrollment is still valid, \
+                     but no gateway pod is running and this segment carries no traffic"
+                        .into()
+                } else {
+                    "gateway Deployment is not scaled down".into()
+                },
+            },
+        ],
     };
     api_status(ctx, &name, status).await?;
-    Ok(Action::requeue(Duration::from_secs(if enrolled { 300 } else { 15 })))
+    // A scale-down requeues on the settled cadence even when not enrolled: with
+    // no pod, enrollment can never progress, so the 15s retry would spin on
+    // something that cannot happen. A scale back up arrives through the
+    // Deployment watch (`.owns` in `run`), not by polling.
+    Ok(Action::requeue(Duration::from_secs(if enrolled || scaled_down {
+        super::SETTLED_REQUEUE_SECS
+    } else {
+        15
+    })))
 }
 
 async fn cleanup_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Error> {

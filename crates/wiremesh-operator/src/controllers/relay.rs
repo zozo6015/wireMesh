@@ -12,7 +12,7 @@
 //! is GC'd (owner ref) and the controller's health pipeline evicts the stale
 //! relay.
 
-use super::{apply, apply_deployment, owner_ref, Context, Error};
+use super::{apply, apply_deployment, owner_ref, Context, Error, Readiness};
 
 use crate::admin_exec::RelayRow;
 use crate::crd::{WiremeshRelay, WiremeshResourceStatus};
@@ -214,16 +214,49 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
     apply_deployment(&deployments, &dep).await?;
 
     let live = deployments.get(&name).await?;
-    let ready = live.status.and_then(|s| s.available_replicas).unwrap_or(0) >= 1;
+    // Applied iff the Deployment reports an available replica AND it is meant to
+    // be up. The desired count matters now that the operator releases
+    // `spec.replicas` instead of force-applying `1`
+    // (`workloads::released_replicas`): a relay scaled to 0 on purpose reports
+    // `availableReplicas: 0` exactly like one that can never start, and calling
+    // that "relay pod starting" forever — while requeuing every 15s to
+    // re-confirm it — would be a false alarm with nothing behind it.
+    //
+    // ASYMMETRY, DELIBERATE AND NOT PAPERED OVER: the controller and gateway
+    // signal this with a typed `ScaledDown` CONDITION; the relay can only put it
+    // in a string. `WiremeshRelay`'s status type is `WiremeshResourceStatus`
+    // (`crd.rs`), which has no `conditions` field — and that type is shared
+    // verbatim with `WiremeshSegment` and `WiremeshPolicy`, so widening it would
+    // change three CRDs' status schemas to serve one consumer and leave two
+    // kinds carrying a field they never populate. A distinct `message` is what
+    // this status shape supports, and `message` already carries exactly this
+    // kind of state. The cost is real: a human running `kubectl describe` reads
+    // it fine, but it is NOT machine-readable the way a typed condition is —
+    // nothing can select on it without string-matching. Accepted limitation of
+    // the relay's status shape, filed as backlog item 31, not a thing to hide.
+    let readiness = super::deployment_readiness(&live);
+    let ready = readiness == Readiness::Available;
+    let scaled_down = readiness == Readiness::ScaledDown;
     let status = WiremeshResourceStatus {
         applied: ready,
         applied_version: None,
-        message: Some(if ready { "relay deployed".into() } else { "relay pod starting".into() }),
+        message: Some(match readiness {
+            Readiness::Available => "relay deployed".into(),
+            Readiness::ScaledDown => "relay scaled down (0 replicas)".into(),
+            Readiness::Starting => "relay pod starting".into(),
+        }),
     };
     Api::<WiremeshRelay>::all(client.clone())
         .patch_status(&name, &PatchParams::default(), &Patch::Merge(serde_json::json!({ "status": status })))
         .await?;
-    Ok(Action::requeue(Duration::from_secs(if ready { 300 } else { 15 })))
+    // A scale-down requeues on the settled cadence, not the 15s not-ready one:
+    // nothing will change until a human scales back up, and that arrives through
+    // the Deployment watch (`.owns` below) rather than by polling.
+    Ok(Action::requeue(Duration::from_secs(if ready || scaled_down {
+        super::SETTLED_REQUEUE_SECS
+    } else {
+        15
+    })))
 }
 
 fn error_policy(_relay: Arc<WiremeshRelay>, err: &Error, _ctx: Arc<Context>) -> Action {

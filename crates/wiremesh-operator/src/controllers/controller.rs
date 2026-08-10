@@ -2,7 +2,7 @@
 //! Deployment (with the admin-token bootstrap sidecar), waits for it to be
 //! available and the admin token minted, and reports `status.ready`.
 
-use super::{apply, apply_deployment, owner_ref, service_dns, Context, Error};
+use super::{apply, apply_deployment, owner_ref, service_dns, Context, Error, Readiness};
 use crate::crd::{Condition, WiremeshController, WiremeshControllerStatus};
 use crate::workloads;
 use futures::StreamExt;
@@ -54,15 +54,20 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
     // ops-finding-pvc-adoption-migration.md bug 1).
     apply_deployment(&Api::<Deployment>::namespaced(client.clone(), &ns), &dep).await?;
 
-    // Ready iff the Deployment reports an available replica. (No admin-token
-    // bootstrap: the operator reaches Admin over the pod-local implicit-admin
-    // UDS via the admin-exec sidecar — spec §0.)
+    // Ready iff the Deployment reports an available replica AND it is meant to
+    // be up. (No admin-token bootstrap: the operator reaches Admin over the
+    // pod-local implicit-admin UDS via the admin-exec sidecar — spec §0.)
+    //
+    // The desired count matters now that the operator releases `spec.replicas`
+    // rather than force-applying `1` (`workloads::released_replicas`): a
+    // controller scaled to 0 on purpose reports `availableReplicas: 0` exactly
+    // like one that can never start. Calling that `WaitingForController`
+    // forever — and requeuing every 10s to re-confirm it — would be a false
+    // alarm with nothing behind it. See `super::workload_readiness`.
     let live = Api::<Deployment>::namespaced(client.clone(), &ns).get(&name).await?;
-    let ready = live
-        .status
-        .and_then(|s| s.available_replicas)
-        .unwrap_or(0)
-        >= 1;
+    let readiness = super::deployment_readiness(&live);
+    let ready = readiness == Readiness::Available;
+    let scaled_down = readiness == Readiness::ScaledDown;
 
     // The advertised control-plane endpoint gateways/relays dial (sync-tcp).
     // (admin-tcp is loopback-only and never exposed — spec §0.)
@@ -71,16 +76,48 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
         ready,
         admin_endpoint: Some(service_dns(&name, &ns, sync_port)),
         observed_version: None,
-        conditions: vec![Condition {
-            type_: "Ready".into(),
-            status: if ready { "True" } else { "False" }.into(),
-            reason: if ready { "AllComponentsReady" } else { "WaitingForController" }.into(),
-            message: if ready {
-                "controller Deployment available".into()
-            } else {
-                "waiting for controller Deployment to become available".into()
+        // `Ready` keeps its meaning (an available replica) and stays FALSE while
+        // scaled down — the control plane really is not serving. What changes is
+        // the reason it gives, and the second condition beside it: `ScaledDown`
+        // separates "deliberately off" from "trying and failing", so
+        // `kubectl describe` and any alerting rule can tell them apart. Both
+        // conditions are always emitted (True/False) rather than only-when-true,
+        // so a consumer never has to read absence as false.
+        conditions: vec![
+            Condition {
+                type_: "Ready".into(),
+                status: if ready { "True" } else { "False" }.into(),
+                reason: match readiness {
+                    Readiness::Available => "AllComponentsReady",
+                    Readiness::ScaledDown => "ScaledDown",
+                    Readiness::Starting => "WaitingForController",
+                }
+                .into(),
+                message: match readiness {
+                    Readiness::Available => "controller Deployment available".into(),
+                    Readiness::ScaledDown => {
+                        "controller Deployment is scaled to 0 replicas — not serving, by request"
+                            .into()
+                    }
+                    Readiness::Starting => {
+                        "waiting for controller Deployment to become available".into()
+                    }
+                },
             },
-        }],
+            Condition {
+                type_: "ScaledDown".into(),
+                status: if scaled_down { "True" } else { "False" }.into(),
+                reason: if scaled_down { "ReplicasZero" } else { "ReplicasNonZero" }.into(),
+                message: if scaled_down {
+                    "spec.replicas is explicitly 0 on the controller Deployment; the operator \
+                     released the field, so this is a deliberate scale-down and will not be \
+                     reverted"
+                        .into()
+                } else {
+                    "controller Deployment is not scaled down".into()
+                },
+            },
+        ],
     };
     Api::<WiremeshController>::all(client.clone())
         .patch_status(
@@ -90,7 +127,14 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
         )
         .await?;
 
-    Ok(Action::requeue(Duration::from_secs(if ready { 300 } else { 10 })))
+    // A scale-down requeues on the settled cadence, not the 10s not-ready one:
+    // nothing will change until a human scales back up, and that arrives through
+    // the Deployment watch (`.owns` below) rather than by polling.
+    Ok(Action::requeue(Duration::from_secs(if ready || scaled_down {
+        super::SETTLED_REQUEUE_SECS
+    } else {
+        10
+    })))
 }
 
 fn error_policy(_cr: Arc<WiremeshController>, err: &Error, _ctx: Arc<Context>) -> Action {

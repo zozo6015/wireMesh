@@ -210,6 +210,30 @@ maintenance.
   &mdash; the CR silently misreports a dead data plane. Shipping "you may now scale a
   gateway to 0" ships that misreport with it.
 
+> **AMENDED 2026-08-10 &mdash; the condition work landed on a different pair of kinds.**
+> The `replicas` bullet above says the `ScaledDown` condition goes **on `WiremeshController`
+> and `WiremeshRelay` only** and that the gateway needs none. What shipped is typed
+> `ScaledDown` conditions on **`WiremeshController` and `WiremeshGateway`**, with
+> **`WiremeshRelay` signalling the same state through `status.message`**. Two corrections,
+> in opposite directions:
+>
+> - **The gateway was added to scope.** The reasoning above about gateway *readiness* is
+>   correct and unchanged &mdash; `apply_gateway` still never reads the gateway Deployment's
+>   status, so its roster-based `Enrolled` computation needed no rework. What it did not
+>   anticipate is the consequence its own "Unfiled gap" bullet then spells out: a gateway
+>   scaled to 0 keeps reporting `Enrolled: True`, the CR claiming a live data plane that is
+>   dead. Fixing that misreport **is** condition work, so the gateway got a `ScaledDown`
+>   condition alongside `Enrolled` &mdash; `Enrolled` deliberately unchanged in meaning, so
+>   the CR states both true things at once.
+> - **The relay could not take a condition at all.** `WiremeshResourceStatus` has no
+>   `conditions` field and is shared verbatim with Segment and Policy, so widening it would
+>   change three CRDs' schemas to serve one consumer. The relay signals scale-down through
+>   `applied=false` plus a distinct `message` instead; the residual (legible to a human, not
+>   machine-selectable) is filed as **item 31**.
+>
+> The shared decision is the pure `controllers::workload_readiness(desired, available)`,
+> extracted in the same change &mdash; see **item 30**.
+
 **2c. RESOLVED &mdash; Helm CRD bundle had drifted.** Fixed in PR #59 (commit `77ca6f7`):
 `render_crd_yaml()` was extracted out of `bin/crdgen.rs` into `crd.rs`, `crdgen.rs` is now a
 one-line wrapper over it, `crates/wiremesh-operator/tests/crd_manifest_freshness.rs`
@@ -521,6 +545,65 @@ migration/backfill exists; `SCHEMA_V3` puts a `CHECK` on `source` but none on `e
 Non-fatal, because the new gateway-side filter absorbs it &mdash; hygiene, not a live crash
 path. **Worth a line in item 1's commit message** so nobody later assumes the store is
 clean.
+
+---
+
+### 31. LOW &mdash; `WiremeshRelay`/`Segment`/`Policy` status carries no `conditions`
+
+Found while implementing 2b piece 4 (2026-08-10). `WiremeshResourceStatus` (`crd.rs:26-33`) has
+only `applied`, `applied_version` and `message`, and it is **shared by three kinds** &mdash;
+Relay, Segment and Policy. Only `WiremeshControllerStatus` (`crd.rs:88`) and
+`WiremeshGatewayStatus` (`crd.rs:207`) carry `conditions: Vec<Condition>`.
+
+Consequence, concretely: 2b's `ScaledDown` signal lands as a typed condition on the controller
+and the gateway, but on the relay it can only be an `applied=false` plus a distinct `message`
+string. That is legible to a human running `kubectl describe` and it does fix the real defect
+(scaled-down stops being indistinguishable from starting), but it is **not machine-readable**
+&mdash; nothing can select on it, and no standard tooling understands it the way it understands
+a condition.
+
+Deliberately NOT fixed in 2b: adding `conditions` to the shared type changes the status schema of
+THREE CRDs to serve one consumer, and leaves Segment and Policy carrying a field they never
+populate. Two shapes if taken: widen the shared type anyway (simple, but the schema change hits
+all three), or give `WiremeshRelay` its own status type (precise, more code). Either is another
+mandatory CRD re-apply, so it should ride along with the next CRD-surface change rather than
+alone.
+
+---
+
+### 30. RESOLVED &mdash; readiness truth tables are inline in async reconcilers, so untestable
+
+**Filed and fixed the same day (2026-08-10), on 2b's own branch.** The extraction this item
+proposes is exactly what shipped: `controllers::workload_readiness(desired, available)` is now a
+pure `pub fn` returning `Available` / `ScaledDown` / `Starting`, with
+`controllers::deployment_readiness` as the thin live-Deployment wrapper, and all three reconcilers
+(`controller`, `relay`, `apply_gateway`) call it instead of computing readiness inline. The truth
+table is pinned by `crates/wiremesh-operator/tests/workload_readiness_truth_table.rs` (7 tests),
+including the two cases the item singles out &mdash; explicit `Some(0)` is the *only* scale-down
+(an omitted `spec.replicas` means "up"), and `Some(0)` is checked BEFORE the available count so a
+mid-scale-down pod still counted available cannot flip the report to `Available` for a pass.
+
+Kept below as a **historical note**, because both halves generalise: the diagnosis (a truth table
+living inline in an async reconciler, in a crate with no fake apiserver, is a code-review invariant
+with no test behind it) and the remedy (extract the decision as a pure function &mdash; the shape
+`gateway.rs` already uses for `should_mint_token`, `identity_persisted`, `needs_rebind` and
+`adoption_needs_stale_drain`). Reach for it the next time a reconcile grows a decision worth
+pinning.
+
+`controllers::controller::reconcile` and `controllers::relay::reconcile` compute readiness inline
+from `available_replicas`, and `apply_gateway` builds its `Enrolled` condition inline. None is a
+pure function, and this crate has no fake apiserver &mdash; so 2b's `ScaledDown` truth table
+(desired `Some(0)` vs absent/`Some(n>0)`, crossed with available) shipped as a **code-review
+invariant with no automated test**.
+
+The fix shape is already precedented in the same file: `controllers/gateway.rs` extracts
+`should_mint_token`, `identity_persisted`, `needs_rebind` and `adoption_needs_stale_drain` as free
+`pub fn`s precisely so they can be unit-tested. Extracting a `workload_readiness(desired, available)`
+would make the whole table mechanically pinnable the same way, with no behaviour change.
+
+Worth doing before anything else touches readiness &mdash; the untested half is exactly where a
+future edit would silently regress a deliberately-scaled-down workload back into a 10s hot requeue
+loop.
 
 ---
 

@@ -184,6 +184,14 @@ pub struct WiremeshGatewaySpec {
     /// ClusterIP. The enroll init-container is NEVER affected by this override.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_endpoint: Option<String>,
+    /// Override for the gateway's `--metrics` bind target (`ip:port`, a LOCAL
+    /// bind address, not a fabric dial target — no DNS hostnames, since the
+    /// binary parses this as a literal `std::net::SocketAddr`). Absent →
+    /// today's hardcoded `0.0.0.0:9090`. IPv4 and IPv6 are both accepted
+    /// (see `workloads::validate_bind_target`); port `0` (OS-assigned) is
+    /// valid. The enroll init-container is NEVER affected by this override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_bind: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
@@ -290,7 +298,7 @@ mod tests {
         let _ = WiremeshController::new("wm", WiremeshControllerSpec::default_for_test());
         let _ = WiremeshSegment::new("s", WiremeshSegmentSpec { segment_name: "s".into(), cidrs: vec![] });
         let _ = WiremeshPolicy::new("p", WiremeshPolicySpec { from: "a".into(), to: "b".into(), rules: vec![] });
-        let _ = WiremeshGateway::new("g", WiremeshGatewaySpec { segment_ref: "s".into(), node_name: None, node_selector: None, wg_port: None, tun: None, image: None, storage_class: None, storage_size: None, observe_endpoint: None, sync_endpoint: None });
+        let _ = WiremeshGateway::new("g", WiremeshGatewaySpec { segment_ref: "s".into(), node_name: None, node_selector: None, wg_port: None, tun: None, image: None, storage_class: None, storage_size: None, observe_endpoint: None, sync_endpoint: None, metrics_bind: None });
         let _ = WiremeshRelay::new("r", WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None });
         // Kind names are what the apiserver registers.
         assert_eq!(WiremeshSegment::kind(&()), "WiremeshSegment");
@@ -313,6 +321,7 @@ mod tests {
             storage_size: Some("256Mi".into()),
             observe_endpoint: None,
             sync_endpoint: None,
+            metrics_bind: None,
         };
         let v = serde_json::to_value(&spec).unwrap();
         assert_eq!(
@@ -338,6 +347,7 @@ mod tests {
             storage_size: None,
             observe_endpoint: None,
             sync_endpoint: None,
+            metrics_bind: None,
         };
         let vb = serde_json::to_value(&bare).unwrap();
         assert!(vb.get("storageClass").is_none(), "storageClass omitted when unset");
