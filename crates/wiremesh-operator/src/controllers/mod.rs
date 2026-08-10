@@ -4,9 +4,14 @@
 //!
 //! **Validation status:** the pure helpers (`service_dns`, the name/guard fns
 //! in each submodule) are unit-tested in-container. The reconcile loops
-//! themselves (apiserver I/O, finalizers, requeue) are proven by the `kind`
-//! e2e (plan Task 9) — they compile here but are NOT cluster-tested in the dev
-//! container.
+//! themselves (apiserver I/O, finalizers, requeue) are **not** covered by any
+//! automated test — they compile here, but that is all. A `kind` e2e harness
+//! was planned (plan Task 9) to prove them; it was never built — no kind
+//! config, script, workflow, or cluster-creating test exists anywhere in this
+//! repo. The reconcile loops' only validation to date has been MANUAL, against
+//! real clusters (zolab, then the px host — see the `zolab e2e` bug comments
+//! in `workloads.rs` and `controllers/gateway.rs`, which record real findings
+//! from that manual testing, not automated coverage).
 //!
 //! **Admin transport (spec §0 amendment):** the controller's Admin TCP is
 //! loopback-only, so in-cluster admin ops (`Apply`/`MintToken`/`RegisterRelay`/

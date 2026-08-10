@@ -41,7 +41,10 @@
 //!   finalizer completes, so a transient dip usually resolves before the CR is
 //!   actually deleted).
 //! * The finalizer flows themselves (kube apiserver, retries) are cluster-only
-//!   — proven by the kind e2e, not here.
+//!   and are **not** covered by any automated test — no `kind` e2e harness
+//!   exists (one was planned as plan Task 9; it was never built). This wiring
+//!   has only ever been validated MANUALLY, against real clusters, not proven
+//!   here or anywhere else in this repo.
 
 use wiremesh_operator::controllers::cleanup_should_skip;
 

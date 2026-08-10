@@ -4,7 +4,8 @@
 //! Port/env/arg wiring mirrors the real binaries:
 //! - controller: env-configured (`WIREMESH_DATA_DIR`, `WIREMESH_TCP_PORT`,
 //!   `WIREMESH_SYNC_TCP_PORT`, `WIREMESH_SOCKET_PATH`, `WIREMESH_ADMIN_TCP_PORT`,
-//!   `WIREMESH_OBSERVE_UDP_PORT` — see `crates/wiremesh-controller/src/main.rs`).
+//!   `WIREMESH_OBSERVE_UDP_PORT`, `WIREMESH_BIND_IP` — see
+//!   `crates/wiremesh-controller/src/main.rs`).
 //! - gateway: `--controller-sync/--observe/--tun/--wg-port/--state-dir` plus the
 //!   `enroll` subcommand (`crates/wiremesh-gateway/src/{config,enroll}.rs`).
 //! - relay: `relay <bind> <certdir> --controller <sync>` plus the
@@ -345,29 +346,46 @@ pub fn admin_exec_sidecar(operator_image: &str) -> Container {
     }
 }
 
-/// The controller Deployment: 1 replica, PVC at `/var/lib/wiremesh`, the six
-/// `WIREMESH_*` env vars, listener ports, and the admin-exec sidecar (running
-/// `operator_image`) the operator execs admin ops into over the shared UDS.
+/// The controller Deployment: 1 replica, PVC at `/var/lib/wiremesh`, the eight
+/// `WIREMESH_*` env vars (`WIREMESH_ROTATION_INTERVAL` is always present —
+/// `off` when `spec.rotation_interval` is unset, the verbatim value when
+/// set), listener ports, and the admin-exec sidecar (running `operator_image`)
+/// the operator execs admin ops into over the shared UDS.
 pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator_image: &str) -> Deployment {
     let image = spec.image.clone().unwrap_or_else(|| DEFAULT_CONTROLLER_IMAGE.to_string());
     let sync = spec.sync_tcp_port.map(|p| p as i32).unwrap_or(SYNC_TCP_PORT);
     let admin = spec.admin_tcp_port.map(|p| p as i32).unwrap_or(ADMIN_TCP_PORT);
     let observe = spec.observe_udp_port.map(|p| p as i32).unwrap_or(OBSERVE_UDP_PORT);
 
+    let container_env = vec![
+        env("WIREMESH_DATA_DIR", DATA_DIR),
+        env("WIREMESH_TCP_PORT", ENROLL_TCP_PORT.to_string()),
+        env("WIREMESH_SYNC_TCP_PORT", sync.to_string()),
+        env("WIREMESH_SOCKET_PATH", UDS_PATH),
+        env("WIREMESH_ADMIN_TCP_PORT", admin.to_string()),
+        env("WIREMESH_OBSERVE_UDP_PORT", observe.to_string()),
+        // Bind enroll/sync/observe to all interfaces so the Service can route
+        // to them (the Admin TCP listener stays loopback-only regardless).
+        env("WIREMESH_BIND_IP", "0.0.0.0"),
+        // Always present, never conditional. `WIREMESH_ROTATION_INTERVAL=off`
+        // is the project-wide default until the in-step rotation done-bar
+        // passes (root CLAUDE.md, "Key rotation") — an unset spec must not
+        // leave the controller to fall back to its own armed-by-default
+        // (30-day) behavior. The operator owns this key under SSA
+        // force-apply (`Container.env` is a `list-map-keys: [name]` merge
+        // key), so a hand-set `off` IS reconciled back on every pass; that's
+        // intended while the done-bar is outstanding. See
+        // `WiremeshControllerSpec::rotation_interval`. Literal duplicated
+        // from `wiremesh-controller::ROTATION_DISABLED_LITERAL` (private,
+        // and this crate has no production dependency on that crate) — keep
+        // the two in sync by hand.
+        env("WIREMESH_ROTATION_INTERVAL", spec.rotation_interval.as_deref().unwrap_or("off")),
+    ];
+
     let container = Container {
         name: "controller".to_string(),
         image: Some(image),
-        env: Some(vec![
-            env("WIREMESH_DATA_DIR", DATA_DIR),
-            env("WIREMESH_TCP_PORT", ENROLL_TCP_PORT.to_string()),
-            env("WIREMESH_SYNC_TCP_PORT", sync.to_string()),
-            env("WIREMESH_SOCKET_PATH", UDS_PATH),
-            env("WIREMESH_ADMIN_TCP_PORT", admin.to_string()),
-            env("WIREMESH_OBSERVE_UDP_PORT", observe.to_string()),
-            // Bind enroll/sync/observe to all interfaces so the Service can route
-            // to them (the Admin TCP listener stays loopback-only regardless).
-            env("WIREMESH_BIND_IP", "0.0.0.0"),
-        ]),
+        env: Some(container_env),
         ports: Some(vec![
             tcp_port("enroll-tcp", ENROLL_TCP_PORT),
             tcp_port("sync-tcp", sync),
@@ -760,7 +778,11 @@ pub fn relay_deployment(
         bind_port != 0,
         "WiremeshRelay endpoint {endpoint:?} must specify a non-zero port"
     );
-    let sync = controller_sync.to_string();
+    // `controllerEndpoint` override flows verbatim into argv — NOT validated
+    // here. Validation lives solely in the reconciler's `validate_dial_target`
+    // gate (mirroring the gateway's observe/sync overrides); duplicating it in
+    // the builder would give this one value two validation call sites.
+    let sync = r.spec.controller_endpoint.as_deref().unwrap_or(controller_sync).to_string();
 
     // enroll init-container: `--token-file` (no shell), invoked directly so the
     // CRD-supplied `endpoint` reaches the binary as one argv element (never
@@ -887,6 +909,7 @@ mod tests {
             admin_tcp_port: None,
             sync_tcp_port: None,
             observe_udp_port: None,
+            rotation_interval: None,
         }
     }
 
@@ -1211,6 +1234,7 @@ mod tests {
                 image: None,
                 storage_class: None,
                 storage_size: None,
+                controller_endpoint: None,
             },
         );
         let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
@@ -1242,7 +1266,7 @@ mod tests {
     fn relay_enrolls_and_binds_endpoint_port() {
         let r = WiremeshRelay::new(
             "relay-eu",
-            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None },
+            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None },
         );
         let d = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "relay-eu-token").unwrap();
         let pod = d.spec.unwrap().template.spec.unwrap();
@@ -1259,7 +1283,7 @@ mod tests {
         for bad in ["not-an-endpoint", "203.0.113.9", "example.com:4443", "[::1]:4443", "203.0.113.9:4443; rm -rf /", "203.0.113.9:0"] {
             let r = WiremeshRelay::new(
                 "r",
-                WiremeshRelaySpec { endpoint: bad.into(), node_name: None, image: None, storage_class: None, storage_size: None },
+                WiremeshRelaySpec { endpoint: bad.into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None },
             );
             assert!(
                 relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").is_err(),
@@ -1354,7 +1378,7 @@ mod tests {
         let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
         let r = WiremeshRelay::new(
             "r",
-            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None },
+            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None },
         );
         let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
 

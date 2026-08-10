@@ -150,6 +150,17 @@ hand-duplicate of the gateway's `config::validate_host_port`, but duplicating a 
 is worse than duplicating a check &mdash; a drift means the operator accepts a value the
 controller rejects at boot, i.e. CrashLoopBackOff.
 
+> **DESCOPED from 2a's first commit (owner decision 2026-08-10) &mdash; filed as item 29.**
+> The CRD field and the conditional env emission shipped without the
+> `parse_rotation_interval` relocation or any reconciler pre-apply check. Rationale:
+> `wiremesh-operator` has no production dependency on `wiremesh-enroll` or
+> `wiremesh-controller` today, so the validation needs a new dependency edge &mdash; a
+> structural change that does not belong inside a field addition. The stakes also differ
+> from the `validate_dial_target` precedent this section cites: a bad dial target **burns a
+> single-use enrollment token** (destructive, unrecoverable), whereas a bad rotation
+> interval crash-loops the controller pod (visible, recoverable). Still worth doing; not
+> worth coupling.
+
 **2b. `args` and `replicas` are force-clobbered with no override.** Upstream
 `Container.args` is `x-kubernetes-list-type: atomic` (as is `Container.command`, which the
 enroll init-containers set), so unlike `env` there is **no per-element survival** &mdash;
@@ -398,17 +409,31 @@ so cross-node failover is explicitly out of scope as built. On a cluster with a 
 autoscaler this is *worse* than a single box: the node can be reclaimed and the pod cannot
 reschedule.
 
-### 22. Two source comments claim a `kind` e2e harness proves the reconcile loops
+### 22. RESOLVED &mdash; Two source comments claimed a `kind` e2e harness proves the reconcile loops
 
-**It does not exist.** No kind config, no script, no workflow, no test that creates a
-cluster. The operator's real automated coverage is pure-builder only; end-to-end validation
-has been manual. This is a false assurance sitting exactly where someone looks before
-deciding how much to test a change &mdash; same class as the `--help` text corrected in
-v0.7.4.
+**Confirmed exactly two, both corrected (doc comments only, no code/behaviour change):**
+`crates/wiremesh-operator/src/controllers/mod.rs` (the module's "Validation status"
+paragraph) and `crates/wiremesh-operator/tests/finalizer_best_effort.rs` (its "Wiring"
+section). A full sweep of `crates/wiremesh-operator/src/` and `crates/wiremesh-operator/tests/`
+for every plausible wording (`e2e`, `kind`, `Task 9`, `cluster-tested`, `proven by`, `covered
+by`, `integration harness`) plus a repo-wide search for any `kind`/e2e CI config or script
+turned up nothing else claiming automated cluster coverage. Two other hits looked similar but
+are accurate and were left alone: `workloads.rs`/`controllers/gateway.rs`'s `zolab e2e` bug
+comments record real bugs found during *manual* testing (true history, not a false claim about
+automation), and `tests/reconcile_guards.rs` correctly says its property "cannot be proven by a
+unit test" and calls it REVIEW-VERIFIED instead of claiming an e2e proves it.
 
-Either correct the comments, or build the harness. The operator crate has no
-aya/boringtun/netns dependency, so unlike the rest of the workspace it *could* run kind on a
-plain runner.
+Both comments now state plainly: the pure helpers/builders **are** unit-tested in-container;
+the reconcile loops (apiserver I/O, finalizers, requeue) are **not** covered by any automated
+test anywhere in this repo — they compile, and their only validation to date has been MANUAL,
+against real clusters. The `kind` e2e harness remains pointed at as intended-but-unbuilt (plan
+Task 9) rather than deleted, so the gap stays visible instead of reverting to silence. This was
+a false assurance sitting exactly where someone looks before deciding how much to test a
+change &mdash; same class as the `--help` text corrected in v0.7.4.
+
+Building the harness itself remains open and unfiled as future work &mdash; the operator crate
+has no aya/boringtun/netns dependency, so unlike the rest of the workspace it *could* run kind
+on a plain runner.
 
 ---
 
@@ -496,6 +521,36 @@ migration/backfill exists; `SCHEMA_V3` puts a `CHECK` on `source` but none on `e
 Non-fatal, because the new gateway-side filter absorbs it &mdash; hygiene, not a live crash
 path. **Worth a line in item 1's commit message** so nobody later assumes the store is
 clean.
+
+---
+
+### 29. MEDIUM &mdash; `rotationInterval` has no admission-time validation
+
+Descoped from 2a's first commit. The CRD field accepts any string; nothing validates it
+until `wiremesh-controller` parses it at boot, so a typo (`"30 days"`, `"0ff"`) is accepted
+by the apiserver and surfaces as a controller **CrashLoopBackOff** with the real reason
+buried in pod logs. `controllers/controller.rs::reconcile()` has zero validation calls of
+any kind today.
+
+The blocker is structural, not conceptual: `wiremesh-operator` depends on neither
+`wiremesh-enroll` nor `wiremesh-controller` in production (`wiremesh-testkit` pulls the
+latter as a dev-dependency only). The backlog's own 2a section argues `parse_rotation_interval`
+should move to `wiremesh-enroll` and be shared &mdash; and explicitly rejects the
+`workloads::validate_dial_target` hand-duplicate counter-precedent, because duplicating a
+GRAMMAR means the operator accepts what the controller rejects at boot, which is the exact
+CrashLoopBackOff this item is about.
+
+Two routes, and the cheap one may be enough: **(a)** a `schemars` pattern/format constraint
+on the field so the apiserver rejects garbage at admission with no Rust dependency at all
+&mdash; check whether the grammar is regex-expressible before assuming it is not; or **(b)**
+relocate `parse_rotation_interval` into `wiremesh-enroll`, add that dependency, and validate
+in `reconcile()` before any PVC/Service/Deployment side effect, mirroring
+`controllers/gateway.rs`'s existing `validate_dial_target` call site (`Error::Admin`,
+fail-closed, before any mutation).
+
+Severity is MEDIUM not HIGH because the failure is loud and recoverable &mdash; `kubectl edit`
+fixes it. Contrast the gateway's dial-target precedent, where the same class of mistake burns
+a single-use enrollment token.
 
 ---
 

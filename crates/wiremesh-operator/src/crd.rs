@@ -60,6 +60,19 @@ pub struct WiremeshControllerSpec {
     #[schemars(range(max = 65535))]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observe_udp_port: Option<u16>,
+    /// `WIREMESH_ROTATION_INTERVAL` passthrough. Unset (`None`) does NOT
+    /// disable rotation by omission — the operator emits `off` explicitly,
+    /// keeping automatic key rotation disabled per the project-wide rule
+    /// (root `CLAUDE.md`, "Key rotation") until the in-step rotation done-bar
+    /// passes. Set (`Some`) is passed through verbatim; grammar validation
+    /// (`off`/`<n>d`/`<n>h`/...) lives on the controller boot path, not here.
+    /// The operator owns this env key under SSA force-apply
+    /// (`controllers::apply`/`apply_deployment`, `.force()` on both), so a
+    /// hand-set value on the Deployment IS reconciled back to match this
+    /// field on every pass — that's deliberate while the done-bar is
+    /// outstanding, not a bug to route around.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rotation_interval: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, JsonSchema)]
@@ -213,6 +226,13 @@ pub struct WiremeshRelaySpec {
     /// enrolled certs are a few KB). Parity with `WiremeshGatewaySpec`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_size: Option<String>,
+    /// Override for the relay's `--controller` (sync) target (`host:port`; DNS
+    /// hostnames accepted). For controllers reached through an external LB /
+    /// DDNS name. Absent → the controller Service ClusterIP (today's default).
+    /// The enroll init-container is NEVER affected by this override — parity
+    /// with `WiremeshGatewaySpec::sync_endpoint`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub controller_endpoint: Option<String>,
 }
 
 /// All five CRDs, for the `crdgen` binary and for the operator's install/verify.
@@ -271,7 +291,7 @@ mod tests {
         let _ = WiremeshSegment::new("s", WiremeshSegmentSpec { segment_name: "s".into(), cidrs: vec![] });
         let _ = WiremeshPolicy::new("p", WiremeshPolicySpec { from: "a".into(), to: "b".into(), rules: vec![] });
         let _ = WiremeshGateway::new("g", WiremeshGatewaySpec { segment_ref: "s".into(), node_name: None, node_selector: None, wg_port: None, tun: None, image: None, storage_class: None, storage_size: None, observe_endpoint: None, sync_endpoint: None });
-        let _ = WiremeshRelay::new("r", WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None });
+        let _ = WiremeshRelay::new("r", WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None });
         // Kind names are what the apiserver registers.
         assert_eq!(WiremeshSegment::kind(&()), "WiremeshSegment");
     }
@@ -371,6 +391,7 @@ mod tests {
                 admin_tcp_port: None,
                 sync_tcp_port: None,
                 observe_udp_port: None,
+                rotation_interval: None,
             }
         }
     }

@@ -37,6 +37,10 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              rotationInterval:
+                description: '`WIREMESH_ROTATION_INTERVAL` passthrough. Unset (`None`) does NOT disable rotation by omission — the operator emits `off` explicitly, keeping automatic key rotation disabled per the project-wide rule (root `CLAUDE.md`, "Key rotation") until the in-step rotation done-bar passes. Set (`Some`) is passed through verbatim; grammar validation (`off`/`<n>d`/`<n>h`/...) lives on the controller boot path, not here. The operator owns this env key under SSA force-apply (`controllers::apply`/`apply_deployment`, `.force()` on both), so a hand-set value on the Deployment IS reconciled back to match this field on every pass — that''s deliberate while the done-bar is outstanding, not a bug to route around.'
+                nullable: true
+                type: string
               storageClass:
                 nullable: true
                 type: string
@@ -362,6 +366,10 @@ spec:
         properties:
           spec:
             properties:
+              controllerEndpoint:
+                description: Override for the relay's `--controller` (sync) target (`host:port`; DNS hostnames accepted). For controllers reached through an external LB / DDNS name. Absent → the controller Service ClusterIP (today's default). The enroll init-container is NEVER affected by this override — parity with `WiremeshGatewaySpec::sync_endpoint`.
+                nullable: true
+                type: string
               endpoint:
                 description: Publicly reachable `ip:port` the relay advertises.
                 type: string

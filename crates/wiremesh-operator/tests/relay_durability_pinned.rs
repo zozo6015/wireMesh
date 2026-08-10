@@ -56,6 +56,7 @@ fn spec(storage_class: Option<String>, storage_size: Option<String>) -> Wiremesh
         image: None,
         storage_class,
         storage_size,
+        controller_endpoint: None,
     }
 }
 
