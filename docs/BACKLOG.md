@@ -150,6 +150,17 @@ hand-duplicate of the gateway's `config::validate_host_port`, but duplicating a 
 is worse than duplicating a check &mdash; a drift means the operator accepts a value the
 controller rejects at boot, i.e. CrashLoopBackOff.
 
+> **DESCOPED from 2a's first commit (owner decision 2026-08-10) &mdash; filed as item 29.**
+> The CRD field and the conditional env emission shipped without the
+> `parse_rotation_interval` relocation or any reconciler pre-apply check. Rationale:
+> `wiremesh-operator` has no production dependency on `wiremesh-enroll` or
+> `wiremesh-controller` today, so the validation needs a new dependency edge &mdash; a
+> structural change that does not belong inside a field addition. The stakes also differ
+> from the `validate_dial_target` precedent this section cites: a bad dial target **burns a
+> single-use enrollment token** (destructive, unrecoverable), whereas a bad rotation
+> interval crash-loops the controller pod (visible, recoverable). Still worth doing; not
+> worth coupling.
+
 **2b. `args` and `replicas` are force-clobbered with no override.** Upstream
 `Container.args` is `x-kubernetes-list-type: atomic` (as is `Container.command`, which the
 enroll init-containers set), so unlike `env` there is **no per-element survival** &mdash;
@@ -496,6 +507,36 @@ migration/backfill exists; `SCHEMA_V3` puts a `CHECK` on `source` but none on `e
 Non-fatal, because the new gateway-side filter absorbs it &mdash; hygiene, not a live crash
 path. **Worth a line in item 1's commit message** so nobody later assumes the store is
 clean.
+
+---
+
+### 29. MEDIUM &mdash; `rotationInterval` has no admission-time validation
+
+Descoped from 2a's first commit. The CRD field accepts any string; nothing validates it
+until `wiremesh-controller` parses it at boot, so a typo (`"30 days"`, `"0ff"`) is accepted
+by the apiserver and surfaces as a controller **CrashLoopBackOff** with the real reason
+buried in pod logs. `controllers/controller.rs::reconcile()` has zero validation calls of
+any kind today.
+
+The blocker is structural, not conceptual: `wiremesh-operator` depends on neither
+`wiremesh-enroll` nor `wiremesh-controller` in production (`wiremesh-testkit` pulls the
+latter as a dev-dependency only). The backlog's own 2a section argues `parse_rotation_interval`
+should move to `wiremesh-enroll` and be shared &mdash; and explicitly rejects the
+`workloads::validate_dial_target` hand-duplicate counter-precedent, because duplicating a
+GRAMMAR means the operator accepts what the controller rejects at boot, which is the exact
+CrashLoopBackOff this item is about.
+
+Two routes, and the cheap one may be enough: **(a)** a `schemars` pattern/format constraint
+on the field so the apiserver rejects garbage at admission with no Rust dependency at all
+&mdash; check whether the grammar is regex-expressible before assuming it is not; or **(b)**
+relocate `parse_rotation_interval` into `wiremesh-enroll`, add that dependency, and validate
+in `reconcile()` before any PVC/Service/Deployment side effect, mirroring
+`controllers/gateway.rs`'s existing `validate_dial_target` call site (`Error::Admin`,
+fail-closed, before any mutation).
+
+Severity is MEDIUM not HIGH because the failure is loud and recoverable &mdash; `kubectl edit`
+fixes it. Contrast the gateway's dial-target precedent, where the same class of mistake burns
+a single-use enrollment token.
 
 ---
 

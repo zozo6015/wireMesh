@@ -4,7 +4,8 @@
 //! Port/env/arg wiring mirrors the real binaries:
 //! - controller: env-configured (`WIREMESH_DATA_DIR`, `WIREMESH_TCP_PORT`,
 //!   `WIREMESH_SYNC_TCP_PORT`, `WIREMESH_SOCKET_PATH`, `WIREMESH_ADMIN_TCP_PORT`,
-//!   `WIREMESH_OBSERVE_UDP_PORT` — see `crates/wiremesh-controller/src/main.rs`).
+//!   `WIREMESH_OBSERVE_UDP_PORT`, `WIREMESH_BIND_IP` — see
+//!   `crates/wiremesh-controller/src/main.rs`).
 //! - gateway: `--controller-sync/--observe/--tun/--wg-port/--state-dir` plus the
 //!   `enroll` subcommand (`crates/wiremesh-gateway/src/{config,enroll}.rs`).
 //! - relay: `relay <bind> <certdir> --controller <sync>` plus the
@@ -345,29 +346,41 @@ pub fn admin_exec_sidecar(operator_image: &str) -> Container {
     }
 }
 
-/// The controller Deployment: 1 replica, PVC at `/var/lib/wiremesh`, the six
-/// `WIREMESH_*` env vars, listener ports, and the admin-exec sidecar (running
-/// `operator_image`) the operator execs admin ops into over the shared UDS.
+/// The controller Deployment: 1 replica, PVC at `/var/lib/wiremesh`, the seven
+/// `WIREMESH_*` env vars (eight when `spec.rotation_interval` is set), listener
+/// ports, and the admin-exec sidecar (running `operator_image`) the operator
+/// execs admin ops into over the shared UDS.
 pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator_image: &str) -> Deployment {
     let image = spec.image.clone().unwrap_or_else(|| DEFAULT_CONTROLLER_IMAGE.to_string());
     let sync = spec.sync_tcp_port.map(|p| p as i32).unwrap_or(SYNC_TCP_PORT);
     let admin = spec.admin_tcp_port.map(|p| p as i32).unwrap_or(ADMIN_TCP_PORT);
     let observe = spec.observe_udp_port.map(|p| p as i32).unwrap_or(OBSERVE_UDP_PORT);
 
+    let mut container_env = vec![
+        env("WIREMESH_DATA_DIR", DATA_DIR),
+        env("WIREMESH_TCP_PORT", ENROLL_TCP_PORT.to_string()),
+        env("WIREMESH_SYNC_TCP_PORT", sync.to_string()),
+        env("WIREMESH_SOCKET_PATH", UDS_PATH),
+        env("WIREMESH_ADMIN_TCP_PORT", admin.to_string()),
+        env("WIREMESH_OBSERVE_UDP_PORT", observe.to_string()),
+        // Bind enroll/sync/observe to all interfaces so the Service can route
+        // to them (the Admin TCP listener stays loopback-only regardless).
+        env("WIREMESH_BIND_IP", "0.0.0.0"),
+    ];
+    // Only push when set. `WIREMESH_ROTATION_INTERVAL=off` is a live
+    // fabric-wide rotation-outage mitigation on some clusters; naming this key
+    // at all — even with a default/empty value — makes the operator own it
+    // under SSA force-apply (`Container.env` is a `list-map-keys: [name]`
+    // merge key), so the next reconcile would silently clobber a human's
+    // hand-set `off`. See `WiremeshControllerSpec::rotation_interval`.
+    if let Some(rotation_interval) = &spec.rotation_interval {
+        container_env.push(env("WIREMESH_ROTATION_INTERVAL", rotation_interval.clone()));
+    }
+
     let container = Container {
         name: "controller".to_string(),
         image: Some(image),
-        env: Some(vec![
-            env("WIREMESH_DATA_DIR", DATA_DIR),
-            env("WIREMESH_TCP_PORT", ENROLL_TCP_PORT.to_string()),
-            env("WIREMESH_SYNC_TCP_PORT", sync.to_string()),
-            env("WIREMESH_SOCKET_PATH", UDS_PATH),
-            env("WIREMESH_ADMIN_TCP_PORT", admin.to_string()),
-            env("WIREMESH_OBSERVE_UDP_PORT", observe.to_string()),
-            // Bind enroll/sync/observe to all interfaces so the Service can route
-            // to them (the Admin TCP listener stays loopback-only regardless).
-            env("WIREMESH_BIND_IP", "0.0.0.0"),
-        ]),
+        env: Some(container_env),
         ports: Some(vec![
             tcp_port("enroll-tcp", ENROLL_TCP_PORT),
             tcp_port("sync-tcp", sync),
@@ -887,6 +900,7 @@ mod tests {
             admin_tcp_port: None,
             sync_tcp_port: None,
             observe_udp_port: None,
+            rotation_interval: None,
         }
     }
 

@@ -37,6 +37,10 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              rotationInterval:
+                description: '`WIREMESH_ROTATION_INTERVAL` passthrough, verbatim — grammar validation (`off`/`<n>d`/`<n>h`/...) lives on the controller boot path, not here. MUST stay `None`-omits-the-env-var: `.force()` on both apply paths (`controllers::apply`/`apply_deployment`) means naming this key at all makes the operator own it under SSA, and the next reconcile would clobber a human''s hand-set `off` — a live fabric-wide rotation-outage mitigation (see root `CLAUDE.md`, "Key rotation"). Removing this field from a CR re-enables rotation (SSA deletes the entry on unset); document that on any UI built over this field.'
+                nullable: true
+                type: string
               storageClass:
                 nullable: true
                 type: string
