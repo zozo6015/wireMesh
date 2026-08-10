@@ -3,7 +3,11 @@
 **Found:** 2026-08-05. Bug 4 predicted by an implementer, confirmed empirically by the
 in-step done-bar run at `5a5f644`. Bug 5 found by the independent verification pass that
 was checking bug 4.
-**Status:** both open. Bug 5 is the more serious of the two.
+**Status:** bug 4 open; **bug 5 FIXED in v0.7.2** (the port authority), which deleted
+`pending_peer_configs`' `candidate_port + OWN_TUN_PORT_OFFSET` epoch-delta formula — the
+mechanism analysed below — and made the device the one authority on the endpoint. Its done
+bar, `second_rotation_of_same_gateway_keeps_traffic_flowing`, is committed and not
+`#[ignore]`d. The bug-5 analysis below is kept as the record of what was wrong.
 
 ## Bug 4 — after a Role-A cutover, nothing durable can address the active tun
 
@@ -72,6 +76,46 @@ port. `replace_peers=true` is session-destructive with this boringtun
 Everything durable in the fabric — observed candidate, reported locals, punch candidates,
 `live_endpoints` — is base-port by construction. The design's stated recovery from a
 divergent port is **reboot** (OD-1). That is not a mechanism; it is the absence of one.
+
+### Sizing (2026-08-10): it is a deadlock, not a slow convergence
+
+The post-rotation reachability wait was widened from 20s to 90s to find out whether the
+pair heals once a grace expires. **It does not.** `test result: FAILED ... finished in
+97.54s`, and it failed on the *first* direction (wlA → wlB), so the reverse direction was
+never measured — do not read this as a symmetric result. After 90s `wg0e1` was still on
+51821 with no handshake, `wg0` was still up, and `wg0o0` had never collapsed.
+
+The two halves gate each other:
+
+- `wg0e1` cannot become live: it dials the peer at `:51820`, where the peer's epoch-0 key
+  still sits.
+- `retire_ready` is assigned **only inside the `if all_live` branch** of
+  `run_rotation_ticks`, and `all_live` requires every peer rx-corroborated live *on the new
+  tun*.
+- `service_retire` is what tears down the old device and calls
+  `renormalize_active_listen_port` to move the active key back to the base port.
+
+So the retire that would make `wg0e1` addressable is gated on `wg0e1` already being live.
+Neither side can advance the other, and nothing else moves the port. The relevant clock is
+the gateway's `RETIRE_GRACE = 2 * ROTATION_KEEPALIVE` (6s), not the controller's
+`rotation::RETIRE_GRACE` (30s) — but neither ever starts, because the gate never opens.
+
+**Blast radius: it churns, it does not settle.** Both gateways log a permanent
+`direct → degraded → disconnected → connecting` cycle, with the controller brokering a
+punch directive roughly every 5s, indefinitely. On a real fabric that is every gateway at
+once, forever, until someone restarts them — so in-step rotation costs control-plane load
+as well as data-plane reachability.
+
+### The trap: do not fix this at the cutover gate
+
+The obvious fix is to tighten the cutover gate — stop `any_live` from flipping routes onto
+a tun that cannot carry them. **Do not.** A stricter gate parks the phase in `Overlapping`,
+and `Rotation::on_directive` is honoured only from `Idle` with **no exit from
+`Overlapping`**: `on_epoch_retired` returns to `Idle` only from `CutOver`. That trades
+today's churning-but-diagnosable outage for a silent permanent wedge in which every later
+directive is ignored and the old key is never scrubbed — strictly worse, and invisible.
+
+**Fix the endpoint the cutover writes, not the gate that lets it happen.**
 
 ## Bug 5 — the SECOND rotation cannot complete
 

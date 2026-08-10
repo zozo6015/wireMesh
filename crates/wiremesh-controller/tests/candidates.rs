@@ -80,25 +80,39 @@ fn candidates_for_returns_observed_and_locals_deduped_observed_first() {
     );
 }
 
+/// (Backlog item 1) This test's fixtures used to be the bare strings `"a"`
+/// and `"b"`, which are not endpoints at all. That was harmless while
+/// `local_endpoints` went unvalidated end to end, but item 1 makes an
+/// unparseable candidate something the fabric must never store — a stored
+/// non-`SocketAddrV4` string is re-advertised to every other gateway, where
+/// `uapi::validate_ipv4_endpoint` rejects it and the resulting `Err` unwinds
+/// out of `apply_state` and EXITS the peer gateway process. The fixtures are
+/// therefore real `ip:port` endpoints now. Nothing this test asserts changed:
+/// it is about `set_local_candidates`' REPLACE semantics and its
+/// bump-only-on-change discipline, and the two endpoints below sort in the
+/// same order `"a"`/`"b"` did.
 #[test]
 fn set_local_candidates_replaces_set_and_bumps_revision_only_on_change() {
     let db = Db::open_memory().unwrap();
     let gw = enroll_test_gateway(&db, "aws", "10.0.0.0/16", "tok-1", "serial-1");
 
+    const A: &str = "10.0.0.1:51820";
+    const B: &str = "10.0.0.2:51820";
+
     let r0 = db.current_revision().unwrap();
 
     let r1 = db
-        .set_local_candidates(gw, &["a".to_string(), "b".to_string()])
+        .set_local_candidates(gw, &[A.to_string(), B.to_string()])
         .unwrap()
         .expect("a genuinely new local set must bump the revision");
     assert!(r1 > r0, "r1={r1} must be > r0={r0}");
-    assert_eq!(db.candidates_for(gw).unwrap(), vec!["a".to_string(), "b".to_string()]);
+    assert_eq!(db.candidates_for(gw).unwrap(), vec![A.to_string(), B.to_string()]);
 
     // Re-supplying the SAME set, just reordered, must be a no-op: no write,
     // no revision bump — mirrors `set_candidate_endpoint`'s change-detection
     // discipline (see its doc comment).
     let unchanged = db
-        .set_local_candidates(gw, &["b".to_string(), "a".to_string()])
+        .set_local_candidates(gw, &[B.to_string(), A.to_string()])
         .unwrap();
     assert_eq!(
         unchanged, None,
@@ -108,11 +122,11 @@ fn set_local_candidates_replaces_set_and_bumps_revision_only_on_change() {
 
     // A genuinely different set (shrunk to one endpoint) must bump again.
     let r2 = db
-        .set_local_candidates(gw, &["a".to_string()])
+        .set_local_candidates(gw, &[A.to_string()])
         .unwrap()
         .expect("a genuinely changed local set must bump the revision");
     assert!(r2 > r1, "r2={r2} must be > r1={r1}");
-    assert_eq!(db.candidates_for(gw).unwrap(), vec!["a".to_string()]);
+    assert_eq!(db.candidates_for(gw).unwrap(), vec![A.to_string()]);
 }
 
 /// The load-bearing regression guard: a gateway that has only ever had its

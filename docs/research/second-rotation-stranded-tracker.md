@@ -1,7 +1,11 @@
 # Every rotation after the first promotes late, and its ack is discarded
 
 **Found:** 2026-08-06, by the rotate-twice done-bar built for a *different* bug.
-**Status:** open. **Pre-existing controller bug — not introduced by the port-authority
+**Status:** FIXED in v0.7.2 — a promoted rotation's retire is now driven, so the
+`retiring` row is no longer stranded and `initiate_due_rotations` (which skips
+`state IN ('pending','retiring')`) stops silently self-disabling after one round per
+gateway. The analysis below is kept as the record of the mechanism.
+**Pre-existing controller bug — not introduced by the port-authority
 branch** (`git diff 68f96e5..a64c7fd --stat` touches only gateway files).
 **Second-rotation-only**, which is why nothing has ever hit it: no test had rotated twice.
 

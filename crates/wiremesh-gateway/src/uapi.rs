@@ -88,6 +88,24 @@ fn validate_ipv4_endpoint(ep: &str) -> anyhow::Result<()> {
     }
 }
 
+/// Can `ep` be written to the UAPI as an `endpoint=` line at all?
+///
+/// (Backlog item 1) The predicate form of [`validate_ipv4_endpoint`], exposed
+/// so the candidate ingest filters in [`crate::state`] are the SAME predicate
+/// rather than a second opinion about what is dialable. That matters because
+/// the two cannot safely disagree in one direction: a filter LOOSER than this
+/// function is a live crash-loop path. `validate_ipv4_endpoint`'s `Err`
+/// propagates through [`push_peer_block`] to [`encode_set`], which
+/// `apply_state` calls with `?` BEFORE its incremental `match delta`, so the
+/// error unwinds out of `run()` past both loops and ends the process from
+/// `main`'s `rt.block_on(run(cfg))`.
+///
+/// Deliberately delegates rather than re-parsing: one definition, one place
+/// to change it.
+pub fn is_dialable_endpoint(ep: &str) -> bool {
+    validate_ipv4_endpoint(ep).is_ok()
+}
+
 /// Validate an allowed-ips entry as an IPv4 CIDR (`a.b.c.d/len`) before it
 /// reaches the UAPI wire — same IPv4-only rationale as
 /// [`validate_ipv4_endpoint`]. An IPv6 CIDR (or malformed entry) is a hard
@@ -969,5 +987,236 @@ errno=0\n\
         let resp = "private_key=deadbeef\nlisten_port=51820\nerrno=0\n\n";
         let parsed = parse_get_response(resp);
         assert!(parsed.is_empty(), "no peers in response: {parsed:?}");
+    }
+
+    // -----------------------------------------------------------------
+    // `validate_ipv4_endpoint` — the WRITE-side endpoint predicate
+    // -----------------------------------------------------------------
+    //
+    // (Backlog item 1) Everything above this line tests the READ side
+    // (`parse_get_response`). The write-side validator had no direct test of
+    // any kind, which is out of proportion to its blast radius: its `Err`
+    // propagates through `push_peer_block` -> `encode_set` ->
+    // `apply_state`'s `uapi::encode_set(&dev).context(..)?`, unwinds out of
+    // `async fn run(cfg)` past both loops, and terminates the process from
+    // `main`'s `rt.block_on(run(cfg))`. It is a validator that can kill the
+    // gateway.
+    //
+    // It is also now a SHARED DEFINITION. The item-1 candidate filters (in
+    // the controller's `Sync.Report` ingress and the gateway's
+    // `PeerState`/`state.json` ingest) are each defined as "drop anything
+    // this function would reject", so a filter that is LOOSER than this
+    // predicate is a live crash-loop path and a filter that is STRICTER
+    // silently strands a correctly-addressed gateway with no candidates.
+    // These tests are the written form of that definition.
+    //
+    // Tested here, privately, rather than by widening the function's
+    // visibility for tests' sake. `tests/uapi_endpoint_validation.rs` keeps
+    // the complementary public-surface coverage — that this predicate is
+    // actually REACHED from `encode_set`/`encode_add_peers` — which is a
+    // different property and worth having as well.
+    //
+    // Characterization of existing behaviour: green on the tree that
+    // introduced them.
+
+    /// Every form that MUST validate. The predicate is exactly "parses as
+    /// `std::net::SocketAddr::V4`", deliberately nothing narrower: port 1 and
+    /// port 65535 are as legitimate as 51820, and a public address is as
+    /// legitimate as an RFC1918 one.
+    #[test]
+    fn validate_ipv4_endpoint_accepts_every_ipv4_socket_address_form() {
+        for ep in [
+            "203.0.113.5:51820", // public, canonical WG port
+            "10.0.0.1:1",        // lowest usable port
+            "192.168.1.7:65535", // highest port
+            "172.16.4.4:51821",  // the +1 overlap port `pending_peer_configs` derives
+        ] {
+            validate_ipv4_endpoint(ep).unwrap_or_else(|e| {
+                panic!(
+                    "{ep:?} is a valid IPv4 socket address and MUST validate. Narrowing \
+                     this predicate (a port allow-range, an RFC1918-only rule) would \
+                     silently cost a correctly-addressed gateway its direct path, and \
+                     would put the item-1 candidate filters — which are defined against \
+                     this function — out of step with it. Got: {e:#}"
+                )
+            });
+        }
+    }
+
+    /// Every form that MUST be rejected, each with the reason it is dangerous
+    /// rather than merely wrong. Reaching the UAPI with one of these is fatal
+    /// to the process, so a candidate filter that admits any of them is a
+    /// crash-loop.
+    #[test]
+    fn validate_ipv4_endpoint_rejects_every_non_ipv4_socket_address_form() {
+        let cases: &[(&str, &str)] = &[
+            ("", "empty string: sorts before every real address, so it takes candidates[0] outright"),
+            (" ", "whitespace only"),
+            ("not-an-endpoint", "unstructured garbage: the base case"),
+            (
+                "abc:123",
+                "a DNS name with a port — THE trap: it survives \
+                 `reconcile::pending_peer_configs`' `rsplit_once(':')` + `u16::parse` \
+                 half-check, the only other shape check on this path, and dies here \
+                 where the error is fatal. v1 dial targets are IPv4 literals; nothing \
+                 resolves names at this layer",
+            ),
+            ("controller.example.com:51820", "the plausible-hostname form of the same trap"),
+            ("localhost:51820", "the most plausible one of all — still not a literal"),
+            ("10.0.0.5", "no port: the UAPI `endpoint=` line requires ip:port"),
+            ("10.0.0.5:", "a present but empty port"),
+            (":51820", "a port with no address"),
+            ("10.0.0.5:65536", "one past the top of u16"),
+            ("10.0.0.5:70000", "well past the top of u16"),
+            ("10.0.0.5:-1", "a negative port"),
+            ("10.0.0.5:0x1", "a hex port — the port is decimal-only"),
+            ("10.0.0.5:+1", "a signed port"),
+            ("999.1.1.1:51820", "an out-of-range octet: dotted-quad SHAPE is not enough"),
+            ("10.0.0.5.6:51820", "five octets"),
+            ("10.0.0:51820", "three octets"),
+            (
+                "010.0.0.5:51820",
+                "a leading-zero octet. Rust's `Ipv4Addr` FromStr refuses these precisely \
+                 because C's `inet_aton` would read them as OCTAL — `010` = 8, not 10 — \
+                 so the same string can name two different hosts depending on who parses \
+                 it. Pinned so a toolchain or hand-rolled-parser change cannot quietly \
+                 reintroduce that ambiguity",
+            ),
+            (" 10.0.0.5:51820", "leading whitespace: `SocketAddr`'s FromStr does not trim"),
+            ("10.0.0.5:51820 ", "trailing whitespace, same reason"),
+            (
+                "10.0.0.5:51820\n",
+                "a trailing newline. The UAPI wire format is newline-delimited \
+                 key=value lines, so this is a line-INJECTION vector into the boringtun \
+                 `set` message, not merely a parse failure",
+            ),
+            (
+                "10.0.0.5:51820\nendpoint=1.2.3.4:1",
+                "the explicit UAPI line-injection payload: accepting it would let the \
+                 string's author append arbitrary UAPI directives",
+            ),
+            ("10.0.0.5:51820:51820", "two ports"),
+            ("10.0.0.5%eth0:51820", "an IPv4 with a zone index"),
+            ("::1:51820", "an unbracketed IPv6-shaped string"),
+            ("[fe80::1%eth0]:51820", "a link-local IPv6 with a zone index"),
+        ];
+
+        // Collected rather than asserted per-iteration so a failure reports
+        // EVERY still-accepted form, not just the first — same discipline as
+        // `parse_get_response_rejects_ipv6_endpoint_as_unpinnable` above.
+        let accepted: Vec<&(&str, &str)> =
+            cases.iter().filter(|(ep, _)| validate_ipv4_endpoint(ep).is_ok()).collect();
+        assert!(
+            accepted.is_empty(),
+            "these must be REJECTED but validated: {accepted:#?}\n\
+             Reaching the UAPI with any of them is FATAL: the `Err` this function returns \
+             propagates through `push_peer_block` -> `encode_set` -> `apply_state` and \
+             unwinds out of `run()` to `main`, ending the process — for every peer at \
+             once, since the device config is built from all of them together. This list \
+             is also the definition the item-1 candidate filters are written against, so \
+             anything that becomes acceptable here silently becomes storable there."
+        );
+    }
+
+    /// IPv6 literals are rejected through a SEPARATE arm with its own message.
+    /// Worth pinning as distinct from a parse failure: this is a deliberate
+    /// v1 scope decision (spec §1 — IPv4-only end to end, matching
+    /// `config.rs`'s IPv6-reject-at-boot), and an operator reading a gateway
+    /// that just died needs to tell "we don't support that yet" apart from
+    /// "that isn't an address". Only the one word an operator would grep for
+    /// is asserted — not the full wording, which is free to change.
+    #[test]
+    fn validate_ipv4_endpoint_rejects_ipv6_literals_as_out_of_scope_not_as_garbage() {
+        for ep in [
+            "[::1]:51820",                                     // loopback, compressed
+            "[2001:db8::1]:51820",                             // compressed global
+            "[2001:0db8:0000:0000:0000:0000:0000:0001]:51820", // full-form literal
+            "[fe80::1]:51820",                                 // link-local
+            "[::ffff:10.0.0.5]:51820",                         // IPv4-MAPPED IPv6
+        ] {
+            let err = validate_ipv4_endpoint(ep)
+                .expect_err("v1 is IPv4-only end to end, so an IPv6 literal must not validate");
+            assert!(
+                format!("{err}").contains("IPv6"),
+                "{ep:?} must be rejected as an explicit IPv6 SCOPE decision, and say so. \
+                 `[::ffff:10.0.0.5]:51820` is the one that makes this load-bearing: it is \
+                 an IPv4 address wearing IPv6 syntax, and it must go down the IPv6 arm \
+                 rather than being unwrapped into its embedded IPv4 — otherwise the \
+                 bracketed form becomes a way to smuggle an address past a filter that \
+                 only inspects dotted quads. Got: {err:#}"
+            );
+        }
+    }
+
+    /// **KNOWN GAP, pinned as characterization — NOT an endorsement.**
+    ///
+    /// `validate_ipv4_endpoint` is a pure PARSE check. It has no reachability
+    /// semantics at all, so every address below validates despite being
+    /// undialable as a WireGuard peer endpoint.
+    ///
+    /// This is a real asymmetry, not a hypothetical one: the gateway's own
+    /// `netif::is_usable_ipv4` — which produces the `local_endpoints` a
+    /// gateway reports in the first place — deliberately filters loopback,
+    /// link-local and unspecified addresses. So the honest-gateway path is
+    /// STRICTER than the validator that guards the wire. A gateway that is
+    /// compromised, modified, or merely version-skewed can report
+    /// `127.0.0.1:51820`, `0.0.0.0:0` or `10.0.0.5:0`, and every one of them
+    /// passes here — which means the item-1 candidate filters, defined as
+    /// "agrees with this function", will store and re-advertise them to every
+    /// peer in the fabric.
+    ///
+    /// Severity is a rung below the crash-loop item 1 exists to fix: these
+    /// parse, so they do NOT kill the process. They poison the peer's direct
+    /// path silently instead (and `127.0.0.1:51820` written into a peer's
+    /// UAPI points that peer at itself).
+    ///
+    /// **DO NOT "fix" this by tightening THIS function. Loopback is load-
+    /// bearing here.** An automated review (CodeRabbit, 2026-08-10) proposed
+    /// exactly that — reject port 0 and every non-unicast IPv4 (unspecified,
+    /// loopback, link-local, multicast, broadcast) right here. It would break
+    /// the relay data path, fatally. `relay::RelayTransport::connect` binds
+    /// its local UDP socket on `127.0.0.1:0` (`relay.rs:130`) and the Cycle-4c
+    /// endpoint switch points the relayed peer at that `local_addr()` — so a
+    /// LOOPBACK peer endpoint is the normal, correct, production shape of a
+    /// relayed path. Rejecting it here returns `Err` from `push_peer_block`,
+    /// which is FATAL: it unwinds through `encode_set` and `apply_state` out
+    /// of `run()` and ends the process. The "hardening" would take down every
+    /// gateway that ever fails over to a relay.
+    ///
+    /// The underlying concern is real but belongs at a different door. What a
+    /// compromised gateway can poison is the CANDIDATE set, and a candidate is
+    /// dropped harmlessly, so any reachability policy belongs in the item-1
+    /// filters (`services::sync::usable_local_candidates`, `state::
+    /// partition_dialable`) where the failure mode is "peer loses a candidate"
+    /// rather than "fabric exits". That would make the filters STRICTER than
+    /// this validator — the safe direction — and `tests/predicate_equality.rs`
+    /// would have to assert containment instead of equality. Filed as backlog
+    /// item 26; deliberately not taken here.
+    ///
+    /// If you are tightening it, THIS is the test to update, on purpose.
+    #[test]
+    fn validate_ipv4_endpoint_is_parse_only_so_undialable_addresses_are_accepted_today() {
+        let undialable: &[(&str, &str)] = &[
+            ("10.0.0.5:0", "port 0 is not a dialable UDP port"),
+            ("0.0.0.0:51820", "the unspecified address names no host"),
+            ("0.0.0.0:0", "both at once"),
+            ("127.0.0.1:51820", "loopback — on a PEER this points that peer at itself; \
+                                 `netif::is_usable_ipv4` refuses to emit it"),
+            ("169.254.1.1:51820", "link-local — `netif::is_usable_ipv4` refuses this too"),
+            ("255.255.255.255:65535", "the broadcast address"),
+            ("224.0.0.1:51820", "multicast is not a unicast peer endpoint"),
+        ];
+
+        let rejected: Vec<&(&str, &str)> =
+            undialable.iter().filter(|(ep, _)| validate_ipv4_endpoint(ep).is_err()).collect();
+        assert!(
+            rejected.is_empty(),
+            "these are accepted TODAY and this test records that gap; they now reject: \
+             {rejected:#?}\n\
+             If you tightened `validate_ipv4_endpoint` on purpose, good — update this \
+             test and the item-1 candidate filters TOGETHER, because they are defined \
+             against this predicate and a filter left looser than the validator is a \
+             crash-loop path."
+        );
     }
 }
