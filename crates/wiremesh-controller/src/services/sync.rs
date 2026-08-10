@@ -40,12 +40,126 @@ use wiremesh_proto::v1::{
 };
 
 use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
-use crate::db::{CasOutcome, DropPendingOutcome, GatewayIdentity};
+use crate::db::{is_usable_candidate_endpoint, CasOutcome, DropPendingOutcome, GatewayIdentity};
 use crate::db_async::DbHandle;
 use crate::projection::{self, ChangeEvent};
 use crate::rotation::{self, RotationDecision, RotationState};
 
 pub type WatchStream = Pin<Box<dyn Stream<Item = Result<SyncMessage, Status>> + Send + 'static>>;
+
+/// (Backlog item 1) The maximum number of locally-reported candidate
+/// endpoints the controller will store for one gateway
+/// (`ReportRequest.local_endpoints`).
+///
+/// **Why a cap exists at all.** `local_endpoints` is `repeated string` with
+/// no constraint and nothing overrides tonic's 4MB `max_decoding_message_size`
+/// — roughly 200k strings — every one of which would be persisted, fanned out
+/// to every other gateway in every snapshot and delta, and run through
+/// [`crate::db::Db::candidates_for`]'s O(n²) `Vec::contains` dedup. One
+/// authenticated gateway must not get to choose how much work the controller
+/// and all of its peers do.
+///
+/// **Why 32.** A local candidate is one `ip:wg_port` per routable local IPv4
+/// address (`wiremesh_gateway::netif`: one per `inet` line, loopback and
+/// link-local filtered, all at the single WG port). A real segment gateway has
+/// 1-4; a container host with extra bridges is still in the single digits. 32
+/// is about an order of magnitude of headroom over the honest worst case while
+/// staying small enough that both the quadratic dedup and the per-peer fanout
+/// stay free — and well under what a NAT puncher could work through anyway,
+/// since it must try candidates in sequence against a bounded punch window.
+pub const MAX_LOCAL_CANDIDATES: usize = 32;
+
+/// How many rejected endpoints are quoted in the filter's log line, and how
+/// many bytes of each. The offending strings are attacker-chosen and can be
+/// megabytes long and arbitrarily numerous, so a log that quoted them all
+/// would just relocate the flood into the controller's stderr. Quoted with
+/// `{:?}`, which escapes the newlines a UAPI-injection payload carries.
+const REJECTED_SAMPLE_COUNT: usize = 3;
+const REJECTED_SAMPLE_BYTES: usize = 64;
+
+/// (Backlog item 1) Reduce one gateway's reported `local_endpoints` to the
+/// set the fabric can actually use: entries [`is_usable_candidate_endpoint`]
+/// accepts, deduplicated, bounded by [`MAX_LOCAL_CANDIDATES`].
+///
+/// `SocketAddrV4` (not `SocketAddr`) is the same predicate the controller
+/// already applies to a relay's endpoint at both registration paths
+/// (`services::enrollment::enroll`, `services::admin::register_relay`) and
+/// the same one `wiremesh_gateway::uapi::validate_ipv4_endpoint` applies at
+/// the far end of this data's journey — which is the point. What the
+/// controller stores here it re-advertises verbatim as
+/// `Peer.candidate_endpoints` to every OTHER gateway, where it becomes
+/// `PeerState::primary_endpoint()` and is written to the WireGuard UAPI. An
+/// entry that fails the parse there is not a degraded peer: `encode_set`'s
+/// `Err` unwinds out of `apply_state` past both loops in the gateway's
+/// `run()` and exits the process, on every peer at once. A stock gateway
+/// cannot emit garbage (`netif::local_wg_endpoints` formats from an
+/// already-parsed `Ipv4Addr`); the threat is a compromised or version-skewed
+/// gateway holding a valid fabric-CA cert.
+///
+/// FILTER, never reject. `Sync.Report` still returns `Ok`: the same request
+/// also carries `applied_version`, `peer_paths`, `relay_health` and
+/// `epoch_acks`, and failing it over one bad address string would wedge
+/// rotation and path state too. A gateway that got one of four addresses
+/// wrong keeps the other three rather than losing its direct path outright.
+/// A report whose entries are ALL unusable therefore filters to empty, which
+/// `Db::set_local_candidates`' full-REPLACE contract CLEARS — deliberately
+/// the same as an explicitly-empty report (cycle-4b Task 8), and the only
+/// party it costs is the gateway that sent it.
+fn usable_local_candidates(gateway_id: i64, gateway_name: &str, reported: Vec<String>) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut rejected = 0usize;
+    let mut samples: Vec<String> = Vec::new();
+    let mut over_cap = 0usize;
+
+    for ep in reported {
+        if !is_usable_candidate_endpoint(&ep) {
+            rejected += 1;
+            if samples.len() < REJECTED_SAMPLE_COUNT {
+                let mut end = REJECTED_SAMPLE_BYTES.min(ep.len());
+                while end > 0 && !ep.is_char_boundary(end) {
+                    end -= 1;
+                }
+                samples.push(format!("{:?}", &ep[..end]));
+            }
+            continue;
+        }
+        // Dedup BEFORE the cap so the bound counts DISTINCT candidates: a
+        // gateway repeating one address must not eat the whole budget.
+        // `set_local_candidates` dedups again (it sorts first), so this is
+        // about what the cap means, not about the stored shape.
+        if !seen.insert(ep.clone()) {
+            continue;
+        }
+        if kept.len() == MAX_LOCAL_CANDIDATES {
+            over_cap += 1;
+            continue;
+        }
+        kept.push(ep);
+    }
+
+    if rejected > 0 {
+        eprintln!(
+            "wiremesh-controller: gateway {gateway_name:?} (id {gateway_id}) reported {rejected} \
+             local endpoint(s) that are not IPv4 ip:port and were DROPPED (kept {}); a stock \
+             gateway cannot produce these, so this is a compromised or version-skewed peer. \
+             First {}: {}",
+            kept.len(),
+            samples.len(),
+            samples.join(", ")
+        );
+    }
+    if over_cap > 0 {
+        eprintln!(
+            "wiremesh-controller: gateway {gateway_name:?} (id {gateway_id}) reported \
+             {} distinct valid local endpoints, over the {MAX_LOCAL_CANDIDATES} cap; the \
+             {over_cap} beyond it were DROPPED",
+            kept.len() + over_cap
+        );
+    }
+
+    kept
+}
 
 pub struct SyncSvc {
     db: DbHandle,
@@ -1540,7 +1654,11 @@ impl Sync for SyncSvc {
 
         let gw = self
             .db
-            .find_gateway_by_name(gateway_name)
+            // Cloned rather than moved: `gateway_name` is the authenticated
+            // cert CN, and `usable_local_candidates` below names it in the
+            // log line that reports a peer sending unusable endpoints — an
+            // id alone would not tell an operator which gateway to go fix.
+            .find_gateway_by_name(gateway_name.clone())
             .await
             .map_err(|e| Status::internal(format!("looking up gateway by cert CN: {e}")))?
             .ok_or_else(|| {
@@ -1600,9 +1718,18 @@ impl Sync for SyncSvc {
         // `Db::set_local_candidates`'s full-REPLACE contract already handles
         // this uniformly, so the call is no longer conditioned on
         // non-emptiness.
+        //
+        // (Backlog item 1) `local_endpoints` is the one genuinely
+        // remote-supplied, free-form value on this surface, and whatever is
+        // stored here is re-advertised verbatim to every other gateway and
+        // written to their WireGuard UAPI. Filter it to what is actually
+        // dialable BEFORE it is persisted — see `usable_local_candidates`
+        // for the predicate, the cap, and why this filters rather than
+        // rejecting the RPC.
+        let local_endpoints = usable_local_candidates(gw.id, &gateway_name, req.local_endpoints);
         let revision = self
             .db
-            .set_local_candidates(gw.id, req.local_endpoints)
+            .set_local_candidates(gw.id, local_endpoints)
             .await
             .map_err(|e| Status::internal(format!("recording local_endpoints: {e}")))?;
 

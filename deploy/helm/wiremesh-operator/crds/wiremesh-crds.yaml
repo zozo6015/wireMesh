@@ -264,6 +264,10 @@ spec:
                   type: string
                 nullable: true
                 type: object
+              observeEndpoint:
+                description: Override for the gateway's `--observe` target (`host:port`; DNS hostnames are accepted — the gateway re-resolves per tick). Needed when the ClusterIP observe path is SNAT'd by kube-proxy (poisoning the observed public mapping); point this at a source-preserving UDP LB instead. Absent → the controller Service ClusterIP (today's default). The enroll init-container is NEVER affected by this override.
+                nullable: true
+                type: string
               segmentRef:
                 description: The `WiremeshSegment` (by `.metadata.name`) this gateway fronts.
                 type: string
@@ -273,6 +277,10 @@ spec:
                 type: string
               storageSize:
                 description: Size of the per-gateway identity PVC. Omitted → the 128Mi default (the persisted identity is a few KB). Parity with `WiremeshControllerSpec`.
+                nullable: true
+                type: string
+              syncEndpoint:
+                description: Override for the gateway's `--controller-sync` target (`host:port`; DNS hostnames accepted — re-resolved per reconnect). For controllers reached through an external LB / DDNS name. Absent → the controller Service ClusterIP. The enroll init-container is NEVER affected by this override.
                 nullable: true
                 type: string
               tun:
@@ -361,6 +369,14 @@ spec:
                 nullable: true
                 type: string
               nodeName:
+                nullable: true
+                type: string
+              storageClass:
+                description: StorageClass for the per-relay identity PVC (`<name>-relay-data`). Omitted → the cluster default class. Parity with `WiremeshGatewaySpec`.
+                nullable: true
+                type: string
+              storageSize:
+                description: Size of the per-relay identity PVC. Omitted → the 128Mi default (the enrolled certs are a few KB). Parity with `WiremeshGatewaySpec`.
                 nullable: true
                 type: string
             required:

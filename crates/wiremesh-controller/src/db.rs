@@ -479,6 +479,19 @@ fn ir_proto_str(proto: &wiremesh_policy::IrProto) -> &'static str {
     }
 }
 
+/// The one predicate for "is this string a candidate endpoint a stock
+/// gateway could have produced" — v1 is IPv4-only, so that means
+/// `std::net::SocketAddrV4`-parseable, nothing looser. [`Db::candidates_for`]
+/// (read side, below) and `services::sync::usable_local_candidates` (ingest
+/// side) both call this rather than each inlining their own `.parse()`, so
+/// the two can't drift apart the way this branch exists to fix. It lives
+/// here rather than in `services::sync` because `db.rs` must not depend on
+/// `services` (the dependency runs the other way already), and `services`
+/// importing from `db` is unremarkable.
+pub(crate) fn is_usable_candidate_endpoint(ep: &str) -> bool {
+    ep.parse::<std::net::SocketAddrV4>().is_ok()
+}
+
 /// Result of a successful [`Db::apply_fabric`] call — the mirror of
 /// `wiremesh_proto::v1::ApplyDiff` on the DB layer (kept as a separate type
 /// so `crate::db` doesn't depend on the proto crate). `deleted_segments` is
@@ -3045,6 +3058,43 @@ impl Db {
     /// — an unknown/inactive `gateway_id` yields an empty `Vec` rather than
     /// erroring, since every caller here is iterating an already-resolved
     /// peer/gateway id, not validating a fresh one.
+    ///
+    /// Both the observed slot and the local rows are passed through
+    /// [`is_usable_candidate_endpoint`] before being returned — dropping bad
+    /// ENTRIES, never erroring the whole call. This is read-side, not
+    /// ingest-side, validation: `SyncSvc::usable_local_candidates` already
+    /// filters what a gateway reports before `set_local_candidates` persists
+    /// it, but a `gateway_candidate` row written by a pre-fix controller
+    /// binary (or any future write path that doesn't route through that
+    /// ingest filter) would otherwise sit in the table forever and be
+    /// re-advertised verbatim into `Peer.candidate_endpoints` (`routes.rs`)
+    /// and `PunchDirective.candidates` (`broker.rs`) on every projection
+    /// build. The observed slot gets the same treatment as defense in
+    /// depth: today `crate::observe::handle_probe` is the column's only
+    /// writer and it always derives the value from a kernel-supplied
+    /// `SocketAddr` via `to_string()`, so it cannot actually be malformed —
+    /// but that's a property of the current single caller, not of
+    /// [`Db::set_candidate_endpoint`] itself, which takes `addr: &str` with
+    /// no validation of its own.
+    ///
+    /// That entry-level filter does not enforce `MAX_LOCAL_CANDIDATES`
+    /// (`services::sync`) — the cap on how many `source = 'local'` rows a
+    /// gateway may have at all. A row set written while a pre-cap controller
+    /// binary was running is still returned here in full: every row in it
+    /// individually passes [`is_usable_candidate_endpoint`], so none of them
+    /// get dropped, and the `Vec::contains` dedup below pays its O(n²) cost
+    /// against the full oversized set on every projection build, for every
+    /// peer — the exact "gateway reports far more candidates than expected"
+    /// shape `MAX_LOCAL_CANDIDATES`'s own doc comment sizes the cap against.
+    /// Peers themselves are not exposed to the size: the gateway's
+    /// `partition_dialable` caps what it actually dials at 64 regardless of
+    /// how many candidates a projection carries. Enforcing the cap here
+    /// would need `MAX_LOCAL_CANDIDATES` itself, and importing it from
+    /// `services::sync` would invert the layering the entry-filter
+    /// paragraph above relies on (`services::sync` depends on `db`, not the
+    /// reverse); closing this for real means relocating the constant to sit
+    /// next to [`is_usable_candidate_endpoint`], not importing across the
+    /// boundary.
     pub fn candidates_for(&self, gateway_id: i64) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
 
@@ -3058,7 +3108,7 @@ impl Db {
             .flatten();
 
         let mut out: Vec<String> = Vec::new();
-        if let Some(o) = observed {
+        if let Some(o) = observed.filter(|ep| is_usable_candidate_endpoint(ep)) {
             out.push(o);
         }
 
@@ -3070,7 +3120,7 @@ impl Db {
             .query_map(params![gateway_id], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<String>>>()?;
         for l in locals {
-            if !out.contains(&l) {
+            if is_usable_candidate_endpoint(&l) && !out.contains(&l) {
                 out.push(l);
             }
         }

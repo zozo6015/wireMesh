@@ -44,9 +44,206 @@ pub struct PeerState {
     /// now ignored as unknown) deserializes with an empty candidate list
     /// rather than failing the boot-from-persisted-state path — the next
     /// controller reconcile repopulates it.
-    #[serde(default)]
+    ///
+    /// **INVARIANT (backlog item 1): every entry is
+    /// [`uapi::is_dialable_endpoint`].** An entry that is not kills the
+    /// gateway PROCESS — `primary_endpoint()` feeds it to the UAPI as
+    /// `endpoint=`, `uapi::encode_set`'s `Err` unwinds out of `apply_state`
+    /// past both loops in `run()` and exits from `main`'s `block_on`. It is
+    /// enforced at BOTH doors into this field:
+    /// [`PeerState::from_proto`] for anything the controller advertises, and
+    /// `deserialize_with` for anything read back off disk. The
+    /// `deserialize_with` is the load-bearing half and it lives HERE, on the
+    /// field, rather than as a pass inside `DesiredState::load`: `load` is a
+    /// bare `serde_json::from_slice`, so the field's own `Deserialize` is
+    /// the only place that covers every present and future deserialization
+    /// route by construction. A `state.json` carrying a bad candidate is the
+    /// case that turns one bad apply into a gateway that cannot BOOT, with
+    /// the controller not even in the loop — fail-static inverted into the
+    /// reason the gateway stays down.
+    ///
+    /// **(Backlog G3) The list is also BOUNDED — at most
+    /// [`MAX_PEER_CANDIDATES`] entries**, enforced at those same two doors.
+    /// The invariant above keeps a hostile advertisement from killing the
+    /// process; the bound keeps it from growing this struct, and `state.json`
+    /// with it, without limit instead.
+    #[serde(default, deserialize_with = "deserialize_dialable_candidates")]
     pub candidates: Vec<String>,
     pub allowed_ips: Vec<String>,
+}
+
+/// (Backlog G3) The most candidate endpoints this gateway will keep for one
+/// peer, from either door.
+///
+/// **Why a cap exists at all.** Without one, everything a controller says
+/// about a peer is retained verbatim: it grows [`PeerState::candidates`], is
+/// written back out to `state.json` on every apply, and is re-parsed on every
+/// boot — per peer, forever. `Peer.candidate_endpoints` is an unconstrained
+/// `repeated string` on a stream this gateway does not size-limit, so a
+/// hostile or buggy control plane picks that number, not us. The rule this
+/// file already states for correctness ("a gateway must survive a control
+/// plane that does not [filter]") has to hold for VOLUME too, or the filter
+/// just moves the damage from a crash into unbounded memory and disk.
+///
+/// **Why 64.** It is derived from what an HONEST controller can advertise,
+/// not guessed. `Db::candidates_for` builds one peer's list as the gateway's
+/// single UDP-observed `gateway.candidate_endpoint` slot (0 or 1 entry) plus
+/// its deduplicated `source = 'local'` rows, which `Sync.Report` ingest caps
+/// at `services::sync::MAX_LOCAL_CANDIDATES = 32`. The true ceiling is
+/// therefore 1 + 32 = 33 — and because [`partition_dialable`]'s cap check
+/// (`kept.len() == MAX_PEER_CANDIDATES`) fires BEFORE the push, a cap set to
+/// exactly 33 would still keep a 33-entry honest advertisement whole;
+/// equality never drops anything. Only a cap set strictly BELOW 33 would
+/// truncate one. 64 is chosen well clear of that ceiling anyway, so the cap
+/// never sits exactly on the honest limit and there's room for the
+/// controller's cap to be raised (to anything through 63) before an honest
+/// advertisement would ever be truncated here — while still bounding what one
+/// peer costs us.
+pub(crate) const MAX_PEER_CANDIDATES: usize = 64;
+
+/// How many dropped endpoints are quoted in the filter's log line, and how
+/// many bytes of each — the same bounds, for the same reason, as the
+/// controller's `services::sync::REJECTED_SAMPLE_{COUNT,BYTES}`. The
+/// offending strings are chosen by whoever is misbehaving and can be
+/// megabytes long and arbitrarily numerous; quoting them all would relocate
+/// the flood into this gateway's stderr instead of preventing it.
+const DROPPED_SAMPLE_COUNT: usize = 3;
+const DROPPED_SAMPLE_BYTES: usize = 64;
+
+/// Outcome of one filtering pass over a peer's advertised candidates.
+///
+/// Split out from the logging so the decisions are testable: `eprintln!`
+/// output is not captured by `cargo test`, so a filter that both decided and
+/// reported inline could only ever be asserted on through what it returned —
+/// which is exactly how an unbounded log survives in a green suite.
+pub(crate) struct CandidateFilter {
+    /// The entries kept, in advertised order, capped at
+    /// [`MAX_PEER_CANDIDATES`].
+    pub(crate) kept: Vec<String>,
+    /// How many entries failed [`uapi::is_dialable_endpoint`].
+    pub(crate) dropped: usize,
+    /// How many otherwise-usable entries were discarded for exceeding
+    /// [`MAX_PEER_CANDIDATES`]. Counted separately from `dropped` because it
+    /// says something entirely different to an operator: those entries were
+    /// well-formed, and the fabric may genuinely be over the cap.
+    pub(crate) over_cap: usize,
+    /// Up to [`DROPPED_SAMPLE_COUNT`] of the undialable entries, each
+    /// truncated to [`DROPPED_SAMPLE_BYTES`] on a char boundary and already
+    /// `{:?}`-quoted.
+    pub(crate) samples: Vec<String>,
+}
+
+/// Partition a peer's advertised candidates into what this build can write to
+/// the WireGuard UAPI and what it cannot, applying [`MAX_PEER_CANDIDATES`]
+/// and collecting bounded samples of the rejects. Pure — no I/O, no logging.
+///
+/// The predicate is [`uapi::is_dialable_endpoint`] — the encoder's own accept
+/// test, not a second opinion about it. Dropping is per-ENTRY and never drops
+/// the peer: a peer with no usable candidate keeps its `allowed_ips` (and
+/// therefore its segment routes) and simply gets no `endpoint=` line, which
+/// is a legal, encodable WireGuard peer that recovers the moment a real
+/// candidate is advertised.
+///
+/// Deliberately does NOT deduplicate: the controller dedups on ingest
+/// (`usable_local_candidates`) and again in `Db::candidates_for`, and adding
+/// a third opinion here would silently reorder/reshape what a well-behaved
+/// control plane asked for. The cap alone is what bounds a misbehaving one.
+pub(crate) fn partition_dialable(candidates: Vec<String>) -> CandidateFilter {
+    let mut f = CandidateFilter {
+        kept: Vec::new(),
+        dropped: 0,
+        over_cap: 0,
+        samples: Vec::new(),
+    };
+
+    for c in candidates {
+        if !crate::uapi::is_dialable_endpoint(&c) {
+            f.dropped += 1;
+            if f.samples.len() < DROPPED_SAMPLE_COUNT {
+                // Back off to a char boundary before slicing: the string is
+                // attacker-chosen and may be multi-byte UTF-8, where a blind
+                // `&c[..64]` panics — inside a serde `deserialize_with`, that
+                // is a boot-time crash caused by the very defense meant to
+                // prevent one.
+                let mut end = DROPPED_SAMPLE_BYTES.min(c.len());
+                while end > 0 && !c.is_char_boundary(end) {
+                    end -= 1;
+                }
+                // `{:?}` deliberately: an endpoint carrying a newline is a
+                // UAPI line-injection payload, and it must not be able to
+                // inject lines into this log either.
+                f.samples.push(format!("{:?}", &c[..end]));
+            }
+            continue;
+        }
+        if f.kept.len() == MAX_PEER_CANDIDATES {
+            f.over_cap += 1;
+            continue;
+        }
+        f.kept.push(c);
+    }
+
+    f
+}
+
+/// Render one warning line for a filtering pass, or `None` when it dropped
+/// nothing. ONE line per pass (per peer, per advertisement) rather than one
+/// per entry: the count is what an operator needs, and a per-entry line hands
+/// the volume of this gateway's stderr to whoever is sending the junk.
+///
+/// `source` names the door the candidates came through, since the two have
+/// very different meanings: a controller advertisement means a peer (or the
+/// control plane) is compromised or version-skewed, while a `state.json`
+/// entry means this gateway persisted one before this filter existed.
+pub(crate) fn format_drop_warning(f: &CandidateFilter, source: &str) -> Option<String> {
+    if f.dropped == 0 && f.over_cap == 0 {
+        return None;
+    }
+
+    let mut msg = format!(
+        "wiremesh-gateway: filtering peer candidate endpoints from {source} — kept {}",
+        f.kept.len()
+    );
+    if f.dropped > 0 {
+        msg.push_str(&format!(
+            ", DROPPED {} that are not an IPv4 ip:port (writing one to the WireGuard UAPI \
+             would fail the whole device apply and terminate this process); first {}: {}",
+            f.dropped,
+            f.samples.len(),
+            f.samples.join(", ")
+        ));
+    }
+    if f.over_cap > 0 {
+        msg.push_str(&format!(
+            ", DROPPED {} valid endpoint(s) beyond the {MAX_PEER_CANDIDATES} per-peer cap",
+            f.over_cap
+        ));
+    }
+    Some(msg)
+}
+
+/// Drop every candidate endpoint this build cannot write to the WireGuard
+/// UAPI (and everything past [`MAX_PEER_CANDIDATES`]), warning once about
+/// what was dropped. The decisions live in [`partition_dialable`] and the
+/// wording in [`format_drop_warning`]; this is only the seam that joins them
+/// to stderr.
+fn retain_dialable(candidates: Vec<String>, source: &str) -> Vec<String> {
+    let f = partition_dialable(candidates);
+    if let Some(msg) = format_drop_warning(&f, source) {
+        eprintln!("{msg}");
+    }
+    f.kept
+}
+
+/// `#[serde(deserialize_with)]` shim for [`PeerState::candidates`] — see that
+/// field's invariant. Filters on the way IN, so no route that produces a
+/// `PeerState` by deserialization (today `DesiredState::load`'s
+/// `serde_json::from_slice`, and any future one) can reintroduce the hole.
+fn deserialize_dialable_candidates<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(retain_dialable(Vec::<String>::deserialize(d)?, "state.json"))
 }
 
 impl PeerState {
@@ -66,7 +263,17 @@ impl PeerState {
             segment_name: p.segment_name.clone(),
             active_pubkey_b64,
             keys,
-            candidates: p.candidate_endpoints.clone(),
+            // (Backlog item 1) The Sync-ingest door. This ONE site covers
+            // `from_snapshot` and `apply_delta`, and through them
+            // `reconcile::{peer_configs, device_config_pinned,
+            // pending_peer_configs}` — deliberately not per-builder checks,
+            // which would be three chances to add a fourth builder without
+            // one. The controller filters this too; a gateway must survive a
+            // control plane that does not.
+            candidates: retain_dialable(
+                p.candidate_endpoints.clone(),
+                "a controller advertisement",
+            ),
             allowed_ips: p.allowed_ips.clone(),
         }
     }
@@ -670,5 +877,551 @@ mod tests {
         };
         ds.apply_delta(&delta2);
         assert_eq!(ds.revoked_serials, vec!["A".to_string(), "B".to_string()]);
+    }
+
+
+    // -----------------------------------------------------------------
+    // (Backlog G3) The bounded drop log
+    // -----------------------------------------------------------------
+    //
+    // `retain_dialable` logged one `eprintln!` PER dropped candidate. The
+    // strings it logs are attacker-chosen: a compromised-but-authenticated
+    // gateway (or a version-skewed controller) picks both how many there are
+    // and how long each one is, and the whole set is re-evaluated on EVERY
+    // snapshot and EVERY delta. So the log an operator relies on to notice
+    // the problem is also the flood — the diagnostic and the denial-of-service
+    // are the same line.
+    //
+    // The contract these pin is therefore a set of BOUNDS, not a wording:
+    // one message per filtering pass, at most `DROPPED_SAMPLE_COUNT` quoted
+    // samples, each cut at `DROPPED_SAMPLE_BYTES` of RAW payload on a char
+    // boundary, `{:?}`-escaped, with counts that stay accurate however few
+    // were sampled. Every assertion below is a bound, a count, a presence, or
+    // an escape — none of them is the message text, which stays free to
+    // change.
+
+    /// Distinct valid endpoints, cheap to generate in bulk for the cap tests.
+    fn valid_eps(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("10.0.{}.{}:51820", i / 256, i % 256)).collect()
+    }
+
+    /// Distinct INVALID endpoints, indexed ALPHABETICALLY rather than
+    /// numerically for two reasons: they must be distinct (`partition_dialable`
+    /// deliberately does not dedup, but a future one must not be able to make
+    /// these collide), and they must contain no decimal digits — a test
+    /// asserting that a specific COUNT appears in the message must not be able
+    /// to match a digit that leaked out of a payload instead.
+    fn invalid_eps(n: usize) -> Vec<String> {
+        (0..n)
+            .map(|i| {
+                let (mut suffix, mut k) = (String::new(), i);
+                loop {
+                    suffix.push((b'a' + (k % 26) as u8) as char);
+                    k /= 26;
+                    if k == 0 {
+                        break;
+                    }
+                }
+                format!("!!!bogus-{suffix}")
+            })
+            .collect()
+    }
+
+    fn warn(candidates: Vec<String>, source: &str) -> Option<String> {
+        format_drop_warning(&partition_dialable(candidates), source)
+    }
+
+    /// THE core of the fix: N bad candidates produce ONE warning, not N.
+    ///
+    /// Breaks if: the implementation keeps a per-entry `eprintln!` (or
+    /// `format_drop_warning` is called inside the loop), or the message is
+    /// rendered across multiple lines — which would restore the per-reconcile
+    /// stderr flood a hostile peer chooses the size of.
+    #[test]
+    fn one_filtering_pass_produces_exactly_one_warning_line_not_one_per_dropped_entry() {
+        let f = partition_dialable(invalid_eps(200));
+        assert_eq!(f.dropped, 200, "all 200 unusable candidates must be counted as dropped");
+
+        let msg = format_drop_warning(&f, "state.json")
+            .expect("200 dropped candidates must produce a warning");
+        assert_eq!(
+            msg.lines().count(),
+            1,
+            "the whole filtering pass must render as ONE line. The pre-G3 code emitted one \
+             `eprintln!` per dropped entry, so a peer advertising 200 unusable candidates \
+             wrote 200 lines on every snapshot AND every delta — for as long as it kept \
+             advertising them. The log an operator watches must not be the thing that \
+             buries the log an operator watches. Got {} lines:\n{msg}",
+            msg.lines().count()
+        );
+    }
+
+    /// At most `DROPPED_SAMPLE_COUNT` payloads are quoted, however many were
+    /// dropped — and at least one is, so the bound is not satisfied by
+    /// quoting nothing.
+    ///
+    /// Breaks if: the sample cap is removed or raised, or samples are dropped
+    /// entirely (which would leave an operator a count with no evidence, and
+    /// no way to tell a stale local file from a hostile advertisement).
+    #[test]
+    fn at_most_the_sample_count_of_payloads_is_quoted_however_many_were_dropped() {
+        // Unique, greppable markers so "how many appear in the message" is a
+        // question with an exact answer.
+        let markers: Vec<String> = (0..10).map(|i| format!("ZQMARK{i}!!!")).collect();
+        let msg = warn(markers.clone(), "state.json")
+            .expect("10 dropped candidates must produce a warning");
+
+        let quoted: Vec<&String> = markers.iter().filter(|m| msg.contains(m.as_str())).collect();
+        assert!(
+            quoted.len() <= DROPPED_SAMPLE_COUNT,
+            "at most {DROPPED_SAMPLE_COUNT} of the offending strings may be quoted; {} \
+             appear. The strings are chosen by whoever sent them and there can be \
+             thousands, so quoting them all relocates the flood from the line COUNT into \
+             the line LENGTH. Quoted: {quoted:?}",
+            quoted.len()
+        );
+        assert!(
+            !quoted.is_empty(),
+            "at least one offending string must be quoted. A count with no example leaves \
+             an operator unable to tell a compromised peer from a stale `state.json` — \
+             which is the entire diagnostic value of this log line.\n{msg}"
+        );
+    }
+
+    /// The sample is bounded by the TRUNCATION, not by the input.
+    ///
+    /// This is the property the raw 64 exists for, and it is asserted two
+    /// ways: the quoted sample must be identical for a 10KB and a 100KB
+    /// candidate that share a prefix (so its size cannot track the input at
+    /// all), and it must sit under an absolute ceiling.
+    ///
+    /// The ceiling is `DROPPED_SAMPLE_BYTES * 10 + 2`, not `+ 2` alone,
+    /// because the stored sample is the `{:?}`-QUOTED form: two quotes always,
+    /// and each escaped character expands (a `\n` to two characters, a control
+    /// byte to a `\u{..}` of up to six). The bound that matters is
+    /// "independent of input size", not a tight byte count.
+    ///
+    /// Breaks if: the truncation is removed or the cap is raised — one
+    /// candidate is bounded only by the Sync message size, so an untruncated
+    /// sample is a multi-megabyte log line, the same flood through the other
+    /// dimension.
+    #[test]
+    fn the_quoted_sample_is_bounded_by_the_truncation_not_by_the_input_size() {
+        let ten_k = partition_dialable(vec!["A".repeat(10_000)]);
+        let hundred_k = partition_dialable(vec!["A".repeat(100_000)]);
+
+        let a = ten_k.samples.first().expect("the dropped candidate must be sampled");
+        let b = hundred_k.samples.first().expect("the dropped candidate must be sampled");
+        assert_eq!(
+            a, b,
+            "two candidates sharing their first {DROPPED_SAMPLE_BYTES} bytes must produce \
+             the IDENTICAL sample, whether the sender wrote 10KB or 100KB after them. A \
+             sample whose size tracks the input is not a sample, and the sender picks the \
+             input."
+        );
+        assert!(
+            a.len() <= DROPPED_SAMPLE_BYTES * 10 + 2,
+            "the quoted sample is {} bytes, past the ceiling {} bytes of raw payload can \
+             expand to under `{{:?}}`. Sample: {a}",
+            a.len(),
+            DROPPED_SAMPLE_BYTES
+        );
+
+        let msg = format_drop_warning(&ten_k, "state.json").expect("one drop must warn");
+        assert!(
+            msg.contains(&"A".repeat(32)),
+            "a prefix of the offending string must survive into the message — truncation \
+             must shorten the evidence, not delete it.\n{msg}"
+        );
+        assert!(
+            !msg.contains(&"A".repeat(DROPPED_SAMPLE_BYTES + 1)),
+            "more than {DROPPED_SAMPLE_BYTES} consecutive RAW payload bytes reached the \
+             message. `A` needs no escaping, so its run length in the rendered line is \
+             exactly the number of raw bytes quoted — this is the direct read of the \
+             truncation.\n{msg}"
+        );
+    }
+
+    /// **The highest-value test here.** Truncating a UTF-8 string by BYTE
+    /// index panics if the index is not a char boundary (`&s[..64]`), and the
+    /// blast radius is worse than a bad log line: `partition_dialable` runs
+    /// inside `PeerState::candidates`' `deserialize_with`, so a panic there
+    /// fires on the `DesiredState::load` fail-static BOOT path. The defense
+    /// added to stop a malformed candidate from preventing boot would itself
+    /// prevent boot — over a string a peer chose.
+    ///
+    /// Breaks if: the implementation slices at a fixed `DROPPED_SAMPLE_BYTES`
+    /// without walking back to a char boundary. Each prefix length below
+    /// places a multi-byte character ACROSS that byte, so at least one lands
+    /// mid-character under any fixed-index slice.
+    #[test]
+    fn sample_truncation_never_splits_a_multibyte_character() {
+        let cut = DROPPED_SAMPLE_BYTES;
+        for back in [1usize, 2, 3, 4] {
+            // 4-byte char starting `back` bytes before the cut: for back < 4 it
+            // straddles the cut, so the naive slice is mid-character.
+            let payload = format!("{}{}TAIL", "x".repeat(cut - back), '\u{1F600}');
+            let msg = warn(vec![payload], "state.json").unwrap_or_else(|| {
+                panic!("back={back}: an unusable candidate must produce a warning")
+            });
+            assert!(
+                !msg.contains("TAIL"),
+                "back={back}: bytes past the {cut}-byte sample cap were quoted — the \
+                 payload's tail marker appears.\n{msg}"
+            );
+        }
+        // The 3-byte and 2-byte continuation depths, so the back-off is
+        // exercised at every width UTF-8 has.
+        for c in ['\u{20AC}', '\u{00E9}'] {
+            for back in [1usize, 2, 3] {
+                let payload = format!("{}{c}TAIL", "x".repeat(cut - back));
+                assert!(
+                    warn(vec![payload], "state.json").is_some(),
+                    "back={back}, char {c:?}: truncating here must not panic. `&s[..{cut}]` \
+                     on a non-char-boundary index PANICS, and this code runs inside \
+                     `PeerState::candidates`' `deserialize_with` — so a multi-byte \
+                     candidate that once got persisted would abort the fail-static boot, \
+                     inverting the exact mechanism backlog item 1 exists to protect."
+                );
+            }
+        }
+    }
+
+    /// The budget is a BYTE budget, not a character budget.
+    ///
+    /// Breaks if: the implementation truncates with `.chars().take(64)`, which
+    /// looks equivalent, passes every ASCII test above, and quietly permits a
+    /// 256-byte sample.
+    #[test]
+    fn the_sample_budget_is_measured_in_bytes_not_characters() {
+        let payload = "\u{1F600}".repeat(200); // 800 bytes, 200 chars
+        let msg = warn(vec![payload], "state.json").expect("an unusable candidate warns");
+        assert!(
+            msg.contains('\u{1F600}'),
+            "the sample must still appear — this test is about its LENGTH, not its \
+             existence.\n{msg}"
+        );
+        let over = DROPPED_SAMPLE_BYTES / 4 + 1; // one 4-byte char past the budget
+        assert!(
+            !msg.contains(&"\u{1F600}".repeat(over)),
+            "{over} consecutive 4-byte characters is {} bytes, past the \
+             {DROPPED_SAMPLE_BYTES}-byte budget. A character-counted truncation would admit \
+             {DROPPED_SAMPLE_BYTES} of them (4x the budget) while looking correct against \
+             ASCII input.\n{msg}",
+            over * 4
+        );
+    }
+
+    /// Samples are `{:?}`-quoted, so a newline in the payload is ESCAPED.
+    ///
+    /// Breaks if: the sample is pushed with `{}` instead of `{:?}`. There are
+    /// already-passing tests proving `"10.0.0.5:51820\nendpoint=1.2.3.4:1"` is
+    /// REJECTED as a UAPI line-injection payload; emitting it raw here would
+    /// reintroduce the same injection one layer over, into the log an operator
+    /// (or a log shipper, or an alerting rule) parses by line.
+    #[test]
+    fn an_injection_payload_is_escaped_in_the_log_not_emitted_raw() {
+        let payload = "10.0.0.5:51820\nendpoint=1.2.3.4:1"; // 33 bytes: under the cut, so it
+                                                            // is quoted whole
+        let msg = warn(vec![payload.to_string()], "state.json")
+            .expect("the injection payload is unusable and must warn");
+
+        assert!(
+            !msg.contains('\n'),
+            "the payload's newline reached the rendered message. The candidate that carries \
+             it is rejected precisely BECAUSE the UAPI wire format is newline-delimited \
+             `key=value` lines; a log that re-emits it raw lets the sender forge a second \
+             log record — and splits this warning into two lines, defeating the one-line \
+             bound as well.\n{msg:?}"
+        );
+        assert!(
+            msg.contains("10.0.0.5:51820\\nendpoint=1.2.3.4:1"),
+            "the payload must appear in its ESCAPED form (the sample is stored already \
+             `{{:?}}`-quoted), so the evidence is preserved without the control character. \
+             Got:\n{msg:?}"
+        );
+    }
+
+    /// The counts describe the whole pass even though only
+    /// `DROPPED_SAMPLE_COUNT` are sampled.
+    ///
+    /// Breaks if: the count is taken from `samples.len()` (a very easy slip
+    /// once sampling exists) — which would report "3 dropped" for any flood
+    /// and hide its size from exactly the operator trying to measure it.
+    #[test]
+    fn the_warning_reports_the_true_dropped_count_not_the_sample_count() {
+        let mut input = invalid_eps(17);
+        input.extend(["10.0.0.5:51820".to_string(), "10.0.0.6:51820".to_string()]);
+
+        let f = partition_dialable(input);
+        assert_eq!(f.dropped, 17, "17 unusable candidates were supplied");
+        assert_eq!(
+            f.kept,
+            vec!["10.0.0.5:51820".to_string(), "10.0.0.6:51820".to_string()],
+            "filtering is per-ENTRY: the two dialable candidates must survive in order. A \
+             peer that got one address wrong must not lose the ones it got right — that \
+             would turn a cosmetic bug into a lost direct path."
+        );
+        assert!(
+            f.samples.len() <= DROPPED_SAMPLE_COUNT,
+            "17 drops must not store 17 samples: {:?}",
+            f.samples
+        );
+
+        let msg = format_drop_warning(&f, "state.json").expect("17 drops must warn");
+        assert!(
+            msg.contains("17"),
+            "the true dropped count (17) must appear, even though at most \
+             {DROPPED_SAMPLE_COUNT} were quoted. Reporting the sample count instead makes \
+             every flood look like three bad entries, which is the one number an operator \
+             actually needs.\n{msg}"
+        );
+    }
+
+    /// Silence on the healthy path.
+    ///
+    /// Breaks if: the warning is emitted unconditionally (e.g. `Some` with a
+    /// "0 dropped" body). This is the overwhelmingly common case — every
+    /// snapshot and every delta of a healthy fabric — so any noise here is
+    /// noise forever, and it is what teaches operators to ignore the line.
+    #[test]
+    fn nothing_dropped_means_no_warning_at_all() {
+        let f = partition_dialable(valid_eps(4));
+        assert_eq!(f.dropped, 0);
+        assert_eq!(f.over_cap, 0);
+        assert_eq!(f.kept.len(), 4, "every dialable candidate is kept");
+        assert_eq!(
+            format_drop_warning(&f, "state.json"),
+            None,
+            "a clean filtering pass must produce NO message. This runs on every snapshot \
+             and every delta for every peer; a line here is permanent background noise, \
+             and a warning that fires when nothing is wrong is a warning nobody reads when \
+             something is."
+        );
+    }
+
+    /// The cap is a CEILING, not a target.
+    ///
+    /// Breaks if: the bound is off by one, or an at-limit advertisement is
+    /// trimmed. `Db::candidates_for` yields at most 1 observed + 32 local = 33
+    /// today, so `MAX_PEER_CANDIDATES` (64) is pure headroom — an honest peer
+    /// must never reach it, and must never be trimmed if it does.
+    #[test]
+    fn a_candidate_list_exactly_at_the_cap_is_kept_whole_and_silent() {
+        let at_cap = valid_eps(MAX_PEER_CANDIDATES);
+        let f = partition_dialable(at_cap.clone());
+        assert_eq!(
+            f.kept, at_cap,
+            "a peer advertising exactly {MAX_PEER_CANDIDATES} usable candidates must keep \
+             every one of them, in order. The cap exists to bound a hostile peer, not to \
+             trim an honest one — and `primary_endpoint()` is `candidates.first()`, so \
+             trimming or reordering silently re-points which address this gateway dials."
+        );
+        assert_eq!(f.over_cap, 0, "nothing is over a cap it exactly meets");
+        assert_eq!(
+            format_drop_warning(&f, "state.json"),
+            None,
+            "and an at-cap list must not warn — it is a legal advertisement"
+        );
+    }
+
+    /// The over-cap case and the invalid case are different problems and must
+    /// read differently.
+    ///
+    /// Breaks if: over-cap drops are folded into the `dropped` counter, or
+    /// both conditions render the same sentence. They mean opposite things to
+    /// an operator: unusable entries mean a peer is compromised or
+    /// version-skewed and its addresses are garbage; over-cap means its
+    /// addresses were all FINE and this gateway chose not to keep them all.
+    #[test]
+    fn the_over_cap_case_is_reported_distinctly_from_the_invalid_case() {
+        const OVER_BY: usize = 5;
+        let capped = partition_dialable(valid_eps(MAX_PEER_CANDIDATES + OVER_BY));
+        assert_eq!(
+            capped.kept.len(),
+            MAX_PEER_CANDIDATES,
+            "the kept set must be bounded by MAX_PEER_CANDIDATES. Without the bound a peer \
+             chooses how many endpoints every reconcile of every apply carries — the same \
+             unbounded work the controller's MAX_LOCAL_CANDIDATES closes on its side, left \
+             open on this one."
+        );
+        assert_eq!(capped.over_cap, OVER_BY, "the excess is counted, not silently discarded");
+        assert_eq!(
+            capped.dropped, 0,
+            "candidates dropped for the CAP must not be counted as unusable: every one of \
+             these parses. Conflating them makes a healthy over-provisioned host look like \
+             a compromised peer."
+        );
+
+        let invalid = partition_dialable(invalid_eps(OVER_BY));
+        assert_eq!(invalid.dropped, OVER_BY);
+        assert_eq!(invalid.over_cap, 0);
+
+        let cap_msg = format_drop_warning(&capped, "state.json")
+            .expect("dropping over-cap entries must warn");
+        let bad_msg =
+            format_drop_warning(&invalid, "state.json").expect("dropping unusable entries must warn");
+        assert_ne!(
+            cap_msg, bad_msg,
+            "with the same number of entries dropped for two DIFFERENT reasons, the two \
+             messages are identical — so the log cannot distinguish \"this peer is sending \
+             garbage\" from \"this peer has more addresses than we keep\". The first is an \
+             incident; the second is a shrug.\ncap: {cap_msg}\nbad: {bad_msg}"
+        );
+        assert!(
+            cap_msg.contains(&OVER_BY.to_string()),
+            "the over-cap message must say how many were dropped ({OVER_BY}).\n{cap_msg}"
+        );
+    }
+
+    /// Both conditions at once still produce ONE line, and both counts.
+    ///
+    /// Breaks if: the over-cap clause is emitted as a second `eprintln!`, or
+    /// either clause suppresses the other. The mixed case is the realistic
+    /// hostile shape — a peer that sends both garbage and volume — and it is
+    /// where a two-`eprintln!` implementation would quietly reappear.
+    #[test]
+    fn a_pass_that_both_drops_and_over_caps_still_renders_one_line_with_both_counts() {
+        const OVER_BY: usize = 7;
+        const BAD: usize = 11;
+        let mut input = invalid_eps(BAD);
+        input.extend(valid_eps(MAX_PEER_CANDIDATES + OVER_BY));
+
+        let f = partition_dialable(input);
+        assert_eq!(f.dropped, BAD, "the unusable entries are counted as dropped");
+        assert_eq!(f.over_cap, OVER_BY, "the valid excess is counted as over-cap");
+
+        let msg = format_drop_warning(&f, "state.json").expect("both conditions must warn");
+        assert_eq!(
+            msg.lines().count(),
+            1,
+            "both clauses must share ONE line. Two `eprintln!`s is how the per-entry flood \
+             starts coming back.\n{msg}"
+        );
+        assert!(
+            msg.contains(&BAD.to_string()) && msg.contains(&OVER_BY.to_string()),
+            "both counts must appear ({BAD} unusable, {OVER_BY} over cap) — a message that \
+             reports only the condition it noticed first leaves the operator debugging half \
+             the problem.\n{msg}"
+        );
+    }
+
+    /// `source` names the door the candidate came through, and must be in the
+    /// message.
+    ///
+    /// Breaks if: the parameter is accepted and ignored. The two doors mean
+    /// very different things: a controller advertisement means a peer or the
+    /// control plane is compromised or version-skewed (act now); a
+    /// `state.json` entry means THIS gateway persisted it before the filter
+    /// existed (self-healing, ignore). Without the source an operator cannot
+    /// tell which one they are looking at.
+    #[test]
+    fn the_source_names_the_door_the_bad_candidate_came_through() {
+        for source in ["state.json", "controller advertisement"] {
+            let msg = warn(invalid_eps(3), source)
+                .unwrap_or_else(|| panic!("dropped candidates from {source} must warn"));
+            assert!(
+                msg.contains(source),
+                "the warning must name its source ({source:?}) — a `state.json` entry is \
+                 this gateway's own stale file and heals itself, while a controller \
+                 advertisement means a live peer is sending things it cannot possibly \
+                 produce. Same log line, opposite responses.\n{msg}"
+            );
+        }
+    }
+
+    /// Control: the log bound must not have been bought with the filter's
+    /// actual job.
+    ///
+    /// Breaks if: `partition_dialable` reorders, rewrites, or drops valid
+    /// entries. Nothing else in this section would notice — every other test
+    /// here inspects the MESSAGE.
+    #[test]
+    fn partition_dialable_keeps_every_valid_candidate_verbatim_and_in_order() {
+        let input = vec![
+            "!!!bogus".to_string(),
+            "203.0.113.9:51820".to_string(),
+            "abc:123".to_string(),
+            "10.0.0.5:51820".to_string(),
+            "[::1]:51820".to_string(),
+            "192.168.1.7:65535".to_string(),
+        ];
+        let f = partition_dialable(input);
+        assert_eq!(
+            f.kept,
+            vec![
+                "203.0.113.9:51820".to_string(),
+                "10.0.0.5:51820".to_string(),
+                "192.168.1.7:65535".to_string(),
+            ],
+            "the dialable candidates must survive VERBATIM and in their advertised order. \
+             Order is load-bearing: `primary_endpoint()` is `candidates.first()`, so \
+             reordering silently re-points which address this gateway dials, and the \
+             controller already decided that order (observed candidate first)."
+        );
+        assert_eq!(f.dropped, 3, "the three unusable entries are dropped and counted");
+        assert_eq!(f.over_cap, 0, "six candidates is nowhere near MAX_PEER_CANDIDATES");
+    }
+
+    /// (CodeRabbit 🟡 Minor, PR #59) A manually-kept-in-sync COPY of
+    /// `wiremesh_controller::services::sync::MAX_LOCAL_CANDIDATES` (as of
+    /// this writing: 32). Not a live reference — this crate deliberately
+    /// does not depend on `wiremesh-controller`, and `MAX_PEER_CANDIDATES`
+    /// below is `pub(crate)` (invisible outside this crate regardless), so
+    /// no dependency edge would make a live cross-crate assertion possible
+    /// anyway. Full reasoning lives in
+    /// `crates/wiremesh-controller/tests/candidate_cap_gateway_relation.rs`,
+    /// which carries the mirror-image constant (a manually-synced copy of
+    /// `MAX_PEER_CANDIDATES`, the counterpart of this one). Keep the two in
+    /// sync by hand when either constant moves. That discipline covers any
+    /// SINGLE unmirrored edit on either side; it does not cover two
+    /// compounding ones made at different times (an unmirrored raise on the
+    /// controller side AND a separate unmirrored lower here) — each side's
+    /// own pin would independently still read green against its own stale
+    /// mirror while the real cross-crate relation had already broken.
+    const CONTROLLER_MAX_LOCAL_CANDIDATES_MIRROR: usize = 32;
+
+    /// Closes the direction that `candidate_cap_gateway_relation.rs`'s own
+    /// mirror cannot cover: that file's tests catch `MAX_LOCAL_CANDIDATES`
+    /// being raised on the controller side without a check here, but go
+    /// stale — silently — if `MAX_PEER_CANDIDATES` is instead LOWERED on
+    /// this side. This test is the other half of that pair.
+    ///
+    /// Breaks if: `MAX_PEER_CANDIDATES` drops to 33 or below.
+    /// `Db::candidates_for` (`crates/wiremesh-controller/src/db.rs`) yields
+    /// at most 1 controller-observed endpoint +
+    /// `MAX_LOCAL_CANDIDATES` (32, mirrored above) locally-reported ones =
+    /// 33 for an HONEST control plane — that IS the exact honest ceiling,
+    /// and a cap of exactly 33 would still fit it whole:
+    /// `partition_dialable` only starts dropping once `kept.len()` REACHES
+    /// the cap (checked before the push, `state.rs:176`), so equality is
+    /// safe and the first entry it would ever drop is the 34th, which an
+    /// honest control plane never sends. The assertion below requires `>`,
+    /// not `>=`, as deliberate MARGIN — so the cap is never left sitting
+    /// exactly on the ceiling, one future `MAX_LOCAL_CANDIDATES` bump away
+    /// from actually truncating a real advertisement. Currently green
+    /// (64 > 33): this is a tripwire against future drift, not a
+    /// reproduction of a live bug.
+    #[test]
+    fn max_peer_candidates_stays_above_the_honest_controller_ceiling() {
+        let honest_ceiling = 1 + CONTROLLER_MAX_LOCAL_CANDIDATES_MIRROR;
+        assert!(
+            MAX_PEER_CANDIDATES > honest_ceiling,
+            "MAX_PEER_CANDIDATES ({MAX_PEER_CANDIDATES}) must stay strictly greater than \
+             1 (controller-observed) + MAX_LOCAL_CANDIDATES \
+             ({CONTROLLER_MAX_LOCAL_CANDIDATES_MIRROR}) = {honest_ceiling} — the honest \
+             ceiling `Db::candidates_for` (crates/wiremesh-controller/src/db.rs) can ever \
+             produce for a correctly-behaving control plane. A cap of exactly \
+             {honest_ceiling} would still keep that whole advertisement — \
+             `partition_dialable` only drops once `kept.len()` reaches the cap, so equality \
+             is safe. Requiring strictly-greater here is deliberate MARGIN, so the cap is \
+             never left sitting exactly on the ceiling where the next \
+             MAX_LOCAL_CANDIDATES increase would truncate a real advertisement. If you \
+             lowered MAX_PEER_CANDIDATES on purpose, first confirm \
+             `wiremesh-controller/src/services/sync.rs`'s MAX_LOCAL_CANDIDATES (mirrored \
+             above) hasn't also moved, then update both mirrors — this one and the one in \
+             `crates/wiremesh-controller/tests/candidate_cap_gateway_relation.rs` — to \
+             match."
+        );
     }
 }

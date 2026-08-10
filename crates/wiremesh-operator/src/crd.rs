@@ -226,6 +226,27 @@ pub fn all_crds() -> Vec<CustomResourceDefinition> {
     ]
 }
 
+/// The committed CRD bundles, rendered as one multi-document YAML string.
+///
+/// This is the whole body of the `crdgen` binary, lifted out of it so that
+/// `tests/crd_manifest_freshness.rs` can assert against the SAME rendering the
+/// binary emits. A test that rebuilt this loop for itself could drift from the
+/// binary and go on passing while `crdgen` wrote something else — which is the
+/// exact class of drift that test exists to catch.
+///
+/// Byte-level shape is load-bearing (the test compares raw file bytes): each
+/// document opens with its own `---` line, `serde_yaml::to_string` emits no
+/// leading separator of its own and already ends in a newline, so the result
+/// ends with exactly one.
+pub fn render_crd_yaml() -> anyhow::Result<String> {
+    let mut out = String::new();
+    for crd in all_crds() {
+        out.push_str("---\n");
+        out.push_str(&serde_yaml::to_string(&crd)?);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,17 +328,32 @@ mod tests {
     fn crdgen_emits_five_cluster_scoped_crds() {
         let crds = all_crds();
         assert_eq!(crds.len(), 5);
-        let mut kinds: Vec<String> = crds.iter().map(|c| c.spec.names.kind.clone()).collect();
-        kinds.sort();
+        // Asserted IN EMISSION ORDER, not sorted. `all_crds()` is what decides
+        // the document order of both committed YAML bundles, and
+        // `tests/crd_manifest_freshness.rs` compares those bundles BYTE FOR
+        // BYTE — so this sequence is part of the generated file's contract, not
+        // an implementation detail.
+        //
+        // This assertion previously sorted first, which meant reordering
+        // `all_crds()` was pinned by nothing. That mattered: a reorder that is
+        // ALSO regenerated into both YAML files leaves the freshness test green
+        // while silently changing the document order of every user's CRD
+        // bundle. This is the only thing that catches it.
+        //
+        // Keep `all_crds()` returning an explicit `vec![..]`. Iterating a
+        // `HashMap` there would make the freshness test nondeterministically
+        // flaky — a failure that looks like a bad test rather than a real one.
+        let kinds: Vec<String> = crds.iter().map(|c| c.spec.names.kind.clone()).collect();
         assert_eq!(
             kinds,
             vec![
                 "WiremeshController",
-                "WiremeshGateway",
+                "WiremeshSegment",
                 "WiremeshPolicy",
-                "WiremeshRelay",
-                "WiremeshSegment"
-            ]
+                "WiremeshGateway",
+                "WiremeshRelay"
+            ],
+            "all_crds() order is the document order of the generated CRD bundles"
         );
         for c in &crds {
             assert_eq!(c.spec.scope, "Cluster", "{} must be cluster-scoped", c.spec.names.kind);

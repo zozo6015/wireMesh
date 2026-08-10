@@ -2033,12 +2033,18 @@ fn sample_tick(ns: &Ns, metrics_addr: &str, base: &BTreeSet<String>, obs: &mut R
 /// `cargo test -p wiremesh-gateway --test key_rotation --features netns-tests \
 ///  -- --test-threads=1 --nocapture --ignored`
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "RED by design, NOT obsolete — do not delete. Blocked on bug 4 (post-cutover \
-            endpoint dials the peer's base port while it listens on an offset port) and bug 5 \
-            (the second rotation of any gateway cannot complete: device_config_at_port and \
-            pending_peer_configs use incompatible port models). Both in \
-            docs/research/rotation-endpoint-and-port-model-is-broken.md; un-ignoring this is \
-            the done bar for that work. See this test's doc comment."]
+#[ignore = "RED by design, NOT obsolete — do not delete. Blocked on bug 4 ALONE \
+            (post-cutover endpoint dials the peer's base port while it listens on an offset \
+            port), in docs/research/rotation-endpoint-and-port-model-is-broken.md; \
+            un-ignoring this is the done bar for that work. It is a permanent DEADLOCK, not \
+            a timing window: the retire that would move the active key back to the base port \
+            is gated on the new tun already being live, and it cannot become live until that \
+            retire happens — measured at 90s with no recovery, both sides churning \
+            direct/degraded/disconnected/connecting forever. Bug 5 (the second rotation of \
+            any gateway cannot complete) is FIXED in v0.7.2's port authority, which deleted \
+            pending_peer_configs' epoch-delta port formula — its done bar, \
+            second_rotation_of_same_gateway_keeps_traffic_flowing, is committed and not \
+            ignored. See this test's doc comment."]
 async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     // Topology: IDENTICAL to `direct_rotation_is_zero_drop` — see that test
     // for the per-step rationale (bridge, netem, veths, identities).
