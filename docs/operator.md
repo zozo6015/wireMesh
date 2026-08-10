@@ -114,7 +114,9 @@ controller is single-tenant — one `WiremeshController` per cluster.
 | `observeUdpPort` | `9600` | endpoint observation listener |
 | `adminTcpPort` | `9443` | loopback-only admin (NOT exposed on the Service) |
 
-Status: `ready`, `adminEndpoint` (the sync-tcp Service DNS), `conditions`.
+Status: `ready`, `adminEndpoint` (the sync-tcp Service DNS), `conditions`
+(`Ready` and `ScaledDown` — both always emitted, `True` or `False`, so a
+consumer never has to read absence as false; see [Scaling to zero](#scaling-to-zero)).
 
 ### WiremeshSegment (`wmseg`)
 
@@ -146,12 +148,36 @@ Default-deny: only what a policy allows passes.
 | `storageClass` | cluster default | identity PVC storage class |
 | `observeEndpoint` | controller Service ClusterIP | override for the gateway's `--observe` target (`host:port`, DNS ok). Use when kube-proxy SNATs the ClusterIP UDP path (poisoning the observed public mapping) — point at a source-preserving UDP LB instead |
 | `syncEndpoint` | controller Service ClusterIP | override for `--controller-sync` (`host:port`, DNS ok) — controllers reached through an external LB / DDNS name |
+| `metricsBind` | `0.0.0.0:9090` | override for the gateway's `--metrics` Prometheus bind address (`ip:port`, IPv4 **or** IPv6 literal, no DNS names). Use to bind loopback-only (`127.0.0.1:9090`), move the port, or go dual-stack (`[::]:9090`) |
 
-Both overrides are validated when the CR is reconciled and **fail closed**
-(`host:port`; DNS names allowed, IPv6 literals and port `0` rejected) — a
-malformed value is reported on the CR instead of rolling out a CrashLooping
-pod. The enroll init-container always uses the in-cluster enroll endpoint — the
-`observeEndpoint`/`syncEndpoint` overrides never affect enrollment.
+All three fields are validated when the CR is reconciled and **fail closed** — a
+malformed value is reported on the CR instead of rolling out a CrashLooping pod.
+The rules differ by field, and they are **not** the same rule:
+
+| | `observeEndpoint` / `syncEndpoint` | `metricsBind` |
+|---|---|---|
+| what it is | a **dial** target the gateway connects *out* to | a **local socket** the gateway binds |
+| validator | `workloads::validate_dial_target` | `workloads::validate_bind_target` |
+| DNS names | **allowed** (re-resolved at connect time) | **rejected** |
+| IPv6 literals | **rejected** | **accepted** |
+| port `0` | **rejected** | **accepted** (OS-assigned) |
+
+The divergence is deliberate, and it follows from what the binary itself does
+with each value. The two dial targets go through the gateway's
+`validate_host_port`, which is IPv4-only end to end in v1 and for which an
+unreachable target (port `0`) is never useful, while a hostname is exactly what
+a DDNS controller needs. `--metrics` is parsed by the binary as a literal
+`std::net::SocketAddr` and nothing more: a hostname there would be accepted by
+the CRD only to CrashLoopBackOff at boot, and IPv6 / port `0` are both
+legitimate bind addresses the binary already takes. `validate_bind_target` is
+therefore exactly "parses as `SocketAddr`" — neither stricter nor looser than
+the binary it guards. **Do not "restore consistency" by tightening `metricsBind`
+to match the dial rule** (owner decision, 2026-08-10): stricter strands a
+legitimate `[::]:9090`, looser ships a CrashLoopBackOff.
+
+The enroll init-container always uses the in-cluster enroll endpoint — none of
+the `observeEndpoint` / `syncEndpoint` / `metricsBind` overrides ever affect
+enrollment.
 
 Editing the referenced segment's **CIDRs** after enrollment automatically mints
 a **rebind token** (a `kind: rebind` token whose authorization scope is the
@@ -166,7 +192,9 @@ edit is picked up on the CR's next requeue — **up to 300s** for an enrolled
 gateway. Force it sooner by touching the `WiremeshGateway` CR (adding a
 `.watches` mapping from Segment → dependent Gateways is the tracked follow-up).
 
-Status: `enrolled`, `gatewayId`, `pathState`, `conditions` — reported from the
+Status: `enrolled`, `gatewayId`, `pathState`, `conditions` (`Enrolled` and
+`ScaledDown` — both always emitted, `True` or `False`; see
+[Scaling to zero](#scaling-to-zero)) — reported from the
 segment's **active** roster row (stale drained/replaced rows are ignored).
 Because that row is active-filtered, `pathState` is effectively degenerate
 today: it mirrors the roster status, which is `active` whenever a row is found
@@ -182,6 +210,62 @@ and absent otherwise — it does **not** surface the data-plane
 | `image` | `…/wiremesh-relay:latest` | relay image |
 | `storageSize` | `128Mi` | identity PVC (`<name>-relay-data`) size |
 | `storageClass` | cluster default | identity PVC storage class |
+
+## Scaling to zero
+
+The operator no longer force-applies `replicas: 1`, so **`kubectl scale
+--replicas=0` now sticks** on all three workloads — the controller, a gateway
+and a relay Deployment:
+
+```bash
+kubectl scale deployment/wiremesh-controller --replicas=0 -n wiremesh
+kubectl scale deployment/gw-home-gateway    --replicas=0 -n wiremesh
+```
+
+This is the **supported way to take a workload down for maintenance**. Scale
+back up and the operator picks it back up through its Deployment watch — no CR
+edit, no re-enrollment. (Only an explicit `replicas: 0` counts: an *omitted*
+`spec.replicas` is defaulted to 1 by the apiserver and means "up", which is the
+steady state now that the operator leaves the field alone.)
+
+**How each kind reports it.** `WiremeshController` and `WiremeshGateway` gain a
+typed **`ScaledDown` condition** (`status: True`, reason `ReplicasZero`; when up
+it is `status: False`, reason `ReplicasNonZero`):
+
+```bash
+kubectl get wiremeshgateways -o custom-columns=\
+NAME:.metadata.name,\
+SCALEDDOWN:'.status.conditions[?(@.type=="ScaledDown")].status'
+```
+
+`WiremeshRelay` signals it **only through `status.message`** — the string
+`"relay scaled down (0 replicas)"`, alongside `applied: false`. Its status type
+(`WiremeshResourceStatus`) has no `conditions` field, and that type is shared
+verbatim with `WiremeshSegment` and `WiremeshPolicy`. A human reading `kubectl
+describe` sees it fine, but it is **not machine-selectable** — nothing can match
+on it without string-comparing the message.
+
+**Operational trap — read this before you scale anything down.** A deliberately
+scaled-down workload is *not* Ready, and it never will be until someone scales
+it back up. `WiremeshController.status.ready` goes `false` (reason `ScaledDown`,
+not `WaitingForController`) and `WiremeshRelay.status.applied` goes `false`. So:
+
+- **`kubectl wait --for=condition=Ready` will block until timeout**, and any
+  "not ready for N minutes" alert **will fire and never clear**.
+- Exclude `ScaledDown=True` from readiness alerting on the controller and
+  gateways. The reason/message strings distinguish "deliberately off" from
+  "trying and failing" precisely so a rule can tell them apart — that
+  distinction only helps if the rule actually consults it.
+- The relay has no condition to exclude on. Suppress it by name during planned
+  maintenance, or match the `status.message` string.
+
+**Gateways specifically:** `Enrolled` stays **`True`** while scaled down, and
+that is deliberate. The roster row is real and the certificates are valid;
+there is simply no pod. Both conditions are true at once — enrolled, and not
+running — and reading them together is the point. Do not treat `Enrolled: True`
+alone as proof of a live data plane; the `ScaledDown` message spells this out
+("the enrollment is still valid, but no gateway pod is running and this segment
+carries no traffic").
 
 ## CA bundle
 

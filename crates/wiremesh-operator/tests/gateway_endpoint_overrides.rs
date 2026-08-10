@@ -52,6 +52,7 @@ fn spec(observe_endpoint: Option<String>, sync_endpoint: Option<String>) -> Wire
         storage_size: None,
         observe_endpoint,
         sync_endpoint,
+        metrics_bind: None,
     }
 }
 

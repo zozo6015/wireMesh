@@ -745,9 +745,9 @@
     "semantic_hash": "78ce4f1375591062b3311262d98187ce"
   },
   "crates/wiremesh-operator/src/controllers/controller.rs": {
-    "mtime": 1785579071.0980718,
-    "ast_hash": "91dcfa50e9bdeb430c431d9da892ae4d",
-    "semantic_hash": "91dcfa50e9bdeb430c431d9da892ae4d"
+    "mtime": 1786386944.7455895,
+    "ast_hash": "50969432357b102df95374a5414e9284",
+    "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/controllers/fabric.rs": {
     "mtime": 1785579071.0986102,
@@ -755,23 +755,23 @@
     "semantic_hash": "18a0e96eaec2b9a54c5234d56c739f7e"
   },
   "crates/wiremesh-operator/src/controllers/gateway.rs": {
-    "mtime": 1785579071.0993059,
-    "ast_hash": "23f3a6ff25f51c2754a7a9c6c9efe7f7",
-    "semantic_hash": "23f3a6ff25f51c2754a7a9c6c9efe7f7"
+    "mtime": 1786387047.247165,
+    "ast_hash": "ff748e4759886ec3750d90f48610932d",
+    "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/controllers/mod.rs": {
-    "mtime": 1786381342.8973038,
-    "ast_hash": "779c8880cab452d4a35b77768024dfa5",
+    "mtime": 1786386916.179219,
+    "ast_hash": "c393cef457d3127ac3d38d017a78dda4",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/controllers/relay.rs": {
-    "mtime": 1786381342.8978682,
-    "ast_hash": "a3f2b9de9ddb16bba4b51b3287af40fd",
+    "mtime": 1786386975.9702435,
+    "ast_hash": "ab87f2f82a881c0a9a3b22f220f37743",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/crd.rs": {
-    "mtime": 1786381342.898202,
-    "ast_hash": "4667ba27763796a6c16bb06f63860a5c",
+    "mtime": 1786386076.2598941,
+    "ast_hash": "7cc1514fd10afb3ae9722a970b3acd65",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/fabric.rs": {
@@ -795,8 +795,8 @@
     "semantic_hash": "b8477d4f59e00f4f827d312209135255"
   },
   "crates/wiremesh-operator/src/workloads.rs": {
-    "mtime": 1786381342.899098,
-    "ast_hash": "b07928a6bd4a19cb273861d853f02a66",
+    "mtime": 1786386865.949573,
+    "ast_hash": "1e4a788878d2fb0520c979566bc38931",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/admin_exec_row_json_contract.rs": {
@@ -815,9 +815,9 @@
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/gateway_endpoint_overrides.rs": {
-    "mtime": 1785579071.1036997,
-    "ast_hash": "9a765cd400649959468b2eab69446561",
-    "semantic_hash": "9a765cd400649959468b2eab69446561"
+    "mtime": 1786386151.5758665,
+    "ast_hash": "81cbb66eb556a0dcb2703f99638b79b9",
+    "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/gateway_rebind.rs": {
     "mtime": 1785579071.1042476,
@@ -1505,8 +1505,8 @@
     "semantic_hash": "378cbfbcaba5d93f692578226a132f77"
   },
   "deploy/helm/wiremesh-operator/crds/wiremesh-crds.yaml": {
-    "mtime": 1786381342.9017673,
-    "ast_hash": "47d25cde3ec01044d794037cd0a8d84a",
+    "mtime": 1786386353.7806084,
+    "ast_hash": "45cdb918ec9d051550e18bbfe3aa4f77",
     "semantic_hash": ""
   },
   "deploy/helm/wiremesh-operator/templates/deployment.yaml": {
@@ -1530,8 +1530,8 @@
     "semantic_hash": "5837455d03b6198a8b423d742c098f40"
   },
   "deploy/operator/crds/wiremesh-crds.yaml": {
-    "mtime": 1786381342.9020362,
-    "ast_hash": "47d25cde3ec01044d794037cd0a8d84a",
+    "mtime": 1786386353.7767377,
+    "ast_hash": "45cdb918ec9d051550e18bbfe3aa4f77",
     "semantic_hash": ""
   },
   "deploy/operator/deployment.yaml": {
@@ -1960,8 +1960,8 @@
     "semantic_hash": ""
   },
   "docs/BACKLOG.md": {
-    "mtime": 1786381342.9025886,
-    "ast_hash": "8582b9d2e72c4ec3da39ceb743868d4b",
+    "mtime": 1786386499.0999403,
+    "ast_hash": "5ee9ba6ce6cb607d87b45ec5afc18fd6",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/candidate_cap_gateway_relation.rs": {
@@ -2017,6 +2017,21 @@
   "docs/research/gateway-key-filter-placement.md": {
     "mtime": 1786381342.9028928,
     "ast_hash": "130696bfc73e67012ff1cabac35a8f98",
+    "semantic_hash": ""
+  },
+  "crates/wiremesh-operator/tests/enroll_init_container_arg_pinning.rs": {
+    "mtime": 1786386152.1585999,
+    "ast_hash": "23f38b4f7509184c3a55646c5b65ffd2",
+    "semantic_hash": ""
+  },
+  "crates/wiremesh-operator/tests/gateway_metrics_bind_override.rs": {
+    "mtime": 1786385889.0305126,
+    "ast_hash": "1ded2a038b7ff46e16027f29fb14f227",
+    "semantic_hash": ""
+  },
+  "crates/wiremesh-operator/tests/replicas_omitted_scaledown_condition.rs": {
+    "mtime": 1786386366.53787,
+    "ast_hash": "1ed02a0be57f34ced7cafc3345a3d09a",
     "semantic_hash": ""
   }
 }

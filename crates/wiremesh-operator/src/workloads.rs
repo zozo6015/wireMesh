@@ -92,6 +92,68 @@ fn recreate_strategy() -> DeploymentStrategy {
     DeploymentStrategy { type_: Some("Recreate".into()), rolling_update: None, ..Default::default() }
 }
 
+/// `spec.replicas` for every workload Deployment: **deliberately released.**
+///
+/// The operator server-side-applies with `.force()`, so any value it sets here
+/// is re-asserted on every reconcile — a typed `Some(1)` made
+/// `kubectl scale --replicas=0` revert on the very next pass, i.e. an operator
+/// could never take a workload down without deleting the CR. Omitting the field
+/// drops it from the apply body, which is what releases SSA ownership: the field
+/// then belongs to whoever last set it (`kubectl scale`), and it sticks.
+///
+/// **Why omission and not a CRD `replicas` field** — the next person to read this
+/// will propose the field, so: a CRD field would still be force-applied under
+/// SSA, which MOVES the knob rather than fixing it (`kubectl scale` would still
+/// revert; you'd have to edit the CR instead), and it would advertise a scaling
+/// capability these workloads do not have. They are hostNetwork, bind a fixed
+/// WireGuard port, mount an RWO PVC, and use `Recreate` (see
+/// `recreate_strategy`) chosen precisely so a second pod never surges. `0` and
+/// `1` are the only counts that work; a field implying otherwise is a lie in the
+/// API surface. Releasing the field gives operators the one meaningful
+/// transition (off/on) without claiming the rest.
+///
+/// **What happens on the upgrade itself** (REASONED, NOT VERIFIED against a
+/// live apiserver — see the caveat at the end). `DeploymentSpec.replicas` is a
+/// nullable int32 — *"a pointer to distinguish between explicit zero and not
+/// specified. Defaults to 1."* The obvious worry is that the first post-upgrade
+/// apply drops the field, the defaulter re-sets `1`, and a Deployment a human
+/// had deliberately scaled to 0 comes back up. We believe it does NOT, and the
+/// mechanism is SSA ownership: **an apply can only REMOVE a field its own field
+/// manager currently owns.** Dropping a field from the apply body is not an
+/// instruction to delete it; it is a release of the applier's claim, and the
+/// removal only follows if that claim was the last one standing.
+///
+/// The reachable cases:
+///
+/// 1. **Operator running, steady state.** The operator owns `replicas: 1`. The
+///    new build applies without it → owned, so removed → defaulter re-sets `1`.
+///    Net effect `1 → 1`: nothing observable.
+/// 2. **Operator running, human runs `kubectl scale --replicas=0`.** The old
+///    build force-reasserts `1` on the next reconcile — that is the bug this
+///    function exists to fix. So this state cannot still be in effect when the
+///    upgrade lands.
+/// 3. **Operator down, human runs `kubectl scale --replicas=0`.** `kubectl
+///    scale` is a non-apply Update against the `scale` subresource, so
+///    ownership of `spec.replicas` TRANSFERS to the `kubectl-scale` field
+///    manager and drops out of the operator's managed-fields entry. The new
+///    build then applies without `replicas` while owning nothing → nothing is
+///    removed → **the Deployment stays at 0.**
+///
+/// Case 3 is the only route by which a pre-upgrade scale-to-0 can survive to
+/// meet the new build, and it is precisely the case where the field is not
+/// removed. So the upgrade should be a no-op for scaled-down workloads, which
+/// is also the behaviour you would want.
+///
+/// **This has NOT been confirmed against a real apiserver.** SSA ownership
+/// semantics are subtle (subresource-vs-resource ownership, and what a
+/// force-apply that omits a field does to a co-owner's entry, are both easy to
+/// get wrong on paper). Confirm it on a live cluster — apply the new build over
+/// a Deployment scaled to 0 by a stopped operator and check `replicas` after —
+/// before relying on it operationally.
+fn released_replicas() -> Option<i32> {
+    None
+}
+
 /// Build the JSON body to hand to `Patch::Apply` for a Deployment, clearing the
 /// API-server defaulter's `rollingUpdate` block when the strategy is `Recreate`.
 ///
@@ -193,6 +255,47 @@ pub fn validate_dial_target(s: &str) -> anyhow::Result<()> {
             .with_context(|| format!("invalid IP literal in {s:?}"))?;
     }
     Ok(())
+}
+
+/// Syntax-only validation of a CRD-supplied `ip:port` BIND target
+/// (`spec.metricsBind`). NOT `validate_dial_target` — a bind address is a
+/// different class of value than a fabric dial target, and reusing that
+/// validator would be wrong in three directions at once:
+///
+/// - The gateway's `--metrics` flag parses the value as a literal
+///   `std::net::SocketAddr` (`GatewayConfig::parse`,
+///   `crates/wiremesh-gateway/src/config.rs`) — unlike `--controller-sync`/
+///   `--observe`, it is never routed through `validate_host_port`, so it
+///   never accepts (or needs to accept) a DNS hostname. `validate_dial_target`
+///   accepts hostnames on purpose (dial targets re-resolve at connect time);
+///   here that would let a hostname through the CRD only to CrashLoopBackOff
+///   at boot on the binary's own `SocketAddr::from_str`.
+/// - Port `0` is a legitimate BIND address (OS-assigned) and is in fact the
+///   binary's own `--metrics`-absent historical default
+///   (`SocketAddr::from(([127, 0, 0, 1], 0))`). `validate_dial_target`
+///   rejects port 0 because an unreachable dial target is never useful; that
+///   reasoning does not apply to a bind address.
+/// - IPv6 is ACCEPTED here. `validate_dial_target` rejects it because v1's
+///   fabric dial/WireGuard-endpoint surface is IPv4-only end to end
+///   (`validate_host_port` carries the same restriction for
+///   `--controller-sync`/`--observe`) — but that rule governs FABRIC
+///   addresses, and a metrics bind is a local observability socket, not a
+///   fabric address. Nothing in `GatewayConfig::parse` rejects IPv6 for
+///   `--metrics` (no IPv6-reject branch guards it, unlike the other two
+///   flags), so rejecting it here would make the operator STRICTER than the
+///   binary for no binary-side reason and strand a legitimate `[::]:9090`
+///   dual-stack config. Owner decision, 2026-08-10: do NOT "restore
+///   consistency" with `validate_host_port` by tightening this later — the
+///   two validators deliberately guard different classes of address.
+///
+/// So: exactly "parses as `std::net::SocketAddr`" — no more, no less. That
+/// makes this validator neither stricter nor looser than the binary it
+/// guards, which is the whole point (stricter strands a legitimate config;
+/// looser ships a CrashLoopBackOff).
+pub fn validate_bind_target(s: &str) -> anyhow::Result<()> {
+    s.parse::<std::net::SocketAddr>()
+        .map(|_| ())
+        .with_context(|| format!("invalid bind target {s:?} (expected ip:port, IPv4 or IPv6)"))
 }
 
 /// A CRD-supplied WireGuard interface name flows into the gateway's argv, so
@@ -450,7 +553,8 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
             ..Default::default()
         },
         spec: Some(DeploymentSpec {
-            replicas: Some(1),
+            // Released, never force-applied — see `released_replicas`.
+            replicas: released_replicas(),
             strategy: Some(recreate_strategy()),
             selector: LabelSelector { match_labels: Some(labels(name)), ..Default::default() },
             template: PodTemplateSpec {
@@ -607,6 +711,7 @@ pub fn gateway_deployment(
     // builder's no-shell invariant keeps them single argv elements.
     let sync_target = gw.spec.sync_endpoint.as_deref().unwrap_or(controller_sync);
     let observe_target = gw.spec.observe_endpoint.as_deref().unwrap_or(controller_observe);
+    let metrics_target = gw.spec.metrics_bind.as_deref().unwrap_or("0.0.0.0:9090");
     let main = Container {
         name: "gateway".to_string(),
         image: Some(image),
@@ -616,7 +721,7 @@ pub fn gateway_deployment(
             "--tun".to_string(), tun,
             "--wg-port".to_string(), wg_port.to_string(),
             "--state-dir".to_string(), DATA_DIR.to_string(),
-            "--metrics".to_string(), "0.0.0.0:9090".to_string(),
+            "--metrics".to_string(), metrics_target.to_string(),
         ]),
         security_context: Some(SecurityContext { privileged: Some(true), ..Default::default() }),
         volume_mounts: Some(vec![
@@ -689,7 +794,8 @@ pub fn gateway_deployment(
     Deployment {
         metadata: ObjectMeta { name: Some(name.clone()), labels: Some(labels(&name)), ..Default::default() },
         spec: Some(DeploymentSpec {
-            replicas: Some(1),
+            // Released, never force-applied — see `released_replicas`.
+            replicas: released_replicas(),
             strategy: Some(recreate_strategy()),
             selector: LabelSelector { match_labels: Some(labels(&name)), ..Default::default() },
             template: PodTemplateSpec {
@@ -883,7 +989,8 @@ pub fn relay_deployment(
     Ok(Deployment {
         metadata: ObjectMeta { name: Some(name.clone()), labels: Some(labels(&name)), ..Default::default() },
         spec: Some(DeploymentSpec {
-            replicas: Some(1),
+            // Released, never force-applied — see `released_replicas`.
+            replicas: released_replicas(),
             strategy: Some(recreate_strategy()),
             selector: LabelSelector { match_labels: Some(labels(&name)), ..Default::default() },
             template: PodTemplateSpec {
@@ -925,6 +1032,7 @@ mod tests {
             storage_size,
             observe_endpoint: None,
             sync_endpoint: None,
+            metrics_bind: None,
         }
     }
 
@@ -943,6 +1051,7 @@ mod tests {
             storage_size: None,
             observe_endpoint: None,
             sync_endpoint: None,
+            metrics_bind: None,
         }
     }
 
@@ -1173,6 +1282,7 @@ mod tests {
                 storage_size: None,
                 observe_endpoint: None,
                 sync_endpoint: None,
+                metrics_bind: None,
             },
         );
         let d = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token", &["10.10.0.0/16".to_string()]);
@@ -1223,6 +1333,7 @@ mod tests {
                 storage_size: None,
                 observe_endpoint: None,
                 sync_endpoint: None,
+                metrics_bind: None,
             },
         );
         let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
@@ -1373,6 +1484,7 @@ mod tests {
                 storage_size: None,
                 observe_endpoint: None,
                 sync_endpoint: None,
+                metrics_bind: None,
             },
         );
         let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);

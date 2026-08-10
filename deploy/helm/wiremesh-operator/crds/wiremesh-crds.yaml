@@ -260,6 +260,10 @@ spec:
               image:
                 nullable: true
                 type: string
+              metricsBind:
+                description: Override for the gateway's `--metrics` bind target (`ip:port`, a LOCAL bind address, not a fabric dial target — no DNS hostnames, since the binary parses this as a literal `std::net::SocketAddr`). Absent → today's hardcoded `0.0.0.0:9090`. IPv4 and IPv6 are both accepted (see `workloads::validate_bind_target`); port `0` (OS-assigned) is valid. The enroll init-container is NEVER affected by this override.
+                nullable: true
+                type: string
               nodeName:
                 nullable: true
                 type: string
