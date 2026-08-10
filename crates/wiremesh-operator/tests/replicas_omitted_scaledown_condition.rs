@@ -1,19 +1,22 @@
 //! Backlog 2b, piece 3 (`replicas`) + piece 4 (the gateway misreport / the
 //! "Unfiled gap" bullet). **Two different maturity levels in one file:**
-//! piece 3's builder assertions are RED today and mechanically checkable;
-//! piece 4's readiness/condition truth table is NOT unit-testable in this
-//! crate at all (see "What this file does NOT prove" below) and is pinned
-//! here only as a documented code-review invariant.
+//! piece 3's builder assertions are mechanically checkable — they were RED
+//! when written and went green when the implementation landed later in this
+//! same PR; piece 4's readiness/condition truth table is not exercised here
+//! at all (see "What this file does NOT prove" below).
 //!
 //! # Piece 3 — omit `replicas` unconditionally, no CRD field
 //!
-//! `replicas: Some(1)` is force-applied by all three workload builders
-//! (`controller_deployment` at `workloads.rs:494`, `gateway_deployment` at
-//! `workloads.rs:734`, `relay_deployment` at `workloads.rs:928` — verified
-//! against current HEAD, after the concurrent `metricsBind` landing, all
-//! three still `Some(1)` as of this file), so
-//! `kubectl scale --replicas=0` reverts on the very next reconcile. The fix
+//! `replicas: Some(1)` WAS force-applied by all three workload builders —
+//! `workloads::controller_deployment`, `workloads::gateway_deployment` and
+//! `workloads::relay_deployment` each hard-coded it — so
+//! `kubectl scale --replicas=0` reverted on the very next reconcile. The fix
 //! per the backlog is to **omit the field unconditionally — no CRD field.**
+//! That fix landed later in this same PR: all three builders now call
+//! `workloads::released_replicas()`, which returns `None`. (Symbols, not line
+//! numbers, on purpose — see "Cite symbols, not line numbers" in
+//! `docs/BACKLOG.md`'s recurring-traps section; the citations this paragraph
+//! used to carry had already drifted by the time the fix landed.)
 //! A field would still be force-applied under SSA (moving the knob, not
 //! fixing it) and would advertise a capability the workloads don't actually
 //! support safely on their own (hostNetwork, a fixed WG port, an RWO PVC,
@@ -36,9 +39,9 @@
 //! 1. **Operator running, steady state** — it owns `replicas: 1`, so the new
 //!    build's apply does remove it and the defaulter re-sets `1`. `1 → 1`,
 //!    nothing observable.
-//! 2. **Operator running, human scales to 0** — today's build force-reasserts
-//!    `1` on the next reconcile (the very bug piece 3 fixes), so this state
-//!    cannot survive to meet the upgrade.
+//! 2. **Operator running, human scales to 0** — the pre-fix build force-
+//!    reasserted `1` on the next reconcile (the very bug piece 3 fixes), so
+//!    this state cannot survive to meet the upgrade.
 //! 3. **Operator down, human scales to 0** — `kubectl scale` is a non-apply
 //!    Update against the `scale` subresource, so ownership of
 //!    `spec.replicas` TRANSFERS to the `kubectl-scale` field manager and
@@ -62,9 +65,9 @@
 //!
 //! Gateway readiness is roster-based, not Deployment-based:
 //! `controllers::gateway::apply_gateway` computes `enrolled =
-//! row.is_some()` from the controller's gateway roster
-//! (`controllers/gateway.rs:637`) and never reads the gateway Deployment's
-//! status at all. So once scaling a gateway to 0 is possible (piece 3), a
+//! row.is_some()` from the controller's gateway roster and never reads the
+//! gateway Deployment's status at all. So once scaling a gateway to 0 is
+//! possible (piece 3), a
 //! gateway a human deliberately took down keeps reporting `Enrolled: True`
 //! off a still-active roster row — the CR silently claims a live data plane
 //! that is dead.
@@ -81,14 +84,14 @@
 //! Two reconcilers read `available_replicas` (verified as the *only* two
 //! read sites, this round, via `git grep -n available_replicas`):
 //!
-//! - `controllers::controller::reconcile` (`controller.rs:61-65`):
+//! - `controllers::controller::reconcile`:
 //!   `live.status.and_then(|s| s.available_replicas).unwrap_or(0) >= 1`
 //!   drives `status.ready`, the `Ready` condition
 //!   (`AllComponentsReady`/`WaitingForController`), and a 300s-vs-10s
 //!   requeue.
-//! - `controllers::relay::reconcile` (`relay.rs:217`): the identical
-//!   expression drives `status.applied`, the message `"relay deployed"` vs
-//!   `"relay pod starting"`, and a 300s-vs-15s requeue.
+//! - `controllers::relay::reconcile`: the identical expression drives
+//!   `status.applied`, the message `"relay deployed"` vs `"relay pod
+//!   starting"`, and a 300s-vs-15s requeue.
 //!
 //! Once `replicas` can legitimately be `0`, a deliberately-scaled-down
 //! workload becomes bit-for-bit indistinguishable from a permanently-starting
@@ -114,50 +117,58 @@
 //!
 //! # What this file does NOT prove
 //!
-//! The truth table above lives ENTIRELY inline in `async fn reconcile(...)`
-//! in `controller.rs` and `relay.rs` — both take a live kube `Client`
+//! Nothing below exercises a reconciler. `async fn reconcile(...)` in
+//! `controller.rs` and `relay.rs` both take a live kube `Client`
 //! (`Api::<Deployment>::namespaced(...).get(...)`) with no fake apiserver in
-//! this crate, the identical limitation `relay_controller_endpoint_override.rs`
+//! this crate — the identical limitation `relay_controller_endpoint_override.rs`
 //! and `gateway_metrics_bind_override.rs` both already document for their own
-//! reconciler-side invariants. Unlike `should_mint_token`/`identity_persisted`/
-//! `needs_rebind`/`adoption_needs_stale_drain` in `controllers/gateway.rs` —
-//! which the SAME reconciler-testability problem was solved for by extracting
-//! them as free `pub fn`s taking plain values — no such extraction exists yet
-//! for the ready/desired-replicas computation in `controller.rs` or
-//! `relay.rs`, nor for the `Enrolled`/condition block in `apply_gateway`
-//! (`gateway.rs:637-650`, also fully inline). **This file does not invent a
-//! fake reconcile harness to work around that.** Implementing piece 4
-//! following that established extraction pattern (e.g. a pure
-//! `fn workload_readiness(desired: Option<i32>, available: i32) -> Readiness`
-//! shared by `controller.rs`/`relay.rs`) would make the truth table above
-//! mechanically pinnable the same way `mint_action`/`adoption_needs_stale_drain`
-//! already are in `gateway.rs` — noted here as a design suggestion, not
-//! performed, since this file is tests-only and does not touch `src/`.
+//! reconciler-side invariants — and **this file does not invent a fake
+//! reconcile harness to work around that.**
+//!
+//! When this file was written the truth table above lived ENTIRELY inline in
+//! those two reconcilers and in the `Enrolled`/condition block in
+//! `apply_gateway`, which left it a code-review invariant with no test behind
+//! it (filed as backlog item 30). **That was fixed later in this same PR**,
+//! following the extraction pattern `controllers/gateway.rs` already used for
+//! `should_mint_token`/`identity_persisted`/`needs_rebind`/
+//! `adoption_needs_stale_drain`: the decision is now the pure
+//! `controllers::workload_readiness(desired, available) -> Readiness`, shared
+//! by `controller.rs`, `relay.rs` and `apply_gateway`, with
+//! `controllers::deployment_readiness` as the thin live-Deployment wrapper.
+//! The truth table is mechanically pinned by
+//! `crates/wiremesh-operator/tests/workload_readiness_truth_table.rs` — not by
+//! this file, which stays scoped to the builders and the apply body.
 //!
 //! ## A design gap the backlog text did not flag: `WiremeshRelay` has nowhere
-//! ## to put a `ScaledDown` condition today
+//! ## to put a `ScaledDown` condition
 //!
 //! `WiremeshController`'s status (`WiremeshControllerStatus`) and
 //! `WiremeshGateway`'s status (`WiremeshGatewayStatus`) both already carry a
 //! `conditions: Vec<Condition>` field. **`WiremeshRelay`'s status
 //! (`WiremeshResourceStatus`) does not** — it has only `applied`,
-//! `applied_version`, `message` (`crd.rs:26-33`), and that same type is
-//! shared verbatim by `WiremeshSegment` and `WiremeshPolicy`. Landing a
-//! `ScaledDown` *condition* on the relay (as the backlog's piece 3 bullet
-//! asks for, "on `WiremeshController` and `WiremeshRelay` only") therefore
-//! requires a status-shape decision that isn't made yet: either add
-//! `conditions: Vec<Condition>` to the shared `WiremeshResourceStatus` (a
-//! no-op for Segment/Policy, which would just carry an always-empty vec), or
-//! give `WiremeshRelay` a dedicated status type. Flagging this for whoever
-//! implements piece 4 — it is a real decision point, not a typo in this file.
+//! `applied_version` and `message`, and that same type is shared verbatim by
+//! `WiremeshSegment` and `WiremeshPolicy`. So the backlog's piece 3 bullet,
+//! "on `WiremeshController` and `WiremeshRelay` only", could not be
+//! implemented as written. **Resolved in this same PR:** the typed
+//! `ScaledDown` condition ships on `WiremeshController` and
+//! `WiremeshGateway` — the two whose status types already carry
+//! `conditions` — and the relay signals the same state through
+//! `status.message` instead, because widening the shared
+//! `WiremeshResourceStatus` would change three CRDs' schemas to serve one
+//! consumer. The residual (the relay's signal is human-legible but not
+//! machine-selectable) is filed as backlog item 31.
 //!
 //! # What IS pinned below
 //!
-//! 1. The three builders really do force `replicas: Some(1)` today (RED
-//!    tests 1-3 — they assert `None` and fail against current HEAD).
+//! 1. The three builders OMIT `replicas` (tests 1-3 assert `None`). These
+//!    were RED when written — the failure WAS the finding, proof the
+//!    force-clobber the backlog describes was real and not hypothetical — and
+//!    went green when `released_replicas()` landed later in this same PR.
+//!    They now stand as regression guards against a hard-coded count coming
+//!    back.
 //! 2. `deployment_apply_body`'s JSON apply body — the thing that actually
 //!    goes over the wire via SSA — genuinely OMITS the `replicas` key (not
-//!    `"replicas": null`) once the builders are fixed; an explicit `null`
+//!    `"replicas": null`) now that the builders are fixed; an explicit `null`
 //!    and an omitted key both happen to release SSA ownership for a scalar
 //!    field, but only omission matches what `deployment_apply_body`'s own
 //!    doc comment describes it doing elsewhere (the `rollingUpdate` null
@@ -227,10 +238,12 @@ fn relay_spec() -> WiremeshRelaySpec {
 }
 
 // ---------------------------------------------------------------------------
-// 1-3. RED: all three builders force `replicas: Some(1)` today. Each asserts
-//      the fixed contract (`None`) and therefore fails against current HEAD —
-//      the failure IS the finding: proof the force-clobber described in the
-//      backlog is real, not hypothetical.
+// 1-3. All three builders must OMIT `replicas`. Written RED against the
+//      then-current builders, which force-set `replicas: Some(1)` — the
+//      failure WAS the finding: proof the force-clobber described in the
+//      backlog was real, not hypothetical. They went green when
+//      `workloads::released_replicas()` landed later in this same PR, and now
+//      guard against a hard-coded count coming back.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -282,12 +295,12 @@ fn relay_deployment_omits_replicas() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. RED: the JSON that actually crosses the wire under SSA must OMIT the
+// 4. The JSON that actually crosses the wire under SSA must OMIT the
 //    "replicas" key entirely (not serialize an explicit null) for all three
-//    workloads, once the builders are fixed. `deployment_apply_body` already
-//    performs one deliberate null-injection (clearing `rollingUpdate` under
-//    `Recreate`) — this test guards that `replicas` does not silently need or
-//    grow a second one.
+//    workloads. Also written RED, green since the builders were fixed.
+//    `deployment_apply_body` already performs one deliberate null-injection
+//    (clearing `rollingUpdate` under `Recreate`) — this test guards that
+//    `replicas` does not silently need or grow a second one.
 // ---------------------------------------------------------------------------
 
 #[test]

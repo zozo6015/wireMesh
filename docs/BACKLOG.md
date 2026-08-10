@@ -210,6 +210,30 @@ maintenance.
   &mdash; the CR silently misreports a dead data plane. Shipping "you may now scale a
   gateway to 0" ships that misreport with it.
 
+> **AMENDED 2026-08-10 &mdash; the condition work landed on a different pair of kinds.**
+> The `replicas` bullet above says the `ScaledDown` condition goes **on `WiremeshController`
+> and `WiremeshRelay` only** and that the gateway needs none. What shipped is typed
+> `ScaledDown` conditions on **`WiremeshController` and `WiremeshGateway`**, with
+> **`WiremeshRelay` signalling the same state through `status.message`**. Two corrections,
+> in opposite directions:
+>
+> - **The gateway was added to scope.** The reasoning above about gateway *readiness* is
+>   correct and unchanged &mdash; `apply_gateway` still never reads the gateway Deployment's
+>   status, so its roster-based `Enrolled` computation needed no rework. What it did not
+>   anticipate is the consequence its own "Unfiled gap" bullet then spells out: a gateway
+>   scaled to 0 keeps reporting `Enrolled: True`, the CR claiming a live data plane that is
+>   dead. Fixing that misreport **is** condition work, so the gateway got a `ScaledDown`
+>   condition alongside `Enrolled` &mdash; `Enrolled` deliberately unchanged in meaning, so
+>   the CR states both true things at once.
+> - **The relay could not take a condition at all.** `WiremeshResourceStatus` has no
+>   `conditions` field and is shared verbatim with Segment and Policy, so widening it would
+>   change three CRDs' schemas to serve one consumer. The relay signals scale-down through
+>   `applied=false` plus a distinct `message` instead; the residual (legible to a human, not
+>   machine-selectable) is filed as **item 31**.
+>
+> The shared decision is the pure `controllers::workload_readiness(desired, available)`,
+> extracted in the same change &mdash; see **item 30**.
+
 **2c. RESOLVED &mdash; Helm CRD bundle had drifted.** Fixed in PR #59 (commit `77ca6f7`):
 `render_crd_yaml()` was extracted out of `bin/crdgen.rs` into `crd.rs`, `crdgen.rs` is now a
 one-line wrapper over it, `crates/wiremesh-operator/tests/crd_manifest_freshness.rs`
