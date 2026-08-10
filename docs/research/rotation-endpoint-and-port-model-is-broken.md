@@ -3,11 +3,47 @@
 **Found:** 2026-08-05. Bug 4 predicted by an implementer, confirmed empirically by the
 in-step done-bar run at `5a5f644`. Bug 5 found by the independent verification pass that
 was checking bug 4.
-**Status:** bug 4 open; **bug 5 FIXED in v0.7.2** (the port authority), which deleted
+**Status:** bug 4 **still open as of 2026-08-10, AFTER its designed fix shipped** — see the
+amendment box below before acting on anything here; **bug 5 FIXED in v0.7.2** (the port
+authority), which deleted
 `pending_peer_configs`' `candidate_port + OWN_TUN_PORT_OFFSET` epoch-delta formula — the
 mechanism analysed below — and made the device the one authority on the endpoint. Its done
 bar, `second_rotation_of_same_gateway_keeps_traffic_flowing`, is committed and not
 `#[ignore]`d. The bug-5 analysis below is kept as the record of what was wrong.
+
+> ## READ THIS BEFORE IMPLEMENTING ANYTHING BELOW (amendment 2026-08-10)
+>
+> **The fix this note designs in "Fix shapes" HAS ALREADY SHIPPED, and bug 4 survived it.**
+> Do not build it again. That mistake was very nearly made on 2026-08-10 and was caught
+> only because a test author checked the premise against the code instead of trusting this
+> document.
+>
+> All three pieces are ancestors of `main`, merged via PR #51 on **2026-08-06**:
+> - `c630760` — piece 1/3, read the peer endpoint back from the device.
+>   `PeerGetInfo.endpoint` exists (`uapi.rs`), the parse branch exists, and it is carried
+>   through `PeerLiveness` and `peer_liveness_from`.
+> - piece 2/3 — shipped as a CONTINUOUS read-through on the ~1s path tick, NOT the one-shot
+>   Role-A cutover seed this note proposes, reconciled against the explicit writer via
+>   `PathCtx::endpoint_commit_gen` so `set_peer_endpoint` wins a race. Read `git show
+>   c630760` for why continuous beat one-shot.
+> - `d3c6fab` — piece 3/3, reserve the own-tun port and delete the epoch-delta guess.
+>
+> **The "Sizing (2026-08-10)" measurement below is POST-fix, not pre-fix.** It was added by
+> `77ca6f7` on 2026-08-10, four days after PR #51. So the 97.54s permanent-deadlock result
+> is what the fabric does **with** ground-truth endpoint feedback and the port authority
+> already in place. The mechanism described under "Mechanism" is the pre-fix analysis and
+> can no longer be assumed to be the live cause.
+>
+> **A hypothesis worth testing before designing anything new** (from reading, not measured):
+> the shipped read-through only pins an endpoint for peers the path state machine judges
+> `Direct` or `Relayed`, and `to_record` deletes the pin on `Degraded`. In the deadlock the
+> pair churns `direct → degraded → disconnected → connecting` and the new-epoch tun never
+> reaches `Direct` at all — so the ground-truth feedback may never fire on the very device
+> that needs it. If true, the defect is in WHEN the feedback applies, not in whether the
+> endpoint is known.
+>
+> Everything below is preserved as the historical record of the original analysis. Treat
+> "Fix shapes" as **done**, not as a plan.
 
 ## Bug 4 — after a Role-A cutover, nothing durable can address the active tun
 
