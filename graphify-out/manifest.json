@@ -440,7 +440,7 @@
     "semantic_hash": "d6e87c94237f722edbdfb9ac5fc32d5f"
   },
   "crates/wiremesh-gateway/src/main.rs": {
-    "mtime": 1786456953.7538526,
+    "mtime": 1786466915.6202366,
     "ast_hash": "d07159433addabb123d5e750e5d7180e",
     "semantic_hash": ""
   },
@@ -480,7 +480,7 @@
     "semantic_hash": "747e09d45452e73291ac33f3d177f36e"
   },
   "crates/wiremesh-gateway/src/reconcile.rs": {
-    "mtime": 1786457382.7178655,
+    "mtime": 1786466915.6206663,
     "ast_hash": "9d7ae30d20ad2720acba45ebab70b7c7",
     "semantic_hash": ""
   },
@@ -490,7 +490,7 @@
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/rotation.rs": {
-    "mtime": 1786456874.413346,
+    "mtime": 1786466915.6211963,
     "ast_hash": "81785505990bb83d7203a5bd85042d0d",
     "semantic_hash": ""
   },
@@ -590,8 +590,8 @@
     "semantic_hash": "63d33a6c17bf445cbd4ee2562958033b"
   },
   "crates/wiremesh-gateway/tests/key_rotation.rs": {
-    "mtime": 1786443480.6722512,
-    "ast_hash": "4ab0d02a3e6b1354d5a69bf3c8ed7cec",
+    "mtime": 1786466915.6225386,
+    "ast_hash": "d24b1cf38e851ffd250585c66e964c44",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/mesh_milestone.rs": {
@@ -1620,8 +1620,8 @@
     "semantic_hash": ""
   },
   "docs/progress.html": {
-    "mtime": 1786383077.9454567,
-    "ast_hash": "61ca5bf78399222e5c824e8c4154453e",
+    "mtime": 1786471490.987301,
+    "ast_hash": "c1be9074ad79aa8b54ca199769baa2d3",
     "semantic_hash": ""
   },
   "docs/research/backlog-program-notes.md": {
@@ -2050,7 +2050,7 @@
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/collapse_dial.rs": {
-    "mtime": 1786456510.8486087,
+    "mtime": 1786466915.6215768,
     "ast_hash": "ee58de1f6cbfd4740c7095f4c1222f66",
     "semantic_hash": ""
   }
