@@ -31,13 +31,14 @@
 //! hide any drop the make-before-break cutover would otherwise cause.
 #![cfg(feature = "netns-tests")]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read as _, Write as _};
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use wiremesh_gateway::identity::Identity;
+use wiremesh_gateway::tunnelset::OWN_TUN_PORT_OFFSET;
 use wiremesh_gateway::uapi::base64_pub_from_priv;
 use wiremesh_proto::v1::{MintTokenRequest, RotateKeyRequest};
 use wiremesh_testkit::netns::{apply_netem, Lab, Ns};
@@ -242,6 +243,24 @@ impl GwProc {
         let s = std::fs::read_to_string(&self.err_log).unwrap_or_default();
         let start = s.len().saturating_sub(4000);
         s[start..].to_string()
+    }
+    /// Every stderr line containing `needle`, from the WHOLE log rather than
+    /// [`stderr_tail`]'s last 4 KiB.
+    ///
+    /// The gateway subprocesses' stderr is drained to a file in a tempdir that
+    /// dies with the test, so a decision the gateway logged once — early, and
+    /// then buried under a rotation's worth of output — is invisible to anyone
+    /// reading a run's console, pass or fail. Nothing asserts on the result:
+    /// it exists so a GREEN run leaves behind the gateway's own statement of
+    /// which branch it took, next to the device-state assertions that prove
+    /// the effect.
+    fn stderr_grep(&self, needle: &str) -> Vec<String> {
+        std::fs::read_to_string(&self.err_log)
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.contains(needle))
+            .map(str::to_string)
+            .collect()
     }
 }
 
@@ -1948,14 +1967,17 @@ fn sample_tick(ns: &Ns, metrics_addr: &str, base: &BTreeSet<String>, obs: &mut R
 
 /// **T3 DONE BAR — the scenario the shipped outage actually needs.**
 ///
-/// **KNOWN FAILING, DELIBERATELY `#[ignore]`d — DO NOT DELETE.** This test is
-/// not flaky, not obsolete, and not superseded: it is a documented red parked
-/// as the done bar for the endpoint/port work described in
-/// `docs/research/rotation-endpoint-and-port-model-is-broken.md`. It fails at
-/// the post-rotation reachability check (`POST-ROTATION FAILED: ICMP wlA ->
-/// wlB ...`) because of bugs 4 and 5 in that document, which are structural
-/// and out of scope for T3. Everything before that point passes and is real
-/// coverage. See "Why this is `#[ignore]`d" at the bottom before touching it.
+/// **This is the in-step done bar, and it is GREEN.** It was committed
+/// deliberately `#[ignore]`d as red-by-design from 2026-08-05 until
+/// 2026-08-11, parked as the acceptance criterion for the endpoint work; that
+/// work landed and the `#[ignore]` came off. It is not a smoke test and not
+/// redundant with the other rotation cases in this file — read "What the fix
+/// was" and "The two assertions that pin WHY it passed" below before changing
+/// anything in it.
+///
+/// **`--features netns-tests` is mandatory.** Without it this whole file
+/// compiles to zero tests and `cargo test` prints a green summary that proves
+/// nothing. The full invocation is at the bottom of this comment.
 ///
 /// Every other rotation test in this file rotates ONE gateway, so an
 /// own-epoch tun and a Role-B overlap tun never carry the same epoch number
@@ -1991,18 +2013,18 @@ fn sample_tick(ns: &Ns, metrics_addr: &str, base: &BTreeSet<String>, obs: &mut R
 /// its own epoch-1 tun when gwB's epoch-1 pending key reaches it — which is
 /// exactly the window in which the collision fires.
 ///
-/// # The assertion that would have been red before the fix
+/// # The T3 assertion, and the collision it would have caught
 ///
 /// Each gateway must, at some instant during the rotation window, have TWO
 /// MORE network interfaces than it had at steady state: its own new epoch tun
 /// (Role A) *and* an overlap tun toward the rotating peer (Role B). Four
 /// rotation devices across the pair, on top of the two base tuns.
 ///
-/// Before the fix, both roles computed the same map key, the same ifname and
-/// the same listen port; `TunnelSet::bring_up` bailed on the duplicate and the
-/// `?` inside `for peer in &ds.peers` aborted the whole Role-B loop, whose
-/// caller only logs. Neither side ever brought an overlap up, so the peak
-/// would have been base + 1, not base + 2, on both gateways.
+/// Before the de-collision fix, both roles computed the same map key, the same
+/// ifname and the same listen port; `TunnelSet::bring_up` bailed on the
+/// duplicate and the `?` inside `for peer in &ds.peers` aborted the whole
+/// Role-B loop, whose caller only logs. Neither side ever brought an overlap
+/// up, so the peak would have been base + 1, not base + 2, on both gateways.
 ///
 /// The probe is deliberately a COUNT of interfaces, not a set of names: the
 /// test asks the kernel "how many devices are up", never "is `wg0e1` up", so
@@ -2012,79 +2034,122 @@ fn sample_tick(ns: &Ns, metrics_addr: &str, base: &BTreeSet<String>, obs: &mut R
 /// `tests/tunnelset_same_epoch_netns.rs`. Sampling `wg show` at the peak would
 /// add a race to this (serial, flake-sensitive) file for no new information.
 ///
-/// # Why this is `#[ignore]`d
+/// # What the fix was, and why the red was structural rather than flaky
 ///
 /// Writing this test was the first time anybody exercised an in-step
 /// both-gateways rotation — the shape the controller's default 30-day timer
-/// produces on every fabric. **It found six bugs. Four are fixed on this
-/// branch** (the `TunnelSet` three-axis collision the T3 assertion above
-/// pins, and the arbitration/route defects around it). **Two are not, and
-/// cannot be without structural work**, so the test is committed red rather
-/// than weakened:
+/// produces on every fabric. It found six bugs. Four were fixed as it was
+/// written (the `TunnelSet` three-axis collision the T3 assertion above pins,
+/// and the arbitration/route defects around it). The fifth — the second
+/// rotation of any gateway could not complete, because `device_config_at_port`
+/// and `pending_peer_configs` held two incompatible port models — was fixed by
+/// v0.7.2's single port authority; its own done bar is
+/// `second_rotation_of_same_gateway_keeps_traffic_flowing`, committed and not
+/// ignored.
 ///
-///  - **Bug 4 — the Role-A cutover leaves nothing durable able to address the
-///    active tun.** After cutover the active tun dials the peer's BASE port
-///    while the peer listens for that epoch on an offset port, so no
-///    handshake ever completes. Everything durable in the fabric (observed
-///    candidate, reported locals, punch candidates, `live_endpoints`) is
-///    base-port by construction; only two transient writers ever emit an
-///    offset port and both *guess*. A one-sided rotation survives this only
-///    by accident of the change-guard rendering an identical no-op forever;
-///    in-step rotation forces a real `uapi::apply` and the accident stops
-///    holding.
-///  - **Bug 5 — the SECOND rotation of any gateway cannot complete at all.**
-///    `device_config_at_port` assumes "the peer listens on the port I chose"
-///    while `pending_peer_configs` assumes "base + epoch delta" — two
-///    mutually incompatible models, both invalidated by T3's free-list
-///    `plan_port` allocator. No test in this file has ever rotated twice
-///    (every case goes 0 -> 1 once from a clean tree), which is why this went
-///    unseen.
+/// The sixth kept this test red, and it was a genuine **deadlock, not a timing
+/// window**: after the Role-A cutover, nothing durable in the fabric could
+/// address the active tun. Every durable endpoint source (observed candidate,
+/// reported locals, punch candidates, `live_endpoints`) is base-port by
+/// construction, while the freshly cut-over key listens on the reserved
+/// own-tun port. One-sided rotation survives that because the base-port dial
+/// is EVENTUALLY correct — the peer's retire is gated on *our overlap's*
+/// session, which is live, so the peer renormalizes to base and the unchanged
+/// dial starts working. In step, the peer's retire is gated on the very
+/// epoch1 ↔ epoch1 session we cannot address, so both sides wait on each
+/// other: measured at 90s with no recovery, both churning
+/// direct/degraded/disconnected/connecting forever.
 ///
-/// Both are written up in full — mechanism, direct observation from the
-/// failing run, the decided fix shape (ground-truth endpoint feedback from
-/// boringtun's `get=1`, plus a single port authority so `device_config_pinned`,
-/// `device_config_at_port` and `pending_peer_configs` stop disagreeing), and
-/// why two other candidate fixes were rejected — in
-/// **`docs/research/rotation-endpoint-and-port-model-is-broken.md`**.
+/// The fix (plan `docs/superpowers/plans/2026-08-11-in-step-rotation-fix.md`,
+/// rebaselined evidence in `docs/research/in-step-rotation-rebaselined.md`) is
+/// two gated additions on the Role-B collapse arm, both discriminated by
+/// `built_at_own_epoch != active.epoch` — "our overlap and our active tun run
+/// DIFFERENT private keys", which is false by construction in every one-sided
+/// case, so neither addition can perturb them:
 ///
-/// ## What still passes, and what does not
+///  - **The rotation dial.** At the same moment the `wg0` pin is dropped, the
+///    collapse arm writes the peer's reserved own-tun port (`candidate_port +
+///    OWN_TUN_PORT_OFFSET` — where the peer's active key lives between its
+///    cutover and its retire) into `live_endpoints`, so the very apply that
+///    performs the rekey carries an endpoint that can reach it. All three
+///    renderers read that one map, so they agree by construction.
+///  - **A handshake kick on the active tun during the collapse.** Our first
+///    init after the rekey is dropped if the peer has not rekeyed yet, and
+///    boringtun's ~5s `REKEY_TIMEOUT` retry costs ~25 flood packets against a
+///    ≤6 allowance. Nothing kicked the active tun during a collapse before, on
+///    a rationale ("routes may still point at the overlap") that is false in
+///    the in-step case, where our own cutover already won the routes.
 ///
-/// Everything up to the post-rotation reachability check is green and is the
-/// coverage this test exists for: the T3 assertion (four rotation devices
-/// across the pair, every one with its enforcer attached — the fail-open
-/// displacement probe) and the traffic-during-overlap assertion (the ICMP
-/// flood loses at most two cutovers' worth of packets). The failure is the
-/// `POST-ROTATION FAILED: ICMP wlA -> wlB no longer passes after BOTH
-/// gateways rotated in step` panic below: bug 4 means neither side's
-/// configured endpoint reaches a device holding the matching key once both
-/// have cut over.
+/// ## What this test covers
 ///
-/// ## Un-ignoring this IS the done bar
+/// The T3 assertion (four rotation devices across the pair, every one with its
+/// enforcer attached — the fail-open displacement probe), the
+/// traffic-during-overlap assertion (the ICMP flood loses at most two
+/// cutovers' worth of packets), post-rotation reachability, and the two
+/// mechanism blocks described next.
 ///
-/// Removing the `#[ignore]` and getting this green is the acceptance
-/// criterion for the endpoint/port work. Nothing here may be relaxed to get
-/// there: no widened packet-loss tolerance, no dropped direction in the
-/// both-ways reachability loop, no softened failure message. If a future
-/// change makes it pass, it must pass for the reason in the research doc.
-/// (The doc also calls for a NEW test that rotates twice — bug 5 is invisible
-/// without one, and this test only rotates once per gateway.)
+/// ## The two assertions that pin WHY it passed, not just that it did
 ///
-/// Run it with `--ignored` to see the current red:
+/// **These two blocks are load-bearing. They read like belt-and-braces on top
+/// of the ping and they are not.** Every assertion described above is an
+/// OUTCOME — a device count, an enforcer gauge, a packet gap, a ping — and
+/// each is satisfiable by a run in which the in-step fix never fired and the
+/// pair converged some other way: traffic can cross on the base tun the whole
+/// time while the epoch1 ↔ epoch1 session never comes up at all. The plan says
+/// so outright: *"A green run still showing `:51820` passed for the wrong
+/// reason."* Deleting either block as redundant would leave a test that goes
+/// green on the exact deadlock it exists to catch. Neither relaxes anything
+/// above them:
+///
+///  - **The mechanism** (after the traffic check): the Device holding each
+///    gateway's own epoch-1 key must be observed DIALING the peer's reserved
+///    own-tun port — `base + OWN_TUN_PORT_OFFSET`, derived from the constant,
+///    never written out — and must complete a real handshake there. Before the
+///    fix the first was measured wrong in every run and the second was `0` on
+///    both gateways in every run. Devices are selected by the KEY THEY HOLD,
+///    because during the collapse window the peer's epoch-1 pubkey sits on two
+///    devices at once and the Role-B overlap's endpoint was ALREADY correct
+///    pre-fix.
+///  - **Post-settle reachability** (after the enforcer gauge returns to 1):
+///    both sides must address each other where they actually listen, and ICMP
+///    must still cross, once BOTH have retired epoch 0 and renormalized to the
+///    base port. This is the only assertion that can detect the mutual pin the
+///    plan names as its sharpest availability risk — both sides left pinned at
+///    the other's now-dead reserved port. Its bound is deliberately under
+///    `path::DEGRADED_AFTER` so a 45s degrade-and-recover cannot be certified
+///    as a steady state.
+///
+/// ## What this test does NOT cover
+///
+/// Two honest gaps, both known and both deferred rather than overlooked:
+///
+///  - **The `replace_peers` cost is invisible here.** The collapse rekey
+///    resets every peer's session, so on a fabric with N peers each rotation
+///    costs N-1 innocent resets. This topology has exactly one peer, so no
+///    assertion in this file can observe it. It is aggravating rather than
+///    causal — scoping the rekey turns nothing green on its own — and is
+///    deferred as Shape C in the plan, behind a multi-peer test.
+///  - **The post-settle check does not FORCE its sharpest case.** The mutual
+///    pin it exists to catch is most likely when both sides renormalize
+///    near-simultaneously, and nothing in the harness makes that happen; the
+///    check observes whatever interleaving the run produces. It asserts the
+///    endpoints AND the ping precisely because the timing cannot be pinned.
+///
+/// ## Nothing here may be relaxed
+///
+/// This test is the acceptance criterion for the endpoint/port work and the
+/// last blocker before the controller's rotation timer can be re-enabled
+/// fabric-wide. No widened packet-loss tolerance, no dropped direction in the
+/// both-ways reachability loop, no softened failure message, and above all no
+/// deletion of the mechanism or post-settle blocks. If a change makes this go
+/// red, the change is the suspect — but see the caution in `CLAUDE.md` about
+/// this file's host-load sensitivity and run an interleaved A/B against the
+/// parent commit before concluding anything from a single red run.
+///
+/// Run it (the feature flag is not optional):
 /// `cargo test -p wiremesh-gateway --test key_rotation --features netns-tests \
-///  -- --test-threads=1 --nocapture --ignored`
+///  -- --test-threads=1 --nocapture`
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "RED by design, NOT obsolete — do not delete. Blocked on bug 4 ALONE \
-            (post-cutover endpoint dials the peer's base port while it listens on an offset \
-            port), in docs/research/rotation-endpoint-and-port-model-is-broken.md; \
-            un-ignoring this is the done bar for that work. It is a permanent DEADLOCK, not \
-            a timing window: the retire that would move the active key back to the base port \
-            is gated on the new tun already being live, and it cannot become live until that \
-            retire happens — measured at 90s with no recovery, both sides churning \
-            direct/degraded/disconnected/connecting forever. Bug 5 (the second rotation of \
-            any gateway cannot complete) is FIXED in v0.7.2's port authority, which deleted \
-            pending_peer_configs' epoch-delta port formula — its done bar, \
-            second_rotation_of_same_gateway_keeps_traffic_flowing, is committed and not \
-            ignored. See this test's doc comment."]
 async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     // Topology: IDENTICAL to `direct_rotation_is_zero_drop` — see that test
     // for the per-step rationale (bridge, netem, veths, identities).
@@ -2308,6 +2373,175 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
         transmitted.saturating_sub(received)
     );
 
+    // ===== THE MECHANISM: an epoch1 <-> epoch1 session, on the device =====
+    //
+    // Everything above this point is an OUTCOME, and every one of those
+    // outcomes is satisfiable by a run in which the in-step fix never fired.
+    // The device counts, the enforcer gauge and the packet gap are all
+    // measured DURING the rotation, before the Role-B collapse; the pings
+    // below are measured after it, by which time a base-port endpoint can have
+    // become correct anyway (one gateway retiring moves its active key back to
+    // the base port, which is exactly how the one-sided cases converge). So a
+    // pair that deadlocked and then got lucky, and a pair that worked for the
+    // designed reason, are indistinguishable to every assertion this test had.
+    //
+    // What is NOT satisfiable any other way is the pair of facts below, and
+    // they are the fix stated as device state:
+    //
+    //  1. our own new-epoch tun DIALED the peer's reserved own-tun port, and
+    //  2. a session actually FORMED there.
+    //
+    // Before the fix (1) was measured wrong in every run — `:51820` twice and
+    // `:51822` once, never the correct port — and (2) was `0`, never a
+    // handshake, on both gateways in every run
+    // (`docs/research/in-step-rotation-rebaselined.md`). The two are asserted
+    // separately because they fail for different reasons and mean different
+    // things.
+    //
+    // Sampled across a window rather than read once: the correct endpoint is
+    // live from the collapse arm until both sides retire and roam back to the
+    // base port, and the retire is gated on this very session having been live
+    // for a full `RETIRE_GRACE` (6s), so the window is comfortably wide — but
+    // it is a window, and "was it ever right" is the honest question.
+    const BASE_WG_PORT: u16 = 51820; // must match `spawn_gw`'s `--wg-port`
+    // The peer's active key lives at `base + OWN_TUN_PORT_OFFSET` between its
+    // cutover and its retire — a RESERVED port, derived from the constant that
+    // reserves it rather than written as `51821`, so a change to the
+    // reservation moves the test with the code instead of silently past it.
+    let own_tun_port = BASE_WG_PORT + OWN_TUN_PORT_OFFSET;
+
+    let a_e1_b64 = poll_epoch_pubkey(&h, ga.id(), 1, Duration::from_secs(10)).await;
+    let b_e1_b64 = poll_epoch_pubkey(&h, gb.id(), 1, Duration::from_secs(10)).await;
+    let (Some(a_e1_b64), Some(b_e1_b64)) = (a_e1_b64, b_e1_b64) else {
+        dump_diag(
+            "in-step-epoch1-pubkey-unresolved",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "MECHANISM UNCHECKABLE: both rotations reported complete, yet the controller never \
+             produced a real epoch-1 pubkey for one or both gateways (still the \
+             `{AWAITING_SUBMISSION}` sentinel, or absent). Every assertion below identifies \
+             devices BY KEY, so without both keys the mechanism cannot be read at all — this is \
+             a harness/controller failure, not the in-step defect."
+        );
+    };
+    let a_e1_hex = base64_pub_to_hex(&a_e1_b64);
+    let b_e1_hex = base64_pub_to_hex(&b_e1_b64);
+    // gwA's underlay address is 10.9.0.1 and gwB's is 10.9.0.2 (`attach_underlay`
+    // above), so each side's target is the OTHER's IP at the reserved port.
+    let want_a = format!("10.9.0.2:{own_tun_port}");
+    let want_b = format!("10.9.0.1:{own_tun_port}");
+
+    let mut mech_a = MechObs::default();
+    let mut mech_b = MechObs::default();
+    let mech_seen = wait_until(Duration::from_secs(45), || {
+        sample_mech(&gwa, &a_e1_hex, &b_e1_hex, &b_e1_b64, &mut mech_a);
+        sample_mech(&gwb, &b_e1_hex, &a_e1_hex, &a_e1_b64, &mut mech_b);
+        mech_a.saw(&want_a) && mech_b.saw(&want_b)
+    });
+    eprintln!(
+        "MECHANISM SAMPLING (both sides satisfied: {mech_seen}):\n  gwA {}\n  gwB {}",
+        mech_a.summary(),
+        mech_b.summary(),
+    );
+
+    // Asserted on BOTH gateways: the mechanism is symmetric, and a one-sided
+    // check would pass a half-working fix in which only one side's own-epoch
+    // tun ever became addressable — which is precisely the shape that
+    // deadlocks, since each side's retire is gated on the OTHER's session.
+    for (name, mech, want, peer_name) in [
+        ("gwA", &mech_a, &want_a, "gwB"),
+        ("gwB", &mech_b, &want_b, "gwA"),
+    ] {
+        if mech.own_epoch_ifnames.is_empty() {
+            dump_diag(
+                "in-step-own-epoch-device-not-found",
+                &[("gwA", &gwa), ("gwB", &gwb)],
+                &[("gwA", &pa), ("gwB", &pb)],
+            );
+            pa.kill();
+            pb.kill();
+            panic!(
+                "MECHANISM UNCHECKABLE on {name}: no Device holding {name}'s epoch-1 private key \
+                 was seen at any point in a 45s window, although the controller reports epoch 1 \
+                 active. Every assertion below is about that Device, so this makes them vacuous \
+                 rather than green. Either the cutover never created it, or it was torn down \
+                 before the window opened.\n{}\nDevices last seen on {name}:\n{}",
+                mech.summary(),
+                fmt_snaps(&mech.devs),
+            );
+        }
+        if !mech.dialed(want) {
+            dump_diag(
+                "in-step-collapse-dial-never-fired",
+                &[("gwA", &gwa), ("gwB", &gwb)],
+                &[("gwA", &pa), ("gwB", &pb)],
+            );
+            pa.kill();
+            pb.kill();
+            panic!(
+                "COLLAPSE DIAL NEVER FIRED on {name}: its own new-epoch tun was never observed \
+                 dialing {peer_name}'s new epoch at {want} — the port {peer_name}'s active key is \
+                 RESERVED on (base {BASE_WG_PORT} + OWN_TUN_PORT_OFFSET {OWN_TUN_PORT_OFFSET}) \
+                 between its cutover and its retire.\n\
+                 WHAT THIS MEANS: an endpoint of `:{BASE_WG_PORT}` (or any other port) is the \
+                 pre-fix shape verbatim — the peer-entry rebuild that the Role-B collapse unpin \
+                 forces inherited a base-port endpoint from `live_endpoints`/the candidate list, \
+                 neither of which can ever produce the reserved port. Nothing else in this test \
+                 distinguishes that from a working fix, so if the rest of the run is green it \
+                 passed BY LUCK OR TIMING, not because the epoch1 <-> epoch1 session was \
+                 addressable. See docs/research/in-step-rotation-rebaselined.md and the tier-3 \
+                 note in docs/superpowers/plans/2026-08-11-in-step-rotation-fix.md.\n{}\n\
+                 Devices last seen on {name}:\n{}",
+                mech.summary(),
+                fmt_snaps(&mech.devs),
+            );
+        }
+        if mech.own_epoch_handshake == 0 {
+            dump_diag(
+                "in-step-own-epoch-tun-never-handshaked",
+                &[("gwA", &gwa), ("gwB", &gwb)],
+                &[("gwA", &pa), ("gwB", &pb)],
+            );
+            pa.kill();
+            pb.kill();
+            panic!(
+                "OWN-EPOCH TUN NEVER HANDSHAKED on {name}: its Device for epoch 1 dialed \
+                 {peer_name}'s reserved port, but `wg`'s latest-handshake for that peer stayed \
+                 0 — a zeroed timestamp, i.e. no session EVER formed there.\n\
+                 WHAT THIS MEANS: this is the strongest single signal in the test, and before the \
+                 fix it was 0 on both gateways in every measured run. The endpoint being right is \
+                 necessary, not sufficient: both the Role-B collapse gate and the peer's Role-A \
+                 retire gate wait on an epoch1 <-> epoch1 session, so a zero here means both gates \
+                 are still parked and any traffic that passed did so over the BASE tun, which is \
+                 about to retire. A green ping alongside this zero is a fabric that is working \
+                 only until the grace expires.\n{}\nDevices last seen on {name}:\n{}",
+                mech.summary(),
+                fmt_snaps(&mech.devs),
+            );
+        }
+    }
+    eprintln!(
+        "MECHANISM PASS: both gateways' own new-epoch tuns dialed the peer's RESERVED own-tun \
+         port {own_tun_port} (base {BASE_WG_PORT} + OWN_TUN_PORT_OFFSET {OWN_TUN_PORT_OFFSET}) \
+         and completed a real handshake there — the epoch1 <-> epoch1 session both collapse/retire \
+         gates wait on came up, which is the reason this test is allowed to be green."
+    );
+    // The gateway's own account of the decision, next to the device evidence
+    // of its effect: the collapse-dial line logs both predicate inputs
+    // (`own_active_epoch`, `built_at_own_epoch`) and the resulting endpoint on
+    // BOTH branches. Printed, never asserted — it is what settles open
+    // question 2 of the plan (whether the gating predicate actually held in
+    // the in-step case) for a human reading a green run.
+    for (name, p) in [("gwA", &pa), ("gwB", &pb)] {
+        for line in p.stderr_grep("collapse dial") {
+            eprintln!("GATEWAY LOG {name}: {line}");
+        }
+    }
+
     // ===== Both directions still work once both rotations have settled =====
     // Both sides rotated, so both directions are checked: a one-way check
     // could pass on a pair where only one gateway actually cut over.
@@ -2376,6 +2610,132 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
         );
     }
     eprintln!("SETTLE PASS: both gateways back to exactly one live enforcer after the overlap collapse and the epoch-0 retire");
+
+    // ===== POST-SETTLE REACHABILITY: the steady state, not the transient =====
+    //
+    // Everything above stops measuring before the last thing that moves. The
+    // reachability pings ran BEFORE this settle, i.e. while each side's active
+    // key was still on its offset port and each side's endpoint still pointed
+    // there. The settle gate that follows them checks an enforcer COUNT — that
+    // the transient state was reclaimed — and says nothing about whether the
+    // fabric can still carry a packet afterwards.
+    //
+    // The gap between those two is a real and specific failure, named in the
+    // plan's risk section as its sharpest unmeasured claim: after BOTH sides
+    // retire, `renormalize_active_listen_port` moves each active key back to
+    // the base port, and each side may be left pinned at the OTHER's now-dead
+    // reserved port while both listen on base — a mutual black hole. Neither
+    // side can correct it, because an endpoint is only corrected by RECEIVING
+    // an authenticated packet and neither side can send one. The design's
+    // mitigation is that the renormalize pokes every peer, and the first side
+    // to renormalize pokes while the other is still on the reserved port; the
+    // residual risk is that poke being lost with near-simultaneous
+    // renormalizations. This block is the only assertion in the test that can
+    // detect any of that — without it the done bar can go green on a fabric
+    // that is unreachable in steady state, which is the exact failure the fix
+    // exists to prevent, merely relocated past the last assertion.
+    //
+    // # What is deterministic here and what is not
+    //
+    // The ENDPOINT assertion is checkable without racing anything: it reads
+    // where each side's surviving Device listens and where it dials, and both
+    // are settled facts once the retires have run (which the enforcer gate
+    // above has already established). It is the part that names the failure.
+    //
+    // The TIMING is not forced. This test cannot make the two renormalizations
+    // near-simultaneous — they are driven by each gateway's own `RETIRE_GRACE`
+    // off its own cutover, and there is no seam to align them from here — so
+    // whether the dangerous interleaving is exercised at all is left to chance
+    // on any given run. What IS pinned is that if it happens, this fails.
+    //
+    // The bound is therefore load-bearing and deliberately SHORT. Endpoint
+    // correction after a landed poke is one round trip; the recovery path if
+    // the poke is lost is `path::DEGRADED_AFTER` (45s) followed by a candidate
+    // chase. A bound at or above 45s would certify degrade-and-recover as
+    // steady state and this assertion would detect nothing. 20s is far past
+    // the poke and far short of the degrade.
+    const POST_SETTLE_CONVERGE: Duration = Duration::from_secs(20);
+    let mut post_a: Vec<DevSnap> = Vec::new();
+    let mut post_b: Vec<DevSnap> = Vec::new();
+    let want_base_a = format!("10.9.0.2:{BASE_WG_PORT}");
+    let want_base_b = format!("10.9.0.1:{BASE_WG_PORT}");
+    let converged = wait_until(POST_SETTLE_CONVERGE, || {
+        post_a = uapi_dump_all(&gwa);
+        post_b = uapi_dump_all(&gwb);
+        let (_, la, ea) = settled_view(&post_a, &a_e1_hex, &b_e1_hex);
+        let (_, lb, eb) = settled_view(&post_b, &b_e1_hex, &a_e1_hex);
+        la == Some(BASE_WG_PORT)
+            && lb == Some(BASE_WG_PORT)
+            && ea.as_deref() == Some(want_base_a.as_str())
+            && eb.as_deref() == Some(want_base_b.as_str())
+    });
+    let (if_a, listen_a, ep_a) = settled_view(&post_a, &a_e1_hex, &b_e1_hex);
+    let (if_b, listen_b, ep_b) = settled_view(&post_b, &b_e1_hex, &a_e1_hex);
+    if !converged {
+        dump_diag(
+            "in-step-post-settle-endpoints-never-converged",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "POST-SETTLE BLACK HOLE: {POST_SETTLE_CONVERGE:?} after both in-step rotations \
+             retired, the two gateways do not address each other where they actually listen.\n\
+             \x20 gwA: Device {if_a:?} listens on {listen_a:?}, dials gwB's epoch-1 key at \
+             {ep_a:?} (required: listens {BASE_WG_PORT}, dials {want_base_a})\n\
+             \x20 gwB: Device {if_b:?} listens on {listen_b:?}, dials gwA's epoch-1 key at \
+             {ep_b:?} (required: listens {BASE_WG_PORT}, dials {want_base_b})\n\
+             WHAT THIS MEANS: both sides renormalized their active key back to the base port, so \
+             the reserved port {own_tun_port} is DEAD on both. A side still pinned there is \
+             sending into nothing, and cannot be corrected — endpoint roaming needs an inbound \
+             authenticated packet and the peer is in the same state. This is the mutual pin the \
+             plan names as its sharpest availability risk: the renormalize's poke to the peer was \
+             lost, or the two renormalizations landed too close together for either poke to reach \
+             a live socket. Recovery, if any, is {:?} of degrade followed by a candidate chase — \
+             which is an outage, not a steady state, and is why this bound is deliberately below \
+             it.\n\
+             gwA devices:\n{}gwB devices:\n{}",
+            wiremesh_gateway::path::DEGRADED_AFTER,
+            fmt_snaps(&post_a),
+            fmt_snaps(&post_b),
+        );
+    }
+    eprintln!(
+        "POST-SETTLE ENDPOINTS PASS: gwA {if_a:?} and gwB {if_b:?} both listen on \
+         {BASE_WG_PORT} and dial each other there ({ep_a:?} / {ep_b:?}) — the reserved port \
+         {own_tun_port} is dead on both sides and neither is still pinned to it."
+    );
+
+    // And the packet that proves it, both ways. The endpoints above are the
+    // diagnosis; this is the product claim. It is bounded well under
+    // `DEGRADED_AFTER` for the same reason, and separately from the endpoint
+    // check so that a failure HERE — correct endpoints, no traffic — reads as
+    // what it would be: routes, policy or the enforcer, not the rotation
+    // endpoint model.
+    for (from, dst, label) in
+        [(&wla, "10.10.2.2", "wlA -> wlB"), (&wlb, "10.10.1.2", "wlB -> wlA")]
+    {
+        if !wait_until(Duration::from_secs(15), || ping_ok(from, dst)) {
+            dump_diag(
+                "post-settle-unreachable",
+                &[("gwA", &gwa), ("gwB", &gwb)],
+                &[("gwA", &pa), ("gwB", &pb)],
+            );
+            pa.kill();
+            pb.kill();
+            panic!(
+                "POST-SETTLE UNREACHABLE: ICMP {label} does not pass in the SETTLED steady state \
+                 — after both gateways retired epoch 0 and moved their active keys back to the \
+                 base port. The earlier POST-ROTATION check passed, so this is not the cutover: \
+                 something the retire/renormalize did took the fabric down after the last \
+                 assertion the done bar used to have. Both sides' endpoints checked out \
+                 immediately above (gwA {ep_a:?}, gwB {ep_b:?}), so look at routes, policy \
+                 reprogramming or the surviving enforcer rather than at the endpoint model."
+            );
+        }
+        eprintln!("POST-SETTLE PASS: ICMP still crosses {label} in the settled steady state");
+    }
 
     pa.kill();
     pb.kill();
@@ -2528,6 +2888,162 @@ fn fmt_snaps(snaps: &[DevSnap]) -> String {
 /// Port half of an `ip:port` UAPI endpoint value.
 fn endpoint_port(ep: &str) -> Option<u16> {
     ep.rsplit_once(':').and_then(|(_, p)| p.parse().ok())
+}
+
+// --- in-step done bar: WHY it passed, read off the devices --------------------
+//
+// The helpers below exist for
+// `in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns` and are
+// sited here, after the `DevSnap`/`uapi_dump_all` toolkit, because they are
+// extensions of it rather than of anything near that test.
+//
+// They exist because that test can PASS FOR THE WRONG REASON. Everything it
+// asserted before them is an OUTCOME — device counts, an enforcer gauge, a
+// packet gap, a ping. Each of those is satisfiable by a run in which the
+// collapse dial never fired and the pair converged some other way (or by luck
+// of timing), and the plan says so in as many words: *"A green run still
+// showing `:51820` passed for the wrong reason."*
+// (`docs/superpowers/plans/2026-08-11-in-step-rotation-fix.md`, test strategy
+// tier 3.) These read the MECHANISM off the devices instead.
+
+/// `(ifname, peer base64 pubkey) -> latest handshake as raw epoch seconds`,
+/// for every device in `ns`, from `wg show all latest-handshakes` — the exact
+/// view `dump_diag` already prints, parsed rather than eyeballed.
+///
+/// `wg` reports a peer that has NEVER handshaked as a zeroed timestamp, so
+/// such a peer appears in this map with a `0` rather than being absent from
+/// it: `Some(0)` means "the peer entry exists and no session ever formed",
+/// which is a different (and much more damning) statement than `None`.
+///
+/// Empty map on ANY harness failure, and callers fold it across a sampling
+/// window keeping the maximum. A dropped sample can therefore only ever make
+/// the assertions harder to satisfy, never easier — the same rule
+/// `uapi_dump_all` and `link_names` are written to.
+fn latest_handshakes(ns: &Ns) -> BTreeMap<(String, String), u64> {
+    let Ok(out) = ns.exec(&["wg", "show", "all", "latest-handshakes"]) else {
+        return BTreeMap::new();
+    };
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let ifname = f.next()?.to_string();
+            let peer = f.next()?.to_string();
+            let secs: u64 = f.next()?.parse().ok()?;
+            Some(((ifname, peer), secs))
+        })
+        .collect()
+}
+
+/// What one gateway's OWN new-epoch tun was observed doing toward its peer's
+/// new epoch, accumulated across a sampling window.
+///
+/// **Sets and a maximum, not last-values** — the same choice, for the same
+/// reason, as [`PortObs`]: the state being watched is transient. The collapse
+/// dial's endpoint is correct from the collapse arm until both sides retire,
+/// after which `renormalize_active_listen_port` moves each active key back to
+/// the base port and boringtun legitimately roams the endpoint there. "The
+/// endpoint was NEVER the peer's own-tun port at any instant" is the falsifiable
+/// claim; "it is not that right now" is not.
+#[derive(Default)]
+struct MechObs {
+    /// `(ifname, endpoint)` of every peer entry seen on the Device holding
+    /// THIS gateway's epoch-1 private key, keyed by the PEER's epoch-1 pubkey
+    /// — i.e. every place our own new epoch dialed the peer's own new epoch.
+    own_epoch_dials: BTreeSet<(String, String)>,
+    /// Largest `latest-handshakes` value seen for that peer on that Device.
+    /// Stays `0` iff the epoch1 <-> epoch1 session never formed.
+    own_epoch_handshake: u64,
+    /// Diagnostics: the ifnames seen holding our epoch-1 key. Normally exactly
+    /// one (`wg0e1`); empty means the Device was never identified at all,
+    /// which makes every other field vacuous and has its own failure message.
+    own_epoch_ifnames: BTreeSet<String>,
+    /// Diagnostics: the richest device snapshot seen during the window.
+    devs: Vec<DevSnap>,
+}
+
+impl MechObs {
+    /// Both halves of the mechanism: our own-epoch tun dialed the peer at
+    /// `want` at some instant, AND a session actually formed there.
+    fn saw(&self, want: &str) -> bool {
+        self.dialed(want) && self.own_epoch_handshake > 0
+    }
+    fn dialed(&self, want: &str) -> bool {
+        self.own_epoch_dials.iter().any(|(_, ep)| ep == want)
+    }
+    fn summary(&self) -> String {
+        format!(
+            "own-epoch Device(s) {:?}; dialed the peer's new epoch at {:?} (ports {:?}); \
+             best latest-handshake seen there: {}",
+            self.own_epoch_ifnames,
+            self.own_epoch_dials,
+            self.own_epoch_dials
+                .iter()
+                .filter_map(|(_, ep)| endpoint_port(ep))
+                .collect::<BTreeSet<u16>>(),
+            self.own_epoch_handshake,
+        )
+    }
+}
+
+/// One tick: fold this gateway's device state into `obs`.
+///
+/// The own-epoch Device is identified by the KEY IT HOLDS (`own_pub_hex ==
+/// own_epoch_hex`), never by its name, and its peer entry by the key that
+/// entry is FOR. That matters more here than it would elsewhere: during the
+/// collapse window a gateway holds the peer's epoch-1 pubkey on *two* devices
+/// at once — its own new-epoch tun and its Role-B overlap — with different
+/// endpoints (measured, `docs/research/in-step-rotation-rebaselined.md`), and
+/// the overlap is the one that was ALREADY right before the fix. Selecting on
+/// the peer key alone would read the overlap's correct endpoint and report the
+/// mechanism as working when it is not. The overlap runs our epoch-0 key, so
+/// keying on our own epoch-1 pubkey excludes it by construction.
+///
+/// The handshake join is by `(ifname, peer base64)` and comes from a second
+/// command, so the two halves of a tick are microseconds apart rather than
+/// atomic. Harmless by construction: both are folded into a window, and a
+/// skewed tick can only lose a sighting.
+fn sample_mech(
+    ns: &Ns,
+    own_epoch_hex: &str,
+    peer_epoch_hex: &str,
+    peer_epoch_b64: &str,
+    obs: &mut MechObs,
+) {
+    let devs = uapi_dump_all(ns);
+    let hs = latest_handshakes(ns);
+    for d in devs.iter().filter(|d| d.own_pub_hex.as_deref() == Some(own_epoch_hex)) {
+        obs.own_epoch_ifnames.insert(d.ifname.clone());
+        for (k, ep) in &d.peers {
+            if k == peer_epoch_hex {
+                if let Some(ep) = ep {
+                    obs.own_epoch_dials.insert((d.ifname.clone(), ep.clone()));
+                }
+            }
+        }
+        if let Some(secs) = hs.get(&(d.ifname.clone(), peer_epoch_b64.to_string())) {
+            obs.own_epoch_handshake = obs.own_epoch_handshake.max(*secs);
+        }
+    }
+    if devs.len() >= obs.devs.len() {
+        obs.devs = devs;
+    }
+}
+
+/// Where the Device holding `own_hex` currently listens and where it dials
+/// `peer_hex`: `(ifname, listen_port, endpoint)`, each `None` if not
+/// observable. The post-settle steady-state view — see the tier-4 block in the
+/// in-step test for what is required of it and why.
+fn settled_view(
+    devs: &[DevSnap],
+    own_hex: &str,
+    peer_hex: &str,
+) -> (Option<String>, Option<u16>, Option<String>) {
+    let Some(d) = devs.iter().find(|d| d.own_pub_hex.as_deref() == Some(own_hex)) else {
+        return (None, None, None);
+    };
+    let ep = d.peers.iter().find(|(k, _)| k == peer_hex).and_then(|(_, ep)| ep.clone());
+    (Some(d.ifname.clone()), d.listen_port, ep)
 }
 
 /// Diagnostics for a gateway that may hold ANY number of rotation Devices —
