@@ -431,10 +431,13 @@ async fn poll_rotation_complete(
 /// reads as a plain `0` rather than `wg show`'s humanized "56 years ago".
 ///
 /// `ip -br link` alongside `-br addr` because a rotation tun can exist
-/// without an address, and `ss -lunp` because the port side is ground
+/// without an address, and `ss -4 -lunp` because the port side is ground
 /// truth the `wg` view cannot give: it shows which socket actually owns
 /// each listen port, including the boringtun listeners known to leak
-/// across a rebind (`docs/research/socket-leak-on-rebind.md`).
+/// across a rebind (`docs/research/socket-leak-on-rebind.md`). `-4`
+/// because v1 is IPv4-only and the unfiltered form prints both a
+/// `0.0.0.0:` and a `*:` row per socket, doubling the output and making
+/// the per-port counts ambiguous to read.
 fn dump_diag(label: &str, gws: &[(&str, &Ns)], procs: &[(&str, &GwProc)]) {
     eprintln!("\n========== DIAGNOSTICS: {label} ==========");
     for (name, ns) in gws {
@@ -446,7 +449,7 @@ fn dump_diag(label: &str, gws: &[(&str, &Ns)], procs: &[(&str, &GwProc)]) {
             vec!["ip", "-br", "link"],
             vec!["ip", "-br", "addr"],
             vec!["ip", "route"],
-            vec!["ss", "-lunp"],
+            vec!["ss", "-4", "-lunp"],
         ] {
             let out = ns.exec(&cmd);
             match out {

@@ -12,8 +12,9 @@ an invitation to delete the item.** Re-audited against the code at `d4a0a55` on
 2026-08-11 &mdash; an item that reads as open but is actually done has already put this
 project two dispatches away from implementing the same fix twice.
 
-Ordered by what to pick up first. Items marked **READY** have a designed and verified
-fix shape and can go straight to test-authoring.
+Ordered by what to pick up first. Items marked **READY** had a designed and verified fix
+shape and could go straight to test-authoring &mdash; both of them (1 and 2) have since
+shipped, so nothing carries that marker right now. **Item 3 is what leads.**
 
 > **Before starting anything here, read [Recurring traps](#recurring-traps) at the
 > bottom.** Four of them have already caught someone, and three are in this backlog's

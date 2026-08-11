@@ -111,8 +111,11 @@ NOT start from the old note's mechanism, which describes a pre-PR-#51 world.
 # Instrumented re-run (2026-08-11) — the overlap tun already has the right answer
 
 Re-ran on `test/rotation-diag-overlap-tun` after widening `dump_diag` (`5b42f6b`) to dump
-every device plus `ss -lunp`. Still red, same assertion. But the device state now answers
-the open question, and the picture is **symmetric and deterministic**, not racy.
+every device plus `ss -4 -lunp`. Still red, same assertion. But the device state now answers
+the open question. The LAYOUT was **symmetric within this run** — both gateways showed the
+identical device/endpoint/handshake shape. The endpoint SELECTION remains **nondeterministic
+across runs** (see below). Two runs cannot establish the absence of a race, and nothing here
+should be read as having done so.
 
 ## Measured
 
@@ -133,13 +136,15 @@ So the correct endpoint is **already computed and already on the box**, one devi
 where it is needed. This is not a missing value; it is a value that one builder derives
 correctly and another does not.
 
-Yesterday's run saw `:51822` on one side; today both sides show `:51820`. The wrong value
-varies between runs, but "wrong" does not — and the RIGHT value is consistently present on
-`wg0o0`.
+Yesterday's run saw `:51822` on one side; today both sides show `:51820`. So the specific
+wrong value is not stable across runs, and no fix should be designed against a fixed offset.
+What IS consistent across both runs is which device is wrong: **`wg0e1`'s endpoint is always
+WRONG and `wg0o0`'s is always RIGHT.** The wrongness is stable even though the wrong value is
+not — that is the actionable part.
 
-## Socket counts, from `ss -lunp` (new evidence)
+## Socket counts, from `ss -4 -lunp` (new evidence)
 
-gwA, IPv4 rows: **2 sockets on :51820, 3 on :51821, 2 on :51822.** This is the leak recorded
+gwA: **2 sockets on :51820, 3 on :51821, 2 on :51822.** This is the leak recorded
 in backlog item 26 / `socket-leak-on-rebind.md`, observed live here.
 
 ## An inference, explicitly NOT measured
@@ -157,7 +162,7 @@ deterministically"; that argument says which socket wins, not that the winner is
 device layer is reading.
 
 **This is reasoning from device state, not a measurement.** It would be confirmed by
-correlating the fds in `ss -lunp` with the boringtun instance that owns each device.
+correlating the fds in `ss -4 -lunp` with the boringtun instance that owns each device.
 
 ## Where to look first
 
