@@ -174,3 +174,108 @@ be".
 
 If the leaked-socket hypothesis also holds, item 26 stops being cosmetic and becomes part of
 this blocker.
+
+---
+
+# MECHANISM FOUND (2026-08-11) — a clobber apply, not a builder divergence
+
+Traced read-only against `main` at `0218b57`; every claim below was verified against the
+code, not doc comments.
+
+**It is not a builder divergence.** `wg0e1`'s endpoint is not *computed* wrong — it is
+*inherited* from the base-tun world by a rebuild that also destroys the session.
+
+## The three endpoint derivations (verified)
+
+| builder | builds | endpoint | value |
+|---|---|---|---|
+| `pending_peer_configs` (`reconcile.rs:89-95`) | `wg0o0` overlap | `candidate_port + OWN_TUN_PORT_OFFSET` | **`:51821` correct** |
+| `device_config_at_port` (`reconcile.rs:246-252`) | `wg0e1` **at creation** | **`endpoint: None`** — *"receive-and-roam, never dial"* | none |
+| `device_config_pinned` (`reconcile.rs:174-180`) | the ACTIVE tun | `live_endpoints[gid]` else `primary_endpoint()` | **both base-port** |
+
+`pending_peer_configs` is the ONLY builder that knows it is dialling a rotation-epoch
+device. `device_config_pinned` takes `listen_port` as a parameter but derives the peer
+endpoint from `(candidates, live_endpoints)` — a per-PEER map, not a per-DEVICE one. It has
+no notion of which device it is building for.
+
+`primary_endpoint()` is `candidates.first()`, and every candidate is base-port by
+construction: the observe socket is bound to `cfg.wg_listen_port` for process life, and
+reported locals are always `netif::local_wg_endpoints(cfg.wg_listen_port)`. **`:51821` cannot
+enter the candidate list at all.**
+
+## The trigger: the Role-B collapse unpin forces a `replace_peers`
+
+`maybe_collapse_role_b` does `rot.wg0_pins.lock().unwrap().remove(aid)` (`main.rs:4719`)
+immediately before `apply_state` on the same `State` event. Its own doc comment
+(`main.rs:4682-4687`) states the consequence:
+
+> unpin `wg0_pins[gid]`, so the apply rebuilds `wg0`'s entry for this peer with its NEW
+> active key … **the key change defeats both the change-guard and the pure-addition
+> incremental path, so a full rebuild is guaranteed by that very apply**
+
+**That comment says `wg0`. `apply_state` resolves `a.ifname` — the ACTIVE tun
+(`main.rs:3495-3497`) — which after our own Role-A cutover is `wg0e1`.** A load-bearing
+prose error: the sentence was written for a world where our own cutover had not happened.
+
+Forced chain:
+1. peer promotes → `pending_key()` becomes `None`, `active_pubkey_b64` becomes epoch-1
+2. unpin → `device_config_pinned` emits the peer under the **epoch-1** key; `wg0e1` holds it
+   under **epoch-0** (what `device_config_at_port` installed)
+3. `classify_peer_delta` → key present-then-absent → `NeedsFullApply`
+4. `uapi::apply` with `replace_peers=true` → boringtun `clear_peers()` → **every peer's
+   `Tunn` and byte counters rebuilt from zero**, new block carrying
+   `endpoint = live_endpoints[gid] = :51820`
+
+## This dissolves the "unexplained" observation — no leaked socket needed
+
+The earlier inference that a leaked socket on `:51821` was servicing handshakes is
+**unsupported**. The real explanation: `wg0o0`'s private key is our epoch-0 key, and the
+peer's `wg0e1` peer-set was built from our epoch-0 pubkey — so `wg0o0 → peer:51821`
+handshakes for real (the 84/84). Then the peer's own collapse-unpin apply `clear_peers()`-es
+its `wg0e1`, **zeroing exactly the record we went looking for.** Symmetric both sides.
+
+The socket leak (item 26) is real but is NOT required to explain this shape.
+
+## And it explains the nondeterminism without any race in port arithmetic
+
+The candidate list can only ever yield `:51820`, so the variation comes entirely from
+`live_endpoints`: whether a roamed endpoint got captured by the read-through **before** the
+clobber apply fired. `:51822` = the peer's overlap source port, roamed-to and read back;
+`:51820` = the stale punch pin, never displaced. Same bug, two arrival orders — a race in
+TIME, not in the port formula.
+
+## The read-through: right device, wrong side of the clobber
+
+**Refuted:** the hypothesis that `wg0e1` is never the judged device. `run_path_ticks` re-reads
+the active ifname every tick (`main.rs:2738`), so after the cutover it IS polling `wg0e1`.
+
+**Confirmed, but a different gap:** the read-through is keyed by the peer's currently
+advertised active pubkey (`main.rs:2856-2867`). After the peer promotes, `hex` flips to
+epoch-1 while `wg0e1` still holds epoch-0 until the clobber → `liveness.get(&hex)` is `None`
+→ the SM receives no evidence at all. That is why there are no read-through lines and no
+degrade churn.
+
+**Decisive:** the read-through can only echo back what the device already has. It has no
+mechanism to PRODUCE `:51821`, because nothing ever wrote it. Post-clobber it will read
+`:51820` off the device and pin it into `live_endpoints` — **cementing the wrong value as
+durable state.** Amplifier, not corrector.
+
+## Checked and NOT the cause
+
+- No surviving epoch-delta formula. `OWN_TUN_PORT_OFFSET` appears only in `tunnelset.rs`
+  (the allocator/reservation) and `reconcile.rs:92`. v0.7.2's deletion was complete.
+- `device_config_at_port` emitting a wrong endpoint — it emits `None`.
+- Candidate-list ordering — cannot yield anything but base-port.
+- The punch path writing post-cutover — it yields without touching the device when the path
+  is `Direct`. It IS the origin of the stale `:51820` pin, written pre-cutover on the base tun.
+- The Role-B collapse gate as root cause — it is stuck, but downstream: it waits on liveness
+  the clobber *it triggered* made unreachable. Cause and symptom are the same apply.
+
+## One line
+
+`pending_peer_configs` gets `:51821` because it is the only builder that knows it is
+dialling a rotation-epoch device. `wg0e1` gets `:51820` because after the Role-A cutover it
+becomes "the active tun" and is rebuilt by the device-agnostic `device_config_pinned`, whose
+two endpoint sources both describe the peer's BASE port — and that rebuild is FORCED by the
+Role-B collapse unpin, whose `replace_peers` also destroys the session `wg0o0`'s counters
+prove really existed.
