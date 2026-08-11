@@ -97,16 +97,28 @@ Netns-first is wrong: ~2 min serial, and the file also holds
    `wg0e1`'s endpoint must be `:51821` with a non-zero handshake. **A green run still
    showing `:51820` passed for the wrong reason.**
 
-Follow-up, separate change: a post-SETTLE reachability check (ping after both
-renormalizations). Nothing covers that today, and it is the only assertion that would catch
-the hazard below.
+4. **Post-SETTLE reachability — PART OF THE DONE BAR, not a follow-up.** Ping after BOTH
+   sides have renormalized, i.e. after the enforcer gauge returns to 1 on each.
+
+   This was originally scoped as a separate follow-up. That was wrong, and a review caught
+   it: the plan names the post-retire mutual pin as its sharpest availability risk AND
+   states that this check is the only assertion that detects it. Deferring it means **the
+   done bar can go green while both gateways are unreachable in steady state** — the exact
+   failure the fix exists to prevent, merely relocated past the assertion window. A 45s
+   degrade-and-recover path is not a substitute for proving steady-state reachability.
+
+   Make it deterministic rather than hoping for the interleaving: drive the two
+   renormalizations close together (or assert directly on the post-settle peer endpoint of
+   each side, which is checkable without racing). If a deterministic near-simultaneous
+   renormalize cannot be forced, assert the endpoints AND ping, and say in the test which
+   part is timing-dependent.
 
 ## Risks
 
 The enumerated regression surface is contained because the builder signature does not change
 and the gate makes the new path a literal no-op for every peer in every existing test.
 
-**The one to watch:** after BOTH sides retire, both may be pinned at the other's `:51821`
+**The one to watch (now covered by done-bar tier 4, above):** after BOTH sides retire, both may be pinned at the other's `:51821`
 while both listen on `:51820` — a mutual black hole. Mitigated by an existing detail:
 `renormalize_active_listen_port` pokes every peer right after moving the port, and the first
 side to renormalize pokes while the other is still on `:51821`. Residual risk only if that
