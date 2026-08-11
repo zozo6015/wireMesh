@@ -105,3 +105,72 @@ The problem is **narrower and more tractable** than "permanent deadlock". The ro
 machinery works; traffic survives; the state machine terminates. What is broken is a single
 programmed endpoint on one device, chosen nondeterministically wrong. Start there — and do
 NOT start from the old note's mechanism, which describes a pre-PR-#51 world.
+
+---
+
+# Instrumented re-run (2026-08-11) — the overlap tun already has the right answer
+
+Re-ran on `test/rotation-diag-overlap-tun` after widening `dump_diag` (`5b42f6b`) to dump
+every device plus `ss -4 -lunp`. Still red, same assertion. But the device state now answers
+the open question. The LAYOUT was **symmetric within this run** — both gateways showed the
+identical device/endpoint/handshake shape. The endpoint SELECTION remains **nondeterministic
+across runs** (see below). Two runs cannot establish the absence of a race, and nothing here
+should be read as having done so.
+
+## Measured
+
+Both gateways, identical shape:
+
+| device | listens | peer endpoint | latest handshake | transfer |
+|---|---|---|---|---|
+| `wg0o0` (Role-B overlap) | 51822 | `10.9.0.x:51821` **correct** | **24 s** | 84/84 (gwA), 168/84 (gwB) |
+| `wg0e1` (own new epoch) | 51821 | `10.9.0.x:51820` **wrong** | **0 — never** | **0/0** |
+| `wg0` (base, epoch 0) | 51820 | `10.9.0.x:51820` | 26 s | 1654/1654 |
+
+**`wg0o0` and `wg0e1` are configured with the SAME peer public key and DIFFERENT
+endpoints.** The overlap tun points at the peer's epoch-1 port (`:51821`) and is live. The
+own-epoch tun points at the peer's BASE port (`:51820`), where the peer's epoch-0 key sits,
+and has never completed a handshake. Routes are on `wg0e1` — the dead one.
+
+So the correct endpoint is **already computed and already on the box**, one device away from
+where it is needed. This is not a missing value; it is a value that one builder derives
+correctly and another does not.
+
+Yesterday's run saw `:51822` on one side; today both sides show `:51820`. So the specific
+wrong value is not stable across runs, and no fix should be designed against a fixed offset.
+What IS consistent across both runs is which device is wrong: **`wg0e1`'s endpoint is always
+WRONG and `wg0o0`'s is always RIGHT.** The wrongness is stable even though the wrong value is
+not — that is the actionable part.
+
+## Socket counts, from `ss -4 -lunp` (new evidence)
+
+gwA: **2 sockets on :51820, 3 on :51821, 2 on :51822.** This is the leak recorded
+in backlog item 26 / `socket-leak-on-rebind.md`, observed live here.
+
+## An inference, explicitly NOT measured
+
+There is a contradiction worth chasing. gwA's `wg0o0` records a completed handshake with the
+peer, and the peer's endpoint for that session is `10.9.0.2:51821`. On gwB, the device
+holding the matching epoch-1 private key and listening on 51821 is `wg0e1` — **yet gwB's
+`wg0e1` reports handshake 0 and zero bytes.** Something on gwB:51821 answered a handshake
+that `wg0e1` did not record.
+
+Hypothesis: one of the **three** sockets bound to :51821 is a leaked socket from an earlier
+apply that still holds the epoch-1 key, and it — not the live `wg0e1` device — is servicing
+those packets. Item 26 was downgraded on the reasoning that "newest-bound wins
+deterministically"; that argument says which socket wins, not that the winner is the one the
+device layer is reading.
+
+**This is reasoning from device state, not a measurement.** It would be confirmed by
+correlating the fds in `ss -4 -lunp` with the boringtun instance that owns each device.
+
+## Where to look first
+
+The fix is likely to make `wg0e1`'s peer endpoint come from wherever `wg0o0`'s comes from,
+rather than computing it again. Compare the two builders: whatever produces the overlap
+device's peer config gets `:51821` right, and whatever produces the own-epoch device's peer
+config does not. That comparison is a much smaller question than "what should the endpoint
+be".
+
+If the leaked-socket hypothesis also holds, item 26 stops being cosmetic and becomes part of
+this blocker.

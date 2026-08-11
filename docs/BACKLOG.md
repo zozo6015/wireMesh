@@ -1,11 +1,20 @@
 # WireMesh backlog
 
-**As of `v0.7.5` (2026-08-07).** 24 open items. Every one has a verified mechanism —
-these are not guesses, and where a claim was checked and turned out wrong, that is
-recorded too.
+**As of `v0.9.0` (2026-08-10).** 24 open items of 31 numbered. Every one has a verified
+mechanism &mdash; these are not guesses, and where a claim was checked and turned out
+wrong, that is recorded too.
 
-Ordered by what to pick up first. Items marked **READY** have a designed and verified
-fix shape and can go straight to test-authoring.
+Seven are fully resolved and kept below as historical notes &mdash; **1, 2 (all four
+sub-items), 16, 22, 24, 25 and 30**. Item **23 is partially resolved** and still counted
+open: its fatal, remotely-reachable half shipped, one named controller door did not. A
+closed item keeps its mechanism and its lesson, so **do not read a `RESOLVED` heading as
+an invitation to delete the item.** Re-audited against the code at `d4a0a55` on
+2026-08-11 &mdash; an item that reads as open but is actually done has already put this
+project two dispatches away from implementing the same fix twice.
+
+Ordered by what to pick up first. Items marked **READY** had a designed and verified fix
+shape and could go straight to test-authoring &mdash; both of them (1 and 2) have since
+shipped, so nothing carries that marker right now. **Item 3 is what leads.**
 
 > **Before starting anything here, read [Recurring traps](#recurring-traps) at the
 > bottom.** Four of them have already caught someone, and three are in this backlog's
@@ -15,7 +24,41 @@ fix shape and can go straight to test-authoring.
 
 ## Do these first
 
-### 1. READY &mdash; Unvalidated `local_endpoints` breaks every gateway's device apply
+**Both items in this section have shipped** (item 1 in v0.7.6, item 2's last sub-item in
+v0.9.0). What leads next is not here &mdash; it is **item 3**, the in-step rotation
+blocker, which is what still holds `WIREMESH_ROTATION_INTERVAL=off` on the live fabric.
+Items 1 and 2 stay in place, and stay first, because every later item's reasoning cites
+theirs.
+
+### 1. RESOLVED &mdash; Unvalidated `local_endpoints` breaks every gateway's device apply
+
+**Shipped in v0.7.6 (PR #59, commits `77ca6f7` + `8fcde64`), both layers as prescribed.**
+Controller ingress: `services::sync::usable_local_candidates` (`sync.rs:108`) filters
+`req.local_endpoints` entry-by-entry against the shared
+`db::is_usable_candidate_endpoint` predicate (`db.rs:491`) and bounds the set at
+`MAX_LOCAL_CANDIDATES = 32` (`sync.rs:70`) &mdash; filtering with a log, not rejecting the
+RPC, and called at `sync.rs:1729` **before** `set_local_candidates` persists anything.
+Gateway ingress: `PeerState::from_proto` routes `candidates` through `retain_dialable`
+(`state.rs:411`), and the `state.json` escape the item singles out as load-bearing is
+closed at the field &mdash; `#[serde(default, deserialize_with = "deserialize_dialable_candidates")]`
+on `PeerState::candidates` (`state.rs:85`), so `DesiredState::load`'s bare
+`serde_json::from_slice` cannot rebuild an unfiltered set. The `PunchDirective` path is
+covered by the controller-side check exactly as the item insists; **it is still not
+redundant.** Covered by `wiremesh-controller/tests/report_local_endpoints_validation.rs`,
+`tests/candidate_cap_gateway_relation.rs`, `wiremesh-gateway/tests/candidate_ingest_validation.rs`,
+`tests/uapi_endpoint_validation.rs` and `tests/predicate_equality.rs` (which pins the
+two predicates' agreement as a contract).
+
+Deliberately **not** taken, and still undecided: whether `encode_set` should skip a
+malformed peer rather than failing the whole device apply. That fail-open/fail-closed call
+was flagged below as not-to-be-smuggled-in, and it wasn't.
+
+The sibling validators are items 23 and 24, both since addressed &mdash; see their
+headings for what actually shipped and, for 23, what did not. Kept below as a
+**historical note**: the crash mechanism it traces (`push_peer_block` &rarr; `encode_set`
+&rarr; `apply_state`'s `?` &rarr; process exit, on every peer at once, then an unbootable
+gateway) is cited verbatim by items 16, 23, 24, 25, 26 and 28, and it is the reasoning to
+reuse the next time a remote-supplied string reaches the UAPI.
 
 **Fabric-wide availability defect, reachable from one gateway.**
 
@@ -93,12 +136,47 @@ today. Do not read a green item 1 as closing the family.
 
 Tests: all pure, no netns. Nothing covers this today.
 
-### 2. READY &mdash; Operator CRD surface (three items remain, one minor release &mdash; 2c shipped in PR #59)
+### 2. RESOLVED &mdash; Operator CRD surface (all four sub-items shipped)
+
+**Complete as of v0.9.0.** 2c in v0.7.6 (PR #59), 2a and 2d in v0.8.0 (PR #61), 2b in
+v0.9.0 (PR #65) &mdash; so the "ship these together" advice was **not** followed, and the
+cost it predicted was real: three CRD-bearing releases, three mandatory manual
+`kubectl apply` re-applies rather than one. Worth remembering, not worth re-litigating.
+
+All three new spec properties are on the CRDs (`crd.rs`):
+`WiremeshControllerSpec::rotation_interval` (`crd.rs:75`),
+`WiremeshGatewaySpec::metrics_bind` (`crd.rs:194`),
+`WiremeshRelaySpec::controller_endpoint` &mdash; each `Option` +
+`skip_serializing_if = "Option::is_none"` as prescribed, and both YAML bundles are
+regenerated and pinned byte-for-byte by `tests/crd_manifest_freshness.rs`.
+
+Two residuals were filed rather than fixed, and both are still open: **item 29**
+(`rotationInterval` has no admission-time validation, descoped from 2a) and **item 31**
+(`WiremeshRelay` cannot carry a typed `ScaledDown` condition). Read each sub-item below
+for what shipped versus what its analysis prescribed &mdash; **2a's shipped shape is the
+inverse of the one this section argues for**, deliberately and for a good reason.
 
 **Ship these together.** Every CRD change costs users a mandatory manual re-apply
 (Helm never upgrades CRDs), so splitting them means two re-applies for no reason.
 
-**2a. No CRD field for `WIREMESH_ROTATION_INTERVAL`.** The key appears nowhere in
+**2a. RESOLVED &mdash; no CRD field for `WIREMESH_ROTATION_INTERVAL`.** Shipped in v0.8.0
+(PR #61, commits `b8ae23a`, `0be1aea`, `b96d8ed`), pinned by
+`crates/wiremesh-operator/tests/controller_rotation_interval.rs` (8 tests).
+
+> **What shipped is the INVERSE of the emission rule this sub-item argues for, and that
+> is deliberate.** The text below says **"Emit only when `Some`"**, on the reasoning that
+> emitting the key with a default makes the operator *own* it under `.force()` and would
+> silently overwrite a human's `off`. What `workloads.rs:485` actually does is emit it
+> **unconditionally**: `env("WIREMESH_ROTATION_INTERVAL", spec.rotation_interval.as_deref().unwrap_or("off"))`.
+> The trap the paragraph identifies is real; the fix inverts its own conclusion by
+> choosing a *safe* default rather than no default. `off` is the mitigation value, so
+> operator ownership now pins rotation OFF instead of re-enabling it, and the **"second
+> trap, from the opposite direction"** &mdash; removing the field from the CR re-enabling
+> rotation on the 30-day default &mdash; is defused by the same stroke: unset means `off`,
+> not `30d`. Read the analysis below for the SSA mechanics, which are unchanged and
+> correct; do not read its emission prescription as describing the code.
+
+The original finding: the key appears nowhere in
 `wiremesh-operator` or `deploy/`, and `.force()` is on both apply paths
 (`controllers::apply`, `controllers::apply_deployment`). **Not an empty list:**
 `controller_deployment` emits `env: Some(vec![..])` with **seven** entries
@@ -161,7 +239,24 @@ controller rejects at boot, i.e. CrashLoopBackOff.
 > interval crash-loops the controller pod (visible, recoverable). Still worth doing; not
 > worth coupling.
 
-**2b. `args` and `replicas` are force-clobbered with no override.** Upstream
+**2b. RESOLVED &mdash; `args` and `replicas` were force-clobbered with no override.**
+Shipped in v0.9.0 (PR #65, commit `7d80233`), all four pieces, and the AMENDED note below
+is the accurate account of where the condition work landed. `metricsBind` is a typed
+`Option<String>` (`crd.rs:194`) consumed at `workloads.rs:714`
+(`.unwrap_or("0.0.0.0:9090")`) and validated in the reconciler by a purpose-written
+`validate_bind_target` &mdash; **not** `validate_dial_target`, exactly as this sub-item
+demands (`controllers/gateway.rs:304-320`, `Error::Admin`). No `extraArgs` was added.
+`replicas` is released rather than force-set, via a single `released_replicas()` helper
+called by all three workload builders (`workloads.rs:153`, `557`, `798`, `993`) whose doc
+comment carries the four-scenario SSA ownership-transfer analysis. Readiness moved to the
+shared pure `workload_readiness` (item 30). Tests:
+`tests/gateway_metrics_bind_override.rs` (11), `tests/replicas_omitted_scaledown_condition.rs`
+(7), and `tests/enroll_init_container_arg_pinning.rs` (6) &mdash; which closes the gap this
+sub-item names precisely, pinning `--cidr`, `--token-file` and `--state-dir` plus the
+relay's `wiremesh-relay-enroll` args, not just the one gateway `--controller` element the
+pre-existing test covered.
+
+The original finding: upstream
 `Container.args` is `x-kubernetes-list-type: atomic` (as is `Container.command`, which the
 enroll init-containers set), so unlike `env` there is **no per-element survival** &mdash;
 hand-added flags are wiped wholesale and the gateway's `--metrics 0.0.0.0:9090` is
@@ -278,7 +373,17 @@ rewrites both YAML files, and this test is what would catch it: document order i
 deterministic only because `all_crds()` returns an explicit `vec![..]`, and property order is
 alphabetical only because `schemars` is built without `preserve_order`.
 
-**2d. Relay `--controller` has no CRD override.** Derived from the in-cluster ClusterIP.
+**2d. RESOLVED &mdash; relay `--controller` had no CRD override.** Shipped in v0.8.0
+(PR #61, commit `b65ef57`), all four pieces and the asymmetry handled as prescribed: the
+field plus serde attrs in `crd.rs`, validation in the **reconciler** &mdash;
+`controllers/relay.rs:101-105`, a `validate_dial_target` call inside the same
+`for (field, value)` loop shape `apply_gateway` uses, returning `Error::Admin` before any
+mint/PVC/Deployment side effect, so `relay_deployment`'s own fail-closed check does not
+become a second validation site &mdash; the `as_deref().unwrap_or(..)` in the builder, and
+`tests/relay_controller_endpoint_override.rs` (5 tests) alongside
+`gateway_endpoint_overrides.rs`.
+
+The original finding: derived from the in-cluster ClusterIP.
 Since the control plane moved to the px host, an in-cluster relay cannot be pointed at it
 &mdash; the identical failure that gave the gateway `syncEndpoint`. Same shape as
 `WiremeshGatewaySpec::sync_endpoint`, four pieces: the field plus serde attrs in `crd.rs`;
@@ -400,9 +505,19 @@ Suspected contributor to the zero-drop flake &mdash; but **note the constraint**
 also fire at the *minimum* flood window, so "the rotation got slower" is not a complete
 mechanism.
 
-### 16. Remaining IPv4-validation gap
+### 16. RESOLVED &mdash; remaining IPv4-validation gap
 
-Largely subsumed by item 1. Two of the three originally-filed sites are **closed as safe**
+**Closed by item 1 shipping in v0.7.6 (PR #59), exactly as this item predicted &mdash; no
+code of its own.** `reconcile::pending_peer_configs` still does the `rsplit_once(':')`
+string surgery (`reconcile.rs:90`), and that is fine: the string it operates on comes from
+`p.primary_endpoint()`, i.e. `PeerState::candidates[0]`, which is now filtered at **both**
+gateway doors (`retain_dialable` in `from_proto`, `deserialize_dialable_candidates` on the
+`state.json` field). The half-check is unreachable rather than removed. **The trap this
+creates is already recorded** &mdash; see "A half-check reads as a check" at the bottom:
+retiring the door filter on the grounds that this site "already parses" reopens item 16
+with no test failing.
+
+Kept as a historical note. The two other originally-filed sites were **closed as safe**
 (the observed endpoint is only a log line; the relay dial target is triple-guarded). The
 third is `pending_peer_configs`' `rsplit_once(':')` string surgery &mdash; real, but the
 least important of its family, and fixed for free by item 1's `PeerState::from_proto` filter.
@@ -464,8 +579,15 @@ on a plain runner.
 ## Ingress validation &mdash; item 1's siblings
 
 Filed 2026-08-10 from an independent audit of `push_peer_block`, and **out of scope for
-item 1's branch** by owner decision. Numbered here to keep the file's numbers ascending;
-**item 23 is HIGH and belongs with "Do these first" by priority.**
+item 1's branch** by owner decision. Numbered here to keep the file's numbers ascending.
+
+> **Status as of v0.8.0 (PR #62, commit `f4a9c87`): item 24 is RESOLVED and item 23 is
+> PARTIALLY resolved.** All three fatal validators are now unreachable from the gateway
+> side, so the fabric-wide crash-and-cannot-boot mechanism this section describes is
+> closed. **Item 23 is no longer HIGH and no longer "remotely reachable today"** &mdash;
+> item 1's closing paragraph still says it is, and that sentence is stale (left in place
+> because item 1 is preserved as a historical note). One named controller door remains
+> unvalidated; see item 23 for exactly which and why.
 
 Item 1 fixes one of **three** fatal validators in `wiremesh_gateway::uapi::push_peer_block`
 (`crates/wiremesh-gateway/src/uapi.rs:134-143`): `validate_ipv4_endpoint(ep)?` (item 1),
@@ -480,9 +602,52 @@ with the controller out of the loop &mdash; transfers verbatim.
 Line numbers are as of `fix/validate-local-endpoints`; per the last trap below, trust the
 symbols over the numbers.
 
-### 23. HIGH &mdash; `Peer.keys[].pubkey` is item 1's bug on a sibling field
+### 23. LOW (residual) &mdash; `Peer.keys[].pubkey` is item 1's bug on a sibling field
 
-**Remotely reachable today.** `key_b64_to_hex` (`uapi.rs:47-54`) errors on non-base64, or
+> **PARTIALLY RESOLVED in v0.8.0 (PR #62, commit `f4a9c87`). Downgraded HIGH &rarr; LOW.
+> Do not implement this from scratch &mdash; read what shipped first.**
+>
+> **Shipped &mdash; the fatal half.** Gateway side, both doors, mirroring item 1:
+> `PeerState::from_proto` filters `active_pubkey_b64` through `uapi::pubkey_b64_to_hex`
+> (`state.rs:388-393`), and `#[serde(default, deserialize_with = "deserialize_valid_active_pubkey")]`
+> (`state.rs:42`) covers the `state.json` path. An undecodable ACTIVE key drops the whole
+> peer &mdash; a deliberately different shape from item 24's per-entry filtering, because
+> `PeerConfig.public_key_b64` is a `String`, not an `Option`, so there is no keyless WG
+> block to emit. Controller side, the `Enroll` door: `services/enrollment.rs:266-272`
+> rejects a non-empty `wg_pubkey` that is not base64-of-32-bytes with
+> `Status::invalid_argument`, **before any DB write**, so a rejected attempt does not
+> consume the single-use token. Empty stays legal &mdash; it is the cycle-2 placeholder
+> branch. Tests: `wiremesh-gateway/tests/peer_key_and_allowedips_validation.rs` (13) and
+> `wiremesh-controller/tests/enroll_wg_pubkey_validation.rs` (2).
+>
+> **Not shipped &mdash; the `SubmitEpochKey` door.** `services/sync.rs:2003` still calls
+> `self.db.set_epoch_pubkey(gw.id, epoch, req.pubkey)` with no decode and no length check;
+> `check_session_generation` remains the only gate before it, and `set_epoch_pubkey` is a
+> CAS over the sentinel, not a validator. Deferred on purpose: roughly eight already-green
+> rotation tests across `epoch_key_submit.rs`, `rotation.rs`, `rotation_disabled.rs` and
+> others submit placeholder pubkeys (`"REALKEY=="`, `"NO-WATCH-KEY=="`) and assert success,
+> so validating this path turns them red, and rotation is this project's most delicate
+> subsystem. **That fixture rot is itself a finding**: those literals encode keys that
+> could never work in production.
+>
+> **Why LOW, not HIGH.** The gateway-side filter closes the crash-loop regardless of which
+> controller path admitted the key, so what remains costs defence-in-depth, not the fix.
+> The controller is still the only choke point between "what a gateway claims" and "what
+> every peer is told", which is why the residual is worth closing &mdash; alongside the
+> fixture cleanup, not before it.
+>
+> **A mechanism correction, load-bearing for whoever finishes this.** The fix shape below
+> says to filter at "the same door item 1 opened". That is right for `active_pubkey_b64`
+> and **wrong for `keys[]`**, which is filtered at the `pending_peer_configs` BUILDER
+> instead (`reconcile.rs:76-89`). `rotation::decide_role_b` must distinguish
+> `RoleBDecision::Unusable { pending_epoch }` (pending key present, undecodable) from
+> `Skip` (no pending key at all), and it reads the `keys` vec to do it &mdash; dropping a
+> bad-keyed entry at ingest collapses those two into `Skip` and silently changes rotation
+> behaviour. Rationale and a hypothesis that was checked and found WRONG are recorded in
+> `docs/research/gateway-key-filter-placement.md`.
+
+The original finding, kept as the historical record. `key_b64_to_hex` (`uapi.rs:47-54`)
+errors on non-base64, or
 on a decode that is not exactly 32 bytes.
 
 Both doors are open. **Gateway side:** `reconcile::peer_configs`
@@ -512,9 +677,25 @@ half:** validate at `enroll` and at `SubmitEpochKey`, mirroring the existing rel
 precedent at `services/enrollment.rs:121` &mdash; that precedent exists and was never
 applied to pubkeys.
 
-### 24. MEDIUM &mdash; `Peer.allowed_ips` is unfiltered at both doors
+### 24. RESOLVED &mdash; `Peer.allowed_ips` was unfiltered at both doors
 
-`state.rs:126` is `allowed_ips: p.allowed_ips.clone()`, no filter, and the field
+**Shipped in v0.8.0 (PR #62, commit `f4a9c87`), both doors.** `PeerState::from_proto` now
+routes `allowed_ips` through `retain_valid_cidrs` (`state.rs:418`), and the unguarded
+`state.json` half this item calls out &mdash; the field carried **no serde attribute at
+all** &mdash; is closed by `#[serde(deserialize_with = "deserialize_valid_cidrs")]`
+(`state.rs:102`). Filtering is per-ENTRY and never drops the peer, which survives with
+whatever CIDRs remain: `allowed_ips` is a list like `candidates`, not a required scalar
+like `active_pubkey_b64`. Covered by
+`crates/wiremesh-gateway/tests/peer_key_and_allowedips_validation.rs` (13 tests, shared
+with item 23's gateway half).
+
+**The open design question below is answered, by what shipped.** The invariant taken is
+the broad one &mdash; "`PeerState` cannot hold anything `encode_set` would reject" &mdash;
+so item 24 was in scope alongside item 23 rather than being ruled out as
+not-gateway-reported. Kept as a historical note.
+
+The original finding: `state.rs:126` was `allowed_ips: p.allowed_ips.clone()`, no filter,
+and the field
 (`state.rs:66`) carries **no serde attribute**, so the `state.json` half is unguarded too
 &mdash; contrast `candidates`, which item 1 gives a `deserialize_with`. `validate_ipv4_cidr`
 (`uapi.rs:110-123`) rejects a non-CIDR / non-IPv4 / prefix>32 entry with the same fatal `?`.
@@ -532,9 +713,27 @@ are both in scope. If it is the narrower "only the gateway-reported field", then
 **still** in scope (`wg_pubkey` is gateway-reported) and item 24 is not. Nobody has stated
 which.
 
-### 25. LOW &mdash; the controller filter is ingest-only; legacy `gateway_candidate` rows are never revalidated
+### 25. RESOLVED &mdash; the controller filter was ingest-only; legacy `gateway_candidate` rows were never revalidated
 
-`usable_local_candidates` runs only in `SyncSvc::report` (`services/sync.rs:1727`), and
+**Shipped in v0.7.6 (PR #59, commit `8fcde64`) &mdash; the same branch's follow-up, as a
+read-side filter rather than a migration.** `Db::candidates_for` now passes **both** the
+observed slot and every local row through `is_usable_candidate_endpoint` before returning,
+dropping bad ENTRIES and never erroring the call, so a row written by a pre-fix binary is
+never served into `Peer.candidate_endpoints` (`routes.rs`) or `PunchDirective.candidates`
+(`broker.rs`) no matter how long it sits in the table. That is why no backfill was needed
+&mdash; the rows may persist, but nothing reads them out. Pinned by
+`crates/wiremesh-controller/tests/candidates.rs`, which added
+`a_persisted_pre_filter_local_row_with_a_non_ipv4_endpoint_is_not_returned`,
+`valid_sibling_local_rows_survive_when_a_bad_row_is_also_present` and
+`a_gateway_whose_local_rows_are_all_invalid_yields_an_empty_list_not_an_error`.
+
+**One half was deliberately left, and it is filed separately: the read filter covers SHAPE
+but not SIZE.** A pre-cap row set is still returned in full, paying the `Vec::contains`
+dedup's O(n²) cost on every projection build. That is **item 28**, which also records why
+a SQL `LIMIT` is the wrong fix. Kept as a historical note.
+
+The original finding: `usable_local_candidates` runs only in `SyncSvc::report`
+(`services/sync.rs:1727`), and
 `Db::set_local_candidates` is a full REPLACE (`db.rs:3098-3140`) &mdash; so an **actively
 reporting** gateway self-heals on its next report. A gateway that is offline, has stopped
 reporting, or is de-rostered keeps whatever rows it wrote before the fix shipped, and

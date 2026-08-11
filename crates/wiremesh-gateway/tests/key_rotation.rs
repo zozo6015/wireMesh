@@ -402,14 +402,54 @@ async fn poll_rotation_complete(
     }
 }
 
+/// Dumps each gateway's device, routing and socket state (plus its stderr
+/// tail) to the test's stderr on a failure path. Purely diagnostic —
+/// nothing asserts on any of it; it exists so a red run leaves behind
+/// enough independent evidence to diagnose without a re-run.
+///
+/// `wg show all` rather than a hardcoded device list, because rotation
+/// device names are DERIVED, not fixed (`tunnelset::plan_ifname`): an
+/// own-epoch tun is `wg0e<epoch>`, unbounded in the epoch number, and an
+/// overlap tun takes the first free slot `wg0o<0..MAX_ROTATION_TUNS>`. The
+/// list this replaced was `wg0` + `wg0e1` only, which meant **`wg0o0` — the
+/// Role-B overlap tun — was never dumped, and that is the device that can
+/// hold the live session while the routes point at `wg0e1`** (measured
+/// 2026-08-10, `docs/research/in-step-rotation-rebaselined.md`): the one
+/// device carrying working traffic was the only one we had no device-level
+/// evidence about, known solely from the gateway's own log line. `all`
+/// enumerates whatever is actually in the namespace, so a second overlap
+/// or a higher epoch cannot go missing the same way.
+///
+/// The three compact `wg show all <field>` views are one scannable line per
+/// peer per device, which the full dump is not once four rotation devices
+/// exist. `endpoints` is the field the in-step defect lives in (a peer
+/// endpoint programmed to the wrong port, nondeterministically), and
+/// `latest-handshakes` next to `transfer` makes a zeroed handshake
+/// alongside nonzero counters — the unexplained `wg0` observation in that
+/// same note — a two-line comparison instead of an accident. Note
+/// `latest-handshakes` prints raw epoch seconds, so a zeroed timestamp
+/// reads as a plain `0` rather than `wg show`'s humanized "56 years ago".
+///
+/// `ip -br link` alongside `-br addr` because a rotation tun can exist
+/// without an address, and `ss -4 -lunp` because the port side is ground
+/// truth the `wg` view cannot give: it shows which socket actually owns
+/// each listen port, including the boringtun listeners known to leak
+/// across a rebind (`docs/research/socket-leak-on-rebind.md`). `-4`
+/// because v1 is IPv4-only and the unfiltered form prints both a
+/// `0.0.0.0:` and a `*:` row per socket, doubling the output and making
+/// the per-port counts ambiguous to read.
 fn dump_diag(label: &str, gws: &[(&str, &Ns)], procs: &[(&str, &GwProc)]) {
     eprintln!("\n========== DIAGNOSTICS: {label} ==========");
     for (name, ns) in gws {
         for cmd in [
-            vec!["wg", "show", "wg0"],
-            vec!["wg", "show", "wg0e1"],
+            vec!["wg", "show", "all"],
+            vec!["wg", "show", "all", "endpoints"],
+            vec!["wg", "show", "all", "latest-handshakes"],
+            vec!["wg", "show", "all", "transfer"],
+            vec!["ip", "-br", "link"],
             vec!["ip", "-br", "addr"],
             vec!["ip", "route"],
+            vec!["ss", "-4", "-lunp"],
         ] {
             let out = ns.exec(&cmd);
             match out {
