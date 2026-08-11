@@ -4680,11 +4680,18 @@ async fn retire_stale_overlap(
 /// Sequence:
 ///
 ///  (a) HERE (sync, before the caller's `apply_state` for the same delta):
-///      unpin `wg0_pins[gid]`, so the apply rebuilds `wg0`'s entry for this
-///      peer with its NEW active key (`device_config_pinned` falls back to
+///      unpin `wg0_pins[gid]`, so the apply rebuilds this peer's entry with
+///      its NEW active key (`device_config_pinned` falls back to
 ///      `active_pubkey_b64` once no pin exists; the key change defeats both
 ///      the change-guard and the pure-addition incremental path, so a full
-///      rebuild is guaranteed by that very apply);
+///      rebuild is guaranteed by that very apply). NB that apply targets the
+///      ACTIVE tun — whichever device `a.ifname` currently resolves to, NOT
+///      necessarily `wg0`. In the IN-STEP case (both gateways rotating off
+///      the controller's one timer) our own Role-A cutover has already run,
+///      so the active tun is `wg0e1` and the guaranteed full rebuild carries
+///      `replace_peers` onto the NEW-epoch tun — boringtun `clear_peers()`
+///      then destroys every session on it. That is a live defect, not a
+///      design intent; see `docs/research/in-step-rotation-rebaselined.md`;
 ///  (b) arm `collapse_armed` — the rotation tick then waits for the peer's
 ///      session on the ACTIVE tun to become rx-corroborated live;
 ///  (c) the tick drops the overlap's route claim (re-deriving the peer's

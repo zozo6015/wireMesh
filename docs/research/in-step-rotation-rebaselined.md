@@ -191,7 +191,7 @@ code, not doc comments.
 |---|---|---|---|
 | `pending_peer_configs` (`reconcile.rs:89-95`) | `wg0o0` overlap | `candidate_port + OWN_TUN_PORT_OFFSET` | **`:51821` correct** |
 | `device_config_at_port` (`reconcile.rs:246-252`) | `wg0e1` **at creation** | **`endpoint: None`** — *"receive-and-roam, never dial"* | none |
-| `device_config_pinned` (`reconcile.rs:174-180`) | the ACTIVE tun | `live_endpoints[gid]` else `primary_endpoint()` | **both base-port** |
+| `device_config_pinned` (`reconcile.rs:174-180`) | the ACTIVE tun | `live_endpoints[gid]` else `primary_endpoint()` | **`:51820` or a roamed `:51822` — never `:51821`** |
 
 `pending_peer_configs` is the ONLY builder that knows it is dialling a rotation-epoch
 device. `device_config_pinned` takes `listen_port` as a parameter but derives the peer
@@ -203,6 +203,13 @@ construction: the observe socket is bound to `cfg.wg_listen_port` for process li
 reported locals are always `netif::local_wg_endpoints(cfg.wg_listen_port)`. **`:51821` cannot
 enter the candidate list at all.**
 
+`live_endpoints[gid]` is a different thing and must not be described as base-port: it is
+timing-dependent, holding whatever was last pinned for that PEER — the stale punch pin
+(`:51820`, the observed fallback) or a roamed overlap source port (`:51822`, seen in run 1).
+What the two sources actually share is narrower: **neither can ever produce `:51821`.** Which
+one fires, and with what value, is settled by ordering — see the nondeterminism section below.
+A fix designed against "the endpoint is always the base port" would miss the `:51822` case.
+
 ## The trigger: the Role-B collapse unpin forces a `replace_peers`
 
 `maybe_collapse_role_b` does `rot.wg0_pins.lock().unwrap().remove(aid)` (`main.rs:4719`)
@@ -213,9 +220,12 @@ immediately before `apply_state` on the same `State` event. Its own doc comment
 > active key … **the key change defeats both the change-guard and the pure-addition
 > incremental path, so a full rebuild is guaranteed by that very apply**
 
-**That comment says `wg0`. `apply_state` resolves `a.ifname` — the ACTIVE tun
+**That comment said `wg0`. `apply_state` resolves `a.ifname` — the ACTIVE tun
 (`main.rs:3495-3497`) — which after our own Role-A cutover is `wg0e1`.** A load-bearing
 prose error: the sentence was written for a world where our own cutover had not happened.
+(The comment has since been corrected to name the ACTIVE tun and point back here; the
+quote above is what it said when this was traced. The BEHAVIOUR is unchanged — the clobber
+apply below is still live.)
 
 Forced chain:
 1. peer promotes → `pending_key()` becomes `None`, `active_pubkey_b64` becomes epoch-1
@@ -224,7 +234,8 @@ Forced chain:
 3. `classify_peer_delta` → key present-then-absent → `NeedsFullApply`
 4. `uapi::apply` with `replace_peers=true` → boringtun `clear_peers()` → **every peer's
    `Tunn` and byte counters rebuilt from zero**, new block carrying
-   `endpoint = live_endpoints[gid] = :51820`
+   `endpoint = live_endpoints[gid]` when a pin exists (`:51820` in these runs, `:51822` in
+   run 1), else `primary_endpoint()` — **never `:51821` on any path**
 
 ## This dissolves the "unexplained" observation — no leaked socket needed
 
@@ -262,8 +273,12 @@ durable state.** Amplifier, not corrector.
 
 ## Checked and NOT the cause
 
-- No surviving epoch-delta formula. `OWN_TUN_PORT_OFFSET` appears only in `tunnelset.rs`
-  (the allocator/reservation) and `reconcile.rs:92`. v0.7.2's deletion was complete.
+- No surviving epoch-delta formula. `OWN_TUN_PORT_OFFSET` is referenced widely — 14 times in
+  `tunnelset.rs`, 15 in `reconcile.rs`, twice in `main.rs` — but **`reconcile.rs:92` is the
+  only place it participates in an endpoint DERIVATION.** Every other occurrence is the
+  allocator/reservation (`tunnelset.rs`), an import (`reconcile.rs:4`), a doc comment
+  (`reconcile.rs:36,57,61,366,376`; `main.rs:4237,4432`), or a test
+  (`reconcile.rs:429-473,595-646`). v0.7.2's deletion was complete.
 - `device_config_at_port` emitting a wrong endpoint — it emits `None`.
 - Candidate-list ordering — cannot yield anything but base-port.
 - The punch path writing post-cutover — it yields without touching the device when the path
@@ -276,6 +291,8 @@ durable state.** Amplifier, not corrector.
 `pending_peer_configs` gets `:51821` because it is the only builder that knows it is
 dialling a rotation-epoch device. `wg0e1` gets `:51820` because after the Role-A cutover it
 becomes "the active tun" and is rebuilt by the device-agnostic `device_config_pinned`, whose
-two endpoint sources both describe the peer's BASE port — and that rebuild is FORCED by the
+two endpoint sources — a candidate list that is base-port by construction, and a per-peer
+`live_endpoints` pin holding whatever was last seen (the stale `:51820` punch pin, or a roamed
+`:51822`) — can neither of them ever yield `:51821`; and that rebuild is FORCED by the
 Role-B collapse unpin, whose `replace_peers` also destroys the session `wg0o0`'s counters
 prove really existed.
