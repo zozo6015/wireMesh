@@ -495,6 +495,68 @@ pub fn new_epoch_watch_keys(
         .collect()
 }
 
+// --- The endpoint the Role-B collapse arm must dial -------------------------
+
+/// The endpoint the Role-B collapse arm must pin for ONE peer, or `None` when
+/// it must pin nothing and leave today's behaviour untouched.
+///
+/// `own_active_epoch` is this gateway's own active epoch RIGHT NOW;
+/// `built_at_own_epoch` is the epoch whose private key the Role-B overlap
+/// toward this peer runs ([`OverlapClaim::built_at_own_epoch`]);
+/// `peer_candidate` is the peer's advertised `ip:port`.
+///
+/// # The equal-epochs `None` is load-bearing
+///
+/// **Equal** means our overlap tun and our active tun run the SAME private
+/// key — we never cut over. That is every ONE-SIDED rotation, and there the
+/// existing base-port behaviour is *eventually* correct: the peer's retire is
+/// gated on OUR overlap's session, which is live, so the peer retires,
+/// `renormalize_active_listen_port` puts its active key back on its base port,
+/// and our unchanged dial starts working. Convergence by waiting. Firing a
+/// rotation dial there would pin a `+1` endpoint at a gateway that never moved
+/// off base, breaking five green one-sided netns tests and the working
+/// rotations they describe. So the new path must be a literal no-op in that
+/// world **by construction, not by argument** — that is what this `None` is.
+///
+/// **Unequal** means our own Role-A cutover has run, so the two devices hold
+/// different keys and only the active tun matches the peer's key set. This is
+/// the IN-STEP case (both gateways rotating off the controller's one timer),
+/// where the base-port endpoint is NEVER correct: the peer's epoch-1 key is on
+/// its reserved own-tun port, our collapse gate waits for a session on the
+/// active tun it therefore cannot address, and the peer's retire is gated on
+/// that same session. Circular — see
+/// `docs/research/in-step-rotation-rebaselined.md`.
+///
+/// # Only the INEQUALITY is read — never the order, never the distance
+///
+/// This is deliberately the exact complement of [`route_owner`]'s
+/// discriminator (`built_at_own_epoch == own_active_epoch`, "the overlap still
+/// runs the key our peer's roster advertises for us"). The two must stay
+/// complements, or there is a state where the routes sit on the active tun
+/// with no endpoint that can reach the peer — the deadlock, reopened one
+/// branch over.
+///
+/// Writing it as `built_at < active`, or as `active - built_at == 1`, would be
+/// epoch arithmetic, which is exactly the class of assumption that produced
+/// bug 5 and would read green against every ordinary case.
+/// `tests/collapse_dial.rs`'s
+/// `only_the_inequality_is_read_never_the_order_or_the_distance` pins this.
+///
+/// The endpoint itself is not derived here: it IS
+/// [`crate::reconcile::own_tun_endpoint`]'s answer, the same one
+/// [`crate::reconcile::pending_peer_configs`] builds the overlap with. One
+/// authority, two readers.
+pub fn collapse_dial(
+    own_active_epoch: u32,
+    built_at_own_epoch: u32,
+    peer_candidate: &str,
+) -> Option<String> {
+    if built_at_own_epoch == own_active_epoch {
+        return None;
+    }
+    crate::reconcile::own_tun_endpoint(peer_candidate)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

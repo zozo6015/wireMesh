@@ -4688,10 +4688,25 @@ async fn retire_stale_overlap(
 ///      ACTIVE tun — whichever device `a.ifname` currently resolves to, NOT
 ///      necessarily `wg0`. In the IN-STEP case (both gateways rotating off
 ///      the controller's one timer) our own Role-A cutover has already run,
-///      so the active tun is `wg0e1` and the guaranteed full rebuild carries
-///      `replace_peers` onto the NEW-epoch tun — boringtun `clear_peers()`
-///      then destroys every session on it. That is a live defect, not a
-///      design intent; see `docs/research/in-step-rotation-rebaselined.md`;
+///      so the active tun is `wg0e<N>` and the guaranteed full rebuild carries
+///      `replace_peers` onto the NEW-epoch tun, rekeying this peer's entry
+///      there from its epoch-0 key to its promoted one. **That rekey is the
+///      intent, not a defect**: both this collapse gate and the peer's Role-A
+///      retire gate require an epoch1<->epoch1 session, and until the rekey
+///      the new-epoch tun peers a key the peer has moved off. What used to
+///      make it fatal is that the rebuilt entry inherited a base-port
+///      endpoint, which the peer's new epoch is never on — so the session
+///      could not form and both gates waited on each other forever
+///      (`docs/research/in-step-rotation-rebaselined.md`). The endpoint that
+///      makes the rekeyed entry addressable is therefore pinned RIGHT HERE,
+///      into `live_endpoints[gid]`, on the same event and before that apply
+///      runs — see [`rotation::collapse_dial`]. It is deliberately NOT
+///      cleared when the collapse completes: by then it equals the live
+///      session's own endpoint, so clearing it would make the next render
+///      disagree with the device and tear a working session down. It is
+///      superseded naturally — the path SM's read-through overwrites it once
+///      the peer is `Direct`, and after both retires the peer's keepalives
+///      arrive from its base port and boringtun roams;
 ///  (b) arm `collapse_armed` — the rotation tick then waits for the peer's
 ///      session on the ACTIVE tun to become rx-corroborated live;
 ///  (c) the tick drops the overlap's route claim (re-deriving the peer's
@@ -4724,12 +4739,45 @@ fn maybe_collapse_role_b(rot: &RotationShared, ds: &DesiredState) {
             continue; // active key isn't the one we overlapped toward
         }
         rot.wg0_pins.lock().unwrap().remove(aid);
+        // The endpoint half of the same decision, in the same lock discipline
+        // as the unpin above (tight scope, guard dropped on the statement).
+        // The unpin GUARANTEES a `replace_peers` rebuild of this peer's entry
+        // on the active tun; `collapse_dial` decides whether that rebuild must
+        // carry a rotation endpoint. `None` — every one-sided rotation, where
+        // our overlap and our active tun run the same key — leaves
+        // `live_endpoints` untouched and today's behaviour exactly as it is.
+        let own_active_epoch = rot.active.lock().unwrap().epoch;
+        let candidate = peer.primary_endpoint().cloned();
+        let dial = candidate
+            .as_deref()
+            .and_then(|c| rotation::collapse_dial(own_active_epoch, b.built_at_own_epoch, c));
+        if let Some(ref ep) = dial {
+            rot.live_endpoints.lock().unwrap().insert(*aid, ep.clone());
+        }
         b.collapse_armed = true;
         eprintln!(
             "wiremesh-gateway: Role B collapse armed for peer {aid} (rotation complete; roster \
              active-only on the new key) — wg0 unpinned, awaiting a live session on the ACTIVE \
              tun before tearing {} down",
             b.new_tun
+        );
+        // Both predicate inputs and the resulting value, unconditionally on
+        // both branches: whether `built_at_own_epoch != own_active_epoch`
+        // actually held in the failing in-step runs is inferred from ordering,
+        // never observed, and this line is what settles it (open question 2 of
+        // `docs/superpowers/plans/2026-08-11-in-step-rotation-fix.md`).
+        eprintln!(
+            "wiremesh-gateway: Role B collapse dial for peer {aid}: own_active_epoch \
+             {own_active_epoch}, overlap built_at_own_epoch {}, candidate {} -> {}",
+            b.built_at_own_epoch,
+            candidate.as_deref().unwrap_or("<none advertised>"),
+            match dial.as_deref() {
+                Some(ep) => ep,
+                None if b.built_at_own_epoch == own_active_epoch =>
+                    "<no dial: equal epochs — one-sided rotation, base-port endpoint converges on \
+                     the peer's retire>",
+                None => "<no dial: in-step, but no own-tun endpoint derivable from the candidate>",
+            },
         );
     }
 }
@@ -5397,10 +5445,17 @@ async fn run_rotation_ticks(rot: RotationShared) {
         // reverse) the Role-A cutover's make-before-break. Until then the
         // overlap keeps carrying whatever traffic still flows (steady-state
         // completion), or simply idles (the peer rebooted onto the base
-        // port). No handshake kick here: routes may still point at the overlap
-        // tun, so a segment-IP ping can't egress the active tun; its
-        // persistent keepalive + the punch/path machinery drive that
-        // handshake instead.
+        // port).
+        //
+        // The handshake kick is IN-STEP ONLY, and the reason is the same
+        // epoch predicate everything else on this path turns on. When our own
+        // Role-A cutover has NOT run (`built_at_own_epoch == active_epoch` —
+        // every one-sided rotation) the routes may still point at the overlap
+        // tun, so a segment-IP ping cannot egress the active tun and there is
+        // nothing to kick with; the peer's persistent keepalive plus the
+        // punch/path machinery drive that handshake instead. That rationale
+        // is FALSE in the in-step case, where our own cutover already won the
+        // routes onto the active tun — see the kick at the liveness gate below.
         //
         // ACTIVE, not BASE (F8). This arm used to watch and flip `rot.base_tun`
         // outright. That is only the same device while THIS gateway isn't
@@ -5428,6 +5483,28 @@ async fn run_rotation_ticks(rot: RotationShared) {
             let live =
                 read_live_peers(&active_ifname, std::iter::once(b.peer_pending_hex.clone())).await;
             if !live.map_or(false, |l| l.contains(&b.peer_pending_hex)) {
+                // IN-STEP ONLY (the same predicate `rotation::collapse_dial`
+                // gates its dial on, and the exact complement of
+                // `route_owner`'s): our own Role-A cutover has run, so this
+                // gateway's cutover already won the peer's routes and they
+                // point at the ACTIVE tun. A segment-IP probe therefore CAN
+                // egress it, and the arm comment's rationale for kicking
+                // nothing (routes possibly still on the overlap) does not
+                // apply here.
+                //
+                // It is needed because the rekey the unpin forced leaves our
+                // first handshake init to race the peer's identical rekey: an
+                // init sent before the peer has rebuilt its own entry is
+                // dropped, and boringtun then waits out `REKEY_TIMEOUT` (~5s)
+                // before retrying — long enough, at the done bar's `-i 0.2`
+                // flood, to blow a ≤6-packet gap allowance. Kicking each tick
+                // until the session comes up costs one ICMP echo through a
+                // temporary /32 (make-before-break preserved,
+                // `probe_overlap_handshake`).
+                if b.built_at_own_epoch != active_epoch {
+                    kick_overlap(active_ifname.clone(), b.peer_cidrs.clone(), rot.base_wg_port)
+                        .await;
+                }
                 continue; // active tun not live yet — keep the overlap intact
             }
             // The active tun is live on the peer's new key. Drop the overlap's

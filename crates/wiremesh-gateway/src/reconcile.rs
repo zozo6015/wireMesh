@@ -30,11 +30,37 @@ pub fn peer_configs(ds: &DesiredState) -> Vec<PeerConfig> {
         .collect()
 }
 
-/// Peer-configs targeting each peer's real-keyed PENDING epoch — the peer set
-/// of a Role-B overlap Device. The pending endpoint reuses the peer's
-/// advertised candidate IP with the UDP port at
-/// [`OWN_TUN_PORT_OFFSET`] above the candidate's own port. A peer with no real
-/// pending key (active-only, or a sentinel pending) contributes nothing.
+/// `ip:(port + OWN_TUN_PORT_OFFSET)` for a peer candidate `ip:port` — the ONE
+/// UDP port a gateway's in-flight new epoch can be reached on, by reservation
+/// rather than by epoch arithmetic. `None` for anything that is not `ip:port`,
+/// and `None` rather than a wrap for a port that cannot be offset inside a
+/// u16.
+///
+/// The overflow case is reachable, not hypothetical: `is_dialable_endpoint`
+/// accepts `:65535`, so the ingest filter keeps such a candidate verbatim
+/// (`state.rs`'s
+/// `partition_dialable_keeps_every_valid_candidate_verbatim_and_in_order`).
+/// Wrapping it would produce `:0` — a wildcard that silently reaches nothing
+/// while every layer above reports a programmed endpoint — so the add is
+/// checked and a peer we cannot derive an endpoint for is DROPPED by its
+/// caller instead of emitted half-built.
+///
+/// # The single authority, and its two readers
+///
+/// This is a derivation, not a validator, and it exists as one function
+/// because the question it answers — *which UDP port is a rotating gateway's
+/// in-flight new epoch on?* — must have exactly one answer:
+///
+///  - [`pending_peer_configs`] asks it while building a Role-B overlap
+///    Device's peer set, i.e. while the peer's new epoch is still `pending`;
+///  - [`crate::rotation::collapse_dial`] asks it at the Role-B collapse arm,
+///    i.e. after the peer has PROMOTED that epoch, to dial the same device
+///    from our own new-epoch tun in the in-step case
+///    (`docs/research/in-step-rotation-rebaselined.md`).
+///
+/// Same question on either side of the peer's promote, and the answer must not
+/// change across it, because the peer's device did not move. `tests/collapse_dial.rs`
+/// compares the two produced strings so neither reader can drift from the other.
 ///
 /// # Why `candidate_port + 1`, and why there is no epoch arithmetic left here
 ///
@@ -59,8 +85,61 @@ pub fn peer_configs(ds: &DesiredState) -> Vec<PeerConfig> {
 ///    NUMBER and regardless of how many overlaps that gateway is carrying.
 ///
 /// So the target is `candidate_port + OWN_TUN_PORT_OFFSET`, and the constant is
-/// imported from the allocator that enforces it rather than restated here:
-/// one definition, two readers, nothing to drift.
+/// imported from the allocator that enforces it rather than restated here.
+/// **Nothing in this derivation reads an epoch NUMBER**, and nothing may start
+/// to: that is precisely what bug 5 was.
+///
+/// # Why this is a socket-address parse, and why the answer is REBUILT
+///
+/// What this returns is written to the WireGuard UAPI as an `endpoint=` line
+/// (via [`pending_peer_configs`] -> the overlap `DeviceConfig`, and via
+/// [`crate::rotation::collapse_dial`] -> the collapse arm's pinned endpoint),
+/// and the UAPI wire format is newline-delimited `key=value`. So this is a
+/// UAPI-injection boundary, and it used to be a `rsplit_once(':')` + port
+/// parse — which splits at the LAST colon and hands everything before it back
+/// verbatim. `"10.9.0.2:51820\nendpoint=203.0.113.1:9"` therefore came out as
+/// `"10.9.0.2:51820\nendpoint=203.0.113.1:10"`: a second `endpoint=` directive
+/// of the sender's choosing, smuggled through the derivation.
+/// `tests/collapse_dial.rs`'s
+/// `an_unparseable_candidate_yields_no_dial_instead_of_a_panic` found it.
+///
+/// The candidate is therefore parsed as a `SocketAddrV4` — the SAME notion of
+/// "is this dialable at all" the rest of the fabric uses, reached through
+/// [`crate::uapi::is_dialable_endpoint`] rather than restated here, so this
+/// cannot become a third opinion about endpoint shape (see that function, and
+/// `tests/predicate_equality.rs`, for why a looser one is a crash-loop path).
+/// `uapi::validate_ipv4_endpoint` rejects an embedded newline for exactly this
+/// reason, and `tests/uapi_endpoint_validation.rs` pins the same payload shape
+/// as rejected at that door.
+///
+/// The returned string is then REBUILT from the parsed parts — the parsed
+/// `Ipv4Addr` and the `checked_add`ed port — never spliced out of the input.
+/// That is the half that matters: a filter can be reasoned around, but a
+/// result assembled only from a `Ipv4Addr` and a `u16` cannot represent a
+/// newline, a second directive, or anything else that is not a canonical
+/// `a.b.c.d:port`. Malformed output is unrepresentable rather than screened.
+pub fn own_tun_endpoint(candidate: &str) -> Option<String> {
+    // Gate on the shared predicate first, so "which endpoints exist at all"
+    // keeps exactly one definition; the parse below is how this function gets
+    // the PARTS, not a second opinion about acceptance (`is_dialable_endpoint`
+    // accepts a `SocketAddr::V4` and nothing else, so it cannot fail after the
+    // gate — `.ok()?` keeps the function total rather than asserting that).
+    if !crate::uapi::is_dialable_endpoint(candidate) {
+        return None;
+    }
+    let addr: std::net::SocketAddrV4 = candidate.parse().ok()?;
+    let own_tun_port = addr.port().checked_add(OWN_TUN_PORT_OFFSET)?;
+    Some(format!("{}:{own_tun_port}", addr.ip()))
+}
+
+/// Peer-configs targeting each peer's real-keyed PENDING epoch — the peer set
+/// of a Role-B overlap Device. The pending endpoint is
+/// [`own_tun_endpoint`] of the peer's advertised candidate: the same IP with
+/// the UDP port at [`OWN_TUN_PORT_OFFSET`] above the candidate's own. A peer
+/// with no real pending key (active-only, or a sentinel pending) contributes
+/// nothing, and so does a peer whose candidate has no derivable own-tun
+/// endpoint — see [`own_tun_endpoint`] for why that derivation is a shared
+/// function rather than inline arithmetic here.
 pub fn pending_peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerConfig> {
     ds.peers
         .iter()
@@ -86,13 +165,13 @@ pub fn pending_peer_configs(ds: &DesiredState, keepalive_secs: u16) -> Vec<PeerC
             // drops the peer from the overlap device exactly like a missing
             // one.
             crate::uapi::pubkey_b64_to_hex(&pending.pubkey_b64)?;
-            let endpoint = p.primary_endpoint()?;
-            let (ip, port_str) = endpoint.rsplit_once(':')?;
-            let candidate_port: u16 = port_str.parse().ok()?;
-            let pending_port = candidate_port.checked_add(OWN_TUN_PORT_OFFSET)?;
+            // ONE definition, two readers (`own_tun_endpoint`): its `?` keeps
+            // this builder's original drop-the-peer behaviour for a candidate
+            // that does not parse or whose port cannot be offset.
+            let pending_endpoint = own_tun_endpoint(p.primary_endpoint()?)?;
             Some(PeerConfig {
                 public_key_b64: pending.pubkey_b64.clone(),
-                endpoint: Some(format!("{ip}:{pending_port}")),
+                endpoint: Some(pending_endpoint),
                 allowed_ips: p.allowed_ips.clone(),
                 keepalive_secs,
             })
@@ -503,6 +582,77 @@ mod tests {
         );
         let ds = ds_with(vec![peer], 0);
         assert!(pending_peer_configs(&ds, 25).is_empty());
+    }
+
+    /// **The `?`-propagation pin, for the extraction of [`own_tun_endpoint`].**
+    ///
+    /// The endpoint derivation moved out of this builder so the Role-B collapse
+    /// arm could read the SAME answer instead of restating it
+    /// (`tests/collapse_dial.rs`). The tests above all pin what the builder
+    /// EMITS; none pins what it does when the derivation has no answer, and that
+    /// is precisely the behaviour an extraction can change without touching a
+    /// single emitted string — from "drop the peer" to "emit it with a wrapped
+    /// port" or "emit it with no endpoint at all". Either would put a peer on
+    /// the overlap Device pointing at nothing.
+    ///
+    /// Port 65535 is not synthetic: `is_dialable_endpoint` accepts it, so the
+    /// ingest filter KEEPS a `:65535` candidate (`state.rs`'s
+    /// `partition_dialable_keeps_every_valid_candidate_verbatim_and_in_order`),
+    /// and `65535 + OWN_TUN_PORT_OFFSET` does not fit in a u16. The malformed
+    /// candidates alongside it are defense-in-depth for a future caller with a
+    /// looser source.
+    ///
+    /// The multi-peer row is the same anti-truncation discipline
+    /// `tests/role_b_decisions.rs` applies to the decision layer: one peer the
+    /// derivation cannot answer for must not take out the peers around it —
+    /// with `initiate_due_rotations` rotating every gateway off one timer, the
+    /// first peer in roster order would otherwise starve all the rest.
+    #[test]
+    fn pending_peer_configs_drops_a_peer_whose_candidate_has_no_own_tun_endpoint() {
+        let keys = || {
+            vec![
+                PeerKeyInfo { epoch: 0, pubkey_b64: "KA".into(), state: "active".into() },
+                PeerKeyInfo {
+                    epoch: 1,
+                    pubkey_b64: VALID_PENDING_KEY.into(),
+                    state: "pending".into(),
+                },
+            ]
+        };
+
+        for (candidate, why) in [
+            ("10.9.0.2:65535", "65535 + OWN_TUN_PORT_OFFSET overflows a u16"),
+            ("10.9.0.2", "no colon"),
+            ("10.9.0.2:", "empty port"),
+            ("10.9.0.2:abc", "non-numeric port"),
+            ("", "empty candidate"),
+        ] {
+            let ds = ds_with(vec![peer_full(2, candidate, keys(), "10.10.2.0/24")], 0);
+            assert!(
+                pending_peer_configs(&ds, 25).is_empty(),
+                "candidate {candidate:?} ({why}): the peer must be DROPPED from the overlap peer \
+                 set. A peer emitted here with a wrapped port dials :0 — a wildcard that reaches \
+                 nothing while the device reports a programmed endpoint — and one emitted with no \
+                 endpoint sits on the overlap unable to dial at all."
+            );
+        }
+
+        // And the drop is per-peer, not per-loop.
+        let ds = ds_with(
+            vec![
+                peer_full(2, "10.9.0.2:65535", keys(), "10.10.2.0/24"),
+                peer_full(3, "10.9.0.3:51820", keys(), "10.10.3.0/24"),
+            ],
+            0,
+        );
+        let cfgs = pending_peer_configs(&ds, 25);
+        assert_eq!(cfgs.len(), 1, "peer 3 is well-formed and must survive peer 2, got {cfgs:?}");
+        assert_eq!(
+            cfgs[0].endpoint.as_deref(),
+            Some(format!("10.9.0.3:{}", 51820 + OWN_TUN_PORT_OFFSET).as_str()),
+            "the surviving peer keeps the reserved-offset endpoint — one unanswerable candidate \
+             must not perturb the peers around it, let alone truncate the set"
+        );
     }
 
     /// **The cross-module pin — the assertion that would have caught bug 5.**
