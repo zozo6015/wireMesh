@@ -1,8 +1,8 @@
 # WireMesh backlog
 
-**As of `v0.9.0` (2026-08-10).** 24 open items of 31 numbered. Every one has a verified
-mechanism &mdash; these are not guesses, and where a claim was checked and turned out
-wrong, that is recorded too.
+**As of `v0.9.0` (2026-08-10), plus item 32 filed 2026-08-12.** 25 open items of 32
+numbered. Every one has a verified mechanism &mdash; these are not guesses, and where a
+claim was checked and turned out wrong, that is recorded too.
 
 Seven are fully resolved and kept below as historical notes &mdash; **1, 2 (all four
 sub-items), 16, 22, 24, 25 and 30**. Item **23 is partially resolved** and still counted
@@ -601,6 +601,49 @@ change &mdash; same class as the `--help` text corrected in v0.7.4.
 Building the harness itself remains open and unfiled as future work &mdash; the operator crate
 has no aya/boringtun/netns dependency, so unlike the rest of the workspace it *could* run kind
 on a plain runner.
+
+---
+
+### 32. LOW &mdash; the operator Helm chart is never stamped, because nothing publishes it
+
+Filed 2026-08-12 on the version-stamping branch, where the fix was **written and then
+deliberately removed**. `deploy/helm/wiremesh-operator/Chart.yaml` is committed at
+`version: 0.1.0` / `appVersion: "0.1.0"` &mdash; unchanged across every tagged release to
+date &mdash; and no script or workflow rewrites either key.
+
+Stamping it in `scripts/set-version.sh` alongside the crate manifests was implemented,
+reviewed, and cut. It is **inert**: nothing packages or publishes the chart. All three
+workflow files were checked &mdash; there is no `helm package`, no chart repo, no index;
+`release.yml` attaches tarballs, `.deb`/`.rpm`, `.msi` and `.pkg` and nothing else. A
+CI-side stamp therefore lives and dies inside the job, and anyone installing from a git
+checkout still gets `0.1.0`. It was not free, either: the block hard-failed if the chart
+moved or its keys were renamed, and because `set-version.sh` runs in every build job of
+BOTH workflows, that failure would have taken down jobs with no interest in the chart at
+all &mdash; including `release.yml`'s Windows job, which builds only `fabricctl`.
+
+The crate half &mdash; the actual defect, five crates including the previously-missing
+`wiremesh-operator`, plus `container-images.yml` finally calling the script &mdash; shipped
+on that branch and is pinned by `crates/wiremesh-operator/tests/release_version_stamping.rs`
+(5 tests). That file's doc comment points here and says not to re-add a chart assertion
+without the publishing half.
+
+Fixing this properly means deciding a **distribution channel first**: an attached
+`helm package` tarball per release (cheap, no hosting, but `helm repo add` does not work),
+or a real chart repo with an `index.yaml` (gh-pages or OCI on ghcr.io &mdash; the registry
+is already in use). Stamping is a two-line follow-on once that is chosen; choosing is the
+work.
+
+**Settle this at the same time**, because publishing a chart makes it user-visible: the
+chart defaults `image.tag: "latest"` (`values.yaml:12`), while `container-images.yml`
+pushes `latest` on every push to `main`
+(`type=raw,value=latest,enable={{is_default_branch}}`, plus `pullPolicy: Always`). So a
+default `helm install` today tracks **main**, not a release. `values.yaml` recommends
+pinning in a comment, but the default is what most people run. The obvious pairing is to
+default `image.tag` to `""` and have `_helpers.tpl` fall back to `.Chart.AppVersion` &mdash;
+which only becomes correct once the chart is stamped AND published, which is why the two
+halves belong in one piece of work. Note this also makes the stamp load-bearing: today
+`_helpers.tpl` never reads `.Chart.AppVersion`, so a stale `appVersion` is metadata rot
+(what `helm list` reports); after such a change it would decide which image runs.
 
 ---
 

@@ -19,7 +19,11 @@ if ! printf '%s' "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)
   exit 1
 fi
 
-for crate in fabricctl wiremesh-controller wiremesh-gateway wiremesh-relay; do
+# Every crate that produces a shipped artifact. wiremesh-operator ships as the
+# ghcr.io/<owner>/wiremesh-operator container image (the `component:` matrix in
+# .github/workflows/container-images.yml) and was missing here, so the operator
+# reported 0.1.0 on every release.
+for crate in fabricctl wiremesh-controller wiremesh-gateway wiremesh-operator wiremesh-relay; do
   f="crates/$crate/Cargo.toml"
   [ -f "$f" ] || { echo "set-version: $f not found" >&2; exit 1; }
   # First `version = "..."` only ($seen starts undef per perl invocation).
