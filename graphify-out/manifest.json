@@ -1620,8 +1620,8 @@
     "semantic_hash": ""
   },
   "docs/progress.html": {
-    "mtime": 1786471490.987301,
-    "ast_hash": "c1be9074ad79aa8b54ca199769baa2d3",
+    "mtime": 1786472138.366977,
+    "ast_hash": "65cdb0a76fbe89af66d961799e392bfe",
     "semantic_hash": ""
   },
   "docs/research/backlog-program-notes.md": {
@@ -2052,6 +2052,11 @@
   "crates/wiremesh-gateway/tests/collapse_dial.rs": {
     "mtime": 1786466915.6215768,
     "ast_hash": "ee58de1f6cbfd4740c7095f4c1222f66",
+    "semantic_hash": ""
+  },
+  "docs/research/2026-08-11-v1.0-release-scope.md": {
+    "mtime": 1786480837.309927,
+    "ast_hash": "8796bbba05a9c5af32de337fbd44b042",
     "semantic_hash": ""
   }
 }
