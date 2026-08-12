@@ -25,10 +25,10 @@ shipped, so nothing carries that marker right now. **Item 3 is what leads.**
 ## Do these first
 
 **Both items in this section have shipped** (item 1 in v0.7.6, item 2's last sub-item in
-v0.9.0). What leads next is not here &mdash; it is **item 3**, the in-step rotation
-blocker, which is what still holds `WIREMESH_ROTATION_INTERVAL=off` on the live fabric.
-Items 1 and 2 stay in place, and stay first, because every later item's reasoning cites
-theirs.
+v0.9.0). What leads next is not here &mdash; it is **item 9**, the rotation wedge, now
+the only thing gating an armed rotation timer anywhere. (Item 3, the in-step blocker that
+used to lead here, was FIXED in v0.9.1.) Items 1 and 2 stay in place, and stay first,
+because every later item's reasoning cites theirs.
 
 ### 1. RESOLVED &mdash; Unvalidated `local_endpoints` breaks every gateway's device apply
 
@@ -185,13 +185,21 @@ The original finding: the key appears nowhere in
 `WIREMESH_BIND_IP`) &mdash; the change is a conditional eighth push, not populating a
 `vec![]` (the fn's own doc comment says "six" and is stale too).
 
-> **Not true, and do not "fix" it:** hand-edits do *not* revert.
+> **HISTORICAL (pre-v0.8.0), and its conclusion is now INVERTED &mdash; do not act on
+> it.** As written, correcting an earlier claim: hand-edits do *not* revert.
 > `io.k8s.api.core.v1.Container.env` carries `x-kubernetes-list-type: map` with
 > `list-map-keys: [name]` (and the matching `patch-merge-key`/`patch-strategy: merge`), so
-> `.force()` asserts ownership **per key**. The operator never names this one, so
-> `kubectl set env` survives every reconcile. (This is per-key &mdash; `WIREMESH_BIND_IP` *is* clobbered, because the
-> operator names it. Read off a live v1.34 schema while `k8s-openapi` is pinned to
-> `v1_30`; these markers have been stable on `env` since ~1.19.)
+> `.force()` asserts ownership **per key**; the operator never named this one, so
+> `kubectl set env` survived every reconcile &mdash; unlike `WIREMESH_BIND_IP`, which *was*
+> clobbered because the operator names it.
+>
+> **The SSA mechanics are still exactly right; only the premise died.** v0.8.0 made
+> `workloads.rs:488` emit `WIREMESH_ROTATION_INTERVAL` unconditionally, and both apply
+> paths force (`controllers/mod.rs:212,225`), so the operator owns that entry like any
+> other: **`kubectl set env` on this key IS reverted on the next reconcile.** Set
+> `spec.rotationInterval` on the CR instead. (Schema read off a live v1.34 while
+> `k8s-openapi` is pinned to `v1_30`; these markers have been stable on `env` since
+> ~1.19.)
 
 **But note there may be no live instance of this.** The control plane moved off zolab k8s
 to the px Debian host on 2026-08-01, where the controller runs as a **systemd unit, not a
@@ -209,9 +217,12 @@ pinned by `override_fields_serialize_camel_case_and_omit_when_unset` in
 legacy-CR deserialization); `scheduler_aware_node_selector`'s omit-when-unset is real but
 less close.
 
-**A second trap, from the opposite direction:** once set and then *removed* from the CR,
-SSA **deletes** the env entry and the controller boots on the 30-day default. Removing a
-field re-enables rotation. Inherent to SSA; document it loudly on the field.
+**A second trap, from the opposite direction** &mdash; **defused; see the banner above.**
+As written: once set and then *removed* from the CR, SSA **deletes** the env entry and
+the controller boots on the 30-day default, so removing a field re-enables rotation.
+Neither half survives. The operator emits the key unconditionally, so removing the field
+yields `off` rather than deleting the entry &mdash; and the controller has no 30-day
+default any more, so even a deleted entry resolves to "no timer".
 
 Validation: a CRD `pattern` **cannot** express the grammar (it cannot reject `0s`, or
 `>3650d`, or a `u64` overflow, and must *accept* whitespace-trimmed forms). So
@@ -416,17 +427,23 @@ the one real design question, now a third smaller.
 
 ## Rotation
 
-**`WIREMESH_ROTATION_INTERVAL=off` is set on the px controller and must stay set.**
-Manual `fabricctl` rotation works. Rotation is now *repeatable* &mdash; a gateway can
-rotate more than once (v0.7.2) and no longer falls out of the timer after one round
-(v0.7.3) &mdash; but one blocker remains.
+**Automatic rotation is off everywhere, and that is now the DEFAULT rather than an
+override.** An absent `WIREMESH_ROTATION_INTERVAL` means no timer at all, so the px
+controller's explicit `off` is one instance of the default &mdash; it should stay, but it
+is no longer the thing doing the work. Manual `fabricctl` rotation works. Rotation is now
+*repeatable* &mdash; a gateway can rotate more than once (v0.7.2) and no longer falls out
+of the timer after one round (v0.7.3) &mdash; and the in-step blocker below is fixed.
+**What still gates arming a timer anywhere is item 9, the rotation wedge.**
 
-### 3. The in-step case &mdash; THE LAST BLOCKER
+### 3. RESOLVED &mdash; the in-step case
 
-The controller rotates every active gateway in one tick off one timer, so the fabric
-rotates **in step**. Committed `#[ignore]`d as RED-by-design in
-`crates/wiremesh-gateway/tests/key_rotation.rs`. **Un-ignoring it is the bar.** This is
-exactly what the timer does, which is why `off` stays until it is green.
+**Fixed in v0.9.1** (commit `b452597`, "address the peer's reserved own-tun port at the
+collapse"). The controller rotates every active gateway in one tick off one timer, so the
+fabric rotates **in step**. Its done bar
+(`in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns` in
+`crates/wiremesh-gateway/tests/key_rotation.rs`) was committed `#[ignore]`d as
+RED-by-design from 2026-08-05; that work landed and the `#[ignore]` came off. Nothing in
+that file is `#[ignore]`d today. This item no longer holds the timer &mdash; item 9 does.
 
 ### 4. T7 &mdash; three-gateway rotation harness + per-peer cutover gate
 
@@ -448,9 +465,17 @@ that is trap #2 below, in a new place.
 
 ### 6. Rotation observability (F2/F5) &mdash; deferred review findings
 
-### 7. `kick_overlap` is provably inert after v0.7.2's piece 3
+### 7. `kick_overlap` &mdash; the "provably inert" verdict is STALE. DO NOT DELETE IT.
 
-Delete it, or make the tun addressable. Currently dead code that looks live.
+As originally written: inert after v0.7.2's piece 3, so delete it or make the tun
+addressable. **Acting on that today would break the in-step done bar.** Commit `b452597`
+(v0.9.1) made the Role-B collapse call site at
+`crates/wiremesh-gateway/src/main.rs:5505` load-bearing: the collapse unpin forces a
+rekey, our handshake init then races the peer's identical rekey, and a dropped init costs
+boringtun a ~5s `REKEY_TIMEOUT` &mdash; long enough to blow the done bar's packet-gap
+allowance. Kicking each tick until the session comes up is what closes that window. The
+other two call sites (`main.rs:5232`, `:5328`) have not been re-examined; if anything is
+left of this item it is scoped to those, not to the function.
 
 ### 8. Piece 1's read-through aborts the first retire grace after every cutover
 
@@ -532,9 +557,12 @@ least important of its family, and fixed for free by item 1's `PeerState::from_p
 
 ### 19. Relay mux `/1` wire break
 
-Deferred with **6 open owner decisions**. The 32-bit `registration_key` makes collisions
-deterministic and permanent (~17% at 200 gateways), so this is a correctness fix, not an
-optimization.
+Deferred with **6 open owner decisions**. **Its stated correctness justification is
+dead:** the 32-bit `registration_key` collision argument (deterministic and permanent,
+~17% at 200 gateways) was fixed in v0.6.0 by commit `94e8b98`, which widened the key to
+the full 64 bits &mdash; `registration_key` now returns `digest[..8]` raw
+(`crates/wiremesh-relay/src/lib.rs:162`). The item may still have other drivers, but that
+collision is not one of them; re-establish the driver before scheduling it.
 
 ### 20. LAN-side route propagation
 

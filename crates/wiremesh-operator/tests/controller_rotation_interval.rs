@@ -3,21 +3,56 @@
 //! # Contract INVERSION — owner-approved, 2026-08-10
 //!
 //! This file previously pinned "omit the env entry when `rotation_interval`
-//! is `None`". That contract is now WRONG and has been inverted:
-//! `wiremesh_controller::rotation_interval_from_env` (`lib.rs:445`) treats an
-//! ABSENT `WIREMESH_ROTATION_INTERVAL` as **armed** — it falls back to
-//! `Config::default_rotation_interval()` (30 days), not to "off". So the old
-//! "omit when unset" behavior left every operator-managed controller with
-//! automatic key rotation silently enabled, in direct violation of the root
-//! `CLAUDE.md` "Key rotation" rule that automatic rotation must stay `off`
-//! until the in-step rotation done-bar passes (`key_rotation.rs`, currently
-//! `#[ignore]`d RED-by-design).
+//! is `None`". That contract is now WRONG and has been inverted.
 //!
-//! **New contract:**
+//! **Contract:**
 //! - `rotation_interval: None` → emit `WIREMESH_ROTATION_INTERVAL=off`
 //!   **explicitly** (not omitted).
 //! - `rotation_interval: Some(v)` → emit `v` verbatim.
 //! - The env vec is therefore **always eight entries**, never seven.
+//!
+//! Tests below marked "INVERTED" assert the literal opposite of what this
+//! file asserted before — that is deliberate, not drift.
+//!
+//! # Why — the ORIGINAL reason expired on 2026-08-12; the contract did not
+//!
+//! When this file was written, the reason was a live bug:
+//! `wiremesh_controller::rotation_interval_from_env` treated an ABSENT
+//! `WIREMESH_ROTATION_INTERVAL` as **armed**, falling back to
+//! `Config::default_rotation_interval()` (30 days). Omitting the key therefore
+//! did not mean "leave rotation alone", it meant "arm automatic rotation at the
+//! controller's 30-day default" — so the old "omit when unset" behavior left
+//! every operator-managed controller silently rotating keys on a schedule
+//! nobody chose.
+//!
+//! **That premise is gone.** As of the 2026-08-12 owner decision, the
+//! controller's own default flipped: an absent `WIREMESH_ROTATION_INTERVAL`
+//! resolves to `Ok(None)` — no rotation-initiation timer, exactly as if `off`
+//! had been written. Automatic rotation is opt-in there too now, so omitting
+//! this key would no longer arm anything, and these assertions are no longer
+//! what stands between the fleet and a scheduled outage. Do not read the
+//! reasoning below as describing current controller behaviour; the contract
+//! is unchanged, but it now rests on the two reasons
+//! `crates/wiremesh-operator/src/workloads.rs` gives at the emission site:
+//!
+//!   1. **The rendered Deployment STATES the fabric's rotation posture**
+//!      rather than leaving it to be inferred from a missing key. Someone
+//!      reading a live manifest, or diffing two clusters, sees `off` written
+//!      down instead of having to know what the controller does with silence.
+//!   2. **It stays correct against an older controller** — one predating the
+//!      2026-08-12 flip, which still reads an absent variable as "rotate every
+//!      30 days". Operator and controller are separately-versioned artifacts
+//!      and a fleet can be mixed mid-upgrade; emitting `off` is what makes the
+//!      manifest mean the same thing on both.
+//!
+//! **Risk profile, for whoever weighs this file next:** it dropped from
+//! "prevents a live, fabric-wide bug" to "prevents cosmetic ambiguity, plus
+//! old-controller compatibility". Nothing here was weakened when the premise
+//! changed — the emission contract is unchanged and every assertion still pins
+//! it exactly — but that is what it is worth now, and a future reader who
+//! over-weights it (or who reads the old rationale and concludes the
+//! controller still arms itself on silence) will be reasoning from a world
+//! that ended on 2026-08-12.
 //!
 //! The original "omit" rationale was that emitting *any* default would let
 //! SSA `.force()` (`Container.env` is `x-kubernetes-list-type: map`,
@@ -25,12 +60,14 @@
 //! reconcile. That risk hasn't gone away — but the *direction* of the clobber
 //! has flipped: the default now emitted IS `off`, so the only reconcile this
 //! contract can silently perform is toward the safe state, never away from
-//! it. A hand-set `45m` being reconciled back to `off` is the intended
-//! behavior until the in-step done-bar passes and the timer can be
-//! re-enabled fabric-wide.
-//!
-//! Tests below marked "INVERTED" assert the literal opposite of what this
-//! file asserted before — that is deliberate, not drift.
+//! it. A hand-set `45m` on the Deployment being reconciled back to the CR's
+//! value is intended: `spec.rotationInterval` is the one place the interval is
+//! declared, and arming the timer is a choice made there, deliberately. That
+//! choice is still not recommended — the in-step rotation done-bar passed in
+//! v0.9.1 (`crates/wiremesh-gateway/tests/key_rotation.rs` is green, with no
+//! `#[ignore]` left), but the rotation wedge is still open: `docs/BACKLOG.md`
+//! item 9, where one part-failed rotation leaves a gateway silently ignoring
+//! every later directive until it is restarted.
 //!
 //! # Pinned surface (unchanged from before)
 //!
@@ -161,17 +198,24 @@ fn legacy_controller_cr_without_the_field_still_deserializes() {
 /// omitted, not empty, not the controller's 30-day default silently taking
 /// over.
 ///
-/// Why this matters: `wiremesh_controller::rotation_interval_from_env`
-/// (`crates/wiremesh-controller/src/lib.rs:445`) treats an ABSENT env var as
-/// **armed** — it falls back to `Config::default_rotation_interval()` (30
-/// days), not to "off". Omitting the key therefore does not mean "leave
-/// rotation alone"; it means "arm automatic rotation at the controller's
-/// 30-day default". The root `CLAUDE.md` "Key rotation" section requires
-/// automatic rotation to stay OFF fabric-wide until the in-step rotation
-/// done-bar passes (`crates/wiremesh-gateway/tests/key_rotation.rs`,
-/// currently committed `#[ignore]`d RED-by-design) — so every
-/// operator-managed controller that omitted this key was silently
-/// non-compliant with that guideline. Emitting `off` explicitly is the fix.
+/// Why this matters — updated 2026-08-12, and the update matters as much as
+/// the test. This assertion was written against a controller whose
+/// `rotation_interval_from_env` treated an ABSENT env var as **armed** (a
+/// fallback to `Config::default_rotation_interval()`, 30 days), so omitting
+/// the key meant "arm automatic rotation at the controller's 30-day default"
+/// and this test was what stopped it. **That is no longer true**: since the
+/// 2026-08-12 owner decision an absent `WIREMESH_ROTATION_INTERVAL` resolves
+/// to no timer at all, so omitting the key would arm nothing.
+///
+/// The contract stands on its two surviving reasons (see this file's module
+/// doc and the emission site in `workloads.rs`): the rendered Deployment
+/// should STATE the fabric's rotation posture rather than imply it by
+/// absence, and the manifest must stay correct against a controller old
+/// enough to still read silence as "rotate every 30 days" — operator and
+/// controller are separately-versioned and a fleet can be mixed mid-upgrade.
+/// What this test prevents is therefore no longer a live outage but an
+/// ambiguous manifest plus a version-skew hazard. Every assertion below is
+/// unchanged.
 #[test]
 fn none_emits_off_explicitly_not_omitted() {
     let env = controller_container_env(&ctrl_spec(None));
@@ -182,11 +226,14 @@ fn none_emits_off_explicitly_not_omitted() {
         1,
         "spec.rotation_interval == None must emit EXACTLY ONE \
          WIREMESH_ROTATION_INTERVAL entry (never zero, never duplicated). \
-         Omitting it entirely leaves automatic key rotation ARMED at the \
-         controller's 30-day default (rotation_interval_from_env, lib.rs:445 \
-         treats absence as \"use the default\", not \"off\") — which violates \
-         the root CLAUDE.md guideline that automatic rotation must stay off \
-         fabric-wide until the in-step rotation done-bar passes: {env:?}"
+         Omitting it leaves the rendered Deployment silent about the fabric's \
+         rotation posture, so a reader has to know what the controller does \
+         with an absent variable to know what this cluster does — and the \
+         answer depends on the controller's version: since 2026-08-12 absence \
+         means no timer, but a controller predating that flip still reads it \
+         as \"rotate every 30 days\", which an operator/controller version skew \
+         makes reachable in a real fleet. Emitting `off` explicitly is what \
+         makes the manifest mean the same thing on both: {env:?}"
     );
     assert_eq!(
         matches[0].1.as_deref(),

@@ -470,14 +470,17 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
         // Bind enroll/sync/observe to all interfaces so the Service can route
         // to them (the Admin TCP listener stays loopback-only regardless).
         env("WIREMESH_BIND_IP", "0.0.0.0"),
-        // Always present, never conditional. `WIREMESH_ROTATION_INTERVAL=off`
-        // is the project-wide default until the in-step rotation done-bar
-        // passes (root CLAUDE.md, "Key rotation") — an unset spec must not
-        // leave the controller to fall back to its own armed-by-default
-        // (30-day) behavior. The operator owns this key under SSA
-        // force-apply (`Container.env` is a `list-map-keys: [name]` merge
-        // key), so a hand-set `off` IS reconciled back on every pass; that's
-        // intended while the done-bar is outstanding. See
+        // Always present, never conditional. Automatic rotation off is the
+        // project-wide default (root CLAUDE.md, "Key rotation"), and since
+        // 2026-08-12 the controller agrees — an absent variable means no timer
+        // there too. Emitting `off` anyway is deliberate on two counts: the
+        // rendered Deployment states the fabric's rotation posture rather than
+        // leaving it to be inferred from a missing key, and it stays correct
+        // against a controller old enough to still fall back to its
+        // armed-by-default (30-day) behavior. The operator owns this key under
+        // SSA force-apply (`Container.env` is a `list-map-keys: [name]` merge
+        // key), so a hand-set `off` IS reconciled back on every pass; the CR
+        // field is where the interval is declared. See
         // `WiremeshControllerSpec::rotation_interval`. Literal duplicated
         // from `wiremesh-controller::ROTATION_DISABLED_LITERAL` (private,
         // and this crate has no production dependency on that crate) — keep

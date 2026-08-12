@@ -72,29 +72,76 @@ losing `ca.key` means re-enrolling every gateway.
 
 ### Automatic key rotation (`WIREMESH_ROTATION_INTERVAL`)
 
-The controller rotates every gateway's WireGuard key on a timer — **every 30
-days by default**. Set `WIREMESH_ROTATION_INTERVAL` in
-`/etc/wiremesh/controller.env` to change or disable it; it takes effect on
-controller restart.
+**Automatic key rotation is OFF unless you turn it on.** A fresh install runs
+no rotation timer: `WIREMESH_ROTATION_INTERVAL` ships commented out in
+`/etc/wiremesh/controller.env`, and an unset variable means *no schedule*, not
+a default one.
+
+**Upgrading from a release that rotated on the unset default?** The *setting*
+does not change: the line was commented out before and is commented out now, so
+nothing you configured is touched, and the behaviour change arrives with the
+new controller **binary**, not with this file. What does change is the comment
+block around it, which this release rewrites — and that makes it a config-file
+change, so the packaging rules below apply. If your `controller.env` is locally
+modified, **deb prompts** and **rpm writes
+`/etc/wiremesh/controller.env.rpmnew`** and leaves yours alone. The pin the
+controller postinstall applies on any host upgraded from the
+`/var/lib/wiremesh` layout counts as a local modification, as does any edit of
+your own; an untouched file is simply replaced by both formats.
+
+**On rpm that is the case worth acting on.** Your existing file keeps the old
+block — the one documenting a 30-day default the binary no longer has. It is
+now wrong, and the correction sits only in the `.rpmnew`: **merge it.** Either
+way, if you were relying on the old default, the upgrade silently stops
+rotating and only an explicit interval brings it back.
+
+**Think hard before you set one.** Scheduled rotation drives a code path with
+a known-open defect — the *rotation wedge*, `docs/BACKLOG.md` item 9. A gateway
+accepts a rotate directive only while its rotation state machine is idle, and a
+rotation that fails part-way through leaves that state machine parked off-idle:
+the gateway then **silently ignores every later rotation until its process is
+restarted**, and never scrubs the old private key, so the security half of the
+rotation never happens either. **Do not count on being told.** The gateway logs
+a `ROTATION WEDGED` line for exactly one route — a cutover whose watch set
+empties — while the most reachable route, a rotation that fails part-way
+through, is **silent**. That line also lands in the *gateway's* journal
+(`journalctl -u wiremesh-gateway`), not the controller's, so an operator who
+arms the timer and watches the controller sees nothing at all. The timer is
+what makes
+this a fabric-wide event rather than a one-gateway one, because it fires for
+every active gateway off the same tick. That is why the `off` escape hatch was
+added in v0.7.0: to defuse a fabric-wide rotation outage that was already
+scheduled for the first timer fire.
+
+**Manual rotation is the supported path today.** `fabricctl` / the Admin
+`RotateKey` RPC rotates one gateway you choose, when you choose, with you
+watching — use it to replace a key you believe is compromised. It is unaffected
+by this setting.
+
+If you do want a schedule anyway, set it in `/etc/wiremesh/controller.env`; the
+value takes effect on controller restart, and the grammar is the same one that
+spells "no schedule":
 
 ```sh
 WIREMESH_ROTATION_INTERVAL=30d    # <integer><s|m|h|d>, lowercase unit
-WIREMESH_ROTATION_INTERVAL=off    # disable the automatic schedule
+WIREMESH_ROTATION_INTERVAL=off    # the default, spelled explicitly
 ```
 
 A malformed value (`30dd`, `30D`, `0d`) is a **startup error** — the controller
-refuses to boot rather than quietly falling back to the 30-day default and
-leaving you believing you changed something. Uppercase units are rejected on
-purpose (`M` reads as "months" to too many people). A zero interval is rejected
-because it would rotate in a hot loop. An interval longer than `3650d`
-(10 years) is rejected as well: at that scale a schedule is indistinguishable
-from no schedule, and in the extreme — a count near the 64-bit limit — the timer
+refuses to boot rather than quietly ignoring what you wrote and leaving you
+believing you changed something. Uppercase units are rejected on purpose (`M`
+reads as "months" to too many people). A zero interval is rejected because it
+would rotate in a hot loop. An interval longer than `3650d` (10 years) is
+rejected as well: at that scale a schedule is indistinguishable from no
+schedule, and in the extreme — a count near the 64-bit limit — the timer
 genuinely never fires. Either way you would have rotation switched off without
 the boot banner below that says so. If you meant "never" in any of these cases,
-write `off`.
+write `off` — or just leave the variable unset, which now means the same thing.
+Writing `off` is still worth doing on a host where someone might otherwise
+assume the missing line is an oversight.
 
-`off` disables the automatic **schedule** only. It does not disable rotation as
-a capability:
+Having no timer — unset or `off` — disables the automatic **schedule** only. It
+does not disable rotation as a capability:
 
 - a rotation already in flight when you switch it off still completes — the
   controller's decision sweep keeps running, including its recovery of a
@@ -104,10 +151,12 @@ a capability:
   compromised;
 - keys already in use keep working; nothing expires on its own.
 
-While it is off, no key is rotated on a schedule for as long as the controller
-runs, and the controller prints a loud `AUTOMATIC KEY ROTATION IS OFF` warning
-at every boot (visible in `journalctl -u wiremesh-controller`). Treat that
-banner as a standing to-do, not background noise.
+While there is no timer, no key is rotated on a schedule for as long as the
+controller runs, and the controller prints a loud `AUTOMATIC KEY ROTATION IS
+OFF` warning at every boot (visible in `journalctl -u wiremesh-controller`). On
+a stock install that banner is the **expected** state, not a misconfiguration —
+but it is still a standing to-do rather than background noise: it means key
+replacement is on you, via `fabricctl`, on whatever cadence your policy needs.
 
 ### Upgrading from a release that used `/var/lib/wiremesh`
 
