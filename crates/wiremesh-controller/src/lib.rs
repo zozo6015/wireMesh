@@ -151,9 +151,14 @@ pub struct Config {
     /// task fires: on each tick, every `active` gateway whose key set is
     /// single-`active`-only (not already mid-rotation — see
     /// [`services::sync::initiate_due_rotations`]) gets a fresh `rotate_key`
-    /// call with no operator action at all. `Some(30 days)`
-    /// ([`Config::default_rotation_interval`]) for every real deployment;
-    /// tests shrink this to sub-second values via
+    /// call with no operator action at all. `None` — no timer — in every
+    /// deployment that has not opted in, because an absent
+    /// `WIREMESH_ROTATION_INTERVAL` resolves to `None` (owner decision
+    /// 2026-08-12; see [`rotation_interval_from_env`]). `Some(interval)` only
+    /// when an operator wrote an interval down;
+    /// [`Config::default_rotation_interval`] is the 30 days that `30d` names —
+    /// the recommended period if you arm the timer, no longer a fallback the
+    /// software picks on its own. Tests shrink this to sub-second values via
     /// `wiremesh_testkit::TestController::start_with_rotation_intervals` so
     /// the timer's behavior can be observed without an actual 30-day wait.
     /// `serve()` consumes `tokio::time::interval`'s immediate first tick
@@ -163,10 +168,12 @@ pub struct Config {
     ///
     /// `None` DISABLES automatic initiation: [`serve`] spawns no
     /// rotation-initiation task at all (not a very-long interval — there is
-    /// no timer). Set from `WIREMESH_ROTATION_INTERVAL=off` via
-    /// [`rotation_interval_from_env`]/[`parse_rotation_interval`]. This is the
-    /// operator escape hatch for the known-broken automatic-rotation path, and
-    /// it is deliberately narrow — it turns off the SCHEDULE only:
+    /// no timer). It is what BOTH an unset `WIREMESH_ROTATION_INTERVAL` and an
+    /// explicit `WIREMESH_ROTATION_INTERVAL=off` resolve to, via
+    /// [`rotation_interval_from_env`]/[`parse_rotation_interval`] — the
+    /// default state for the known-broken automatic-rotation path, with `off`
+    /// left as the way to write that state down deliberately. It is
+    /// deliberately narrow — it turns off the SCHEDULE only:
     ///
     ///   * the decision sweep ([`Config::rotation_sweep_interval`] /
     ///     [`services::sync::sweep_rotations`]) keeps running, so a rotation
@@ -214,8 +221,28 @@ impl Config {
         std::net::Ipv4Addr::LOCALHOST
     }
 
-    /// The default rotation-initiation interval: 30 days. See
-    /// [`Config::rotation_interval`]'s doc comment.
+    /// The interval the token `30d` denotes: 30 days — and the rotation period
+    /// recommended to an operator who decides to arm the timer.
+    ///
+    /// NOT a default the software applies on its own: since 2026-08-12 an
+    /// absent `WIREMESH_ROTATION_INTERVAL` means NO timer, not this
+    /// ([`rotation_interval_from_env`]), and no production code path calls this
+    /// function any more.
+    ///
+    /// It survives because the TESTS need a name for the interval `30d`
+    /// denotes: `wiremesh_testkit::TestController::start`/`start_on` boot with
+    /// it, `tests/boot_leaves_no_residue.rs` builds its `Config` with it, and
+    /// `tests/rotation_interval_parse.rs` pins `30d` against it in
+    /// `thirty_days_equals_the_named_interval_constant`, so a change to either
+    /// end of that pair has to be deliberate.
+    ///
+    /// The operator-facing surfaces do NOT quote this value, and cannot: the
+    /// docs, `--help` and the disabled-rotation banner all spell the TOKEN
+    /// `30d` inside prose, which no constant can be interpolated into, and each
+    /// is pinned by its own test instead. (The one site that did interpolate it
+    /// — the `NotUnicode` rejection message — stopped on 2026-08-12, because it
+    /// was explaining itself by reference to a fallback that no longer exists.)
+    /// See [`Config::rotation_interval`]'s doc comment.
     pub fn default_rotation_interval() -> std::time::Duration {
         std::time::Duration::from_secs(30 * 24 * 60 * 60)
     }
@@ -247,9 +274,9 @@ const ROTATION_DISABLED_LITERAL: &str = "off";
 ///   * `off`, in any casing → `Ok(None)`, automatic rotation DISABLED.
 ///
 /// Surrounding whitespace is trimmed (env files and Kubernetes manifests pick
-/// up stray spaces and newlines trivially, and a ` off ` that silently fell
-/// back to the 30-day timer would reinstate exactly the scheduled fabric-wide
-/// outage the operator just tried to switch off). Interior whitespace is not.
+/// up stray spaces and newlines trivially, and a ` 30d ` rejected for its
+/// spaces would stop the boot of an operator who did everything right).
+/// Interior whitespace is not.
 ///
 /// Everything else is an `Err` the caller is expected to turn into a non-zero
 /// exit, rather than a fallback to some default:
@@ -422,61 +449,289 @@ fn invalid_rotation_interval(raw: &str, why: &str) -> anyhow::Error {
 /// `lookup` mirrors [`std::env::var`]'s signature ON PURPOSE, rather than the
 /// lossy `.ok()` form: `std::env::var` returns `Err(VarError::NotUnicode(..))`
 /// for a PRESENT variable whose bytes are not UTF-8, and collapsing that into
-/// `None` would make it indistinguishable from ABSENT — i.e. it would arm the
-/// 30-day timer, with no banner and no error, for an operator who believes
-/// they wrote `off`. Keeping the distinction in the signature also keeps it
-/// testable without touching the real process environment.
+/// `None` would make it indistinguishable from ABSENT — i.e. the controller
+/// would silently answer, with the answer the operator did not give, a
+/// question they DID answer. Keeping the distinction in the signature also
+/// keeps it testable without touching the real process environment.
 ///
-/// ABSENT (`Err(VarError::NotPresent)`) →
-/// `Ok(Some(Config::default_rotation_interval()))`, the unchanged 30-day
-/// behaviour. NOT UTF-8 → `Err`. PRESENT → whatever [`parse_rotation_interval`]
-/// makes of it, INCLUDING an error: a present-but-malformed value is a startup
-/// error, not a silent fallback — the same precedent (and the same reasoning)
-/// as `main.rs`'s `port_env`. An operator who mistyped `30dd` must find out at
-/// boot rather than discover a 30-day timer still running months later, and
-/// one who mistyped `of` must not be left believing rotation is off when it is
-/// not. (Deliberately NOT the warn-and-fall-back treatment `WIREMESH_BIND_IP`
-/// gets: a wrong bind IP fails loudly the moment nothing can connect, whereas
-/// a wrong rotation interval is invisible until it fires.)
+/// ABSENT (`Err(VarError::NotPresent)`) → `Ok(None)`: NO rotation-initiation
+/// timer, exactly as if `off` had been written. **Owner decision, 2026-08-12 —
+/// automatic rotation is opt-in.** Absent used to mean
+/// `Some(Config::default_rotation_interval())`, which armed the timer in every
+/// artifact that ships without the variable set: the `.deb`/`.rpm` (whose
+/// `deploy/packages/env/controller.env` leaves it commented out), the
+/// container image, and any source build — only the Kubernetes operator path
+/// escaped, and only because `workloads.rs` emits `off` explicitly. Arming
+/// that timer points a fabric at a KNOWN-OPEN defect (`docs/BACKLOG.md` item 9,
+/// the rotation wedge: a rotation that fails part-way parks the gateway's
+/// phase off `Idle`, `Rotation::on_directive` is honoured only from `Idle`, so
+/// that gateway silently ignores every later directive until it is restarted
+/// and never scrubs the old key), on a fuse that burns for a month before
+/// anyone sees it. An operator who never made a choice must not have one made
+/// for them; arming automatic rotation now takes an interval written down
+/// where a human can find it. `Err` here would be worse than either — every
+/// controller that has never set the variable would refuse to boot on upgrade.
+///
+/// NOT UTF-8 → `Err`. PRESENT → whatever [`parse_rotation_interval`] makes of
+/// it, INCLUDING an error: a present-but-malformed value is a startup error,
+/// not a silent fallback — the same precedent (and the same reasoning) as
+/// `port_from_env` below. An operator who mistyped `30dd` must find out at
+/// boot rather than discover months later that nothing has ever rotated.
+/// (Deliberately NOT the warn-and-fall-back treatment `WIREMESH_BIND_IP` gets:
+/// a wrong bind IP fails loudly the moment nothing can connect, whereas a
+/// wrong rotation interval is invisible until it fires — or, now, until it
+/// doesn't.)
 pub fn rotation_interval_from_env(
     lookup: impl FnOnce(&str) -> std::result::Result<String, std::env::VarError>,
 ) -> Result<Option<std::time::Duration>> {
     match lookup(ROTATION_INTERVAL_ENV) {
-        Err(std::env::VarError::NotPresent) => Ok(Some(Config::default_rotation_interval())),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(std::env::VarError::NotUnicode(_)) => Err(anyhow::anyhow!(
-            "{ROTATION_INTERVAL_ENV} is set, but its value is not valid UTF-8. It is being \
-             treated as a startup error rather than as unset, because falling back to the \
-             {}-day default here would silently arm the automatic key-rotation timer for an \
-             operator who believes they disabled it. Set {ROTATION_INTERVAL_ENV} to \
-             `<integer><s|m|h|d>` (e.g. `30d`, `12h`, `900s`), or to \
-             `{ROTATION_DISABLED_LITERAL}` to disable automatic key rotation",
-            Config::default_rotation_interval().as_secs() / (24 * 60 * 60),
+            "{ROTATION_INTERVAL_ENV} is set, but its value is not valid UTF-8. The bytes are \
+             deliberately NOT echoed back — `VarError::NotUnicode` does carry them, but a \
+             mis-encoded value renders as mojibake or as an escape soup that is worse than \
+             useless for spotting the typo, so the variable's name is what you are given to \
+             act on. It is being treated as a startup error rather than as unset, because \
+             the variable IS set: the operator meant something by it, and the one resolution \
+             the controller could silently pick — reading it as unset, there being no \
+             interval left to fall back to since 2026-08-12 — would leave a fabric \
+             with no rotation timer at all for someone who typed `12h`, and nothing would \
+             tell them. Re-set {ROTATION_INTERVAL_ENV} to `<integer><s|m|h|d>` (e.g. `30d`, \
+             `12h`, `900s`), or to `{ROTATION_DISABLED_LITERAL}` to keep automatic key \
+             rotation disabled"
         )),
         Ok(raw) => parse_rotation_interval(&raw)
             .with_context(|| format!("reading {ROTATION_INTERVAL_ENV}")),
     }
 }
 
+/// Reads `var` as a `u16` port through `lookup`: an ABSENT variable falls back
+/// to `default` (`0` = OS-assigned, everywhere this is called), but a
+/// PRESENT-but-malformed value (e.g. `WIREMESH_ADMIN_TCP_PORT=abc`) is a
+/// startup error rather than silently becoming `0` — an operator who mistyped a
+/// port number must find out at boot, not discover an unexpected ephemeral
+/// listener later.
+///
+/// The `NotPresent`-vs-any-other-`VarError` split is the same one
+/// [`rotation_interval_from_env`] keeps, for the same reason: a
+/// PRESENT-but-non-UTF-8 value is an answer the controller cannot READ, not an
+/// absent one, so it is reported rather than replaced by `default`.
+fn port_from_env(
+    var: &str,
+    default: u16,
+    lookup: impl FnOnce(&str) -> std::result::Result<String, std::env::VarError>,
+) -> Result<u16> {
+    match lookup(var) {
+        Ok(v) => v
+            .parse::<u16>()
+            .with_context(|| format!("{var}={v:?} is not a valid u16 port")),
+        Err(std::env::VarError::NotPresent) => Ok(default),
+        Err(e) => Err(e).with_context(|| format!("reading {var}")),
+    }
+}
+
+/// Builds the [`Config`] the binary boots with, reading every `WIREMESH_*`
+/// variable through `lookup` (`main.rs` passes `|k| std::env::var(k)`).
+///
+/// # Why this lives in the library and not in `main.rs`
+///
+/// `main.rs` is unreachable from an integration test, so for as long as this
+/// assembly lived there it was the one UNPINNED link in the rotation contract
+/// ratified on 2026-08-12 (automatic key rotation is OPT-IN). Both of its
+/// neighbours were covered — env absent → `Ok(None)` by
+/// `tests/rotation_interval_parse.rs`, and `rotation_interval: None` → no timer
+/// task by `tests/rotation_disabled.rs` — while the step BETWEEN them, putting
+/// the resolved value into the field, was covered by nothing. Writing
+///
+/// ```ignore
+/// rotation_interval: rotation_interval.or(Some(Config::default_rotation_interval())),
+/// ```
+///
+/// here — for "upgrade compatibility", or while resolving a merge conflict —
+/// would re-arm a 30-day timer on every `.deb`/`.rpm`/container/source install
+/// while leaving the entire suite green, which is the exact regression the flip
+/// exists to prevent. `tests/config_from_env.rs` now pins it, and can only do
+/// so because the assembly is a library function taking an injectable `lookup`.
+///
+/// Spawning the real binary is the other way to cover it, and is the wrong
+/// instrument: a real boot mints a CA and trips the `/var/lib/wiremesh` re-mint
+/// guard on any host that already has one, and [`Config::legacy_data_dir`] is
+/// deliberately NOT env-settable (an operator-settable override would be a
+/// one-line bypass of that guard), so such a test would go red on real
+/// controller hosts and on developer boxes for reasons having nothing to do
+/// with the environment it was checking.
+///
+/// # `lookup`
+///
+/// `Fn`, not `FnOnce`: eight variables are read. It mirrors [`std::env::var`]'s
+/// own signature rather than the lossy `.ok()` form, and that shape is carried
+/// ALL THE WAY DOWN — each variable's reader is handed `&lookup`, never a
+/// narrowed `Option<String>`. Collapsing to `Option<String>` once at the top is
+/// the obvious simplification, since six of the eight variables only care about
+/// present-vs-absent, and it silently destroys the third case:
+/// `Err(VarError::NotUnicode(..))` means PRESENT-but-unreadable, and reading
+/// that as ABSENT answers a question the operator DID answer, with the answer
+/// they did not give. Both [`rotation_interval_from_env`] and this module's
+/// `port_from_env` are built on that distinction surviving the trip.
+///
+/// # The one deliberate asymmetry
+///
+/// A malformed `WIREMESH_BIND_IP` WARNS and falls back to loopback; a malformed
+/// port or rotation interval is a hard startup error. Not an oversight: a wrong
+/// bind IP announces itself the moment nothing can connect, so refusing to boot
+/// would be strictly worse than coming up on loopback — whereas a wrong
+/// rotation interval is invisible until it fires, or, since the flip, until it
+/// doesn't. `tests/config_from_env.rs` pins both sides, so neither can be
+/// "fixed" into the other.
+pub fn config_from_env(
+    lookup: impl Fn(&str) -> std::result::Result<String, std::env::VarError>,
+) -> Result<Config> {
+    // The read order below is `main.rs`'s pre-extraction order, kept even where
+    // regrouping would read better (the two paths apart from each other, the
+    // four ports apart from `bind_ip`). Nothing pins it and nothing should —
+    // which variable is reached first is an implementation detail — but it IS
+    // observable on a boot that is going to fail anyway: with two variables
+    // malformed at once, the one reached first decides which error the operator
+    // gets, and reaching `bind_ip` before a doomed `rotation_interval` would
+    // also add a stderr warning the old binary never printed. Keeping the order
+    // makes this extraction identical rather than merely equivalent.
+
+    // Absent → the production locations the packaging, the systemd unit and
+    // `docs/install.md` all assume. These two alone among the eight swallow
+    // EVERY `VarError`, so a present-but-non-UTF-8 value reads as absent —
+    // carried over verbatim because this extraction is behaviour-preserving,
+    // not because the shape is obviously right. `std::env::var_os` would take
+    // such a value unharmed (`OsString` → `PathBuf` is lossless), and
+    // `data_dir` is both the variable here most likely to hold non-UTF-8 bytes
+    // and the one the CA re-mint guard keys on. Changing that is a behaviour
+    // change and needs its own test first.
+    let data_dir = lookup("WIREMESH_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/var/lib/wiremesh"));
+    // All four ports default to `0` = OS-assigned; see their `Config` fields.
+    let tcp_port = port_from_env("WIREMESH_TCP_PORT", 0, &lookup)?;
+    let sync_tcp_port = port_from_env("WIREMESH_SYNC_TCP_PORT", 0, &lookup)?;
+    let socket_path = lookup("WIREMESH_SOCKET_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/run/wiremesh/controller.sock"));
+    let admin_tcp_port = port_from_env("WIREMESH_ADMIN_TCP_PORT", 0, &lookup)?;
+    let observe_udp_port = port_from_env("WIREMESH_OBSERVE_UDP_PORT", 0, &lookup)?;
+
+    // How often (if ever) the rotation-initiation timer fires. Absent = NO
+    // timer, the same resolution as an explicit `off` — automatic rotation is
+    // opt-in (owner decision 2026-08-12; see `rotation_interval_from_env`). A
+    // PRESENT-but-malformed value is a startup error (the `?`), for the reason
+    // the asymmetry section above gives.
+    let rotation_interval = rotation_interval_from_env(&lookup)?;
+
+    // The IP the enroll/sync/observe listeners bind to. Defaults to loopback
+    // (historical/dev). In Kubernetes the operator sets
+    // `WIREMESH_BIND_IP=0.0.0.0` so those listeners are reachable via the
+    // controller Service (the Admin TCP listener stays loopback-only regardless
+    // — see `Config::bind_ip`). A malformed value falls back to the loopback
+    // default, never to a wildcard: "I could not understand you, so I exposed
+    // the control plane on every interface" is not a recoverable mistake.
+    let bind_ip = match lookup("WIREMESH_BIND_IP") {
+        Ok(s) => s.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "wiremesh-controller: invalid WIREMESH_BIND_IP={s:?}, using {}",
+                Config::default_bind_ip()
+            );
+            Config::default_bind_ip()
+        }),
+        Err(_) => Config::default_bind_ip(),
+    };
+
+    Ok(Config {
+        data_dir,
+        tcp_port,
+        sync_tcp_port,
+        socket_path,
+        admin_tcp_port,
+        observe_udp_port,
+        bind_ip,
+        rotation_interval,
+        // Deliberately not an operator knob: the sweep is what promotes,
+        // retires and recovers rotations already in flight, and it keeps
+        // running even with the initiation timer off — see
+        // `Config::rotation_sweep_interval`.
+        rotation_sweep_interval: Config::default_rotation_sweep_interval(),
+        // Production always probes the real `/var/lib/wiremesh`. Deliberately
+        // not env-configurable — see `Config::legacy_data_dir`.
+        legacy_data_dir: None,
+    })
+}
+
 /// The boot-time banner [`serve`] prints when `rotation_interval: None` —
-/// automatic key rotation is off, and that is a standing operational risk an
-/// operator must not be able to forget they took on. Printed to stderr because
-/// that is this binary's only diagnostic surface: the controller exposes no
-/// metrics/Prometheus endpoint to also publish it on (unlike the gateway),
-/// and inventing one for a single gauge is not in scope for this knob.
-fn warn_automatic_rotation_disabled() {
-    eprintln!(
+/// automatic key rotation is off, and that is a standing operational fact an
+/// operator must not be able to forget. It is also the reason
+/// [`MAX_ROTATION_INTERVAL_SECS`] exists: an interval so long it never fires
+/// would be "disabled" without this line ever being printed.
+///
+/// It does NOT say WHICH of the two causes put the controller here, and that
+/// is deliberate. Since 2026-08-12 an absent `WIREMESH_ROTATION_INTERVAL`
+/// resolves to `None` exactly like an explicit `off`
+/// ([`rotation_interval_from_env`]), and absent is now the majority path — the
+/// `.deb`/`.rpm` ship the line commented out, the container image sets no env,
+/// a source build inherits nothing. Stating `off` as a fact about the running
+/// configuration, which this banner used to do verbatim, would send its one
+/// reader grepping `/etc/wiremesh/controller.env` for a value nobody wrote,
+/// left choosing between "the controller is lying" and "something sets this
+/// behind my back". This function knows nothing about the cause anyway — it
+/// receives no arguments, because `serve` reaches it through the resolved
+/// `Option`.
+///
+/// Exposed (rather than being inlined into
+/// [`warn_automatic_rotation_disabled`]) so the text is assertable from an
+/// integration test without spawning the binary: a real boot mints a CA and
+/// trips the `/var/lib/wiremesh` re-mint guard on any host that already has
+/// one (see [`Config::legacy_data_dir`], deliberately not env-settable), so a
+/// stderr-scraping test would go red on real controller hosts and developer
+/// boxes for reasons having nothing to do with this prose. There is exactly
+/// ONE copy of it: `warn_automatic_rotation_disabled` prints what this returns
+/// and knows nothing else, so the tested string cannot drift from the printed
+/// one. See `tests/rotation_disabled_banner.rs`.
+pub fn automatic_rotation_disabled_banner() -> String {
+    format!(
         "wiremesh-controller: ############################################################\n\
          wiremesh-controller: ##  WARNING: AUTOMATIC KEY ROTATION IS OFF                ##\n\
          wiremesh-controller: ############################################################\n\
-         wiremesh-controller: {ROTATION_INTERVAL_ENV}={ROTATION_DISABLED_LITERAL} — no \
-         rotation-initiation timer is running, so NO gateway's WireGuard key will be \
-         rotated on a schedule, for as long as this controller runs. Keys will not be \
-         rotated until automatic rotation is re-enabled (set {ROTATION_INTERVAL_ENV} to an \
-         interval, e.g. 30d, and restart the controller).\n\
+         wiremesh-controller: {ROTATION_INTERVAL_ENV} is unset, or is set to \
+         `{ROTATION_DISABLED_LITERAL}` — either way no rotation-initiation timer is running, \
+         so NO gateway's WireGuard key will be rotated on a schedule, for as long as this \
+         controller runs. Keys will not be rotated until automatic rotation is turned on \
+         (set {ROTATION_INTERVAL_ENV} to an interval, e.g. 30d, and restart the \
+         controller).\n\
          wiremesh-controller: Still working: rotations already in flight complete normally \
          (the decision sweep keeps running), and manual rotation via Admin.RotateKey \
          (fabricctl) is unaffected."
-    );
+    )
+}
+
+/// Prints [`automatic_rotation_disabled_banner`] to stderr at boot — this
+/// binary's only diagnostic surface for the state, since the controller
+/// exposes no metrics/Prometheus endpoint to also publish it on (unlike the
+/// gateway), and inventing one for a single gauge is not in scope for this
+/// knob.
+///
+/// RETURNS what it printed, and [`serve`] keeps that value on the
+/// [`RunningController`] ([`RunningController::rotation_disabled_banner`]).
+/// That is not for the caller's benefit — nothing in the binary reads it — but
+/// so the CALL ITSELF is observable. Every test of this banner used to reach
+/// the formatter directly, which meant deleting `serve`'s call to this function
+/// left all of them green while the controller's only runtime signal that
+/// rotation is off silently disappeared. Returning the string makes the
+/// accessor `Some` if and only if this ran: the value cannot exist unless the
+/// call happened. It does not prove the bytes reached fd 2 — but `eprintln!` is
+/// then the only statement in a three-line function whose result is pinned,
+/// which is as close as an in-process test gets without `dup2`-ing a
+/// process-global fd out from under every other test in the binary. The same
+/// trade [`RunningController::automatic_rotation_disabled`] already makes by
+/// reading the spawn rather than a remembered `bool`.
+fn warn_automatic_rotation_disabled() -> String {
+    let banner = automatic_rotation_disabled_banner();
+    eprintln!("{banner}");
+    banner
 }
 
 /// A live, in-process controller instance. Dropping it stops both servers
@@ -518,6 +773,11 @@ pub struct RunningController {
     /// signal or join here.
     rotation_timer_shutdown_tx: Option<oneshot::Sender<()>>,
     rotation_timer_join: Option<JoinHandle<()>>,
+    /// What [`warn_automatic_rotation_disabled`] actually printed at boot, or
+    /// `None` when rotation was armed and it was never called. Held only so
+    /// that the PRINT is observable in-process — see that function's doc
+    /// comment and [`RunningController::rotation_disabled_banner`].
+    rotation_disabled_banner: Option<String>,
     /// (Key-rotation Task 4) The decision-sweep's background task — see
     /// [`Config::rotation_sweep_interval`] / [`services::sync::sweep_rotations`].
     rotation_sweep_shutdown_tx: Option<oneshot::Sender<()>>,
@@ -574,9 +834,11 @@ impl RunningController {
     }
 
     /// True when this controller booted with automatic key rotation DISABLED
-    /// (`rotation_interval: None`, i.e. `WIREMESH_ROTATION_INTERVAL=off`) —
-    /// no rotation-initiation task is running and no gateway key will be
-    /// rotated on a schedule for this process's lifetime.
+    /// (`rotation_interval: None` — i.e. `WIREMESH_ROTATION_INTERVAL` unset or
+    /// set to `off`, which have resolved to the same thing since 2026-08-12,
+    /// with unset now the majority path) — no rotation-initiation task is
+    /// running and no gateway key will be rotated on a schedule for this
+    /// process's lifetime.
     ///
     /// Read off the SPAWN ITSELF (`rotation_timer_join.is_none()`), not off a
     /// remembered copy of the config: [`serve`] disables rotation by not
@@ -589,6 +851,27 @@ impl RunningController {
     /// rotation is off.
     pub fn automatic_rotation_disabled(&self) -> bool {
         self.rotation_timer_join.is_none()
+    }
+
+    /// The disabled-rotation banner this controller PRINTED to stderr at boot,
+    /// or `None` if it booted with the timer armed and printed nothing.
+    ///
+    /// The companion to [`Self::automatic_rotation_disabled`], covering the
+    /// other half of the `None` arm: that accessor reads the spawn (no timer
+    /// task), this one reads the warning (the operator was told). Both are
+    /// needed because they fail independently — deleting `serve`'s
+    /// [`warn_automatic_rotation_disabled`] call leaves the timer correctly
+    /// unspawned and every banner test green while removing the controller's
+    /// ONLY runtime signal that rotation is off (unlike the gateway, this crate
+    /// has no metrics surface, so stderr at boot is all there is).
+    ///
+    /// `Some` if and only if the print happened: the string is the printer's
+    /// return value, so it cannot be produced without calling it. Compare it
+    /// against [`automatic_rotation_disabled_banner`] rather than a literal —
+    /// there is exactly one copy of that prose and this is a handle on it, not
+    /// a second one.
+    pub fn rotation_disabled_banner(&self) -> Option<&str> {
+        self.rotation_disabled_banner.as_deref()
     }
 
     /// Signals all servers to stop and waits (bounded) for their tasks to
@@ -971,14 +1254,15 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     let rotations = sync_svc.rotations_handle();
 
     // (Key-rotation Task 4) The rotation-initiation timer: fires every
-    // `config.rotation_interval` (default 30 days; tests shrink this via
+    // `config.rotation_interval` (only ever `Some` when an operator opted in
+    // with an explicit interval; tests shrink this via
     // `TestController::start_with_rotation_intervals`) and initiates a fresh
     // rotation for every `active` gateway not already mid-rotation. The
     // immediate first tick `tokio::time::interval` fires is deliberately
     // consumed BEFORE the loop starts (mirrors `broker::Broker::spawn`'s
     // identical comment) — without this, a controller boot would
     // immediately rotate every gateway's key rather than waiting a full
-    // interval, which is both surprising and (for the 30-day default)
+    // interval, which is both surprising and (for a 30-day interval)
     // irrelevant, but for a shrunk test interval would make "one interval
     // elapsed" tests unable to distinguish "fired at t=0" from "fired after
     // one real interval."
@@ -986,38 +1270,41 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     // `rotation_interval: None` = DISABLED, and it is disabled by NOT SPAWNING
     // THIS TASK AT ALL — deliberately not by substituting a very long interval,
     // which would still be a live timer that eventually fires (and which no
-    // in-process test could tell apart from "fell back to the 30-day default").
+    // in-process test could tell apart from "resolved to some long interval").
     // There is no `initiate_due_rotations` call site anywhere else, so with the
     // `None` arm taken nothing in the process can initiate a rotation on its
     // own. The decision sweep below is a SEPARATE task and is spawned
     // unconditionally — see `Config::rotation_interval`'s doc comment for why
     // stranding an in-flight rotation would be worse than either rotating or
     // not.
-    let (rotation_timer_shutdown_tx, rotation_timer_join) = match config.rotation_interval {
-        Some(rotation_interval) => {
-            let (tx, mut rotation_timer_shutdown_rx) = oneshot::channel::<()>();
-            let rotation_timer_db = db_handle.clone();
-            let rotation_timer_change_tx = change_tx.clone();
-            let join = tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(rotation_interval);
-                ticker.tick().await;
-                loop {
-                    tokio::select! {
-                        _ = &mut rotation_timer_shutdown_rx => break,
-                        _ = ticker.tick() => {
-                            services::sync::initiate_due_rotations(&rotation_timer_db, &rotation_timer_change_tx)
-                                .await;
+    //
+    // The third element is the banner the `None` arm printed, kept so that the
+    // PRINT is observable in-process — see `warn_automatic_rotation_disabled`
+    // and `RunningController::rotation_disabled_banner`. `None` on the armed
+    // arm: nothing was printed there, and nothing should have been.
+    let (rotation_timer_shutdown_tx, rotation_timer_join, rotation_disabled_banner) =
+        match config.rotation_interval {
+            Some(rotation_interval) => {
+                let (tx, mut rotation_timer_shutdown_rx) = oneshot::channel::<()>();
+                let rotation_timer_db = db_handle.clone();
+                let rotation_timer_change_tx = change_tx.clone();
+                let join = tokio::spawn(async move {
+                    let mut ticker = tokio::time::interval(rotation_interval);
+                    ticker.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = &mut rotation_timer_shutdown_rx => break,
+                            _ = ticker.tick() => {
+                                services::sync::initiate_due_rotations(&rotation_timer_db, &rotation_timer_change_tx)
+                                    .await;
+                            }
                         }
                     }
-                }
-            });
-            (Some(tx), Some(join))
-        }
-        None => {
-            warn_automatic_rotation_disabled();
-            (None, None)
-        }
-    };
+                });
+                (Some(tx), Some(join), None)
+            }
+            None => (None, None, Some(warn_automatic_rotation_disabled())),
+        };
 
     // (Key-rotation Task 4) The decision sweep: fires every
     // `config.rotation_sweep_interval` (default 5s) and drives the Task-3
@@ -1109,6 +1396,7 @@ pub async fn serve(config: Config) -> Result<RunningController> {
         // same way they handle an already-taken handle.
         rotation_timer_shutdown_tx,
         rotation_timer_join,
+        rotation_disabled_banner,
         rotation_sweep_shutdown_tx: Some(rotation_sweep_shutdown_tx),
         rotation_sweep_join: Some(rotation_sweep_join),
     })

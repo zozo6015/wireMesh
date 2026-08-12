@@ -4,14 +4,27 @@
 //! feeds it in `main.rs`.
 //!
 //! Why this knob exists (and why the DISABLED path is the one tested
-//! hardest): the controller automatically rotates every active gateway's
-//! WireGuard key on a 30-day timer (`services::sync::initiate_due_rotations`).
-//! Automatic rotation is currently known-broken in ways that make a scheduled
-//! fabric-wide outage inevitable, so an operator must be able to turn the
-//! timer OFF until the structural fix lands. `off` is that escape hatch, and
-//! the parser is its only gate — an `off` that silently parses as "some
-//! interval" (or a `0s` that silently parses as "off", or as a hot-looping
-//! zero interval) is the failure mode this file exists to prevent.
+//! hardest): when the rotation-initiation timer is armed, the controller
+//! automatically rotates every active gateway's WireGuard key on it
+//! (`services::sync::initiate_due_rotations`). Automatic rotation is currently
+//! known-broken in ways that make a scheduled fabric-wide outage inevitable
+//! (backlog item 9 — the rotation wedge: one failed rotation makes a gateway
+//! silently ignore every further `RotateDirective` until it is restarted), so
+//! an operator must be able to keep that timer OFF until the structural fix
+//! lands. `off` is the explicit escape hatch, and the parser is its only gate
+//! — an `off` that silently parses as "some interval" (or a `0s` that silently
+//! parses as "off", or as a hot-looping zero interval) is the failure mode
+//! this file exists to prevent.
+//!
+//! **Contract flip, owner-ratified 2026-08-12 — automatic rotation is now
+//! OPT-IN.** An ABSENT `WIREMESH_ROTATION_INTERVAL` used to mean "rotate every
+//! gateway every 30 days". That armed the wedge by default in every shipped
+//! artifact — the `.deb`/`.rpm` (whose `deploy/packages/env/controller.env`
+//! leaves the variable commented out), the ghcr container image, and any
+//! source build; only the Kubernetes operator path escaped it, and only
+//! because it emits `off` explicitly. Absent now resolves to `Ok(None)`, the
+//! same no-timer state as `off`. Arming automatic rotation requires an
+//! operator to write an interval down.
 //!
 //! Contract under test:
 //!
@@ -54,18 +67,22 @@
 //! ```
 //!
 //! `lookup` mirrors `std::env::var`'s own signature rather than the lossy
-//! `.ok()` form, and that is load-bearing: `Err(VarError::NotUnicode(..))`
-//! means PRESENT-but-not-UTF-8, and collapsing it into "absent" would arm the
-//! 30-day timer, silently, for an operator who believes they wrote `off`.
+//! `.ok()` form, and that is still load-bearing after the flip:
+//! `Err(VarError::NotUnicode(..))` means PRESENT-but-not-UTF-8, and collapsing
+//! it into "absent" would silently answer a question the operator DID answer,
+//! with the answer they did not give.
 //!
-//!   * ABSENT (`Err(VarError::NotPresent)`) →
-//!     `Ok(Some(Config::default_rotation_interval()))` — the unchanged 30-day
-//!     behaviour every existing deployment takes;
-//!   * NOT UTF-8 (`Err(VarError::NotUnicode(..))`) → `Err`, never the default;
+//!   * ABSENT (`Err(VarError::NotPresent)`) → `Ok(None)`, no timer — the
+//!     operator made no choice, so none is made for them;
+//!   * NOT UTF-8 (`Err(VarError::NotUnicode(..))`) → `Err`. The value is
+//!     PRESENT, so it is a value the operator meant something by, and neither
+//!     resolution is honest: silently arming an interval they may not have
+//!     asked for, or silently running with no timer when they may have typed
+//!     `12h`;
 //!   * PRESENT (`Ok(raw)`) → whatever the parser makes of it, INCLUDING the
-//!     error. A malformed value must never be swallowed into the default: an
-//!     operator who typed `of` instead of `off` would otherwise believe
-//!     rotation was disabled while a 30-day timer was in fact still armed.
+//!     error. A malformed value must never be swallowed into any fallback: an
+//!     operator who typed `30dd` must find out at boot rather than discover
+//!     months later that nothing has ever rotated.
 //!
 //! These tests do not compile until `parse_rotation_interval` exists — that
 //! compile failure is the expected RED.
@@ -393,23 +410,50 @@ fn rejects_intervals_above_the_ten_year_cap() {
     }
 }
 
-/// Requirement 6: the default is unchanged at 30 days. `Config::default_rotation_interval()`
-/// stays a plain `Duration` (the `Option` lives on the `Config` field, where
-/// `None` means "disabled"), and `30d` — the string an operator would write to
-/// restore the default explicitly — parses to exactly it.
+/// Requirement 6: `Config::default_rotation_interval()` still names 30 days,
+/// and `30d` still parses to exactly it.
+///
+/// Both assertions predate the 2026-08-12 flip and both survive it — what
+/// changed is what the constant MEANS. It is no longer "what an operator who
+/// sets nothing gets" (silence now gets no timer at all — see
+/// `env_absent_means_no_timer_never_a_default_interval`); it is simply the
+/// interval the string `30d` denotes.
+///
+/// Why it survives at all, since no production path calls it any more: the
+/// TESTS need a name for that interval — `wiremesh_testkit`'s
+/// `TestController::start`/`start_on` boot with it, `boot_leaves_no_residue.rs`
+/// builds its `Config` with it, and the second assertion below pins `30d`
+/// against it, so a change to either end of that pair has to be deliberate.
+/// Deleting it in the name of "there is no default any more" would scatter
+/// `30 * 24 * 60 * 60` across those call sites; making it mean "the fallback"
+/// again would re-arm every silent install.
+///
+/// What it is NOT is a value the operator-facing surfaces quote. They cannot:
+/// the docs, `--help` and the disabled-rotation banner all spell the TOKEN
+/// `30d` inside prose, which no constant can be interpolated into, and each is
+/// pinned by its own test instead (`cli_help_version.rs`,
+/// `rotation_disabled_banner.rs`). This doc comment claimed the opposite until
+/// 2026-08-12, in the same words `Config::default_rotation_interval`'s own doc
+/// used — two statements of one false rationale, each reading as corroboration
+/// of the other, which is precisely how it survived. Both are now fixed; if
+/// they ever disagree again, `lib.rs` is the one to believe.
+///
+/// It also stays a plain `Duration` — the `Option` lives on the `Config` field,
+/// where `None` means "disabled".
 #[test]
-fn thirty_days_equals_the_unchanged_default() {
+fn thirty_days_equals_the_named_interval_constant() {
     assert_eq!(
         Config::default_rotation_interval(),
         Duration::from_secs(30 * 24 * 60 * 60),
-        "the production default must stay 30 days — this knob only adds an override, it \
-         must not change what an operator who sets nothing gets"
+        "the constant must stay 30 days — it is the recommended rotation period quoted to \
+         operators, and `30d` below is pinned against it"
     );
     assert_eq!(
         parsed("30d"),
         Some(Config::default_rotation_interval()),
-        "`30d` must parse to exactly the built-in default, so an operator can write the \
-         default down explicitly and get identical behaviour"
+        "`30d` must parse to exactly the named constant, so an operator who wants the \
+         recommended 30-day rotation can write it down and get precisely that — which is \
+         now the ONLY way to get it (see only_an_explicit_interval_can_arm_the_timer)"
     );
 }
 
@@ -496,23 +540,53 @@ fn miscased_suffix_on_a_broken_count_does_not_claim_units_are_lowercase() {
 // Environment resolution (`rotation_interval_from_env`).
 // ---------------------------------------------------------------------------
 
-/// **The important one.** An ABSENT variable is the path every existing
-/// deployment takes: it must keep yielding the unchanged, ENABLED 30-day
-/// timer. Neither `None` (rotation silently disabled fabric-wide for everyone
-/// who never set the variable) nor an error (every existing controller refuses
-/// to boot) is acceptable here.
+/// **The important one.** An ABSENT variable means NO TIMER — the same
+/// resolved value as `off`.
+///
+/// This is the path every shipped artifact takes out of the box: the
+/// `.deb`/`.rpm` ship `deploy/packages/env/controller.env` with the variable
+/// commented out, the ghcr container image's controller stage sets no env, and
+/// a source build inherits whatever the host has (nothing). It used to resolve
+/// to `Some(30 days)`, which armed the rotation-initiation timer for every one
+/// of them.
+///
+/// Why that is not acceptable, in one line: automatic rotation still points at
+/// a KNOWN-OPEN defect — backlog item 9, the rotation wedge, where a rotation
+/// that fails part-way parks the gateway's phase off `Idle` and
+/// `Rotation::on_directive` is honoured only from `Idle`, so that gateway
+/// silently ignores every later `RotateDirective` until the process is
+/// restarted, and never scrubs the old key. Arming that on a 30-day fuse for
+/// anyone who merely installed the package is a decision the software was
+/// making on the operator's behalf, out of their sight, with a failure that
+/// only shows up 30 days later on a fabric nobody is watching.
+///
+/// So the rule is: an operator who never made a choice must not have one made
+/// for them. Automatic rotation is now OPT-IN — arming it takes an explicit
+/// interval, written down somewhere a human can find it.
+///
+/// An `Err` is equally wrong: every existing controller would refuse to boot
+/// on upgrade over a variable it has never had set.
 #[test]
-fn env_absent_yields_the_unchanged_thirty_day_default() {
+fn env_absent_means_no_timer_never_a_default_interval() {
     let got = rotation_interval_from_env(|_| Err(VarError::NotPresent)).unwrap_or_else(|e| {
-        panic!("an ABSENT {ROTATION_INTERVAL_ENV} must not be an error, got: {e:#}")
+        panic!(
+            "an ABSENT {ROTATION_INTERVAL_ENV} must not be an error — that would break the \
+             boot of every deployment that has never set the variable, which is all of them \
+             except the Kubernetes operator path. Got: {e:#}"
+        )
     });
     assert_eq!(
-        got,
-        Some(Config::default_rotation_interval()),
-        "with {ROTATION_INTERVAL_ENV} unset the controller must behave exactly as it did \
-         before this knob existed: automatic rotation ENABLED at the 30-day default. \
-         `None` here would silently disable rotation for every deployment that never set \
-         the variable."
+        got, None,
+        "with {ROTATION_INTERVAL_ENV} unset the controller must run with NO \
+         rotation-initiation timer, exactly as if the operator had written \
+         {ROTATION_INTERVAL_ENV}=off. `Some(_)` here — and \
+         `Some(Config::default_rotation_interval())` in particular, which is what this \
+         resolved to before 2026-08-12 — silently arms automatic key rotation for every \
+         .deb/.rpm/container/source install that never set the variable, and automatic \
+         rotation still walks into backlog item 9 (the rotation wedge: a part-failed \
+         rotation parks the gateway off `Idle`, and every later RotateDirective is \
+         silently ignored until it restarts). An operator who never made a choice must \
+         not have one made for them. Got: {got:?}"
     );
 }
 
@@ -524,6 +598,10 @@ fn env_present_and_valid_yields_the_parsed_value() {
         ("15m", Duration::from_secs(15 * 60)),
         ("12h", Duration::from_secs(12 * 3600)),
         ("7d", Duration::from_secs(7 * 86_400)),
+        // The former implicit default, now reachable only by writing it down.
+        // An operator who WANTS 30-day rotation must still get exactly the
+        // behaviour they used to get by accident.
+        ("30d", Config::default_rotation_interval()),
         // Whitespace an env file or Kubernetes manifest would pick up.
         ("  15m\n", Duration::from_secs(15 * 60)),
     ] {
@@ -553,18 +631,97 @@ fn env_present_off_disables_rotation() {
     }
 }
 
+/// `off` and ABSENT now resolve to the same value, and that is the whole point
+/// of the flip — but they agree by CONSTRUCTION, not by coincidence, and this
+/// test exists to make a future regression prove which one it broke.
+///
+/// The trap it guards: `None` from `off` and `None` from absent are
+/// indistinguishable in the return type, so a change that reintroduces a
+/// default interval — "just restore the 30-day fallback, `off` still works" —
+/// looks locally harmless and leaves every `off` test green while silently
+/// re-arming every install that sets nothing. That is exactly the shape the
+/// pre-2026-08-12 code had, and exactly how it survived unnoticed through the
+/// `.deb`, the `.rpm`, and the container image.
+///
+/// So the property asserted is not "absent == off" (which a `None`-returning
+/// stub would satisfy) but the one that actually matters: **the only way to
+/// arm the timer is to say an interval out loud.** Both non-answers resolve to
+/// no timer; a written-down interval, and only a written-down interval,
+/// resolves to `Some`. `Config::default_rotation_interval()` survives as the
+/// value `30d` names — it must never again be the value silence names.
+#[test]
+fn only_an_explicit_interval_can_arm_the_timer() {
+    // The two ways an operator ends up having expressed no interval. Neither
+    // is the operator asking for rotation.
+    let absent = rotation_interval_from_env(|_| Err(VarError::NotPresent))
+        .expect("an ABSENT variable must resolve, not error");
+    let explicit_off = rotation_interval_from_env(|_| Ok("off".to_string()))
+        .expect("an explicit `off` must resolve, not error");
+    assert_eq!(
+        absent, explicit_off,
+        "an unset {ROTATION_INTERVAL_ENV} and an explicit {ROTATION_INTERVAL_ENV}=off must \
+         resolve to the same thing: no rotation-initiation timer. Got absent={absent:?} vs \
+         off={explicit_off:?} — they have diverged, which means one of the two paths grew a \
+         default the other did not"
+    );
+    assert_eq!(
+        absent, None,
+        "...and the thing they agree on must be None. Two paths agreeing on \
+         Some(interval) would satisfy the assertion above while arming exactly what this \
+         contract exists to leave disarmed. Got: {absent:?}"
+    );
+    assert_ne!(
+        absent,
+        Some(Config::default_rotation_interval()),
+        "silence must not resolve to the 30-day interval (or to any interval). This is the \
+         literal pre-2026-08-12 behaviour, restated so that reintroducing it fails HERE, \
+         with a message that says why, rather than in whichever gateway wedges 30 days \
+         after someone installs the .deb"
+    );
+
+    // And the mirror: an interval the operator actually wrote down still arms
+    // the timer, at exactly the value written. Without this, a
+    // `rotation_interval_from_env` stubbed to `Ok(None)` would pass everything
+    // above — "nothing rotates, ever" is not the contract either. The knob
+    // still has to work for the operator who deliberately turns it on.
+    for raw in ["30d", "12h", "900s"] {
+        let armed = rotation_interval_from_env(|_| Ok(raw.to_string()))
+            .unwrap_or_else(|e| panic!("{ROTATION_INTERVAL_ENV}={raw:?} must parse: {e:#}"));
+        assert_eq!(
+            armed,
+            parse_rotation_interval(raw).expect("the same value parses standalone"),
+            "the env path must resolve {raw:?} to exactly what the parser makes of it — \
+             an explicit interval is the ONE input that arms the timer, so it must not be \
+             filtered, clamped, or defaulted on its way through"
+        );
+        assert!(
+            armed.is_some(),
+            "{ROTATION_INTERVAL_ENV}={raw:?} is an operator explicitly asking for automatic \
+             rotation and must resolve to Some(_). Making absence mean 'off' must not turn \
+             into making everything mean 'off': the escape hatch is opt-in rotation, not \
+             no rotation. Got: {armed:?}"
+        );
+    }
+}
+
 /// **The review finding.** A PRESENT variable whose bytes are not UTF-8
-/// (`Err(VarError::NotUnicode(..))`) is a hard error — never the 30-day
-/// default.
+/// (`Err(VarError::NotUnicode(..))`) is a hard error — never any silent
+/// resolution.
 ///
 /// `std::env::var(k).ok()`, the obvious closure to pass, collapses this case
-/// into `None`; `None` reads as absent; absent means the default. So a value
-/// the operator did set — plausibly a mis-encoded `off` pasted out of a
-/// terminal or a mangled env file — would have silently ARMED the automatic
-/// rotation timer, with no error and no banner, for someone who believed they
-/// had switched it off. The whole point of `lookup` mirroring `std::env::var`'s
-/// signature is that this third case cannot be dropped on the floor, so the
-/// test asserts the distinction the type now preserves.
+/// into `None`; `None` reads as absent. Before the 2026-08-12 flip that meant
+/// silently ARMING the 30-day timer for someone who believed they had written
+/// `off`. The flip does not retire this test, it only changes which lie gets
+/// told: absent now means no timer, so collapsing a mis-encoded value into
+/// "absent" would silently DISARM rotation for an operator who wrote `12h`.
+/// Either way the software answers a question the operator did answer, with an
+/// answer they did not give — and this is the one case where it can tell that
+/// they answered at all. The whole point of `lookup` mirroring
+/// `std::env::var`'s signature is that this third case cannot be dropped on
+/// the floor, so the test asserts the distinction the type preserves.
+///
+/// It also pins the REJECTION PROSE, because that message currently explains
+/// itself by reference to a default that no longer exists.
 #[test]
 fn env_non_utf8_value_is_a_hard_error_not_the_default() {
     // `off` with a stray continuation byte on the end — present, non-empty,
@@ -575,13 +732,20 @@ fn env_non_utf8_value_is_a_hard_error_not_the_default() {
     match rotation_interval_from_env(|_| Err(VarError::NotUnicode(not_utf8))) {
         Ok(v) => panic!(
             "a PRESENT-but-not-UTF-8 {ROTATION_INTERVAL_ENV} must be a startup error, got \
-             Ok({v:?}). {} would be the worst of these: it is indistinguishable from \
-             'absent', so an operator who set the variable and got it mis-encoded would run \
-             a 30-day rotation timer they believe is off.",
-            if v == Some(Config::default_rotation_interval()) {
-                "Falling back to the 30-day default (which is what happened here)"
-            } else {
-                "Falling back to any default"
+             Ok({v:?}). {} The operator SET this variable; the one thing that must not \
+             happen is the controller quietly picking a value for them and booting.",
+            match v {
+                Some(d) if d == Config::default_rotation_interval() =>
+                    "Falling back to the 30-day interval (which is what happened here) arms \
+                     automatic rotation for someone who may well have been typing `off`.",
+                Some(_) =>
+                    "Falling back to any interval arms automatic rotation for someone who \
+                     may well have been typing `off`.",
+                None =>
+                    "Resolving to None (which is what happened here) is the mis-encoded \
+                     value being treated as ABSENT — indistinguishable from having set \
+                     nothing, so an operator who wrote `12h` runs with no timer at all and \
+                     nothing tells them.",
             }
         ),
         Err(e) => {
@@ -597,6 +761,18 @@ fn env_non_utf8_value_is_a_hard_error_not_the_default() {
                 "the rejection must say the value is not valid UTF-8 — that is the ONLY \
                  clue the operator has, since the bytes themselves cannot be echoed back \
                  legibly. Got: {msg:?}"
+            );
+            assert!(
+                !msg.to_lowercase().contains("-day default"),
+                "the rejection must not justify itself by pointing at a default interval \
+                 that no longer exists. This message used to read '...falling back to the \
+                 30-day default here would silently arm the automatic key-rotation timer', \
+                 interpolating Config::default_rotation_interval(); after the 2026-08-12 \
+                 flip an unset variable arms nothing, so that sentence describes behaviour \
+                 the code does not have. An operator who reads it goes looking for a \
+                 30-day timer that is not running — the same class of misdirection this \
+                 whole knob exists to remove. Say instead that the variable is set to \
+                 something unreadable and must be re-set. Got: {msg:?}"
             );
         }
     }
@@ -661,7 +837,12 @@ fn env_lookup_is_called_once_with_the_canonical_variable_name() {
         Err(VarError::NotPresent)
     })
     .expect("an absent variable must not be an error");
-    assert_eq!(got, Some(Config::default_rotation_interval()));
+    assert_eq!(
+        got, None,
+        "sanity: the absent case resolves to no timer (the contract pinned in \
+         env_absent_means_no_timer_never_a_default_interval) — asserted here too so this \
+         test cannot pass against a lookup that was consulted correctly and then ignored"
+    );
 
     let seen = seen.into_inner();
     assert_eq!(

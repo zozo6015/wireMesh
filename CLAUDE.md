@@ -127,15 +127,24 @@ gateway and relay Sync channels run HTTP/2 keepalive (15s/10s, while-idle)
 there: Sync session generation (below) and controller-side alerting on
 roster `applied_version` lag.
 
-**Key rotation (2026-08-05/06, v0.5.0 → v0.7.2).** Automatic rotation is
-DISABLED on the live fabric (`WIREMESH_ROTATION_INTERVAL=off`) and **must stay
-off**. Manual `fabricctl` rotation works. Two blockers remain before the timer
-can be re-enabled:
+**Key rotation (2026-08-05/12, v0.5.0 → v0.9.1).** Automatic rotation is OFF BY
+DEFAULT EVERYWHERE, not just on the live fabric: an absent
+`WIREMESH_ROTATION_INTERVAL` now means **no timer** (it used to mean 30d), so
+the schedule is opt-in and the live fabric's `off` is one instance of the
+default rather than a local override. Manual `fabricctl` rotation works and is
+the supported path. Both original blockers are now cleared; what gates arming
+the timer anywhere is a third finding — **backlog item 9, the rotation wedge**,
+which surfaced while clearing the first:
 
-1. **The in-step case is red.** The controller rotates every active gateway off
-   one timer, so the fabric rotates in step — a scenario nothing had tested. Its
-   done-bar is committed `#[ignore]`d as RED-by-design at
-   `crates/wiremesh-gateway/tests/key_rotation.rs`. **Un-ignoring it is the bar.**
+1. ~~**The in-step case is red.**~~ **FIXED in v0.9.1.** The controller rotates
+   every active gateway off one timer, so the fabric rotates in step — a
+   scenario nothing had tested. Its done-bar at
+   `crates/wiremesh-gateway/tests/key_rotation.rs` is green with no `#[ignore]`s
+   left. What still gates the timer is **backlog item 9, the rotation wedge**: a
+   rotation that fails part-way parks the phase off-`Idle`, and
+   `Rotation::on_directive` is honoured only from `Idle`, so that gateway
+   silently ignores every later directive until the process restarts (and never
+   scrubs the old key). `docs/BACKLOG.md` item 9.
 2. ~~The reserved-port handoff rests on kernel UDP hash ordering.~~ **Checked
    2026-08-07 and DOWNGRADED — no longer a blocker.** The boringtun socket leak
    is real and larger than predicted (four sockets on the reserved port at the

@@ -133,16 +133,17 @@ pub struct TestController {
     // intervals this instance was booted with — captured at
     // `start`/`start_on`/`start_with_rotation_intervals` so `restart` reuses
     // the SAME small intervals a test started with, rather than reverting to
-    // `Config`'s 30-day/5s defaults. Without this, a test that shrinks these
-    // intervals to observe timer/sweep behavior would silently lose that
+    // the 30-day/5s pair `start()` picks. Without this, a test that shrinks
+    // these intervals to observe timer/sweep behavior would silently lose that
     // after a `restart()` — exactly the scenario
     // `sweep_retires_orphaned_retiring_row_after_crash` depends on NOT
     // happening.
     //
     // `rotation_interval` mirrors `Config::rotation_interval` exactly,
     // `None` included: a controller booted with automatic rotation DISABLED
-    // must still be disabled after `restart()`, not silently back on the
-    // 30-day default (see `wiremesh-controller/tests/rotation_disabled.rs`).
+    // must still be disabled after `restart()`, not silently re-armed at the
+    // 30-day interval `start()` uses (see
+    // `wiremesh-controller/tests/rotation_disabled.rs`).
     rotation_interval: Option<std::time::Duration>,
     rotation_sweep_interval: std::time::Duration,
     // Held only so the directory (and everything the controller wrote under
@@ -206,8 +207,16 @@ impl TestController {
     pub async fn start_on(bind_ip: std::net::Ipv4Addr) -> TestController {
         Self::start_inner(
             bind_ip,
-            // `Some(..)` — automatic rotation ENABLED at the production
-            // default, exactly as before this knob existed.
+            // `Some(..)` — the initiation timer ARMED, at 30 days. Not "the
+            // production default": since 2026-08-12 there is no default, and a
+            // real controller that sets nothing runs with no timer at all (see
+            // `wiremesh_controller::rotation_interval_from_env`). This is a
+            // deliberate choice for the harness, not an inherited one — an
+            // interval this long can never fire inside a test, so every
+            // `start()`/`start_on()` caller sees a controller with the timer
+            // present and quiescent, which is what they were written against.
+            // Tests that need the timer to actually tick, or need it OFF, use
+            // `start_with_rotation_intervals` and say so.
             Some(Config::default_rotation_interval()),
             Config::default_rotation_sweep_interval(),
         )
@@ -217,14 +226,13 @@ impl TestController {
     /// (Key-rotation Task 4) Additive counterpart to [`Self::start`]/
     /// [`Self::start_on`] that boots against the DEFAULT `bind_ip` but
     /// caller-supplied `rotation_interval`/`rotation_sweep_interval` — what
-    /// every rotation-timer/decision-sweep test uses instead of `start()`'s
-    /// 30-day/5s production defaults, so the timer's/sweep's background
-    /// cadence can be observed within a test's own bounded budget rather than
-    /// requiring an actual 30-day (or even 5s-per-tick) wait. Both intervals
-    /// are stored on the returned `TestController` so a later `restart()`
-    /// reuses them (see the `rotation_interval`/`rotation_sweep_interval`
-    /// fields' doc comment) — a restart must NOT silently revert to
-    /// `Config`'s production defaults.
+    /// every rotation-timer/decision-sweep test uses instead of the 30-day/5s
+    /// pair `start()` picks, so the timer's/sweep's background cadence can be
+    /// observed within a test's own bounded budget rather than requiring an
+    /// actual 30-day (or even 5s-per-tick) wait. Both intervals are stored on
+    /// the returned `TestController` so a later `restart()` reuses them (see
+    /// the `rotation_interval`/`rotation_sweep_interval` fields' doc comment) —
+    /// a restart must NOT silently revert to what `start()` would have chosen.
     ///
     /// `rotation_interval` is an `Option`, mirroring `Config::rotation_interval`:
     /// `Some(d)` boots with the initiation timer ENABLED at `d`, `None` boots
@@ -422,6 +430,22 @@ impl TestController {
     /// this `TestController`'s `rotation_interval`, `None` included).
     pub fn automatic_rotation_disabled(&self) -> bool {
         self.running().automatic_rotation_disabled()
+    }
+
+    /// The disabled-rotation banner the CURRENT controller printed at boot, or
+    /// `None` if it booted with the timer armed and printed nothing. Delegates
+    /// to `RunningController::rotation_disabled_banner`, so after a `restart()`
+    /// this reflects the freshly booted instance — which is the point: a
+    /// restart is the one moment this state could change with nobody watching
+    /// the console.
+    ///
+    /// The companion to [`Self::automatic_rotation_disabled`]: that one reads
+    /// whether the timer task was spawned, this one reads whether the operator
+    /// was TOLD. They fail independently — deleting `serve`'s print leaves the
+    /// first true and the second `None` — which is why both exist. Needed
+    /// because `running()` is private to this crate.
+    pub fn rotation_disabled_banner(&self) -> Option<&str> {
+        self.running().rotation_disabled_banner()
     }
 
     /// Connects a tonic `AdminClient` over the controller's Unix socket.

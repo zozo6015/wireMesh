@@ -6,9 +6,13 @@
 //! ignores it, `unwrap_or_default()`s it, or logs-and-continues the way
 //! `WIREMESH_BIND_IP` deliberately does. The promise to the operator is that a
 //! mistyped interval stops the controller at boot — because the alternative is
-//! someone who typed `of` instead of `off` believing automatic rotation is
-//! disabled while a 30-day timer is still armed, and finding out only when it
-//! fires across the fabric.
+//! someone who typed `30dd` believing they armed rotation, or `of` believing
+//! they disabled it, running for months on whatever the fallback silently
+//! picked and finding out at the worst possible moment. (Which fallback is
+//! moot: since the 2026-08-12 flip an absent variable means NO timer, so a
+//! swallowed value would strand the fabric un-rotated rather than rotate it on
+//! a schedule nobody chose. Both are the software deciding in the operator's
+//! place, which is what the non-zero exit refuses to do.)
 //!
 //! Only the FAILURE path is exercised here, deliberately: it aborts before
 //! `serve()` binds a listener, mints a CA, or touches any state, so this test
@@ -24,7 +28,7 @@ use wiremesh_controller::ROTATION_INTERVAL_ENV;
 
 /// A present-but-malformed `WIREMESH_ROTATION_INTERVAL` must exit the
 /// controller non-zero, name the variable and the offending value on stderr,
-/// and leave nothing behind — never fall back to the 30-day default and boot
+/// and leave nothing behind — never fall back to any resolution and boot
 /// anyway.
 #[test]
 fn malformed_rotation_interval_aborts_the_boot() {
@@ -56,8 +60,8 @@ fn malformed_rotation_interval_aborts_the_boot() {
                 panic!(
                     "the controller was still running 15s after being started with \
                      {ROTATION_INTERVAL_ENV}={bogus:?} — a malformed rotation interval must \
-                     abort the boot, not be swallowed into the 30-day default while the \
-                     operator believes they changed it"
+                     abort the boot, not be swallowed into whatever the unset case resolves \
+                     to while the operator believes they changed it"
                 );
             }
             None => std::thread::sleep(Duration::from_millis(100)),

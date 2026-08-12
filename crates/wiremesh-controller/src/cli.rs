@@ -90,18 +90,31 @@ CONFIGURATION (environment variables — this binary takes NO flags):
                                     stays loopback-only regardless. A malformed
                                     value falls back to the default.
     WIREMESH_ROTATION_INTERVAL <interval|off>
-                                    (optional, default 30d) How often every
-                                    gateway's WireGuard key is automatically
-                                    rotated. <integer><s|m|h|d>, lowercase unit
-                                    (30d, 12h, 900s). `off` disables the
-                                    automatic SCHEDULE only: in-flight rotations
-                                    still complete and manual rotation
-                                    (fabricctl / Admin RotateKey) still works,
-                                    but no key is rotated on a timer until it is
-                                    re-enabled. A zero interval is rejected —
-                                    use `off`. So is anything above 3650d (10
-                                    years): a timer that never fires is `off`
-                                    without the warning that says so.
+                                    (optional; UNSET = no timer) Automatic key
+                                    rotation is OPT-IN. Leave this unset and no
+                                    rotation-initiation timer runs at all: no
+                                    gateway's WireGuard key is ever rotated on
+                                    a schedule. To arm it, set
+                                    <integer><s|m|h|d>, lowercase unit (30d,
+                                    12h, 900s) — 30d is the recommended period
+                                    if you do. Arming it is an informed choice
+                                    against a known-open defect: a rotation
+                                    that fails part-way leaves that gateway
+                                    ignoring every later rotation directive
+                                    until its process is restarted, and never
+                                    scrubbing the old key (docs/BACKLOG.md item
+                                    9, the rotation wedge). That is why the
+                                    schedule is opt-in.
+                                    `off` is the explicit spelling of the
+                                    unset behaviour, worth writing down to
+                                    record the intent. Either way only the
+                                    SCHEDULE is off: in-flight rotations still
+                                    complete and manual rotation (fabricctl /
+                                    Admin RotateKey) still works. A zero
+                                    interval is rejected — use `off`. So is
+                                    anything above 3650d (10 years): a timer
+                                    that never fires is `off` without the boot
+                                    warning that says so.
 
     A malformed port value (e.g. WIREMESH_TCP_PORT=abc), or a malformed
     WIREMESH_ROTATION_INTERVAL, is a startup error, not a silent fallback.
@@ -109,24 +122,24 @@ CONFIGURATION (environment variables — this binary takes NO flags):
 DEPLOYMENT:
     The packaged systemd unit reads these variables from /etc/wiremesh/
     controller.env. The Kubernetes operator sets them on the controller
-    Deployment — except WIREMESH_ROTATION_INTERVAL, for which there is no CRD
-    field yet. Setting it by hand DOES work and DOES survive reconciles:
+    Deployment from the WiremeshController CR — including this one:
 
-        kubectl set env deployment/<name> WIREMESH_ROTATION_INTERVAL=off \\
-            -c controller
+        spec:
+          rotationInterval: 30d      # opt in to the schedule; omit to keep
+                                     # rotation off. Read the wedge caveat
+                                     # above before arming it.
 
-    The operator force-applies the Deployment, but a container's `env` is a
-    server-side-apply list-map keyed by name, so force only overrides the keys
-    the operator itself sets. It never names this one, so your value is not
-    owned by it and is not reverted.
-
-    The one thing that does drop it is the Deployment being RECREATED — it is
-    owner-referenced to the WiremeshController CR, so deleting the CR (or the
-    Deployment) rebuilds it from the operator's env list alone, without your
-    variable, silently back on the 30d default. If you need it durable across
-    that, bake `ENV WIREMESH_ROTATION_INTERVAL=off` into the image named by
-    `spec.image`; the operator does not set the key, so the image value is not
-    shadowed. This binary is Unix-only.
+    Operator v0.8.0 (2026-08-10) and newer always emits
+    WIREMESH_ROTATION_INTERVAL, passing that field through verbatim and falling
+    back to `off` when it is unset. It owns the key under server-side apply
+    with force, so editing the Deployment by hand (kubectl set env) is reverted
+    on the next reconcile — set the CR field instead. OLDER operators omitted
+    the key entirely: against one of those this controller sees an unset
+    variable (so, no timer) and a hand-applied kubectl set env survives every
+    reconcile. The controller and the operator are separate images and can run
+    at different versions, and this binary cannot detect which operator is
+    reconciling it — so check that version rather than trusting this paragraph
+    indefinitely. This binary is Unix-only.
 
 EXAMPLE:
     WIREMESH_DATA_DIR=/var/lib/wiremesh WIREMESH_BIND_IP=0.0.0.0 \\

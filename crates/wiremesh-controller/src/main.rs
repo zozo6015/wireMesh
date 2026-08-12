@@ -1,31 +1,21 @@
-//! `wiremesh-controller` binary: a thin wrapper that builds a [`Config`] from
-//! environment variables (CLI flags are out of this task's scope — real
-//! deployments/`fabricctl` wiring lands in later tasks) and hands off to the
-//! library entrypoint [`wiremesh_controller::serve`], which does all the
-//! actual work. Kept thin on purpose: `wiremesh-testkit::TestController`
-//! calls `serve` directly (in-process) for integration tests, so all real
-//! boot logic must live in the library, not here.
+//! `wiremesh-controller` binary: a thin wrapper that reads the process
+//! environment, builds a `Config` from it via
+//! [`wiremesh_controller::config_from_env`], and hands off to the library
+//! entrypoint [`wiremesh_controller::serve`], which does all the actual work.
+//!
+//! Kept thin on purpose, and thinner since 2026-08-12: everything here is
+//! unreachable from an integration test (`wiremesh-testkit::TestController`
+//! calls `serve` in-process, and no test can call `main`), so any logic left in
+//! this file is logic nothing can pin. The env→`Config` assembly used to live
+//! here and was exactly that — the one untested link in the opt-in rotation
+//! contract, where a one-line edit re-armed a 30-day timer on every install
+//! with the whole suite green. It now lives in the library behind an injectable
+//! lookup; see `config_from_env`'s doc comment and
+//! `tests/config_from_env.rs`. What remains is argv handling, the listener
+//! banner, and the ctrl-c wait.
 
-use std::path::PathBuf;
-
-use anyhow::{Context, Result};
-use wiremesh_controller::{serve, Config};
-
-/// Reads `var` as a `u16` port: an ABSENT variable falls back to `default`
-/// (`0` = OS-assigned, everywhere this is called), but a PRESENT-but-
-/// malformed value (e.g. `WIREMESH_ADMIN_TCP_PORT=abc`) is a startup error
-/// rather than silently becoming `0` — an operator who mistyped a port
-/// number must find out at boot, not discover an unexpected ephemeral
-/// listener later.
-fn port_env(var: &str, default: u16) -> Result<u16> {
-    match std::env::var(var) {
-        Ok(v) => v
-            .parse::<u16>()
-            .with_context(|| format!("{var}={v:?} is not a valid u16 port")),
-        Err(std::env::VarError::NotPresent) => Ok(default),
-        Err(e) => Err(e).with_context(|| format!("reading {var}")),
-    }
-}
+use anyhow::Result;
+use wiremesh_controller::{config_from_env, serve};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -43,59 +33,20 @@ async fn main() -> Result<()> {
         wiremesh_controller::cli::CliAction::Run => {}
     }
 
-    let data_dir = std::env::var("WIREMESH_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/var/lib/wiremesh"));
-    let tcp_port = port_env("WIREMESH_TCP_PORT", 0)?;
-    let sync_tcp_port = port_env("WIREMESH_SYNC_TCP_PORT", 0)?;
-    let socket_path = std::env::var("WIREMESH_SOCKET_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/run/wiremesh/controller.sock"));
-    let admin_tcp_port = port_env("WIREMESH_ADMIN_TCP_PORT", 0)?;
-    let observe_udp_port = port_env("WIREMESH_OBSERVE_UDP_PORT", 0)?;
-    // The IP the enroll/sync/observe listeners bind to. Defaults to loopback
-    // (historical/dev). In Kubernetes the operator sets `WIREMESH_BIND_IP=0.0.0.0`
-    // so those listeners are reachable via the controller Service (the Admin TCP
-    // listener stays loopback-only regardless — see Config::bind_ip). Malformed
-    // values fall back to the loopback default.
-    // How often (if ever) the rotation-initiation timer fires. Absent = the
-    // unchanged 30-day default; `off` disables the timer entirely. A
-    // PRESENT-but-malformed value is a startup error (the `?` below), NOT the
-    // warn-and-fall-back treatment `WIREMESH_BIND_IP` gets right after: an
-    // operator who mistyped this would otherwise be left believing rotation is
-    // off (or retimed) when it is not, and nothing would contradict them until
-    // the timer fired. Same precedent/reasoning as `port_env` above —
-    // including its NotPresent-vs-other-VarError distinction: the lookup handed
-    // over is `std::env::var` itself, NOT the lossy `|k| std::env::var(k).ok()`,
-    // so a PRESENT-but-non-UTF-8 value cannot be mistaken for "unset" and
-    // silently arm the 30-day timer. (Wrapped in a closure rather than passed
-    // as the bare `std::env::var` path: `var` is generic over `K: AsRef<OsStr>`,
-    // so the bare path infers ONE specific lifetime and fails the callee's
-    // higher-ranked `FnOnce(&str)` bound.)
+    // The real process environment, read through `std::env::var` itself rather
+    // than the lossy `|k| std::env::var(k).ok()`: `config_from_env` and
+    // everything under it distinguish a PRESENT-but-non-UTF-8 value from an
+    // absent one, and this is the call that decides whether they get to. A
+    // malformed port or rotation interval comes back as an `Err` here and exits
+    // non-zero — see `config_from_env`'s doc comment for which variables are
+    // hard errors and which warn and fall back.
+    //
+    // (Wrapped in a closure rather than passed as the bare `std::env::var`
+    // path: `var` is generic over `K: AsRef<OsStr>`, so the bare path infers
+    // ONE specific lifetime and fails the callee's higher-ranked `Fn(&str)`
+    // bound.)
     #[allow(clippy::redundant_closure)]
-    let rotation_interval = wiremesh_controller::rotation_interval_from_env(|k| std::env::var(k))?;
-    let bind_ip = match std::env::var("WIREMESH_BIND_IP") {
-        Ok(s) => s.parse().unwrap_or_else(|_| {
-            eprintln!("wiremesh-controller: invalid WIREMESH_BIND_IP={s:?}, using {}", Config::default_bind_ip());
-            Config::default_bind_ip()
-        }),
-        Err(_) => Config::default_bind_ip(),
-    };
-
-    let config = Config {
-        data_dir,
-        tcp_port,
-        sync_tcp_port,
-        socket_path,
-        admin_tcp_port,
-        observe_udp_port,
-        bind_ip,
-        rotation_interval,
-        rotation_sweep_interval: Config::default_rotation_sweep_interval(),
-        // Production always probes the real `/var/lib/wiremesh`. Deliberately
-        // not env-configurable — see `Config::legacy_data_dir`.
-        legacy_data_dir: None,
-    };
+    let config = config_from_env(|k| std::env::var(k))?;
 
     let running = serve(config).await?;
     eprintln!(
