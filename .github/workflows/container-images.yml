@@ -56,6 +56,15 @@ jobs:
   # (`COPY . .` precedes the build in deploy/docker/Dockerfile), so every image
   # build would miss the builder cache and recompile the whole workspace.
   #
+  # EXPECTED COST, so nobody debugs it later: because the version now lives in
+  # Cargo.toml above that `COPY . .`, the build context digest is a function of
+  # the version. A tag push and the main push that preceded it point at the SAME
+  # tree but derive DIFFERENT versions (1.2.3 vs 0.0.0-g<sha>), so a release can
+  # no longer reuse the builder cache the main build just wrote — every release
+  # pays one full workspace + eBPF compile per arch. That is inherent to
+  # stamping (the version has to be in Cargo.toml before cargo build), not a
+  # misconfiguration. Same-run builder->images caching is unaffected.
+  #
   # Same shape and the same validate-before-it-is-an-output rule as release.yml's
   # `version` job; that one also derives a numeric MSI version, which nothing
   # here needs.
