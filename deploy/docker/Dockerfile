@@ -7,8 +7,8 @@
 # carrying exactly one binary plus only the OS tools that binary shells out to.
 #
 # Build a single image:  docker build -f deploy/docker/Dockerfile --target gateway -t wiremesh-gateway .
-# CI (.github/workflows/container-images.yml) builds all four targets and
-# pushes them to ghcr.io/<owner>/wiremesh-{controller,gateway,relay,fabricctl}.
+# CI (.github/workflows/container-images.yml) builds all five targets and pushes
+# them to ghcr.io/<owner>/wiremesh-{controller,gateway,relay,fabricctl,operator}.
 #
 # Base images are pinned by digest for reproducibility (refresh with
 # `docker buildx imagetools inspect <ref>`); the runtime servers drop to a

@@ -12,6 +12,11 @@ name: Container images
 # per-component image jobs reuse; per-arch images are pushed by digest and a
 # final `merge` job stitches them into one tagged multi-arch manifest per
 # component (the documented buildx "distribute across runners" pattern).
+#
+# Every binary reports env!("CARGO_PKG_VERSION") — whatever crates/*/Cargo.toml
+# said at compile time, which is the committed 0.1.0 placeholder unless
+# scripts/set-version.sh rewrote it first. So both compiling jobs stamp before
+# they build; see the `version` job for where the number comes from.
 
 on:
   push:
@@ -25,6 +30,13 @@ on:
       - 'deploy/docker/**'
       - '.dockerignore'
       - '.github/workflows/container-images.yml'
+      # Both compiling jobs now RUN scripts/set-version.sh, and it exits
+      # non-zero if it cannot stamp every crate it lists. Editing it alone
+      # used to change nothing this workflow watched, so a break would land
+      # on main untested and first surface on the next tag push — a
+      # release-time outage, which is the failure mode this stamping exists
+      # to prevent.
+      - 'scripts/set-version.sh'
   # PRs build every image on both arches to validate the Dockerfile/build, but
   # do NOT push (see the `push:` guards below) — only main/tags publish.
   pull_request:
@@ -36,9 +48,54 @@ env:
   REGISTRY: ghcr.io
 
 jobs:
+  # The single place the stamped version is decided. Stamping itself has to be
+  # per-JOB — it rewrites the checkout, and `builder` and `images` are separate
+  # jobs with separate runners and separate checkouts — but the VALUE must come
+  # from here for both. If the two jobs ever derived different numbers, the
+  # Cargo.toml `images` builds would no longer match the layer `builder` cached
+  # (`COPY . .` precedes the build in deploy/docker/Dockerfile), so every image
+  # build would miss the builder cache and recompile the whole workspace.
+  #
+  # Same shape and the same validate-before-it-is-an-output rule as release.yml's
+  # `version` job; that one also derives a numeric MSI version, which nothing
+  # here needs.
+  version:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            # A real release: the tag with its leading v stripped (v1.2.3 -> 1.2.3).
+            VER="${GITHUB_REF#refs/tags/v}"
+          else
+            # main, PRs and workflow_dispatch are not releases, so the version
+            # says so instead of claiming a number that was never released.
+            # `git describe` spells an untagged commit `…-g<sha>`, and that `g`
+            # also keeps the pre-release identifier alphanumeric — an all-digit
+            # short sha would otherwise be a numeric identifier with a leading
+            # zero, which is invalid semver and would fail to parse.
+            VER="0.0.0-g${GITHUB_SHA:0:12}"
+          fi
+          # Validate before it becomes an output that other jobs interpolate into
+          # their own run: blocks — reject anything but a version token. The
+          # MAJOR.MINOR.PATCH shape is checked by scripts/set-version.sh, which
+          # owns that regex; a `v*` tag that is not a version fails every build
+          # job loudly there rather than publishing a wrong number quietly.
+          if ! printf '%s' "$VER" | grep -qE '^[0-9A-Za-z.+-]+$'; then
+            echo "::error::invalid version '$VER' (allowed: [0-9A-Za-z.+-])"; exit 1
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=$VER"
+
   # Warm the shared `builder` stage cache once per arch (the whole release +
   # eBPF build), natively on that arch's runner.
   builder:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -51,6 +108,15 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Stamp version
+        # `cargo build --release --workspace` runs INSIDE the builder stage and
+        # the runtime stages only COPY out of it, so this is where the version a
+        # binary reports is fixed. Stamping only in `images` would also mean the
+        # cached builder layer is built from a different Cargo.toml than the one
+        # `images` presents, i.e. a guaranteed cache miss.
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash scripts/set-version.sh "$VERSION"
       - name: Build & cache the builder stage (${{ matrix.platform.arch }})
         uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -66,7 +132,7 @@ jobs:
   # stage) and push it by digest; the merge job below tags the pair as one
   # multi-arch manifest. On PRs this builds (validation) without pushing.
   images:
-    needs: builder
+    needs: [version, builder]
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +147,16 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - name: Stamp version
+        # This job has its own runner and its own checkout, so the `builder`
+        # job's stamp does nothing for it — and this checkout is the build
+        # context the runtime image is assembled from. It must be the SAME value
+        # `builder` stamped (both read needs.version.outputs.version) or the
+        # cached builder layer no longer matches and every component rebuilds the
+        # whole workspace.
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: bash scripts/set-version.sh "$VERSION"
       - name: Log in to ghcr.io
         if: github.event_name != 'pull_request'
         uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
