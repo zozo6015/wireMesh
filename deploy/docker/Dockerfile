@@ -26,13 +26,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # eBPF toolchain: nightly rustc (BPF codegen) + rust-src + bpf-linker.
-# NOTE: nightly + bpf-linker are intentionally left floating here to match
-# dev/Dockerfile — the proven build toolchain the whole test suite runs on.
-# Pinning them to a dated nightly + an explicit bpf-linker version is a tracked
-# follow-up: capture the known-good versions from a green CI run first, since an
-# unverified nightly can break aya_build's eBPF compilation.
+#
+# bpf-linker is PINNED, and this is why. It used to float, which broke the
+# v0.10.0 release: bpf-linker 0.11.0 links against system LLVM and its build
+# script aborts with "could not find llvm-config in directories specified by
+# environment variable PATH" on this image, which ships no LLVM. Nothing in
+# this repo changed — an unpinned `cargo install` simply picked up a new
+# upstream release, so a tag that built on 2026-08-11 failed on 2026-08-13.
+#
+# 0.10.4 is the version the dev container has and the entire test suite is
+# proven against, which is the "capture the known-good version from a green
+# run first" this comment used to defer. Note the container-images workflow
+# did NOT catch the break: it restores a cached builder layer, so only a cold
+# build (release.yml's export stage) reaches this line.
+#
+# nightly is still floating, deliberately: pinning a dated nightly needs its
+# own verification pass, since an unverified one can break aya_build's eBPF
+# compilation. Keep this in step with dev/Dockerfile.
 RUN rustup toolchain install nightly --component rust-src \
-    && cargo install bpf-linker
+    && cargo install bpf-linker --version 0.10.4 --locked
 
 WORKDIR /src
 COPY . .
