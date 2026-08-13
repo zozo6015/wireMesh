@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# dev/doctor.sh — verify the container/kernel can run every spike
+# dev/doctor.sh — verify the container/kernel can run the data-plane tests
 set -u
 pass=0; fail=0
 chk() { if eval "$2" >/dev/null 2>&1; then echo "PASS $1"; ((pass++)); else echo "FAIL $1"; ((fail++)); fi; }

@@ -1,9 +1,8 @@
 # `wiremesh-enforcer-ebpf` — the graduated Phase 0 eBPF-enforcer spike
 # (`spike/enforcer/{enforcer-ebpf,enforcer-common}`), Task 7. STANDALONE
 # workspace: the aya template ships its own `[workspace]` and must not be
-# nested inside the root workspace (same reason every `spike/*` crate is
-# standalone — see CLAUDE.md's "Execution rules" and root `Cargo.toml`'s
-# `exclude = ["crates/wiremesh-enforcer-ebpf", "spike"]`).
+# nested inside the root workspace — see CLAUDE.md's "Execution rules" and
+# root `Cargo.toml`'s `exclude = ["crates/wiremesh-enforcer-ebpf"]`.
 #
 # `common`'s `#[repr(C)]` types (`Rule`/`FlowKey`) and count constants are
 # shared, target-agnostic layout; `program` is the actual `#![no_std]

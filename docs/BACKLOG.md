@@ -430,7 +430,8 @@ the one real design question, now a third smaller.
 **Automatic rotation is off everywhere, and that is now the DEFAULT rather than an
 override.** An absent `WIREMESH_ROTATION_INTERVAL` means no timer at all, so the px
 controller's explicit `off` is one instance of the default &mdash; it should stay, but it
-is no longer the thing doing the work. Manual `fabricctl` rotation works. Rotation is now
+is no longer the thing doing the work. Rotation on demand works as the Admin `RotateKey`
+RPC, but nothing wraps it &mdash; see item 33. Rotation is now
 *repeatable* &mdash; a gateway can rotate more than once (v0.7.2) and no longer falls out
 of the timer after one round (v0.7.3) &mdash; and the in-step blocker below is fixed.
 **What still gates arming a timer anywhere is item 9, the rotation wedge.**
@@ -644,6 +645,45 @@ which only becomes correct once the chart is stamped AND published, which is why
 halves belong in one piece of work. Note this also makes the stamp load-bearing: today
 `_helpers.tpl` never reads `.Chart.AppVersion`, so a stale `appVersion` is metadata rot
 (what `helm list` reports); after such a change it would decide which image runs.
+
+### 33. `fabricctl` does not expose `RotateKey`, so on-demand rotation has no operator interface
+
+Filed 2026-08-13, on the branch that corrected the docs claiming otherwise. `docs/install.md`,
+`deploy/packages/env/controller.env`, `README.md` and this file all told operators that manual
+rotation via `fabricctl` "works and is the supported path". **There is no such command.**
+`grep -rni rotate crates/fabricctl/` returns zero hits, and the complete subcommand set
+(`crates/fabricctl/src/main.rs`, `enum Command`) is Segment, Gateway, Relay, Token, Audit,
+Apply, Policy, EnrollToken.
+
+The RPC itself is real and works &mdash; `proto/wiremesh/v1/admin.proto` (`rpc RotateKey`),
+handler `AdminSvc::rotate_key` in `crates/wiremesh-controller/src/services/admin.rs` &mdash; but
+it has **no production caller anywhere**. Its only callers in the tree are in
+`crates/wiremesh-gateway/tests/key_rotation.rs`. So the sole way to rotate a key on demand is
+to hand-roll a gRPC call, which also means obtaining `gateway_id` (`RotateKeyRequest` takes the
+numeric id, not a name) out of band.
+
+**Why this is more than a missing convenience.** v0.9.2 made automatic rotation off-by-default
+everywhere, and justified that partly by pointing at manual rotation as the safe alternative.
+An operator who believes a key is compromised reaches for `fabricctl` and finds nothing &mdash;
+at exactly the moment improvisation is most expensive. A mitigation that requires writing a
+gRPC client is not an operator-usable mitigation. This also compounds item 9: the wedge is what
+gates arming the timer, and this is what makes the recommended substitute impractical.
+
+The transport half is already solved and needs no new work: `fabricctl` dials the Admin service
+over either `--socket <path>` (UDS, implicit admin) or `--token <bearer> --addr <host:port>`
+(bearer-gated TCP), and every existing subcommand rides that. Adding `fabricctl key rotate` is
+a subcommand plus an `AdminAuthClient::rotate_key` call &mdash; small, and worth doing before
+anyone is asked to rely on the path. Resolving a gateway **name** to its id (the ergonomics
+`gateway list` already implies) is the only real design question. Note both routes are
+host-local: the Admin TCP listener binds `127.0.0.1` unconditionally and deliberately ignores
+`Config::bind_ip` (`crates/wiremesh-controller/src/lib.rs`, the Admin TCP listener bind), since
+a bearer token on plaintext gRPC would be interceptable on a routable interface. A CLI does not
+change that, and should not.
+
+The specs have said `fabricctl key rotate` since the design was ratified
+(`docs/superpowers/specs/2026-07-21-key-rotation-design.md`,
+`2026-07-15-wiremesh-engineering-design.md` OQ3/D5) &mdash; the CLI was designed and simply
+never built, and the docs then described the design as if it had shipped.
 
 ---
 

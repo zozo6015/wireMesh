@@ -71,10 +71,19 @@ Pin images by editing the `images:` block in `deploy/operator/kustomization.yaml
 ### B. Helm
 
 ```sh
+# Set this to the release you want — see the Releases page for published tags.
+WIREMESH_VERSION=v0.9.2
+
 helm install wiremesh deploy/helm/wiremesh-operator/ \
   --namespace wiremesh --create-namespace \
-  --set image.tag=v0.1.0
+  --set image.tag="$WIREMESH_VERSION"
 ```
+
+**Pin a release tag.** The chart's own default is `image.tag: "latest"` with
+`pullPolicy: Always`, and `latest` is republished on every push to `main` — so
+leaving it unset tracks the development branch rather than a release. Pass the
+tag of the release you want instead. (An earlier revision of this page pinned
+`v0.1.0` — a real tag, still pullable, but long superseded.)
 
 The chart ships the CRDs in its `crds/` directory. **Helm installs CRDs on
 first install but never upgrades or deletes them** — on a chart upgrade,

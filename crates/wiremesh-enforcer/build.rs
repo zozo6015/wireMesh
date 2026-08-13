@@ -11,8 +11,8 @@
 //!
 //! `wiremesh-enforcer` and `wiremesh-enforcer-program` are NOT in the same
 //! workspace -- the eBPF program lives in the sibling STANDALONE workspace
-//! `crates/wiremesh-enforcer-ebpf` (excluded from the root workspace, same
-//! reason every `spike/*` crate is standalone -- see CLAUDE.md). Two
+//! `crates/wiremesh-enforcer-ebpf` (excluded from the root workspace because
+//! the aya template ships its own `[workspace]` -- see CLAUDE.md). Two
 //! adaptations follow from that:
 //!  1. `MetadataCommand` is pointed explicitly at that workspace's own
 //!     `Cargo.toml` via `manifest_path`, instead of relying on the default
