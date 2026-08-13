@@ -131,8 +131,9 @@ roster `applied_version` lag.
 DEFAULT EVERYWHERE, not just on the live fabric: an absent
 `WIREMESH_ROTATION_INTERVAL` now means **no timer** (it used to mean 30d), so
 the schedule is opt-in and the live fabric's `off` is one instance of the
-default rather than a local override. Manual `fabricctl` rotation works and is
-the supported path. Both original blockers are now cleared; what gates arming
+default rather than a local override. Rotation on demand works, but only as the
+Admin `RotateKey` RPC — `fabricctl` has **no `rotate` subcommand**, so it takes a
+hand-rolled gRPC call against the loopback-only Admin service (backlog item 33). Both original blockers are now cleared; what gates arming
 the timer anywhere is a third finding — **backlog item 9, the rotation wedge**,
 which surfaced while clearing the first:
 
@@ -208,8 +209,18 @@ complete.
   `./dev.sh {build|shell|run <cmd>}` (exists after Phase 0 Task 1). tun/eBPF/netns/
   nftables do not work on the host.
 - Network tests are serial: `cargo test -- --test-threads=1 --nocapture`.
-- Each `spike/*` crate is standalone — no root cargo workspace (the aya template
-  ships its own workspace and must not be nested).
+- `crates/wiremesh-enforcer-ebpf` is standalone — it is `exclude`d from the root
+  workspace because the aya template ships its own `[workspace]`, which cargo
+  forbids nesting. Build/test it from its own directory, not via the root.
+- **`spike/` is gone.** The eight Phase-0 de-risk crates (`enforcer keyrot natlab
+  natpunch natpunch2 punch relay tunnel`) were deleted once every bet had
+  graduated into `crates/`; their vendored `Cargo.lock` files were generating
+  most of the repo's Dependabot noise. Comments throughout `crates/` still cite
+  `spike/*` paths as **provenance** — where a piece of code was graduated from,
+  and why it looks the way it does. Those citations are accurate history, not a
+  broken checkout: read the code with `git show 378f45e:spike/<path>` (the last
+  commit that contained it), and the verdicts/measurements in
+  `docs/research/phase0-report.md`.
 - v1 is IPv4-only; measured numbers go in `docs/research/phase0-results.md`, never
   just the terminal.
 

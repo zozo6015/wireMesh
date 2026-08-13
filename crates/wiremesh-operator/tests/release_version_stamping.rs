@@ -561,8 +561,7 @@ fn cargo_package_flags(run: &str) -> Vec<String> {
 
 /// `(crate name, repo-relative directory)` for every workspace member.
 /// Read from the root manifest's `members = [...]`, so `exclude`d trees (the
-/// standalone `wiremesh-enforcer-ebpf` aya workspace, `spike/*`) are correctly
-/// absent.
+/// standalone `wiremesh-enforcer-ebpf` aya workspace) are correctly absent.
 fn workspace_members() -> Vec<(String, String)> {
     let text = read(&repo("Cargo.toml"), "Cargo.toml");
     // Anchor on the `members` KEY, not the first place that substring appears.

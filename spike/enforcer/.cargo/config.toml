@@ -1,5 +1,0 @@
-# The aya template ships `runner = "sudo -E"` here so a non-root dev user can
-# run/test binaries that make privileged BPF syscalls. Our dev container runs
-# everything as root already and has no `sudo` binary, so that runner breaks
-# every `cargo test`/`cargo run` in this workspace (the canonical Task 6 test
-# command included). No runner needed: binaries execute directly as root.

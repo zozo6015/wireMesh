@@ -6,7 +6,6 @@
 .superpowers
 **/target
 target
-spike
 docs
 dev
 *.md

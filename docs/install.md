@@ -113,10 +113,23 @@ every active gateway off the same tick. That is why the `off` escape hatch was
 added in v0.7.0: to defuse a fabric-wide rotation outage that was already
 scheduled for the first timer fire.
 
-**Manual rotation is the supported path today.** `fabricctl` / the Admin
-`RotateKey` RPC rotates one gateway you choose, when you choose, with you
-watching — use it to replace a key you believe is compromised. It is unaffected
-by this setting.
+**Rotation on demand exists, but there is no CLI for it.** The capability is the
+Admin `RotateKey` RPC, which rotates one gateway you choose, when you choose,
+with you watching, and is unaffected by this setting. What does not exist is a
+wrapper: `fabricctl` has **no `rotate` subcommand**, so triggering a rotation
+today means a hand-rolled gRPC call against the controller's Admin service —
+there is no supported command to copy. Budget for that before you need it, and
+see backlog item 33.
+
+The Admin service is reachable only from the controller host. It is served on
+two listeners, both local: the Unix socket at `WIREMESH_SOCKET_PATH` (implicit
+admin — anyone who can open the socket is trusted, which is why its directory is
+mode `0700`), and a plaintext-gRPC TCP listener behind a bearer token. That TCP
+listener binds `127.0.0.1` **unconditionally** — it deliberately ignores the
+bind address the Sync/enrollment/observation listeners use, because a bearer
+token on plaintext gRPC would be interceptable and replayable on a routable
+interface. So rotating a key means getting onto the controller host (or
+forwarding a port to it) first.
 
 If you do want a schedule anyway, set it in `/etc/wiremesh/controller.env`; the
 value takes effect on controller restart, and the grammar is the same one that
@@ -146,9 +159,11 @@ does not disable rotation as a capability:
 - a rotation already in flight when you switch it off still completes — the
   controller's decision sweep keeps running, including its recovery of a
   rotation orphaned by a crash;
-- **manual rotation still works.** `fabricctl` / the Admin `RotateKey` RPC
-  rotates a chosen gateway on demand — use it if you believe a key is
-  compromised;
+- **rotation on demand still works, but only as an RPC.** The Admin `RotateKey`
+  RPC rotates a chosen gateway; `fabricctl` does not wrap it, so reaching for it
+  in an incident means writing a gRPC call against the controller's
+  loopback-only Admin service (above). Treat this as friction to plan around,
+  not a command you can look up mid-incident;
 - keys already in use keep working; nothing expires on its own.
 
 While there is no timer, no key is rotated on a schedule for as long as the
@@ -156,7 +171,8 @@ controller runs, and the controller prints a loud `AUTOMATIC KEY ROTATION IS
 OFF` warning at every boot (visible in `journalctl -u wiremesh-controller`). On
 a stock install that banner is the **expected** state, not a misconfiguration —
 but it is still a standing to-do rather than background noise: it means key
-replacement is on you, via `fabricctl`, on whatever cadence your policy needs.
+replacement is on you, on whatever cadence your policy needs — and by the
+hand-rolled `RotateKey` call described above, since no CLI exposes it.
 
 ### Upgrading from a release that used `/var/lib/wiremesh`
 
