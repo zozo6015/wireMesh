@@ -576,9 +576,55 @@ least important of its family, and fixed for free by item 1's `PeerState::from_p
 Deferred with **6 open owner decisions**. **Its stated correctness justification is
 dead:** the 32-bit `registration_key` collision argument (deterministic and permanent,
 ~17% at 200 gateways) was fixed in v0.6.0 by commit `94e8b98`, which widened the key to
-the full 64 bits &mdash; `registration_key` now returns `digest[..8]` raw
-(`crates/wiremesh-relay/src/lib.rs:162`). The item may still have other drivers, but that
-collision is not one of them; re-establish the driver before scheduling it.
+the full 64 bits &mdash; `wiremesh_relay::registration_key` now returns `digest[..8]` raw.
+The item may still have other drivers, but that collision is not one of them;
+re-establish the driver before scheduling it.
+
+**D2 (ALPN) &mdash; SETTLED in Phase B, owner ruling 2026-08-25. v1.0 speaks
+`wiremesh-relay/0` ONLY, on both sides.** The shipped client offers `/0` only; the relay
+accepts `/0` only. Rationale, recorded because it is what a future change must re-answer:
+**a client that offers a protocol must be able to speak it.** A v1.0 client cannot speak
+`/1`, so against a *future* mux relay a dual-offer would negotiate `/1` and then speak
+`/0` framing &mdash; the same defect as accepting `/1`, with the roles reversed. And the
+accept side was never safe to open: `/1`'s framing is not a defined wire while owner
+decisions **F** (channel semantics) and **G** (the relay&rarr;gateway return header,
+recorded *"OPEN &mdash; load-bearing"*) remain open in
+`docs/research/relay-mux-design-verification.md`.
+
+What shipped (`wiremesh_relay::{ALPN_V0, ALPN_SUPPORTED}`):
+
+* **One constant set.** The four hand-copied `b"wiremesh-relay/0"` literals &mdash;
+  `server_config`, `server_config_with_denylist`, `build_client_endpoint`, and
+  `tests/dest_pinning.rs::raw_client_endpoint` &mdash; now consume one exported list.
+  `ALPN_SUPPORTED` has exactly one member in v1.0 but **stays a list**, so adding `/1`
+  later is a one-line change at one site. (`relay-mux-design-verification.md` says the
+  ALPN literal lives in "three places"; it was **four** &mdash; the test replica counts.)
+* **Negotiated-ALPN readback** via `quinn::Connection::handshake_data()` on both sides
+  (`Client::negotiated_alpn`, and the relay's per-session read), previously called
+  nowhere in the repo.
+* **Decision H's deprecation anchor:** a per-ALPN cumulative session counter on the
+  relay, surfaced in the registration log line as `alpn="…" alpn_sessions=N`. A counter
+  and a log line, **not** a metrics endpoint &mdash; the relay has no metrics surface at
+  all, and building one is item S4. It counts *accepted registrations*, so a rejected
+  connection never reaches it, and re-registrations do count. Recorded limitation: a
+  per-relay count is necessary but **not fleet-complete**, because `relay_next_idx`
+  round-robins, so a pair that only ever uses R1 is invisible to R2.
+* **Connect-failure distinguishability.** `wiremesh_relay::RelayConnectFailure`
+  (`AlpnMismatch` / `PeerRejectedCredentials(alert)` / `Unreachable` / `Other`) is
+  classified at **every** fallible step of `Client::finish_connect` on the raw error,
+  before `.context()` erases the type &mdash; because the rejection does **not** reliably
+  surface at the handshake step: `tests/bridge.rs`'s header records that a certless
+  client's `endpoint.connect(...).await` returns **Ok**, with the failure manifesting at
+  the registration-ack read. Paired with `relay_connect_backoff::RelayConnectBackoff`,
+  which replaced `ensure_relay_transport`'s bare `eprintln!`-and-return: an unusable
+  relay used to be retried every tick forever, indistinguishably. Permanent causes back
+  off from the first failure, transient ones after three.
+
+The `/1` mux wire itself remains deferred on decisions F and G. **Follow-up filed:** the
+relay's application-level registration rejections (identity mismatch, id in use, id
+collision) close the connection *after* a successful TLS handshake, so they classify as
+`Other` rather than a named variant &mdash; a `RelayRejected { code, reason }` variant
+would name them, at the cost of widening the enum past D2's four-cause bar.
 
 ### 20. LAN-side route propagation
 

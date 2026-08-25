@@ -59,6 +59,222 @@ const RELAY_SERVER_NAME: &str = "relay";
 /// misbehaving/hostile peer from streaming an unbounded registration.
 const MAX_REGISTRATION_BYTES: usize = 1024;
 
+/// The v1.0 relay wire protocol, negotiated via ALPN.
+///
+/// This is the ONE definition. It used to be four hand-copied
+/// `b"wiremesh-relay/0"` literals — both server builders, the client endpoint
+/// builder, and `tests/dest_pinning.rs`'s hand-rolled replica — so a protocol
+/// change meant finding all four.
+pub const ALPN_V0: &[u8] = b"wiremesh-relay/0";
+
+/// Every ALPN protocol this build speaks, for BOTH the relay's accept list and
+/// the client's offer list. **v1.0 has exactly one member, and that is a
+/// deliberate owner ruling (2026-08-25), not an oversight.**
+///
+/// `wiremesh-relay/1` — the mux wire (`[8B dest_gid][2B channel]`, MTU floor
+/// 1322, `docs/research/backlog-program-notes.md`) — is **neither offered nor
+/// accepted**, for two reasons that are the same defect with the roles
+/// reversed:
+///
+///   * **Accept side.** `/1`'s framing is not a defined wire: owner decisions
+///     **F** (channel semantics) and **G** (the relay→gateway return header,
+///     recorded *"OPEN — load-bearing"*) are both still open in
+///     `docs/research/relay-mux-design-verification.md`. Accepting a protocol
+///     whose framing two open decisions have not fixed would break every
+///     future mux client that negotiates it.
+///   * **Offer side.** A client that offers a protocol must be able to speak
+///     it. A v1.0 client cannot speak `/1`, so against a *future* mux relay a
+///     dual-offer would negotiate `/1` and then speak `/0` framing.
+///
+/// It stays a **list** with one member precisely so adding `/1` later is a
+/// one-line change at this one site rather than an archaeology exercise. The
+/// relay's accept path is already tolerant of a *superset* offer — a client
+/// offering `["/1", "/0"]` negotiates `/0` — which is the forward-compatibility
+/// property `tests/alpn.rs` pins with a TEST client (never the shipped one).
+pub const ALPN_SUPPORTED: &[&[u8]] = &[ALPN_V0];
+
+/// `ALPN_SUPPORTED` in the `Vec<Vec<u8>>` shape rustls wants.
+fn alpn_protocols() -> Vec<Vec<u8>> {
+    ALPN_SUPPORTED.iter().map(|p| p.to_vec()).collect()
+}
+
+/// TLS alert 120, `no_application_protocol` (RFC 8446 §6.2) — what a server
+/// sends when it shares no ALPN protocol with the client.
+///
+/// A named `const` **on purpose**: in PATTERN position a lowercase identifier
+/// is a fresh irrefutable BINDING rather than a reference to this value, so a
+/// lowercase spelling would match every alert and classify every credentials
+/// rejection as [`RelayConnectFailure::AlpnMismatch`] — while reading exactly
+/// as intended. (The nested match in [`classify_transport_code`] means such a
+/// slip also makes the following arm `unreachable_pattern`, so it fails to
+/// compile under `-D warnings` too. Belt and braces: both are cheap.)
+const ALERT_NO_APPLICATION_PROTOCOL: u8 = 120;
+
+/// Why a relay connection attempt failed, in the four terms an operator can
+/// act on differently.
+///
+/// This exists because every cause used to surface identically: one
+/// `eprintln!` reading `connecting relay=… failed: …`, repeated per tick
+/// forever with nothing to tell a version-skewed relay from a revoked cert,
+/// a CA mismatch, or a relay that is simply down.
+///
+/// Attached to the returned [`anyhow::Error`] as the chain **root**
+/// (`anyhow::Error::new(failure).context(…)`), so a caller recovers it with
+/// `err.downcast_ref::<RelayConnectFailure>()`. Building it the other way
+/// round — `Err(quinn_err).context(…)` with the classification computed
+/// separately — would leave the quinn error as the root and the downcast
+/// would return `None`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayConnectFailure {
+    /// No shared ALPN protocol: the relay speaks a protocol set disjoint from
+    /// this build's [`ALPN_SUPPORTED`]. In practice a version skew.
+    AlpnMismatch,
+    /// The relay rejected our credentials during the TLS handshake, carrying
+    /// the TLS alert it sent: revoked (44), unknown CA (48), access denied
+    /// (49), bad certificate (42), certificate required (116), ...
+    ///
+    /// Match the VARIANT, not the payload — which alert arrives depends on the
+    /// cause and on the rustls version.
+    PeerRejectedCredentials(u8),
+    /// Nothing answered: timeout, reset, or no mutually supported QUIC
+    /// version. The relay is down, unreachable, or behind a black hole.
+    Unreachable,
+    /// Anything else. Reachable and NOT a dead end: the relay's own
+    /// application-level registration rejections (identity mismatch,
+    /// registration id in use, id collision) close the connection AFTER a
+    /// successful TLS handshake, so they land here rather than in any of the
+    /// three named variants. The underlying error is preserved in the
+    /// `anyhow` context chain — which is why the caller must log `{err:#}`
+    /// and not `{err}`, or this becomes an empty bucket.
+    Other,
+}
+
+impl std::fmt::Display for RelayConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlpnMismatch => {
+                f.write_str("relay rejected our ALPN offer (no shared application protocol)")
+            }
+            Self::PeerRejectedCredentials(alert) => {
+                write!(f, "relay rejected our credentials (TLS alert {alert})")
+            }
+            Self::Unreachable => f.write_str("relay unreachable (no response before timeout)"),
+            Self::Other => f.write_str(
+                "relay connect failed for an unclassified reason \
+                 (see the preceding context for the underlying error)",
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RelayConnectFailure {}
+
+/// Classifies a QUIC transport error code. Pure — no I/O, no connection
+/// state — so it is directly unit-testable with bare codes.
+fn classify_transport_code(code: quinn::TransportErrorCode) -> RelayConnectFailure {
+    let raw = u64::from(code);
+    match raw {
+        // The CRYPTO_ERROR range and the ALPN alert OVERLAP: a TLS alert `n`
+        // is encoded as `0x100 | n`, so `crypto(120)` == 0x178 sits INSIDE
+        // 0x100..0x200. The two are nested rather than written as sequential
+        // sibling arms so that no reordering can silently reclassify an ALPN
+        // mismatch as a credentials rejection — there are no sibling arms to
+        // reorder, and the inner match is over disjoint `u8` values the
+        // compiler checks for reachability.
+        r if (0x100..0x200).contains(&r) => match (r & 0xFF) as u8 {
+            ALERT_NO_APPLICATION_PROTOCOL => RelayConnectFailure::AlpnMismatch,
+            alert => RelayConnectFailure::PeerRejectedCredentials(alert),
+        },
+        _ => RelayConnectFailure::Other,
+    }
+}
+
+/// Classifies a connection-level error. Thin wrapper over
+/// [`classify_transport_code`] — everything that needs deciding lives there.
+fn classify_connection_error(err: &quinn::ConnectionError) -> RelayConnectFailure {
+    match err {
+        quinn::ConnectionError::ConnectionClosed(close) => {
+            classify_transport_code(close.error_code)
+        }
+        quinn::ConnectionError::TimedOut
+        | quinn::ConnectionError::Reset
+        | quinn::ConnectionError::VersionMismatch => RelayConnectFailure::Unreachable,
+        // `ApplicationClosed` lands here on purpose: the relay's own
+        // registration rejections are application closes AFTER a successful
+        // handshake. See `RelayConnectFailure::Other`.
+        _ => RelayConnectFailure::Other,
+    }
+}
+
+/// Reads the ALPN protocol negotiated on an established connection off the
+/// completed TLS handshake. Used by both sides — the client records it on
+/// [`Client`], the relay logs and counts it per session.
+///
+/// `handshake_data()` is `Some` on an established connection and downcasts to
+/// rustls' [`quinn::crypto::rustls::HandshakeData`], whose `protocol` is
+/// documented as set whenever a nonempty ALPN list was configured. Both sides
+/// always configure [`ALPN_SUPPORTED`], so this is `Some` in practice; it
+/// still returns `Option` rather than unwrapping.
+fn negotiated_alpn(conn: &Connection) -> Option<Vec<u8>> {
+    conn.handshake_data()?
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?
+        .protocol
+}
+
+/// Renders a negotiated ALPN for a log line, or `unknown` if none was
+/// negotiated. Quoted like the `owner=`/`peer=` tokens beside it.
+fn alpn_label(alpn: Option<&[u8]>) -> String {
+    match alpn {
+        Some(p) => format!("{:?}", String::from_utf8_lossy(p)),
+        None => "unknown".to_string(),
+    }
+}
+
+/// Per-ALPN cumulative session counter for one [`serve`] loop.
+///
+/// This is decision **H**'s deprecation-horizon anchor
+/// (`docs/research/relay-mux-design-verification.md`): `/0` cannot be retired
+/// until the fleet can show zero `/0` sessions, and that measurement has to
+/// exist in the shipped 1.0 relay or it cannot start until 1.1.
+///
+/// A counter plus a log line, deliberately **not** a metrics endpoint — the
+/// relay has no metrics surface at all, and building one is a separate item
+/// (S4). Recorded counter-argument: a per-relay count is necessary but not
+/// fleet-complete, because `relay_next_idx` round-robins, so a pair that only
+/// ever uses R1 is invisible to R2.
+///
+/// Counts **accepted registrations** — the increment sits at the registration
+/// log line, so a connection rejected for a bad cert, an identity mismatch or
+/// a key collision never reaches it. Re-registrations (`ReplaceOwnSlot`) do
+/// count, so this is "sessions", not "unique peers". Never decremented.
+#[derive(Clone, Default)]
+struct AlpnSessionCounts(Arc<std::sync::Mutex<std::collections::HashMap<Vec<u8>, u64>>>);
+
+impl AlpnSessionCounts {
+    /// Records one accepted session for `alpn` and returns the new cumulative
+    /// count for that protocol.
+    fn record(&self, alpn: Option<&[u8]>) -> u64 {
+        let key = alpn.unwrap_or(b"unknown").to_vec();
+        let mut map = self.0.lock().expect("alpn session counter poisoned");
+        let n = map.entry(key).or_insert(0);
+        *n += 1;
+        *n
+    }
+}
+
+/// Builds the error for a failed [`Client::finish_connect`] step: `failure`
+/// becomes the chain ROOT (so `downcast_ref::<RelayConnectFailure>()`
+/// resolves) and the raw error's `Display` is embedded in the context (so
+/// even an unclassified `Other` still shows the operator what happened).
+fn connect_step_error(
+    failure: RelayConnectFailure,
+    step: &'static str,
+    raw: impl std::fmt::Display,
+) -> anyhow::Error {
+    anyhow::Error::new(failure).context(format!("{step}: {raw}"))
+}
+
 /// Minimum spacing between repeated log lines of ONE kind from ONE connection
 /// in `serve`'s datagram loop (see [`DatagramDropLog`]). Every event is
 /// counted, but at most one line per kind per connection per interval is
@@ -310,7 +526,7 @@ pub fn server_config(certdir: &Path) -> Result<QuinnServerConfig> {
     let mut tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(relay_certs, relay_key)?;
-    tls.alpn_protocols = vec![b"wiremesh-relay/0".to_vec()];
+    tls.alpn_protocols = alpn_protocols();
 
     let quic_crypto = QuicServerConfig::try_from(tls)?;
     let mut server_config = QuinnServerConfig::with_crypto(Arc::new(quic_crypto));
@@ -334,7 +550,7 @@ fn build_client_endpoint(
         Some((certs, key)) => builder.with_client_auth_cert(certs, key)?,
         None => builder.with_no_client_auth(),
     };
-    tls.alpn_protocols = vec![b"wiremesh-relay/0".to_vec()];
+    tls.alpn_protocols = alpn_protocols();
 
     let quic_crypto = QuicClientConfig::try_from(tls)?;
     let mut client_config = QuinnClientConfig::new(Arc::new(quic_crypto));
@@ -384,6 +600,9 @@ pub struct Client {
     /// `registration_key(peer_identity, my_identity)` — i.e. exactly the id
     /// the peer registered its own side under.
     dest_key: [u8; 8],
+    /// The ALPN protocol actually negotiated, read back off the handshake.
+    /// See [`Client::negotiated_alpn`].
+    negotiated_alpn: Option<Vec<u8>>,
 }
 
 impl Client {
@@ -435,10 +654,31 @@ impl Client {
         my_identity: &str,
         peer_identity: &str,
     ) -> Result<Client> {
+        // Every fallible step below is classified on its RAW error, before
+        // `.context()` erases the type. This is deliberate and it is not
+        // over-engineering: the rejection does NOT reliably surface at the
+        // handshake step. `tests/bridge.rs`'s module header records, from a
+        // live run, that a certless client's `endpoint.connect(...).await`
+        // returns **Ok** — the server's rejection is a CONNECTION_CLOSE that
+        // lands later, and the failure actually manifests at the ack read
+        // ("...the cryptographic handshake failed: error 116: peer sent no
+        // certificates"). Classifying only at the connect step would file
+        // every credentials rejection under `Other`.
+        //
+        // Steps 1 and 5 map to `Other` explicitly rather than by fallthrough:
+        // `ConnectError` is entirely local/config (`EndpointStopping`,
+        // `InvalidServerName`, ...) and `ClosedStream` is a unit struct, so
+        // neither can carry a peer-attributable cause. That is a property of
+        // those types, not an omission here.
         let conn = endpoint
-            .connect(relay_addr, RELAY_SERVER_NAME)?
+            // Step 1: `ConnectError` — local/config only, never a peer cause.
+            .connect(relay_addr, RELAY_SERVER_NAME)
+            .map_err(|e| connect_step_error(RelayConnectFailure::Other, "QUIC connect", e))?
             .await
-            .context("QUIC handshake failed")?;
+            // Step 2: `ConnectionError` — where an ALPN mismatch lands.
+            .map_err(|e| {
+                connect_step_error(classify_connection_error(&e), "QUIC handshake failed", e)
+            })?;
 
         // Registration uses a *bidirectional* stream, not a bare uni stream:
         // `send.finish()` only flushes locally and returns as soon as the
@@ -452,19 +692,54 @@ impl Client {
         // wait until the relay has processed (and ACCEPTED) the registration
         // — an identity-mismatch/duplicate rejection instead closes the
         // connection, surfacing here as an `Err` on the ack read.
-        let (mut send, mut recv) = conn.open_bi().await.context("open registration stream")?;
+        // Step 3: `ConnectionError`.
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| {
+            connect_step_error(classify_connection_error(&e), "open registration stream", e)
+        })?;
+        // Step 4: `WriteError` — one unwrap to reach the connection cause.
         send.write_all(&encode_registration(my_identity, peer_identity))
             .await
-            .context("write registration")?;
-        send.finish().context("finish registration stream")?;
-        recv.read_to_end(1)
-            .await
-            .context("await registration ack")?;
+            .map_err(|e| {
+                let failure = match &e {
+                    quinn::WriteError::ConnectionLost(ce) => classify_connection_error(ce),
+                    _ => RelayConnectFailure::Other,
+                };
+                connect_step_error(failure, "write registration", e)
+            })?;
+        // Step 5: `ClosedStream` — a unit struct; carries no peer cause.
+        send.finish().map_err(|e| {
+            connect_step_error(RelayConnectFailure::Other, "finish registration stream", e)
+        })?;
+        // Step 6: `ReadToEndError` — TWO unwraps to reach the connection
+        // cause, and the step where a credentials rejection actually lands
+        // (see the note above `endpoint.connect`).
+        recv.read_to_end(1).await.map_err(|e| {
+            let failure = match &e {
+                quinn::ReadToEndError::Read(quinn::ReadError::ConnectionLost(ce)) => {
+                    classify_connection_error(ce)
+                }
+                _ => RelayConnectFailure::Other,
+            };
+            connect_step_error(failure, "await registration ack", e)
+        })?;
+
+        // Guaranteed `Some` whenever a nonempty ALPN list was configured, and
+        // `build_client_endpoint` always configures `ALPN_SUPPORTED` — but
+        // read defensively rather than unwrapping.
+        let negotiated_alpn = negotiated_alpn(&conn);
 
         Ok(Client {
             conn,
             dest_key: registration_key(peer_identity, my_identity),
+            negotiated_alpn,
         })
+    }
+
+    /// The ALPN protocol this connection negotiated, as read back off the
+    /// completed TLS handshake — not what we offered. `None` only if the peer
+    /// negotiated no protocol at all.
+    pub fn negotiated_alpn(&self) -> Option<&[u8]> {
+        self.negotiated_alpn.as_deref()
     }
 
     /// Send `data` to this client's bound peer as one QUIC datagram:
@@ -708,19 +983,30 @@ async fn remove_if_owner(registry: &Registry, key: &[u8; 8], conn: &Connection) 
 /// blind-overwritten — both rejections close the connection (fail-closed).
 pub async fn serve(endpoint: Endpoint) {
     let registry: Registry = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+    // Cumulative per-ALPN session counts for THIS serve loop. The relay
+    // binary calls `serve` exactly once, so for it this is per-process; two
+    // embedded relays in one test process get independent counters.
+    let alpn_counts = AlpnSessionCounts::default();
 
     while let Some(incoming) = endpoint.accept().await {
         let registry = registry.clone();
+        let alpn_counts = alpn_counts.clone();
         tokio::spawn(async move {
             let conn = match incoming.await {
                 Ok(conn) => conn,
                 Err(e) => {
                     // Mandatory client-cert handshake failures land here —
-                    // e.g. a certless client (Client::connect_no_cert).
+                    // e.g. a certless client (Client::connect_no_cert). An
+                    // ALPN mismatch also fails here, before any session
+                    // exists to count.
                     eprintln!("relay: handshake failed: {e}");
                     return;
                 }
             };
+
+            // Read back what THIS session negotiated, off the completed
+            // handshake — not what we advertised.
+            let session_alpn = negotiated_alpn(&conn);
 
             // The unforgeable identity: read straight off the authenticated
             // client certificate, never from the wire.
@@ -818,9 +1104,12 @@ pub async fn serve(endpoint: Endpoint) {
                 return;
             }
             eprintln!(
-                "relay: registered key={} owner={cert_identity:?} peer={peer_identity:?} from {}",
+                "relay: registered key={} owner={cert_identity:?} peer={peer_identity:?} \
+                 from {} alpn={} alpn_sessions={}",
                 key_hex(&key),
-                conn.remote_address()
+                conn.remote_address(),
+                alpn_label(session_alpn.as_deref()),
+                alpn_counts.record(session_alpn.as_deref())
             );
 
             // SECURITY (item 3a): the ONE destination this connection is
@@ -1343,7 +1632,7 @@ pub fn server_config_with_denylist(
     let mut tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
         .with_single_cert(relay_certs, relay_key)?;
-    tls.alpn_protocols = vec![b"wiremesh-relay/0".to_vec()];
+    tls.alpn_protocols = alpn_protocols();
 
     let quic_crypto = QuicServerConfig::try_from(tls)?;
     let mut server_config = QuinnServerConfig::with_crypto(Arc::new(quic_crypto));
