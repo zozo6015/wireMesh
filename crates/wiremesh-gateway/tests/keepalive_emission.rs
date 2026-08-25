@@ -40,6 +40,12 @@
 //!  - `src/tunnel.rs` / `src/tunnelset.rs` `reconcile(..., keepalive_secs)`
 //!    pass-through parameters, and `main.rs` call sites.
 
+// The module doc above indents its continuation lines to line up under the
+// list item they belong to. Clippy reads that alignment as a missing indent
+// and its fix flattens a table a human laid out on purpose, so the
+// disagreement is recorded here rather than resolved against the reader.
+#![allow(clippy::doc_lazy_continuation)]
+
 use std::collections::HashMap;
 
 use wiremesh_gateway::reconcile::{device_config, device_config_pinned, peer_configs};

@@ -64,6 +64,12 @@
 //!    `ct state ...` line and the final `counter name "default_deny" drop`
 //!    line, with no rule lines and no `r_*` counters in between.
 
+// The module doc above indents its continuation lines to line up under the
+// list item they belong to. Clippy reads that alignment as a missing indent
+// and its fix flattens a table a human laid out on purpose, so the
+// disagreement is recorded here rather than resolved against the reader.
+#![allow(clippy::doc_lazy_continuation)]
+
 use wiremesh_policy::{
     compile, parse_policy, IrAction, IrBlock, IrProto, IrRule, PolicyIR, SegmentDef,
 };

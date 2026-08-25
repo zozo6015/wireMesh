@@ -75,6 +75,12 @@
 //!    not once per skipped directive (plan T3) — log behavior is not
 //!    pinned here.
 
+// The doc comment above column-aligns its continuation lines under the list
+// item they belong to. Clippy wants them at the minimum indent, which
+// ragged-edges a table a human laid out on purpose, so the disagreement is
+// recorded here rather than resolved against the reader.
+#![allow(clippy::doc_overindented_list_items)]
+
 use std::time::{Duration, Instant};
 
 use wiremesh_gateway::punch_backoff::{
