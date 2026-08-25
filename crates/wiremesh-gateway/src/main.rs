@@ -2659,10 +2659,28 @@ async fn ensure_relay_transport(
     let addr: SocketAddr = match relay_info.endpoint.parse() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!(
-                "wiremesh-gateway: relay={} endpoint {:?} unparseable for peer={gid}: {e}",
-                relay_info.relay_id, relay_info.endpoint
-            );
+            // A malformed advertisement is DATA, not a peer rejection — the
+            // relay never got the chance to reject us — so it is TRANSIENT
+            // (`Other`, threshold 3), not permanent: a controller that
+            // re-advertises a corrected endpoint recovers on the next tick
+            // instead of waiting out a window earned by something already
+            // fixed.
+            //
+            // But it MUST be recorded. This arm sits AFTER
+            // `relay_connect_allowed` has already consumed a decide, so
+            // returning without an outcome leaves the counter at zero, no
+            // window ever opens, and the line below repeats every tick
+            // forever — precisely the defect this back-off exists to stop.
+            if ctx.record_relay_connect_outcome(
+                gid,
+                relay_info.relay_id,
+                Err(RelayConnectFailure::Other),
+            ) {
+                eprintln!(
+                    "wiremesh-gateway: relay={} endpoint {:?} unparseable for peer={gid}: {e}",
+                    relay_info.relay_id, relay_info.endpoint
+                );
+            }
             return;
         }
     };
