@@ -36,26 +36,48 @@ async fn receives_snapshot_and_reports_version() {
         gateway_id: g1.id(),
         observe_key: String::new(),
         wg_private_key_b64: {
-            let pk = String::from_utf8(std::process::Command::new("wg").arg("genkey").output().unwrap().stdout).unwrap().trim().to_string();
+            let pk = String::from_utf8(
+                std::process::Command::new("wg")
+                    .arg("genkey")
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .unwrap()
+            .trim()
+            .to_string();
             let _ = base64_pub_from_priv(&pk).unwrap();
             pk
         },
     };
 
-    let mut client = sync::connect(&h.sync_tcp_addr().to_string(), &id).await.expect("mTLS connect");
+    let mut client = sync::connect(&h.sync_tcp_addr().to_string(), &id)
+        .await
+        .expect("mTLS connect");
     let mut stream = sync::watch(&mut client).await.expect("watch");
     let mut cur = None;
     // The first Sync message is always a snapshot, surfaced as SyncEvent::State.
-    let ds = match sync::next_event(&mut stream, &mut cur).await.expect("first msg").expect("snapshot") {
+    let ds = match sync::next_event(&mut stream, &mut cur)
+        .await
+        .expect("first msg")
+        .expect("snapshot")
+    {
         sync::SyncEvent::State(ds) => ds,
         sync::SyncEvent::Punch(p) => panic!("expected snapshot, got punch directive: {p:?}"),
         sync::SyncEvent::Rotate(r) => panic!("expected snapshot, got rotate directive: {r:?}"),
     };
     // Gateway A's peer is gateway B (seg-b, 10.10.2.0/24).
-    assert!(ds.peers.iter().any(|p| p.allowed_ips.contains(&"10.10.2.0/24".to_string())),
-            "snapshot lists peer B's segment: {:?}", ds.peers);
+    assert!(
+        ds.peers
+            .iter()
+            .any(|p| p.allowed_ips.contains(&"10.10.2.0/24".to_string())),
+        "snapshot lists peer B's segment: {:?}",
+        ds.peers
+    );
 
-    sync::report(&mut client, ds.policy_version, vec![], vec![], vec![], None).await.expect("report ack");
+    sync::report(&mut client, ds.policy_version, vec![], vec![], vec![], None)
+        .await
+        .expect("report ack");
     let _ = stream; // keep alive
 }
 
@@ -117,13 +139,20 @@ async fn session_generation_is_nonzero_stable_and_accepted_end_to_end() {
 
     // ...and the report must carry the SAME one, or the controller rejects
     // it. A fresh-per-call or per-connection nonce fails right here.
-    sync::report(&mut client, 0, vec!["10.10.1.1:51820".to_string()], vec![], vec![], None)
-        .await
-        .expect(
-            "a report from the same process that opened the Watch must be accepted — a \
+    sync::report(
+        &mut client,
+        0,
+        vec!["10.10.1.1:51820".to_string()],
+        vec![],
+        vec![],
+        None,
+    )
+    .await
+    .expect(
+        "a report from the same process that opened the Watch must be accepted — a \
              failure here means watch() and report() disagree about this process's \
              session_generation",
-        );
+    );
 
     assert_eq!(
         first,
@@ -161,7 +190,10 @@ async fn pending_epoch_after_rotate(h: &TestController, gateway_id: u64) -> u32 
         .iter()
         .max_by_key(|(epoch, _, _)| *epoch)
         .unwrap_or_else(|| panic!("no GATEWAY_KEY rows after rotation: {states:?}"));
-    assert_eq!(state, "pending", "the freshly rotated epoch must be pending: {states:?}");
+    assert_eq!(
+        state, "pending",
+        "the freshly rotated epoch must be pending: {states:?}"
+    );
     assert_eq!(
         pubkey, "awaiting-submission",
         "the freshly rotated epoch must hold the sentinel: {states:?}"
@@ -233,23 +265,32 @@ async fn submit_epoch_key_stamps_the_same_nonzero_process_nonce_as_watch() {
     let superseded = enroll_one(&h, "seg-superseded", "10.20.2.0/24").await;
 
     let process_nonce = sync::session_generation();
-    assert_ne!(process_nonce, 0, "the process nonce must be nonzero to begin with");
+    assert_ne!(
+        process_nonce, 0,
+        "the process nonce must be nonzero to begin with"
+    );
 
     // --- Phase A: the submission carries the same value `watch` recorded ---
     let mut live_client = sync::connect(&h.sync_tcp_addr().to_string(), &identity_of(&live))
         .await
         .expect("mTLS connect (live gateway)");
     // This is what RECORDS the process nonce against `live` controller-side.
-    let _live_watch = sync::watch(&mut live_client).await.expect("watch (live gateway)");
+    let _live_watch = sync::watch(&mut live_client)
+        .await
+        .expect("watch (live gateway)");
 
     let epoch_a = pending_epoch_after_rotate(&h, live.id()).await;
-    sync::submit_epoch_key(&mut live_client, epoch_a, "GATEWAY-SUBMITTED-A==".to_string())
-        .await
-        .expect(
-            "a submission from the same process that opened the Watch must be accepted — a \
+    sync::submit_epoch_key(
+        &mut live_client,
+        epoch_a,
+        "GATEWAY-SUBMITTED-A==".to_string(),
+    )
+    .await
+    .expect(
+        "a submission from the same process that opened the Watch must be accepted — a \
              failure here means submit_epoch_key stamps a DIFFERENT value than watch does \
              (per-call or per-connection instead of per-process)",
-        );
+    );
     assert_eq!(
         epoch_pubkey(&h, live.id(), epoch_a).await,
         "GATEWAY-SUBMITTED-A==",
@@ -270,7 +311,10 @@ async fn submit_epoch_key_stamps_the_same_nonzero_process_nonce_as_watch() {
     // with a submission still in flight. The stub stands in for the newer
     // process; only the recorded value matters to the gate.
     let newer_generation = superseded.session_generation();
-    assert_ne!(newer_generation, 0, "the superseding generation must be nonzero");
+    assert_ne!(
+        newer_generation, 0,
+        "the superseding generation must be nonzero"
+    );
     assert_ne!(
         newer_generation, process_nonce,
         "the superseding generation must DIFFER from this process's nonce, or there is no \

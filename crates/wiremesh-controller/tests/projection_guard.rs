@@ -57,9 +57,9 @@ async fn consume_initial_snapshot(b_stream: &mut tonic::Streaming<SyncMessage>) 
         .expect("Sync.Watch stream yielded an error instead of B's initial snapshot");
     match msg.body {
         Some(sync_message::Body::Snapshot(_)) => {}
-        other => panic!(
-            "expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"
-        ),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 }
 
@@ -98,9 +98,7 @@ async fn sentinel_pending_not_advertised_until_submitted() {
 
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest {
-            gateway_id: a.id(),
-        })
+        .rotate_key(RotateKeyRequest { gateway_id: a.id() })
         .await
         .expect("Admin.RotateKey(gateway_id = a.id()) must succeed");
 
@@ -247,9 +245,7 @@ async fn key_rotated_delta_preserves_candidate_endpoints() {
 
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest {
-            gateway_id: a.id(),
-        })
+        .rotate_key(RotateKeyRequest { gateway_id: a.id() })
         .await
         .expect("Admin.RotateKey(gateway_id = a.id()) must succeed");
 

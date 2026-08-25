@@ -25,6 +25,16 @@ default-members = ["common"]
 [workspace.package]
 license = "Apache-2.0"
 edition = "2024"
+# NO `rust-version` here, deliberately. This workspace is edition 2024 and is
+# only ever compiled by the undated nightly named in its `rust-toolchain.toml`
+# (via `aya_build`, or via a standalone build from this directory), so any MSRV
+# stated here would be a claim nothing in the project can ever verify -- a
+# doc-comment asserting behaviour, in metadata form. For the record, it was
+# measured: `cargo +1.85 check --all-targets` here PASSES on default features,
+# and fails only with the `user` feature ("aya@0.14.0 requires rustc 1.87.0").
+# That number is real but describes a configuration nobody builds, which is
+# exactly why it is not declared. The root workspace's `rust-version` is the
+# one that means something, because CI and packagers actually exercise it.
 
 [workspace.dependencies]
 aya = { version = "0.14.0", default-features = false }

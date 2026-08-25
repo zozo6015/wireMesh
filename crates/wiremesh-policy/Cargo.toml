@@ -2,6 +2,7 @@
 name = "wiremesh-policy"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 [dependencies]
 # `PolicyIR::from_json` (ir.rs, Task 2) returns `anyhow::Result`.

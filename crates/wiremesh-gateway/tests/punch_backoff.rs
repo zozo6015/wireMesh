@@ -82,7 +82,10 @@ use wiremesh_gateway::punch_backoff::{
 };
 
 fn cands() -> Vec<String> {
-    vec!["203.0.113.5:51820".to_string(), "10.0.125.12:51820".to_string()]
+    vec![
+        "203.0.113.5:51820".to_string(),
+        "10.0.125.12:51820".to_string(),
+    ]
 }
 
 /// Unwrap a `Skip` decision's `until`, panicking (with context) on `Allow`.
@@ -114,7 +117,10 @@ fn fail_n(b: &mut PunchBackoff, t: Instant, n: u32, candidates: &[String]) -> In
 /// T3 plan contract constants: N=3, base 30s, cap 5min.
 #[test]
 fn t3_contract_constants() {
-    assert_eq!(FAILURE_THRESHOLD, 3, "plan T3: back off after N=3 consecutive failures");
+    assert_eq!(
+        FAILURE_THRESHOLD, 3,
+        "plan T3: back off after N=3 consecutive failures"
+    );
     assert_eq!(BACKOFF_BASE, Duration::from_secs(30), "plan T3: base 30s");
     assert_eq!(BACKOFF_CAP, Duration::from_secs(300), "plan T3: cap 5min");
 }
@@ -128,12 +134,21 @@ fn t3_failures_below_threshold_stay_allowed() {
     let mut b = PunchBackoff::new(7);
     let c = cands();
 
-    assert!(matches!(b.decide(t0, &c), PunchDecision::Allow), "fresh pair must be allowed");
+    assert!(
+        matches!(b.decide(t0, &c), PunchDecision::Allow),
+        "fresh pair must be allowed"
+    );
     b.record_failure(t0);
-    assert!(matches!(b.decide(t0, &c), PunchDecision::Allow), "1 failure: still allowed");
+    assert!(
+        matches!(b.decide(t0, &c), PunchDecision::Allow),
+        "1 failure: still allowed"
+    );
     b.record_failure(t0 + Duration::from_secs(1));
     assert!(
-        matches!(b.decide(t0 + Duration::from_secs(1), &c), PunchDecision::Allow),
+        matches!(
+            b.decide(t0 + Duration::from_secs(1), &c),
+            PunchDecision::Allow
+        ),
         "2 failures: still allowed"
     );
 }
@@ -165,8 +180,14 @@ fn t3_third_failure_backs_off_about_30s() {
 /// (raw hits/passes the cap; delay is clamped to <= 300s).
 #[test]
 fn t3_backoff_doubles_toward_cap_and_never_exceeds_it() {
-    let stage_bounds: [(u64, u64); 6] =
-        [(60, 90), (120, 180), (240, 300), (240, 300), (240, 300), (240, 300)];
+    let stage_bounds: [(u64, u64); 6] = [
+        (60, 90),
+        (120, 180),
+        (240, 300),
+        (240, 300),
+        (240, 300),
+        (240, 300),
+    ];
     for seed in [0u64, 1, 7, 42, 1337] {
         let t0 = Instant::now();
         let mut b = PunchBackoff::new(seed);
@@ -219,12 +240,18 @@ fn t3_success_resets_immediately_and_counter_restarts() {
     b.record_failure(t1);
     b.record_failure(t1 + Duration::from_secs(1));
     assert!(
-        matches!(b.decide(t1 + Duration::from_secs(1), &c), PunchDecision::Allow),
+        matches!(
+            b.decide(t1 + Duration::from_secs(1), &c),
+            PunchDecision::Allow
+        ),
         "post-success failures 1..2 must be allowed again (counter was reset)"
     );
     b.record_failure(t1 + Duration::from_secs(2));
     assert!(
-        matches!(b.decide(t1 + Duration::from_secs(2), &c), PunchDecision::Skip { .. }),
+        matches!(
+            b.decide(t1 + Duration::from_secs(2), &c),
+            PunchDecision::Skip { .. }
+        ),
         "3rd post-success consecutive failure backs off again"
     );
 }
@@ -242,8 +269,10 @@ fn t3_candidate_set_change_resets() {
     assert!(matches!(b.decide(t_fail, &old), PunchDecision::Skip { .. }));
 
     // New observed mapping for the peer → different candidate set.
-    let fresh =
-        vec!["198.51.100.7:41000".to_string(), "10.0.125.12:51820".to_string()];
+    let fresh = vec![
+        "198.51.100.7:41000".to_string(),
+        "10.0.125.12:51820".to_string(),
+    ];
     assert!(
         matches!(b.decide(t_fail, &fresh), PunchDecision::Allow),
         "a changed candidate set must clear the back-off and allow immediately"
@@ -253,7 +282,10 @@ fn t3_candidate_set_change_resets() {
     b.record_failure(t_fail);
     b.record_failure(t_fail + Duration::from_secs(1));
     assert!(
-        matches!(b.decide(t_fail + Duration::from_secs(1), &fresh), PunchDecision::Allow),
+        matches!(
+            b.decide(t_fail + Duration::from_secs(1), &fresh),
+            PunchDecision::Allow
+        ),
         "failures 1..2 against the fresh set must be allowed (counter was reset)"
     );
 }
@@ -266,14 +298,22 @@ fn t3_candidate_set_change_resets() {
 fn t3_same_set_reordered_is_not_a_change() {
     let t0 = Instant::now();
     let mut b = PunchBackoff::new(3);
-    let c = vec!["203.0.113.5:51820".to_string(), "10.0.125.12:51820".to_string()];
+    let c = vec![
+        "203.0.113.5:51820".to_string(),
+        "10.0.125.12:51820".to_string(),
+    ];
     let t_fail = fail_n(&mut b, t0, 3, &c);
     let until = skip_until(b.decide(t_fail, &c));
 
-    let reordered =
-        vec!["10.0.125.12:51820".to_string(), "203.0.113.5:51820".to_string()];
+    let reordered = vec![
+        "10.0.125.12:51820".to_string(),
+        "203.0.113.5:51820".to_string(),
+    ];
     let until2 = skip_until(b.decide(t_fail + Duration::from_secs(1), &reordered));
-    assert_eq!(until, until2, "reordering the same candidate set must not reset the window");
+    assert_eq!(
+        until, until2,
+        "reordering the same candidate set must not reset the window"
+    );
 }
 
 /// T3(f): skip decisions are STABLE within the window — the same directive
@@ -290,11 +330,17 @@ fn t3_skip_is_stable_within_window_then_expires() {
     let u1 = skip_until(b.decide(t_fail + Duration::from_secs(1), &c));
     let u2 = skip_until(b.decide(t_fail + Duration::from_secs(5), &c));
     let u3 = skip_until(b.decide(t_fail + Duration::from_secs(20), &c));
-    assert_eq!(u1, u2, "repeated directives inside the window see one stable until");
+    assert_eq!(
+        u1, u2,
+        "repeated directives inside the window see one stable until"
+    );
     assert_eq!(u2, u3, "deciding must not extend the window");
 
     assert!(
-        matches!(b.decide(u1 + Duration::from_millis(1), &c), PunchDecision::Allow),
+        matches!(
+            b.decide(u1 + Duration::from_millis(1), &c),
+            PunchDecision::Allow
+        ),
         "once the until-instant passes, the pair may punch again"
     );
 }

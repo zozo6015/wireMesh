@@ -122,7 +122,10 @@ fn missing_pvc_is_never_persisted_even_with_a_roster_row() {
         !relay_identity_persisted(false, &roster, EP),
         "no PVC → NOT persisted even with a matching roster row (the identity has nowhere to live)"
     );
-    assert!(!relay_identity_persisted(false, &[], EP), "neither → not persisted");
+    assert!(
+        !relay_identity_persisted(false, &[], EP),
+        "neither → not persisted"
+    );
 }
 
 #[test]

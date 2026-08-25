@@ -120,7 +120,9 @@ impl Drop for RootNetGuard {
 fn attach_underlay(ns: &Ns, tag: &str, ip: &str) {
     let hostend = format!("wmu{tag}h");
     let nsend = format!("wmu{tag}n");
-    run_root(&["ip", "link", "add", &hostend, "type", "veth", "peer", "name", &nsend]);
+    run_root(&[
+        "ip", "link", "add", &hostend, "type", "veth", "peer", "name", &nsend,
+    ]);
     run_root(&["ip", "link", "set", &hostend, "master", BRIDGE]);
     run_root(&["ip", "link", "set", &hostend, "up"]);
     run_root(&["ip", "link", "set", &nsend, "netns", &ns.name]);
@@ -210,17 +212,30 @@ impl Drop for GwProc {
     }
 }
 
-fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, tag: &str) -> GwProc {
+fn spawn_gw(
+    ns: &Ns,
+    statedir: &Path,
+    sync: &str,
+    observe: &str,
+    logdir: &Path,
+    tag: &str,
+) -> GwProc {
     let metrics = format!("0.0.0.0:{METRICS_PORT}");
     let statedir_s = statedir.to_str().unwrap();
     let args = [
         GW_BIN,
-        "--controller-sync", sync,
-        "--observe", observe,
-        "--tun", "wg0",
-        "--wg-port", "51820",
-        "--state-dir", statedir_s,
-        "--metrics", &metrics,
+        "--controller-sync",
+        sync,
+        "--observe",
+        observe,
+        "--tun",
+        "wg0",
+        "--wg-port",
+        "51820",
+        "--state-dir",
+        statedir_s,
+        "--metrics",
+        &metrics,
     ];
     let mut child = ns.spawn(&args).expect("spawn wiremesh-gateway");
     let mut drains = vec![];
@@ -241,7 +256,11 @@ fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, 
             }
         }));
     }
-    GwProc { child, err_log, drains }
+    GwProc {
+        child,
+        err_log,
+        drains,
+    }
 }
 
 // --- traffic + metrics probes -----------------------------------------------
@@ -259,7 +278,8 @@ while True:
     c.close()
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn listener")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn listener")
 }
 
 fn tcp_connect(ns: &Ns, dst: &str, port: u16) -> bool {
@@ -381,10 +401,16 @@ async fn direct_mesh_enforces_policy_and_survives_controller_outage() {
     attach_underlay(&gwb, "b", "10.9.0.2");
 
     // Segment veths + workload default routes.
-    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
-        .expect("seg-b veth");
+    lab.veth(
+        (&gwa, "seg0", "10.10.1.1/24"),
+        (&wla, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.2.1/24"),
+        (&wlb, "eth0", "10.10.2.2/24"),
+    )
+    .expect("seg-b veth");
     wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
         .expect("wlA default route");
     wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
@@ -401,8 +427,22 @@ async fn direct_mesh_enforces_policy_and_survives_controller_outage() {
     let observe_addr = h.observe_addr().to_string();
     let metrics_b = format!("10.9.0.2:{METRICS_PORT}");
 
-    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let mut pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let mut pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     // ===== Assertion 1: ALLOWED flow over the encrypted tunnel =====
     let allowed = wait_until(Duration::from_secs(45), || {
@@ -418,7 +458,9 @@ async fn direct_mesh_enforces_policy_and_survives_controller_outage() {
         pb.kill();
         panic!("ASSERTION 1 FAILED: workload A -> workload B tcp/8080 (policy-permitted) never passed over the tunnel");
     }
-    eprintln!("ASSERTION 1 PASS: tcp/8080 workload A -> workload B delivered over the direct WG tunnel");
+    eprintln!(
+        "ASSERTION 1 PASS: tcp/8080 workload A -> workload B delivered over the direct WG tunnel"
+    );
 
     // ===== Assertion 2: DENIED flow + deny counter increments =====
     let deny_before = scrape_deny(&metrics_b).unwrap_or_else(|| {
@@ -466,7 +508,9 @@ async fn direct_mesh_enforces_policy_and_survives_controller_outage() {
         );
         pa.kill();
         pb.kill();
-        panic!("ASSERTION 4 FAILED: after pushing a policy permitting tcp/9090, it still did not pass");
+        panic!(
+            "ASSERTION 4 FAILED: after pushing a policy permitting tcp/9090, it still did not pass"
+        );
     }
     eprintln!("ASSERTION 4 PASS: pushed policy permitting tcp/9090; it now passes");
 
@@ -484,7 +528,9 @@ async fn direct_mesh_enforces_policy_and_survives_controller_outage() {
         );
         pa.kill();
         pb.kill();
-        panic!("ASSERTION 3a FAILED: allowed tcp/8080 flow dropped after the controller was killed");
+        panic!(
+            "ASSERTION 3a FAILED: allowed tcp/8080 flow dropped after the controller was killed"
+        );
     }
     eprintln!("ASSERTION 3a PASS: tcp/8080 still works with the controller dead (fail-static)");
 
@@ -494,7 +540,14 @@ async fn direct_mesh_enforces_policy_and_survives_controller_outage() {
     // Clear any stale boringtun UAPI socket left by the SIGKILLed process
     // (its private mount-ns tmpfs persists across the restart).
     let _ = gwa.exec(&["rm", "-f", "/var/run/wireguard/wg0.sock"]);
-    let mut pa2 = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a2");
+    let mut pa2 = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a2",
+    );
     let reformed = wait_until(Duration::from_secs(45), || {
         check_tcp(&wla, &wlb, "10.10.2.2", 8080)
     });

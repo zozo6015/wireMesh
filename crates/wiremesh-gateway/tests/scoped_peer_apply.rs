@@ -82,12 +82,24 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 fn b64_32(bytes: &[u8; 32]) -> String {
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(B64[((n >> 18) & 63) as usize] as char);
         out.push(B64[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { B64[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -123,9 +135,13 @@ fn read_peers(ifname: &str) -> std::collections::HashMap<String, GotPeer> {
     let path = format!("/var/run/wireguard/{ifname}.sock");
     let mut stream = UnixStream::connect(&path)
         .unwrap_or_else(|e| panic!("connecting to WG UAPI socket {path}: {e}"));
-    stream.write_all(b"get=1\n\n").expect("writing get=1 request");
+    stream
+        .write_all(b"get=1\n\n")
+        .expect("writing get=1 request");
     let mut resp = String::new();
-    stream.read_to_string(&mut resp).expect("reading get=1 response");
+    stream
+        .read_to_string(&mut resp)
+        .expect("reading get=1 response");
 
     let mut out: std::collections::HashMap<String, GotPeer> = std::collections::HashMap::new();
     let mut current: Option<String> = None;
@@ -169,7 +185,11 @@ fn scoped_endpoint_update_touches_only_target_peer() {
 
     // Sanity precondition: both peers really landed before the scoped update.
     let before = read_peers(&ifname);
-    assert_eq!(before.len(), 2, "precondition: both B and C configured: {before:?}");
+    assert_eq!(
+        before.len(),
+        2,
+        "precondition: both B and C configured: {before:?}"
+    );
 
     // SCOPED update: re-point ONLY peer C to a new endpoint (punch/relay path).
     let c_new = peer(&C_PUB, C_ENDPOINT_NEW, C_CIDR);
@@ -182,9 +202,9 @@ fn scoped_endpoint_update_touches_only_target_peer() {
     // (1) Target C is PRESENT with the NEW endpoint. Catches the "remove
     //     succeeded but re-add was dropped → peer vanished / endpoint None"
     //     regression the scoped path was written to avoid.
-    let c = after
-        .get(&c_hex)
-        .unwrap_or_else(|| panic!("BUG(re-add dropped): peer C vanished after scoped update: {after:?}"));
+    let c = after.get(&c_hex).unwrap_or_else(|| {
+        panic!("BUG(re-add dropped): peer C vanished after scoped update: {after:?}")
+    });
     assert_eq!(
         c.endpoint.as_deref(),
         Some(C_ENDPOINT_NEW),
@@ -193,9 +213,9 @@ fn scoped_endpoint_update_touches_only_target_peer() {
 
     // (2) Non-target B is STILL PRESENT with its ORIGINAL endpoint AND CIDR.
     //     Catches the "replace_peers reset every peer" regression.
-    let b = after
-        .get(&b_hex)
-        .unwrap_or_else(|| panic!("BUG(replace_peers): peer B was reset by a scoped update: {after:?}"));
+    let b = after.get(&b_hex).unwrap_or_else(|| {
+        panic!("BUG(replace_peers): peer B was reset by a scoped update: {after:?}")
+    });
     assert_eq!(
         b.endpoint.as_deref(),
         Some(B_ENDPOINT),

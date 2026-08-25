@@ -90,8 +90,14 @@ use wiremesh_testkit::netns::{join_netns, wg_lab};
 /// segment widths only need to make a policy that compiles.
 fn segments() -> Vec<SegmentDef> {
     vec![
-        SegmentDef { name: "seg-a".into(), cidrs: vec!["10.10.0.1/32".parse().unwrap()] },
-        SegmentDef { name: "seg-b".into(), cidrs: vec!["10.10.0.2/32".parse().unwrap()] },
+        SegmentDef {
+            name: "seg-a".into(),
+            cidrs: vec!["10.10.0.1/32".parse().unwrap()],
+        },
+        SegmentDef {
+            name: "seg-b".into(),
+            cidrs: vec!["10.10.0.2/32".parse().unwrap()],
+        },
     ]
 }
 
@@ -142,7 +148,10 @@ fn apply_ready_at_is_the_flip_instant_plus_the_configured_reap_grace() {
     let (lab, _a, b) = wg_lab("aethrd");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let cfg = EnforcerConfig { reap_grace: grace, ..EnforcerConfig::default() };
+    let cfg = EnforcerConfig {
+        reap_grace: grace,
+        ..EnforcerConfig::default()
+    };
     let mut enforcer = probe("wg0", cfg).expect("probe should load + attach eBPF on wg0");
 
     // Before the FIRST apply neither outer-array slot has ever been written
@@ -161,7 +170,9 @@ fn apply_ready_at_is_the_flip_instant_plus_the_configured_reap_grace() {
 
     let ir = policy(9401, 1);
     let before = Instant::now();
-    enforcer.apply(&ir).expect("first apply (one allow rule) must succeed");
+    enforcer
+        .apply(&ir)
+        .expect("first apply (one allow rule) must succeed");
     let after = Instant::now();
 
     let deadline = enforcer
@@ -201,12 +212,19 @@ fn apply_ready_at_stops_being_a_future_deadline_once_the_grace_elapses() {
     let (lab, _a, b) = wg_lab("aethrd");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let cfg = EnforcerConfig { reap_grace: grace, ..EnforcerConfig::default() };
+    let cfg = EnforcerConfig {
+        reap_grace: grace,
+        ..EnforcerConfig::default()
+    };
     let mut enforcer = probe("wg0", cfg).expect("probe should load + attach eBPF on wg0");
 
-    enforcer.apply(&policy(9402, 1)).expect("first apply must succeed");
+    enforcer
+        .apply(&policy(9402, 1))
+        .expect("first apply must succeed");
     assert!(
-        enforcer.apply_ready_at().is_some_and(|t| t > Instant::now()),
+        enforcer
+            .apply_ready_at()
+            .is_some_and(|t| t > Instant::now()),
         "sanity: immediately after the flip the deadline must still be in the future, \
          otherwise the lapse assertion below would be vacuous"
     );
@@ -258,16 +276,22 @@ fn apply_does_not_park_the_calling_thread_for_the_reap_grace() {
     let mut enforcer = probe("wg0", cfg).expect("probe should load + attach eBPF on wg0");
 
     // First apply: no pending reap, nothing to wait for either way.
-    enforcer.apply(&policy(9403, 1)).expect("first apply must succeed");
+    enforcer
+        .apply(&policy(9403, 1))
+        .expect("first apply must succeed");
     assert!(
-        enforcer.apply_ready_at().is_some_and(|t| t > Instant::now()),
+        enforcer
+            .apply_ready_at()
+            .is_some_and(|t| t > Instant::now()),
         "sanity: a reap must be pending, otherwise the second apply below has nothing \
          to (not) wait for and this test proves nothing"
     );
 
     // Second apply, back-to-back and WELL inside the 10s grace.
     let t0 = Instant::now();
-    enforcer.apply(&policy(9404, 2)).expect("second apply must succeed");
+    enforcer
+        .apply(&policy(9404, 2))
+        .expect("second apply must succeed");
     let elapsed = t0.elapsed();
 
     assert!(
@@ -280,7 +304,9 @@ fn apply_does_not_park_the_calling_thread_for_the_reap_grace() {
     // ... and the flip really did happen: the deadline advanced to the NEW
     // flip's instant, so this was a real generation install that returned
     // fast, not a silently skipped no-op.
-    let deadline = enforcer.apply_ready_at().expect("the second flip has a pending reap too");
+    let deadline = enforcer
+        .apply_ready_at()
+        .expect("the second flip has a pending reap too");
     assert!(
         deadline > t0 + Duration::from_secs(9),
         "the second apply must have really flipped (its deadline must be ~10s after it \
@@ -302,7 +328,10 @@ fn each_flip_republishes_the_deadline_from_its_own_flip_instant() {
     let (lab, _a, b) = wg_lab("aethrd");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let cfg = EnforcerConfig { reap_grace: grace, ..EnforcerConfig::default() };
+    let cfg = EnforcerConfig {
+        reap_grace: grace,
+        ..EnforcerConfig::default()
+    };
     let mut enforcer = probe("wg0", cfg).expect("probe should load + attach eBPF on wg0");
 
     let mut previous: Option<Instant> = None;
@@ -361,14 +390,20 @@ fn nftables_backend_publishes_no_apply_deadline() {
     // the same forced-choice rationale `tests/nft_backend.rs` documents.
     let mut enforcer = probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
         .expect("nftables backend should install on wg0");
-    assert_eq!(enforcer.kind(), BackendKind::Nftables, "sanity: forced-choice backend");
+    assert_eq!(
+        enforcer.kind(),
+        BackendKind::Nftables,
+        "sanity: forced-choice backend"
+    );
 
     assert!(
         enforcer.apply_ready_at().is_none(),
         "the nftables backend has no reap grace before its first apply"
     );
 
-    enforcer.apply(&policy(9421, 1)).expect("nft apply must succeed");
+    enforcer
+        .apply(&policy(9421, 1))
+        .expect("nft apply must succeed");
     assert!(
         enforcer.apply_ready_at().is_none(),
         "the nftables backend has no reap grace after an apply either — one atomic \
@@ -376,7 +411,9 @@ fn nftables_backend_publishes_no_apply_deadline() {
          protect and no reason to make the caller wait"
     );
 
-    enforcer.apply(&policy(9422, 2)).expect("second nft apply must succeed");
+    enforcer
+        .apply(&policy(9422, 2))
+        .expect("second nft apply must succeed");
     assert!(
         enforcer.apply_ready_at().is_none(),
         "still none after a back-to-back re-apply"

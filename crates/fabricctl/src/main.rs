@@ -310,9 +310,11 @@ async fn main() -> anyhow::Result<()> {
         Command::Audit { cmd } => run_audit(&mut client, cmd).await,
         Command::Apply { file } => run_apply(&mut client, file).await,
         Command::Policy { cmd } => run_policy(&mut client, cmd).await,
-        Command::EnrollToken { kind, cidr, rebind_segment } => {
-            run_enroll_token(&mut client, kind, cidr, rebind_segment).await
-        }
+        Command::EnrollToken {
+            kind,
+            cidr,
+            rebind_segment,
+        } => run_enroll_token(&mut client, kind, cidr, rebind_segment).await,
     }
 }
 

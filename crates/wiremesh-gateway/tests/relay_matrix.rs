@@ -247,7 +247,9 @@ impl Drop for RootNetGuard {
 /// and addressing it `cidr`.
 fn attach_bridge(ns: &Ns, host_end: &str, ns_end_tag: &str, ifname: &str, cidr: &str) {
     let tmp = format!("wmri{ns_end_tag}n");
-    run_root(&["ip", "link", "add", host_end, "type", "veth", "peer", "name", &tmp]);
+    run_root(&[
+        "ip", "link", "add", host_end, "type", "veth", "peer", "name", &tmp,
+    ]);
     run_root(&["ip", "link", "set", host_end, "master", BRIDGE]);
     run_root(&["ip", "link", "set", host_end, "up"]);
     run_root(&["ip", "link", "set", &tmp, "netns", &ns.name]);
@@ -354,7 +356,10 @@ async fn enroll_relay_certs(h: &TestController, addr: &str, csr_tag: &str) -> te
     std::fs::write(certdir.path().join("relay.key"), key_pair.serialize_pem())
         .expect("write relay.key");
     std::fs::write(certdir.path().join("ca.pem"), &resp.ca_bundle_pem).expect("write ca.pem");
-    eprintln!("enroll_relay_certs: relay_id={} addr={addr}", resp.gateway_id);
+    eprintln!(
+        "enroll_relay_certs: relay_id={} addr={addr}",
+        resp.gateway_id
+    );
 
     certdir
 }
@@ -414,13 +419,19 @@ async fn enroll_and_spawn_killable_relay(
     h: &TestController,
     addr: &str,
     csr_tag: &str,
-) -> (tempfile::TempDir, quinn::Endpoint, tokio::task::JoinHandle<()>) {
+) -> (
+    tempfile::TempDir,
+    quinn::Endpoint,
+    tokio::task::JoinHandle<()>,
+) {
     let certdir = enroll_relay_certs(h, addr, csr_tag).await;
     let bind: std::net::SocketAddr = addr.parse().expect("relay addr must parse");
     let cfg = wiremesh_relay::server_config(certdir.path()).expect("relay server_config");
     let endpoint = quinn::Endpoint::server(cfg, bind)
         .unwrap_or_else(|e| panic!("binding killable relay endpoint on {addr}: {e}"));
-    let bound_addr = endpoint.local_addr().expect("reading bound relay endpoint address");
+    let bound_addr = endpoint
+        .local_addr()
+        .expect("reading bound relay endpoint address");
     assert_eq!(
         bound_addr, bind,
         "killable relay must bind exactly the enrolled/advertised endpoint"
@@ -547,7 +558,9 @@ impl GwProc {
     /// counts taken against such a marker need a ±1 tolerance around
     /// transitions).
     fn stderr_len(&self) -> u64 {
-        std::fs::metadata(&self.err_log).map(|m| m.len()).unwrap_or(0)
+        std::fs::metadata(&self.err_log)
+            .map(|m| m.len())
+            .unwrap_or(0)
     }
     /// Everything the gateway wrote to stderr from byte `offset` onward
     /// (lossy UTF-8; `offset` clamped to the file's current length).
@@ -564,18 +577,31 @@ impl Drop for GwProc {
     }
 }
 
-fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, tag: &str) -> GwProc {
+fn spawn_gw(
+    ns: &Ns,
+    statedir: &Path,
+    sync: &str,
+    observe: &str,
+    logdir: &Path,
+    tag: &str,
+) -> GwProc {
     let metrics = format!("0.0.0.0:{METRICS_PORT}");
     let wg_port = WG_PORT.to_string();
     let statedir_s = statedir.to_str().unwrap();
     let args = [
         GW_BIN,
-        "--controller-sync", sync,
-        "--observe", observe,
-        "--tun", "wg0",
-        "--wg-port", &wg_port,
-        "--state-dir", statedir_s,
-        "--metrics", &metrics,
+        "--controller-sync",
+        sync,
+        "--observe",
+        observe,
+        "--tun",
+        "wg0",
+        "--wg-port",
+        &wg_port,
+        "--state-dir",
+        statedir_s,
+        "--metrics",
+        &metrics,
     ];
     let mut child = ns.spawn(&args).expect("spawn wiremesh-gateway");
     let mut drains = vec![];
@@ -596,7 +622,11 @@ fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, 
             }
         }));
     }
-    GwProc { child, err_log, drains }
+    GwProc {
+        child,
+        err_log,
+        drains,
+    }
 }
 
 // --- traffic + metrics probes -----------------------------------------------
@@ -821,10 +851,22 @@ fn unblock_direct(sc: &Scenario) {
 fn sever_relay(sc: &Scenario) {
     let relay_host = RELAY_ADDR.split(':').next().expect("RELAY_ADDR has a host");
     sc.ra
-        .exec(&["ip", "route", "add", "blackhole", &format!("{relay_host}/32")])
+        .exec(&[
+            "ip",
+            "route",
+            "add",
+            "blackhole",
+            &format!("{relay_host}/32"),
+        ])
         .expect("install ra relay blackhole");
     sc.rb
-        .exec(&["ip", "route", "add", "blackhole", &format!("{relay_host}/32")])
+        .exec(&[
+            "ip",
+            "route",
+            "add",
+            "blackhole",
+            &format!("{relay_host}/32"),
+        ])
         .expect("install rb relay blackhole");
 }
 
@@ -874,7 +916,13 @@ fn sever_relay(sc: &Scenario) {
 fn sever_peer_from_relay(sc: &Scenario) {
     let relay_host = RELAY_ADDR.split(':').next().expect("RELAY_ADDR has a host");
     sc.rb
-        .exec(&["ip", "route", "add", "blackhole", &format!("{relay_host}/32")])
+        .exec(&[
+            "ip",
+            "route",
+            "add",
+            "blackhole",
+            &format!("{relay_host}/32"),
+        ])
         .expect("install rb-only relay blackhole (peer-side departure)");
 }
 
@@ -913,7 +961,10 @@ async fn build_scenario(
     // Fabric BEFORE enrollment, so each gateway's first snapshot already
     // carries the compiled policy.
     let diff = h.apply(FABRIC).await;
-    assert!(diff.policy_updated, "fabric apply must compile a real policy, got: {diff:?}");
+    assert!(
+        diff.policy_updated,
+        "fabric apply must compile a real policy, got: {diff:?}"
+    );
 
     // Enroll + spawn every relay BEFORE the gateways connect, so the very
     // first `Sync.Watch` snapshot either gateway receives already carries
@@ -948,10 +999,16 @@ async fn build_scenario(
     let rb = lab.nat_router("rb", nat).expect("rb");
 
     // Inside (gateway <-> router) links.
-    lab.veth((&gwa, "nat0", "192.168.80.2/24"), (&ra, "in0", "192.168.80.1/24"))
-        .expect("gwA<->ra");
-    lab.veth((&gwb, "nat0", "192.168.81.2/24"), (&rb, "in0", "192.168.81.1/24"))
-        .expect("gwB<->rb");
+    lab.veth(
+        (&gwa, "nat0", "192.168.80.2/24"),
+        (&ra, "in0", "192.168.80.1/24"),
+    )
+    .expect("gwA<->ra");
+    lab.veth(
+        (&gwb, "nat0", "192.168.81.2/24"),
+        (&rb, "in0", "192.168.81.1/24"),
+    )
+    .expect("gwB<->rb");
 
     // Router outside interfaces onto the internet bridge (must be `out0`).
     attach_bridge(&ra, HOST_ENDS[0], "ra", "out0", "198.51.100.2/24");
@@ -979,18 +1036,28 @@ async fn build_scenario(
     }
 
     // Segment (workload) links + default routes.
-    lab.veth((&gwa, "seg0", "10.10.11.1/24"), (&wla, "eth0", "10.10.11.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.12.1/24"), (&wlb, "eth0", "10.10.12.2/24"))
-        .expect("seg-b veth");
-    wla.exec(&["ip", "route", "add", "default", "via", "10.10.11.1"]).expect("wlA route");
-    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.12.1"]).expect("wlB route");
+    lab.veth(
+        (&gwa, "seg0", "10.10.11.1/24"),
+        (&wla, "eth0", "10.10.11.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.12.1/24"),
+        (&wlb, "eth0", "10.10.12.2/24"),
+    )
+    .expect("seg-b veth");
+    wla.exec(&["ip", "route", "add", "default", "via", "10.10.11.1"])
+        .expect("wlA route");
+    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.12.1"])
+        .expect("wlB route");
 
     // Gateway default routes point at their NAT router (so the controller +
     // relay's shared-bridge addresses are reachable through the NAT — same
     // as `nat_matrix.rs`).
-    gwa.exec(&["ip", "route", "add", "default", "via", "192.168.80.1"]).expect("gwA route");
-    gwb.exec(&["ip", "route", "add", "default", "via", "192.168.81.1"]).expect("gwB route");
+    gwa.exec(&["ip", "route", "add", "default", "via", "192.168.80.1"])
+        .expect("gwA route");
+    gwb.exec(&["ip", "route", "add", "default", "via", "192.168.81.1"])
+        .expect("gwB route");
 
     // Right-reason guard: there really is no route from gwA's private
     // subnet to gwB's (or vice versa) at the network layer at all — neither
@@ -1000,12 +1067,14 @@ async fn build_scenario(
     // Mirrors `spike/relay/tests/wg_over_relay.rs`'s "A has no direct path
     // to B" sanity check.
     assert!(
-        gwa.exec(&["ping", "-c", "1", "-W", "1", "192.168.81.2"]).is_err(),
+        gwa.exec(&["ping", "-c", "1", "-W", "1", "192.168.81.2"])
+            .is_err(),
         "gwA must have NO direct network-layer route/reachability to gwB's private \
          address — otherwise a passing overlay ping wouldn't prove the relay carried it"
     );
     assert!(
-        gwb.exec(&["ping", "-c", "1", "-W", "1", "192.168.80.2"]).is_err(),
+        gwb.exec(&["ping", "-c", "1", "-W", "1", "192.168.80.2"])
+            .is_err(),
         "gwB must have NO direct network-layer route/reachability to gwA's private \
          address — otherwise a passing overlay ping wouldn't prove the relay carried it"
     );
@@ -1025,8 +1094,22 @@ async fn build_scenario(
         relays.len()
     );
 
-    let pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     Scenario {
         pa,
@@ -1066,7 +1149,10 @@ async fn build_scenario(
 async fn case1_symmetric_pair_flows_over_relay() {
     let sc = build_scenario(
         "rm1",
-        vec![RelaySpec::InProcess { addr: RELAY_ADDR, csr_tag: "relay-case1" }],
+        vec![RelaySpec::InProcess {
+            addr: RELAY_ADDR,
+            csr_tag: "relay-case1",
+        }],
         NatKind::Symmetric,
         false,
     )
@@ -1103,7 +1189,10 @@ async fn case1_symmetric_pair_flows_over_relay() {
             path_state(&sc.gwb)
         );
     }
-    eprintln!("case1: PASS both sides reached path_state=relayed in {:?}", start.elapsed());
+    eprintln!(
+        "case1: PASS both sides reached path_state=relayed in {:?}",
+        start.elapsed()
+    );
 
     // Marker for the defer-spam guard (phase 4 below): everything either
     // gateway writes to stderr AFTER this instant is post-steady-state
@@ -1317,8 +1406,14 @@ async fn case3_relay_eviction_repaths_to_second_relay() {
     let sc = build_scenario(
         "rm3",
         vec![
-            RelaySpec::Killable { addr: RELAY_ADDR, csr_tag: "relay-case3-r1" },
-            RelaySpec::InProcess { addr: RELAY_ADDR_2, csr_tag: "relay-case3-r2" },
+            RelaySpec::Killable {
+                addr: RELAY_ADDR,
+                csr_tag: "relay-case3-r1",
+            },
+            RelaySpec::InProcess {
+                addr: RELAY_ADDR_2,
+                csr_tag: "relay-case3-r2",
+            },
         ],
         NatKind::Symmetric,
         false,
@@ -1351,7 +1446,10 @@ async fn case3_relay_eviction_repaths_to_second_relay() {
             path_state(&sc.gwb)
         );
     }
-    eprintln!("case3: PASS both sides reached path_state=relayed (via R1) in {:?}", start.elapsed());
+    eprintln!(
+        "case3: PASS both sides reached path_state=relayed (via R1) in {:?}",
+        start.elapsed()
+    );
 
     // Prove the FIRST flow (via R1), exactly like case 1: a policy-permitted
     // ping crossing, plus the WG endpoint pointing at a local relay socket
@@ -1363,8 +1461,12 @@ async fn case3_relay_eviction_repaths_to_second_relay() {
     }
     let ep_a_before = wg_endpoint(&sc.gwa);
     let ep_b_before = wg_endpoint(&sc.gwb);
-    if !ep_a_before.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
-        || !ep_b_before.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
+    if !ep_a_before
+        .as_deref()
+        .is_some_and(|e| e.starts_with("127.0.0.1:"))
+        || !ep_b_before
+            .as_deref()
+            .is_some_and(|e| e.starts_with("127.0.0.1:"))
     {
         dump_diag("case3 endpoint-check (pre-evict)", &sc);
         panic!(
@@ -1417,7 +1519,10 @@ async fn case3_relay_eviction_repaths_to_second_relay() {
             path_state(&sc.gwb)
         );
     }
-    eprintln!("case3: PASS re-pathed and flowed again within {:?} of R1's eviction", evict_at.elapsed());
+    eprintln!(
+        "case3: PASS re-pathed and flowed again within {:?} of R1's eviction",
+        evict_at.elapsed()
+    );
 
     // Concrete "really on a relay socket again, and it's a DIFFERENT one
     // than before" proof: both R1 and R2 point the WG peer at a LOCAL
@@ -1429,8 +1534,12 @@ async fn case3_relay_eviction_repaths_to_second_relay() {
     // just a stale reading with R1's session never actually replaced.
     let ep_a_after = wg_endpoint(&sc.gwa);
     let ep_b_after = wg_endpoint(&sc.gwb);
-    if !ep_a_after.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
-        || !ep_b_after.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
+    if !ep_a_after
+        .as_deref()
+        .is_some_and(|e| e.starts_with("127.0.0.1:"))
+        || !ep_b_after
+            .as_deref()
+            .is_some_and(|e| e.starts_with("127.0.0.1:"))
     {
         dump_diag("case3 endpoint-check (post-evict)", &sc);
         panic!(
@@ -1632,7 +1741,10 @@ async fn case4_relay_leg_death_unwedges_direct_punch() {
     // `TimedOut` punch-window branch this case pins).
     let sc = build_scenario(
         "rm4",
-        vec![RelaySpec::InProcess { addr: RELAY_ADDR, csr_tag: "relay-case4" }],
+        vec![RelaySpec::InProcess {
+            addr: RELAY_ADDR,
+            csr_tag: "relay-case4",
+        }],
         NatKind::PortRestricted,
         true,
     )
@@ -1674,8 +1786,12 @@ async fn case4_relay_leg_death_unwedges_direct_punch() {
     }
     let ep_a_relayed = wg_endpoint(&sc.gwa);
     let ep_b_relayed = wg_endpoint(&sc.gwb);
-    if !ep_a_relayed.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
-        || !ep_b_relayed.as_deref().is_some_and(|e| e.starts_with("127.0.0.1:"))
+    if !ep_a_relayed
+        .as_deref()
+        .is_some_and(|e| e.starts_with("127.0.0.1:"))
+        || !ep_b_relayed
+            .as_deref()
+            .is_some_and(|e| e.starts_with("127.0.0.1:"))
     {
         dump_diag("case4 endpoint-check (relayed)", &sc);
         panic!(
@@ -1721,7 +1837,10 @@ async fn case4_relay_leg_death_unwedges_direct_punch() {
     let defer_off_b = sc.pb.stderr_len();
     let severed_at = Instant::now();
     sever_relay(&sc);
-    eprintln!("case4: severed both relay legs (silence, no close frame) at t+{:?}", start.elapsed());
+    eprintln!(
+        "case4: severed both relay legs (silence, no close frame) at t+{:?}",
+        start.elapsed()
+    );
 
     // Phase 4: THE regression assertion. Within detection budget + recovery
     // budget both sides must reach a REAL direct path — path_state=direct on
@@ -1779,8 +1898,12 @@ async fn case4_relay_leg_death_unwedges_direct_punch() {
     // 127.0.0.1 endpoint would mean still pointed at a (dead) relay socket.
     let ep_a_direct = wg_endpoint(&sc.gwa);
     let ep_b_direct = wg_endpoint(&sc.gwb);
-    if !ep_a_direct.as_deref().is_some_and(|e| e.starts_with("198.51.100."))
-        || !ep_b_direct.as_deref().is_some_and(|e| e.starts_with("198.51.100."))
+    if !ep_a_direct
+        .as_deref()
+        .is_some_and(|e| e.starts_with("198.51.100."))
+        || !ep_b_direct
+            .as_deref()
+            .is_some_and(|e| e.starts_with("198.51.100."))
     {
         dump_diag("case4 endpoint-check (direct)", &sc);
         panic!(
@@ -2033,7 +2156,10 @@ async fn case5_peer_departure_unpins_survivor_from_relayed() {
     // survivor too, which is the one thing this case must not do.
     let sc = build_scenario(
         "rm5",
-        vec![RelaySpec::Killable { addr: RELAY_ADDR, csr_tag: "relay-case5" }],
+        vec![RelaySpec::Killable {
+            addr: RELAY_ADDR,
+            csr_tag: "relay-case5",
+        }],
         NatKind::Symmetric,
         false,
     )
@@ -2092,7 +2218,9 @@ async fn case5_peer_departure_unpins_survivor_from_relayed() {
     // Phase 2: baseline the relay's own connection census (right-reason
     // guard 1 — see the doc comment). One relayed pair == exactly one QUIC
     // connection per gateway.
-    if !wait_until(Duration::from_secs(10), || sc.relays[0].open_connections() == 2) {
+    if !wait_until(Duration::from_secs(10), || {
+        sc.relays[0].open_connections() == 2
+    }) {
         dump_diag("case5 connection-census", &sc);
         panic!(
             "case5: expected the relay to hold exactly 2 open QUIC connections (one per \

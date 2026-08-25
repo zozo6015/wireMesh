@@ -91,7 +91,15 @@ pub fn validate(doc: &PolicyDoc, segments: &[SegmentDef]) -> Vec<CompileError> {
         }
 
         for (rule_idx, rule) in block.rules.iter().enumerate() {
-            validate_rule(block_idx, rule_idx, &ctx, from_seg, to_seg, rule, &mut errors);
+            validate_rule(
+                block_idx,
+                rule_idx,
+                &ctx,
+                from_seg,
+                to_seg,
+                rule,
+                &mut errors,
+            );
         }
     }
 
@@ -159,9 +167,7 @@ fn validate_cidrs(
                         errors.push(CompileError {
                             block: Some(block_idx),
                             rule: Some(rule_idx),
-                            msg: format!(
-                                "{ctx} {field} '{raw}' is not IPv4 (v1 is IPv4-only)"
-                            ),
+                            msg: format!("{ctx} {field} '{raw}' is not IPv4 (v1 is IPv4-only)"),
                         });
                     }
                     _ => {
@@ -182,9 +188,7 @@ fn validate_cidrs(
                 errors.push(CompileError {
                     block: Some(block_idx),
                     rule: Some(rule_idx),
-                    msg: format!(
-                        "{ctx} {field} '{raw}' is not a subset of segment's CIDRs"
-                    ),
+                    msg: format!("{ctx} {field} '{raw}' is not a subset of segment's CIDRs"),
                 });
             }
         }
@@ -213,9 +217,7 @@ fn validate_ports(
             errors.push(CompileError {
                 block: Some(block_idx),
                 rule: Some(rule_idx),
-                msg: format!(
-                    "{ctx} invalid proto '{other}' (must be tcp, udp, icmp, or omitted)"
-                ),
+                msg: format!("{ctx} invalid proto '{other}' (must be tcp, udp, icmp, or omitted)"),
             });
             return;
         }
@@ -251,9 +253,7 @@ fn validate_ports(
                         errors.push(CompileError {
                             block: Some(block_idx),
                             rule: Some(rule_idx),
-                            msg: format!(
-                                "{ctx} port range '{s}' invalid: lo > hi ({lo} > {hi})"
-                            ),
+                            msg: format!("{ctx} port range '{s}' invalid: lo > hi ({lo} > {hi})"),
                         });
                     }
                 }

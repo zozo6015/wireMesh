@@ -124,7 +124,11 @@ async fn bridges_datagrams_and_rejects_certless_clients() {
         .await
         .expect("recv timed out")
         .expect("recv errored");
-    assert_eq!(data, b"hello".to_vec(), "payload must survive the bridge unmodified");
+    assert_eq!(
+        data,
+        b"hello".to_vec(),
+        "payload must survive the bridge unmodified"
+    );
     // The forwarded datagram carries the TRUE sender's registration key
     // (gw-A's own registered id), not the relay's or a spoofable value.
     assert_eq!(

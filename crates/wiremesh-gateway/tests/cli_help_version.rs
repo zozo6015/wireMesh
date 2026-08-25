@@ -41,7 +41,11 @@
 use wiremesh_gateway::cli::{cli_action, CliAction};
 
 fn argv(tokens: &[&str]) -> impl Iterator<Item = String> {
-    tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    tokens
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 /// `--version` (long) yields `Version` whose rendered line carries the crate
@@ -55,7 +59,10 @@ fn long_version_flag_yields_version_with_crate_version() {
                 "version output must contain CARGO_PKG_VERSION {:?}, got {s:?}",
                 env!("CARGO_PKG_VERSION")
             );
-            assert!(s.contains("wiremesh-gateway"), "version line names the binary, got {s:?}");
+            assert!(
+                s.contains("wiremesh-gateway"),
+                "version line names the binary, got {s:?}"
+            );
         }
         other => panic!("--version must yield Version, got {:?}", ActionDbg(&other)),
     }
@@ -97,13 +104,24 @@ fn short_help_flag_yields_full_manual() {
 /// crucially before the parser would reject anything.
 #[test]
 fn help_and_version_are_recognized_after_other_flags() {
-    match cli_action(argv(&["wiremesh-gateway", "--controller-sync", "c:1", "--help"])) {
+    match cli_action(argv(&[
+        "wiremesh-gateway",
+        "--controller-sync",
+        "c:1",
+        "--help",
+    ])) {
         CliAction::Help(m) => assert_manual(&m),
-        other => panic!("--help after flags must yield Help, got {:?}", ActionDbg(&other)),
+        other => panic!(
+            "--help after flags must yield Help, got {:?}",
+            ActionDbg(&other)
+        ),
     }
     match cli_action(argv(&["wiremesh-gateway", "--tun", "wg0", "--version"])) {
         CliAction::Version(s) => assert!(s.contains(env!("CARGO_PKG_VERSION"))),
-        other => panic!("--version after flags must yield Version, got {:?}", ActionDbg(&other)),
+        other => panic!(
+            "--version after flags must yield Version, got {:?}",
+            ActionDbg(&other)
+        ),
     }
 }
 
@@ -113,20 +131,36 @@ fn help_and_version_are_recognized_after_other_flags() {
 #[test]
 fn plain_run_args_yield_run() {
     assert!(
-        matches!(cli_action(argv(&["wiremesh-gateway", "--controller-sync", "c:1"])), CliAction::Run),
+        matches!(
+            cli_action(argv(&["wiremesh-gateway", "--controller-sync", "c:1"])),
+            CliAction::Run
+        ),
         "non-help/version argv must yield Run so normal dispatch proceeds"
     );
     // The `enroll` subcommand path is likewise Run (its own parser handles it).
     assert!(
-        matches!(cli_action(argv(&["wiremesh-gateway", "enroll", "--token", "t"])), CliAction::Run),
+        matches!(
+            cli_action(argv(&["wiremesh-gateway", "enroll", "--token", "t"])),
+            CliAction::Run
+        ),
         "enroll subcommand argv must yield Run"
     );
 }
 
 fn assert_manual(m: &str) {
     assert!(!m.trim().is_empty(), "help manual must be non-empty");
-    for needle in ["--controller-sync", "--observe", "--tun", "--wg-port", "--state-dir", "enroll"] {
-        assert!(m.contains(needle), "help manual must mention {needle:?}; got:\n{m}");
+    for needle in [
+        "--controller-sync",
+        "--observe",
+        "--tun",
+        "--wg-port",
+        "--state-dir",
+        "enroll",
+    ] {
+        assert!(
+            m.contains(needle),
+            "help manual must mention {needle:?}; got:\n{m}"
+        );
     }
 }
 

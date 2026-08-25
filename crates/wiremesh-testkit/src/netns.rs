@@ -84,7 +84,9 @@ impl Lab {
         run(&["ip", "netns", "add", &full])?;
         // Track immediately so Drop cleans up even if later steps fail.
         self.namespaces.push(full.clone());
-        run(&["ip", "netns", "exec", &full, "ip", "link", "set", "lo", "up"])?;
+        run(&[
+            "ip", "netns", "exec", &full, "ip", "link", "set", "lo", "up",
+        ])?;
 
         std::fs::create_dir_all(MOUNTNS_DIR).context("create natlab mountns dir")?;
         let mountns = mountns_path(&full);
@@ -103,7 +105,10 @@ impl Lab {
             "mount --make-rprivate / && mkdir -p /var/run/wireguard && mount -t tmpfs tmpfs /var/run/wireguard",
         ])?;
 
-        Ok(Ns { name: full, mountns })
+        Ok(Ns {
+            name: full,
+            mountns,
+        })
     }
 
     pub fn veth(&mut self, a: (&Ns, &str, &str), b: (&Ns, &str, &str)) -> Result<()> {
@@ -112,7 +117,9 @@ impl Lab {
         // unique temp names to avoid collisions across parallel labs
         let ta = format!("{}0", &self.prefix);
         let tb = format!("{}1", &self.prefix);
-        run(&["ip", "link", "add", &ta, "type", "veth", "peer", "name", &tb])?;
+        run(&[
+            "ip", "link", "add", &ta, "type", "veth", "peer", "name", &tb,
+        ])?;
         let setup = (|| -> Result<()> {
             run(&["ip", "link", "set", &ta, "netns", &na.name, "name", ia])?;
             run(&["ip", "link", "set", &tb, "netns", &nb.name, "name", ib])?;
@@ -289,7 +296,9 @@ impl Ns {
     /// see the `MOUNTNS_DIR` doc comment above.
     pub fn exec(&self, cmd: &[&str]) -> Result<Output> {
         let mount_arg = format!("--mount={}", self.mountns);
-        let mut full = vec!["nsenter", &mount_arg, "--", "ip", "netns", "exec", &self.name];
+        let mut full = vec![
+            "nsenter", &mount_arg, "--", "ip", "netns", "exec", &self.name,
+        ];
         full.extend_from_slice(cmd);
         run(&full)
     }
@@ -310,7 +319,10 @@ impl Ns {
 /// `wg_keypair` helper.
 fn wg_keypair() -> (String, String) {
     let priv_out = Command::new("wg").arg("genkey").output().unwrap();
-    let privkey = String::from_utf8(priv_out.stdout).unwrap().trim().to_string();
+    let privkey = String::from_utf8(priv_out.stdout)
+        .unwrap()
+        .trim()
+        .to_string();
     let pub_out = {
         let mut c = Command::new("wg")
             .arg("pubkey")
@@ -318,12 +330,19 @@ fn wg_keypair() -> (String, String) {
             .stdout(Stdio::piped())
             .spawn()
             .unwrap();
-        c.stdin.as_mut().unwrap().write_all(privkey.as_bytes()).unwrap();
+        c.stdin
+            .as_mut()
+            .unwrap()
+            .write_all(privkey.as_bytes())
+            .unwrap();
         c.wait_with_output().unwrap()
     };
     (
         privkey.clone(),
-        String::from_utf8(pub_out.stdout).unwrap().trim().to_string(),
+        String::from_utf8(pub_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string(),
     )
 }
 
@@ -357,25 +376,54 @@ pub fn wg_lab(prefix: &str) -> (Lab, Ns, Ns) {
     let mut lab = Lab::new(prefix).unwrap();
     let a = lab.ns("a").unwrap();
     let b = lab.ns("b").unwrap();
-    lab.veth((&a, "u0", "10.9.1.1/24"), (&b, "u1", "10.9.1.2/24")).unwrap();
+    lab.veth((&a, "u0", "10.9.1.1/24"), (&b, "u1", "10.9.1.2/24"))
+        .unwrap();
 
     let (apriv, apub) = wg_keypair();
     let (bpriv, bpub) = wg_keypair();
 
     for (ns, privkey, peer_pub, my_ip, _peer_ip, peer_ep) in [
-        (&a, &apriv, &bpub, "10.10.0.1/24", "10.10.0.2", "10.9.1.2:51820"),
-        (&b, &bpriv, &apub, "10.10.0.2/24", "10.10.0.1", "10.9.1.1:51820"),
+        (
+            &a,
+            &apriv,
+            &bpub,
+            "10.10.0.1/24",
+            "10.10.0.2",
+            "10.9.1.2:51820",
+        ),
+        (
+            &b,
+            &bpriv,
+            &apub,
+            "10.10.0.2/24",
+            "10.10.0.1",
+            "10.9.1.1:51820",
+        ),
     ] {
-        ns.exec(&["ip", "link", "add", "wg0", "type", "wireguard"]).unwrap();
+        ns.exec(&["ip", "link", "add", "wg0", "type", "wireguard"])
+            .unwrap();
         let kf = format!("/tmp/{}.key", ns.name);
         std::fs::write(&kf, privkey).unwrap();
         ns.exec(&[
-            "wg", "set", "wg0", "listen-port", "51820", "private-key", &kf,
-            "peer", peer_pub, "allowed-ips", "10.10.0.0/24",
-            "endpoint", peer_ep,
-        ]).unwrap();
-        ns.exec(&["ip", "addr", "add", my_ip, "dev", "wg0"]).unwrap();
-        ns.exec(&["ip", "link", "set", "wg0", "up", "mtu", "1280"]).unwrap();
+            "wg",
+            "set",
+            "wg0",
+            "listen-port",
+            "51820",
+            "private-key",
+            &kf,
+            "peer",
+            peer_pub,
+            "allowed-ips",
+            "10.10.0.0/24",
+            "endpoint",
+            peer_ep,
+        ])
+        .unwrap();
+        ns.exec(&["ip", "addr", "add", my_ip, "dev", "wg0"])
+            .unwrap();
+        ns.exec(&["ip", "link", "set", "wg0", "up", "mtu", "1280"])
+            .unwrap();
     }
 
     (lab, a, b)
@@ -443,7 +491,10 @@ pub fn join_netns_and_mountns(ns: &Ns) -> Result<()> {
     // unshare(CLONE_FS) gives this thread its own private fs_struct first.
     let rc = unsafe { libc::unshare(libc::CLONE_FS) };
     if rc != 0 {
-        bail!("unshare(CLONE_FS) failed: {}", std::io::Error::last_os_error());
+        bail!(
+            "unshare(CLONE_FS) failed: {}",
+            std::io::Error::last_os_error()
+        );
     }
     let file = std::fs::File::open(&ns.mountns)
         .map_err(|e| anyhow::anyhow!("open {}: {e}", ns.mountns))?;

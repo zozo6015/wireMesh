@@ -88,11 +88,7 @@ fn src_not_subset_of_from_segment_cidrs_is_a_compile_error() {
     assert_eq!(errors[0].block, Some(0));
     assert_eq!(errors[0].rule, Some(0));
     assert!(errors[0].msg.contains("src"), "msg: {}", errors[0].msg);
-    assert!(
-        errors[0].msg.contains("subset"),
-        "msg: {}",
-        errors[0].msg
-    );
+    assert!(errors[0].msg.contains("subset"), "msg: {}", errors[0].msg);
 }
 
 #[test]
@@ -102,11 +98,7 @@ fn dst_not_subset_of_to_segment_cidrs_is_a_compile_error() {
     assert_eq!(errors[0].block, Some(0));
     assert_eq!(errors[0].rule, Some(0));
     assert!(errors[0].msg.contains("dst"), "msg: {}", errors[0].msg);
-    assert!(
-        errors[0].msg.contains("subset"),
-        "msg: {}",
-        errors[0].msg
-    );
+    assert!(errors[0].msg.contains("subset"), "msg: {}", errors[0].msg);
 }
 
 #[test]
@@ -188,11 +180,7 @@ fn port_zero_is_a_compile_error() {
     assert_eq!(errors.len(), 1, "errors: {errors:?}");
     assert_eq!(errors[0].block, Some(0));
     assert_eq!(errors[0].rule, Some(0));
-    assert!(
-        errors[0].msg.contains("port 0"),
-        "msg: {}",
-        errors[0].msg
-    );
+    assert!(errors[0].msg.contains("port 0"), "msg: {}", errors[0].msg);
 }
 
 #[test]
@@ -201,11 +189,7 @@ fn port_above_65535_is_a_compile_error() {
     assert_eq!(errors.len(), 1, "errors: {errors:?}");
     assert_eq!(errors[0].block, Some(0));
     assert_eq!(errors[0].rule, Some(0));
-    assert!(
-        errors[0].msg.contains("65535"),
-        "msg: {}",
-        errors[0].msg
-    );
+    assert!(errors[0].msg.contains("65535"), "msg: {}", errors[0].msg);
 }
 
 #[test]
@@ -214,11 +198,7 @@ fn port_range_lo_greater_than_hi_is_a_compile_error() {
     assert_eq!(errors.len(), 1, "errors: {errors:?}");
     assert_eq!(errors[0].block, Some(0));
     assert_eq!(errors[0].rule, Some(0));
-    assert!(
-        errors[0].msg.contains("lo > hi"),
-        "msg: {}",
-        errors[0].msg
-    );
+    assert!(errors[0].msg.contains("lo > hi"), "msg: {}", errors[0].msg);
 }
 
 #[test]
@@ -253,11 +233,7 @@ fn non_ipv4_cidr_is_a_compile_error() {
     assert_eq!(errors.len(), 1, "errors: {errors:?}");
     assert_eq!(errors[0].block, Some(0));
     assert_eq!(errors[0].rule, Some(0));
-    assert!(
-        errors[0].msg.contains("IPv4"),
-        "msg: {}",
-        errors[0].msg
-    );
+    assert!(errors[0].msg.contains("IPv4"), "msg: {}", errors[0].msg);
 }
 
 #[test]
@@ -328,11 +304,7 @@ fn multiple_independent_errors_are_all_collected() {
 
     assert_eq!(errors[1].block, Some(1));
     assert_eq!(errors[1].rule, Some(0));
-    assert!(
-        errors[1].msg.contains("port 0"),
-        "msg: {}",
-        errors[1].msg
-    );
+    assert!(errors[1].msg.contains("port 0"), "msg: {}", errors[1].msg);
 
     assert_eq!(errors[2].block, Some(2));
     assert_eq!(errors[2].rule, Some(0));

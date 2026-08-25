@@ -121,7 +121,9 @@ impl Drop for RootNetGuard {
 /// addressing it `cidr`.
 fn attach_bridge(ns: &Ns, host_end: &str, ns_end_tag: &str, ifname: &str, cidr: &str) {
     let tmp = format!("wmni{ns_end_tag}n");
-    run_root(&["ip", "link", "add", host_end, "type", "veth", "peer", "name", &tmp]);
+    run_root(&[
+        "ip", "link", "add", host_end, "type", "veth", "peer", "name", &tmp,
+    ]);
     run_root(&["ip", "link", "set", host_end, "master", BRIDGE]);
     run_root(&["ip", "link", "set", host_end, "up"]);
     run_root(&["ip", "link", "set", &tmp, "netns", &ns.name]);
@@ -214,18 +216,31 @@ impl Drop for GwProc {
     }
 }
 
-fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, tag: &str) -> GwProc {
+fn spawn_gw(
+    ns: &Ns,
+    statedir: &Path,
+    sync: &str,
+    observe: &str,
+    logdir: &Path,
+    tag: &str,
+) -> GwProc {
     let metrics = format!("0.0.0.0:{METRICS_PORT}");
     let wg_port = WG_PORT.to_string();
     let statedir_s = statedir.to_str().unwrap();
     let args = [
         GW_BIN,
-        "--controller-sync", sync,
-        "--observe", observe,
-        "--tun", "wg0",
-        "--wg-port", &wg_port,
-        "--state-dir", statedir_s,
-        "--metrics", &metrics,
+        "--controller-sync",
+        sync,
+        "--observe",
+        observe,
+        "--tun",
+        "wg0",
+        "--wg-port",
+        &wg_port,
+        "--state-dir",
+        statedir_s,
+        "--metrics",
+        &metrics,
     ];
     let mut child = ns.spawn(&args).expect("spawn wiremesh-gateway");
     let mut drains = vec![];
@@ -246,7 +261,11 @@ fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, 
             }
         }));
     }
-    GwProc { child, err_log, drains }
+    GwProc {
+        child,
+        err_log,
+        drains,
+    }
 }
 
 // --- traffic + metrics probes -----------------------------------------------
@@ -264,7 +283,8 @@ while True:
     c.close()
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn listener")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn listener")
 }
 
 fn tcp_connect(ns: &Ns, dst: &str, port: u16) -> bool {
@@ -439,7 +459,10 @@ async fn build_scenario(kind: NatKind, prefix: &str) -> Scenario {
     // Fabric BEFORE enrollment, so each gateway's first snapshot already
     // carries the compiled policy.
     let diff = h.apply(FABRIC).await;
-    assert!(diff.policy_updated, "fabric apply must compile a real policy, got: {diff:?}");
+    assert!(
+        diff.policy_updated,
+        "fabric apply must compile a real policy, got: {diff:?}"
+    );
 
     let (a_priv, a_pub) = wg_keypair();
     let (b_priv, b_pub) = wg_keypair();
@@ -458,10 +481,16 @@ async fn build_scenario(kind: NatKind, prefix: &str) -> Scenario {
     let rb = lab.nat_router("rb", kind).expect("rb");
 
     // Inside (gateway <-> router) links.
-    lab.veth((&gwa, "nat0", "192.168.70.2/24"), (&ra, "in0", "192.168.70.1/24"))
-        .expect("gwA<->ra");
-    lab.veth((&gwb, "nat0", "192.168.71.2/24"), (&rb, "in0", "192.168.71.1/24"))
-        .expect("gwB<->rb");
+    lab.veth(
+        (&gwa, "nat0", "192.168.70.2/24"),
+        (&ra, "in0", "192.168.70.1/24"),
+    )
+    .expect("gwA<->ra");
+    lab.veth(
+        (&gwb, "nat0", "192.168.71.2/24"),
+        (&rb, "in0", "192.168.71.1/24"),
+    )
+    .expect("gwB<->rb");
 
     // Router outside interfaces onto the internet bridge (must be `out0`).
     attach_bridge(&ra, HOST_ENDS[0], "ra", "out0", "198.51.100.2/24");
@@ -475,17 +504,27 @@ async fn build_scenario(kind: NatKind, prefix: &str) -> Scenario {
     assert_netem_present(&rb, "out0");
 
     // Segment (workload) links + default routes.
-    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
-        .expect("seg-b veth");
-    wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"]).expect("wlA route");
-    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"]).expect("wlB route");
+    lab.veth(
+        (&gwa, "seg0", "10.10.1.1/24"),
+        (&wla, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.2.1/24"),
+        (&wlb, "eth0", "10.10.2.2/24"),
+    )
+    .expect("seg-b veth");
+    wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
+        .expect("wlA route");
+    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
+        .expect("wlB route");
 
     // Gateway default routes point at their NAT router (so controller + peer
     // NAT-mapped endpoints are reachable through the NAT).
-    gwa.exec(&["ip", "route", "add", "default", "via", "192.168.70.1"]).expect("gwA route");
-    gwb.exec(&["ip", "route", "add", "default", "via", "192.168.71.1"]).expect("gwB route");
+    gwa.exec(&["ip", "route", "add", "default", "via", "192.168.70.1"])
+        .expect("gwA route");
+    gwb.exec(&["ip", "route", "add", "default", "via", "192.168.71.1"])
+        .expect("gwB route");
 
     // Provision identity dirs and spawn the two REAL gateway binaries.
     let sda = tempfile::tempdir().unwrap();
@@ -501,8 +540,22 @@ async fn build_scenario(kind: NatKind, prefix: &str) -> Scenario {
         kindname(kind)
     );
 
-    let pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     Scenario {
         pa,
@@ -543,7 +596,9 @@ fn establish_direct(sc: &Scenario, label: &str) {
     });
     if !crossed {
         dump_diag(label, sc);
-        panic!("{label}: workload wlA->wlB tcp/8080 never crossed the tunnel (no direct path formed)");
+        panic!(
+            "{label}: workload wlA->wlB tcp/8080 never crossed the tunnel (no direct path formed)"
+        );
     }
     // The handshake is up; the 1s path-tick reflects Direct momentarily after.
     // Bounded generously (20s, not just enough for the ~1s tick): the
@@ -650,7 +705,9 @@ async fn case2_symmetric_relay_needed() {
              (gwA={ha}, gwB={hb}) — investigate before changing the assertion"
         );
     }
-    eprintln!("CASE 2 PASS: symmetric pair correctly reached relay-needed, no direct handshake, no hang.");
+    eprintln!(
+        "CASE 2 PASS: symmetric pair correctly reached relay-needed, no direct handshake, no hang."
+    );
 }
 
 /// Case 3: go-skew determinism. The direct case passes on repeat runs (no
@@ -661,7 +718,10 @@ async fn case3_direct_determinism() {
     const RUNS: usize = 2;
     for i in 0..RUNS {
         let prefix = format!("nm3r{i}");
-        eprintln!("case3: determinism run {} / {RUNS} (prefix {prefix})", i + 1);
+        eprintln!(
+            "case3: determinism run {} / {RUNS} (prefix {prefix})",
+            i + 1
+        );
         let sc = build_scenario(NatKind::PortRestricted, &prefix).await;
         assert_direct_and_traffic(&sc, &format!("case3-run{}", i + 1));
         drop(sc); // full teardown before the next iteration
@@ -698,7 +758,9 @@ async fn case4_direct_then_degraded() {
     let block = "table ip block {\n  chain input {\n    type filter hook input priority 0;\n    udp dport 51820 drop;\n  }\n}\n";
     let block_path = format!("/tmp/{}-block.nft", sc.gwa.name);
     std::fs::write(&block_path, block).expect("write block ruleset");
-    sc.gwa.exec(&["nft", "-f", &block_path]).expect("apply inbound WG drop on gwA");
+    sc.gwa
+        .exec(&["nft", "-f", &block_path])
+        .expect("apply inbound WG drop on gwA");
     eprintln!("case4: inbound WG blocked on gwA at t=0; awaiting Degraded (~45s)");
 
     // Bounded (~65s): catch the FIRST `degraded` sighting, logging gwA's

@@ -55,7 +55,9 @@ async fn connect(socket: &PathBuf) -> anyhow::Result<AdminClient<Channel>> {
 /// `wiremesh-operator operator-admin`).
 pub async fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let mut args = args;
-    let op = args.next().ok_or_else(|| anyhow!("operator-admin: missing <op>"))?;
+    let op = args
+        .next()
+        .ok_or_else(|| anyhow!("operator-admin: missing <op>"))?;
 
     let mut socket = PathBuf::from(DEFAULT_SOCKET);
     let mut kind = String::new();
@@ -87,8 +89,13 @@ pub async fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
     let out: serde_json::Value = match op.as_str() {
         "apply" => {
             let mut yaml = String::new();
-            std::io::stdin().read_to_string(&mut yaml).context("reading fabric YAML from stdin")?;
-            let d = client.apply(ApplyRequest { fabric_yaml: yaml }).await?.into_inner();
+            std::io::stdin()
+                .read_to_string(&mut yaml)
+                .context("reading fabric YAML from stdin")?;
+            let d = client
+                .apply(ApplyRequest { fabric_yaml: yaml })
+                .await?
+                .into_inner();
             // Report the change counts the reconciler surfaces in status.
             serde_json::json!({
                 "applied": true,
@@ -124,7 +131,11 @@ pub async fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
                 ));
             }
             let r = client
-                .mint_token(MintTokenRequest { kind, bound_cidrs: cidrs, rebind_segment_id })
+                .mint_token(MintTokenRequest {
+                    kind,
+                    bound_cidrs: cidrs,
+                    rebind_segment_id,
+                })
                 .await?
                 .into_inner();
             serde_json::json!({ "token": r.token })
@@ -137,21 +148,35 @@ pub async fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
             serde_json::json!({ "id": r.id })
         }
         "delete-segment" => {
-            let segs = client.list_segments(ListSegmentsRequest {}).await?.into_inner().segments;
+            let segs = client
+                .list_segments(ListSegmentsRequest {})
+                .await?
+                .into_inner()
+                .segments;
             if let Some(s) = segs.into_iter().find(|s| s.name == name) {
-                client.delete_segment(DeleteSegmentRequest { segment_id: s.id }).await?;
+                client
+                    .delete_segment(DeleteSegmentRequest { segment_id: s.id })
+                    .await?;
             }
             serde_json::json!({ "deleted": name })
         }
         "segment-id" => {
             // Name → controller-side segment id (the rebind mint needs it);
             // `id: null` when the segment isn't registered.
-            let segs = client.list_segments(ListSegmentsRequest {}).await?.into_inner().segments;
+            let segs = client
+                .list_segments(ListSegmentsRequest {})
+                .await?
+                .into_inner()
+                .segments;
             let id = segs.into_iter().find(|s| s.name == name).map(|s| s.id);
             serde_json::json!({ "id": id })
         }
         "list-relays" => {
-            let relays = client.list_relays(ListRelaysRequest {}).await?.into_inner().relays;
+            let relays = client
+                .list_relays(ListRelaysRequest {})
+                .await?
+                .into_inner()
+                .relays;
             serde_json::Value::Array(
                 relays
                     .into_iter()
@@ -167,7 +192,11 @@ pub async fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
             )
         }
         "list-gateways" => {
-            let gws = client.list_gateways(ListGatewaysRequest {}).await?.into_inner().gateways;
+            let gws = client
+                .list_gateways(ListGatewaysRequest {})
+                .await?
+                .into_inner()
+                .gateways;
             serde_json::Value::Array(
                 gws.into_iter()
                     .map(|g| {

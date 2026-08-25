@@ -68,11 +68,8 @@ fn candidates_for_returns_observed_and_locals_deduped_observed_first() {
     db.set_candidate_endpoint(gw, "1.2.3.4:5").unwrap();
     // One local candidate is a genuinely new address; the other duplicates
     // the observed value and must not appear twice in the merged set.
-    db.set_local_candidates(
-        gw,
-        &["10.0.0.5:9000".to_string(), "1.2.3.4:5".to_string()],
-    )
-    .unwrap();
+    db.set_local_candidates(gw, &["10.0.0.5:9000".to_string(), "1.2.3.4:5".to_string()])
+        .unwrap();
 
     let candidates = db.candidates_for(gw).unwrap();
     assert_eq!(
@@ -109,7 +106,10 @@ fn set_local_candidates_replaces_set_and_bumps_revision_only_on_change() {
         .unwrap()
         .expect("a genuinely new local set must bump the revision");
     assert!(r1 > r0, "r1={r1} must be > r0={r0}");
-    assert_eq!(db.candidates_for(gw).unwrap(), vec![A.to_string(), B.to_string()]);
+    assert_eq!(
+        db.candidates_for(gw).unwrap(),
+        vec![A.to_string(), B.to_string()]
+    );
 
     // Re-supplying the SAME set, just reordered, must be a no-op: no write,
     // no revision bump — mirrors `set_candidate_endpoint`'s change-detection
@@ -121,7 +121,11 @@ fn set_local_candidates_replaces_set_and_bumps_revision_only_on_change() {
         unchanged, None,
         "re-supplying an unchanged (just reordered) local set must return None"
     );
-    assert_eq!(db.current_revision().unwrap(), r1, "revision must not have moved");
+    assert_eq!(
+        db.current_revision().unwrap(),
+        r1,
+        "revision must not have moved"
+    );
 
     // A genuinely different set (shrunk to one endpoint) must bump again.
     let r2 = db
@@ -223,7 +227,10 @@ const HOSTILE_LOCAL_ENDPOINTS: &[(&str, &str)] = &[
          validation effort exists for",
     ),
     ("not-an-endpoint", "unstructured garbage: the base case"),
-    ("10.0.0.5", "an IPv4 address with no port: WireGuard's UAPI endpoint= needs ip:port"),
+    (
+        "10.0.0.5",
+        "an IPv4 address with no port: WireGuard's UAPI endpoint= needs ip:port",
+    ),
     (
         "[::1]:51820",
         "a bracketed IPv6 literal: parses as `SocketAddr::V6` and is a hard error in \
@@ -236,8 +243,11 @@ const HOSTILE_LOCAL_ENDPOINTS: &[(&str, &str)] = &[
          boringtun's `set` message on every peer it's advertised to, not merely a parse \
          failure",
     ),
-    ("", "an empty string parses as nothing and sorts before every real address, so it \
-          would take candidates[0] for free"),
+    (
+        "",
+        "an empty string parses as nothing and sorts before every real address, so it \
+          would take candidates[0] for free",
+    ),
 ];
 
 /// (Item 1) A `gateway_candidate` row with `source = 'local'` holding a

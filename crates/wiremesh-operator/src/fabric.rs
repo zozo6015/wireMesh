@@ -59,7 +59,10 @@ pub fn render_fabric_yaml(
 ) -> String {
     let segments_out = segments
         .iter()
-        .map(|s| SegmentOut { name: s.segment_name.clone(), cidrs: s.cidrs.clone() })
+        .map(|s| SegmentOut {
+            name: s.segment_name.clone(),
+            cidrs: s.cidrs.clone(),
+        })
         .collect();
 
     let policy = if policies.is_empty() {
@@ -86,7 +89,11 @@ pub fn render_fabric_yaml(
         )
     };
 
-    serde_yaml::to_string(&FabricDoc { segments: segments_out, policy }).unwrap_or_default()
+    serde_yaml::to_string(&FabricDoc {
+        segments: segments_out,
+        policy,
+    })
+    .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -103,12 +110,18 @@ mod tests {
 
     #[test]
     fn renders_segments_and_policy() {
-        let segments = vec![seg("aws", &["10.10.1.0/24"]), seg("proxmox", &["10.20.0.0/16"])];
+        let segments = vec![
+            seg("aws", &["10.10.1.0/24"]),
+            seg("proxmox", &["10.20.0.0/16"]),
+        ];
         let policies = vec![WiremeshPolicySpec {
             from: "proxmox".to_string(),
             to: "aws".to_string(),
             rules: vec![PolicyRule {
-                allow: AllowRule { proto: "tcp".to_string(), ports: vec![443] },
+                allow: AllowRule {
+                    proto: "tcp".to_string(),
+                    ports: vec![443],
+                },
             }],
         }];
         let yaml = render_fabric_yaml(&segments, &policies);
@@ -139,6 +152,9 @@ mod tests {
         let yaml = render_fabric_yaml(&segments, &[]);
         let v: serde_yaml::Value = serde_yaml::from_str(&yaml).expect("valid yaml");
         assert!(v.get("segments").is_some(), "segments present:\n{yaml}");
-        assert!(v.get("policy").is_none(), "policy key omitted when empty:\n{yaml}");
+        assert!(
+            v.get("policy").is_none(),
+            "policy key omitted when empty:\n{yaml}"
+        );
     }
 }

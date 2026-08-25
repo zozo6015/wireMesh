@@ -222,7 +222,11 @@ fn set_version_stamps_no_crate_that_ships_nothing() {
     let run = run_set_version();
     let shipped = shipped_crates();
 
-    let extra: Vec<&String> = run.stamped.iter().filter(|c| !shipped.contains_key(*c)).collect();
+    let extra: Vec<&String> = run
+        .stamped
+        .iter()
+        .filter(|c| !shipped.contains_key(*c))
+        .collect();
     assert!(
         extra.is_empty(),
         "scripts/set-version.sh stamps {} — crate(s) that ship no artifact this test can \
@@ -232,7 +236,12 @@ fn set_version_stamps_no_crate_that_ships_nothing() {
          build job, not just one), or it ships through a path this test does not know \
          about (extend shipped_crates() so the invariant covers it).\n\n\
          stamped: {}\nshipped: {}",
-        joined(&extra.iter().map(|s| (*s).clone()).collect::<BTreeSet<String>>()),
+        joined(
+            &extra
+                .iter()
+                .map(|s| (*s).clone())
+                .collect::<BTreeSet<String>>()
+        ),
         joined(&run.stamped),
         joined(&shipped.keys().cloned().collect::<BTreeSet<String>>()),
     );
@@ -257,7 +266,10 @@ fn every_job_that_compiles_a_shipped_binary_stamps_the_version_first() {
                 None => continue,
             };
 
-            let first_build = steps.iter().enumerate().find_map(|(i, s)| build_reason(s).map(|r| (i, r)));
+            let first_build = steps
+                .iter()
+                .enumerate()
+                .find_map(|(i, s)| build_reason(s).map(|r| (i, r)));
             let first_stamp = steps.iter().position(|s| is_stamp_step(s));
 
             let (build_idx, why) = match first_build {
@@ -340,7 +352,8 @@ fn set_version_rewrites_exactly_the_package_version_it_claims() {
     );
 
     assert_eq!(
-        run.claimed, run.stamped,
+        run.claimed,
+        run.stamped,
         "{SET_VERSION_SH} reports success for a different set of crates than it actually \
          rewrote.\n\n  claims to have stamped: {}\n  actually carries {SENTINEL} as its \
          [package] version: {}\n\nA crate it claims but did not stamp ships the 0.1.0 \
@@ -527,16 +540,14 @@ fn shipped_crates() -> BTreeMap<String, BTreeSet<String>> {
 }
 
 fn crate_of_bin(bins: &BTreeMap<String, String>, bin: &str, whence: &str) -> String {
-    bins.get(bin)
-        .cloned()
-        .unwrap_or_else(|| {
-            panic!(
-                "{whence} ships a binary named `{bin}`, but no workspace crate declares a \
+    bins.get(bin).cloned().unwrap_or_else(|| {
+        panic!(
+            "{whence} ships a binary named `{bin}`, but no workspace crate declares a \
                  [[bin]] with that name and none owns it implicitly via src/main.rs. Known \
                  binaries: {:?}",
-                bins.keys().collect::<Vec<_>>()
-            )
-        })
+            bins.keys().collect::<Vec<_>>()
+        )
+    })
 }
 
 /// `-p foo -p bar` / `--package foo` out of a `cargo build` command line.
@@ -580,21 +591,32 @@ fn workspace_members() -> Vec<(String, String)> {
         })
         .map(|(i, _)| i)
         .expect("root Cargo.toml must declare a workspace `members = [...]` key");
-    let open = start + text[start..].find('[').expect("workspace members must be a list");
-    let close = open + text[open..].find(']').expect("unterminated workspace members list");
+    let open = start
+        + text[start..]
+            .find('[')
+            .expect("workspace members must be a list");
+    let close = open
+        + text[open..]
+            .find(']')
+            .expect("unterminated workspace members list");
     let mut out = Vec::new();
     for raw in text[open + 1..close].split(',') {
         let dir = raw.trim().trim_matches('"').trim();
         if dir.is_empty() {
             continue;
         }
-        let manifest = read(&repo(&format!("{dir}/Cargo.toml")), &format!("{dir}/Cargo.toml"));
-        let name = section_value(&manifest, "[package]", "name").unwrap_or_else(|| {
-            panic!("{dir}/Cargo.toml has no [package] name")
-        });
+        let manifest = read(
+            &repo(&format!("{dir}/Cargo.toml")),
+            &format!("{dir}/Cargo.toml"),
+        );
+        let name = section_value(&manifest, "[package]", "name")
+            .unwrap_or_else(|| panic!("{dir}/Cargo.toml has no [package] name"));
         out.push((name, dir.to_string()));
     }
-    assert!(!out.is_empty(), "parsed zero workspace members out of the root Cargo.toml");
+    assert!(
+        !out.is_empty(),
+        "parsed zero workspace members out of the root Cargo.toml"
+    );
     out
 }
 
@@ -604,7 +626,10 @@ fn workspace_members() -> Vec<(String, String)> {
 fn bin_to_crate() -> BTreeMap<String, String> {
     let mut map: BTreeMap<String, String> = BTreeMap::new();
     for (name, dir) in workspace_members() {
-        let manifest = read(&repo(&format!("{dir}/Cargo.toml")), &format!("{dir}/Cargo.toml"));
+        let manifest = read(
+            &repo(&format!("{dir}/Cargo.toml")),
+            &format!("{dir}/Cargo.toml"),
+        );
         let mut section = String::new();
         for line in manifest.lines() {
             let t = line.trim();
@@ -722,7 +747,10 @@ fn workflow_files() -> Vec<String> {
         .map(|n| format!("{WORKFLOW_DIR}/{n}"))
         .collect();
     out.sort();
-    assert!(!out.is_empty(), "no workflow files found under {WORKFLOW_DIR}");
+    assert!(
+        !out.is_empty(),
+        "no workflow files found under {WORKFLOW_DIR}"
+    );
     out
 }
 
@@ -738,16 +766,23 @@ fn build_reason(step: &serde_yaml::Value) -> Option<String> {
         }
     }
     if let Some(uses) = step["uses"].as_str() {
-        if uses.starts_with("docker/build-push-action") && step["with"]["file"].as_str() == Some(DOCKERFILE) {
+        if uses.starts_with("docker/build-push-action")
+            && step["with"]["file"].as_str() == Some(DOCKERFILE)
+        {
             let target = step["with"]["target"].as_str().unwrap_or("<default>");
-            return Some(format!("builds {DOCKERFILE} (target `{target}`) via docker/build-push-action"));
+            return Some(format!(
+                "builds {DOCKERFILE} (target `{target}`) via docker/build-push-action"
+            ));
         }
     }
     None
 }
 
 fn is_stamp_step(step: &serde_yaml::Value) -> bool {
-    step["run"].as_str().map(|r| r.contains("set-version.sh")).unwrap_or(false)
+    step["run"]
+        .as_str()
+        .map(|r| r.contains("set-version.sh"))
+        .unwrap_or(false)
 }
 
 fn matrix_components(doc: &serde_yaml::Value, job: &str) -> Vec<String> {
@@ -763,7 +798,9 @@ fn matrix_components(doc: &serde_yaml::Value, job: &str) -> Vec<String> {
     seq.iter()
         .map(|v| {
             v.as_str()
-                .unwrap_or_else(|| panic!("{CONTAINER_WF} job `{job}` matrix component is not a string"))
+                .unwrap_or_else(|| {
+                    panic!("{CONTAINER_WF} job `{job}` matrix component is not a string")
+                })
                 .to_string()
         })
         .collect()
@@ -829,7 +866,10 @@ fn run_set_version() -> StampRun {
     let mut stamped = BTreeSet::new();
     let mut changed_lines: BTreeMap<String, Vec<(usize, String, String)>> = BTreeMap::new();
     for (name, rel) in &members {
-        let after = read(&dir.join(format!("{rel}/Cargo.toml")), &format!("{rel}/Cargo.toml (stamped)"));
+        let after = read(
+            &dir.join(format!("{rel}/Cargo.toml")),
+            &format!("{rel}/Cargo.toml (stamped)"),
+        );
         let before = &manifests_before[name];
         if section_value(&after, "[package]", "version").as_deref() == Some(SENTINEL) {
             stamped.insert(name.clone());
@@ -856,7 +896,11 @@ fn claimed_from_stdout(stdout: &str) -> BTreeSet<String> {
             let t = l.trim();
             let rest = t.strip_prefix("set ")?;
             let name = rest.split_whitespace().next()?;
-            if rest.contains("version") { Some(name.to_string()) } else { None }
+            if rest.contains("version") {
+                Some(name.to_string())
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -885,7 +929,8 @@ fn repo(rel: &str) -> PathBuf {
 }
 
 fn read(path: &Path, display: &str) -> String {
-    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("cannot read {display} ({}): {e}", path.display()))
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("cannot read {display} ({}): {e}", path.display()))
 }
 
 fn read_yaml(rel: &str) -> serde_yaml::Value {

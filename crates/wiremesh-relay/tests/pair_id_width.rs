@@ -78,7 +78,11 @@ fn registration_key_header_must_carry_full_octets_not_a_hex_expanded_32_bit_pref
 
     for i in 0..RANGE_SAMPLES {
         let key = registration_key("gw-A", &format!("gw-{i}"));
-        assert_eq!(key.len(), 8, "the relay's datagram header is a fixed 8 bytes");
+        assert_eq!(
+            key.len(),
+            8,
+            "the relay's datagram header is a fixed 8 bytes"
+        );
         for (pos, b) in key.iter().enumerate() {
             seen_per_position[pos].insert(*b);
             if !HEX_ALPHABET.contains(b) {

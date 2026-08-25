@@ -582,7 +582,12 @@ async fn rebind_token_accepted_at_gateway_boundary_and_takes_rebind_path() {
     let db_path: PathBuf = h.data_dir().join("controller.db");
     let (statuses, certs) = tokio::task::spawn_blocking({
         let db_path = db_path.clone();
-        move || (gateway_statuses(&db_path), certificate_revocations(&db_path))
+        move || {
+            (
+                gateway_statuses(&db_path),
+                certificate_revocations(&db_path),
+            )
+        }
     })
     .await
     .expect("blocking rebind-row inspection task panicked");

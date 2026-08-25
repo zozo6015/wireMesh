@@ -69,14 +69,23 @@ async fn operator_minted_rebind_token_replaces_the_segments_active_gateway() {
         new_serial, old_serial,
         "the replacement gateway must receive a freshly issued cert distinct from the incumbent's"
     );
-    assert_ne!(replacement.id(), old_id, "the replacement is a distinct gateway id");
+    assert_ne!(
+        replacement.id(),
+        old_id,
+        "the replacement is a distinct gateway id"
+    );
 
     // ...and the roster shows the incumbent REPLACED, with exactly one active
     // gateway left on the segment (the one-gateway-per-segment invariant holds).
     // Read back through the operator's own list_gateways for symmetry.
-    let roster = admin.list_gateways().await.expect("listing the gateway roster");
-    let active: Vec<_> =
-        roster.iter().filter(|g| g.segment == "aws" && g.status == "active").collect();
+    let roster = admin
+        .list_gateways()
+        .await
+        .expect("listing the gateway roster");
+    let active: Vec<_> = roster
+        .iter()
+        .filter(|g| g.segment == "aws" && g.status == "active")
+        .collect();
     assert_eq!(
         active.len(),
         1,
@@ -88,7 +97,9 @@ async fn operator_minted_rebind_token_replaces_the_segments_active_gateway() {
         "the surviving active gateway must be the REPLACEMENT, not the incumbent"
     );
     assert!(
-        roster.iter().any(|g| g.id == old_id && g.status != "active"),
+        roster
+            .iter()
+            .any(|g| g.id == old_id && g.status != "active"),
         "the incumbent must be left non-active (replaced), proving a REPLACEMENT rather \
          than a second active gateway; roster: {roster:?}"
     );

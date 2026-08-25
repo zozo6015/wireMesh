@@ -218,8 +218,14 @@ fn partial_rollout_is_available_not_starting() {
 
 fn deployment(replicas: Option<i32>, available: Option<i32>) -> Deployment {
     Deployment {
-        spec: Some(DeploymentSpec { replicas, ..Default::default() }),
-        status: Some(DeploymentStatus { available_replicas: available, ..Default::default() }),
+        spec: Some(DeploymentSpec {
+            replicas,
+            ..Default::default()
+        }),
+        status: Some(DeploymentStatus {
+            available_replicas: available,
+            ..Default::default()
+        }),
         ..Default::default()
     }
 }
@@ -280,7 +286,10 @@ fn deployment_readiness_reads_spec_replicas_and_status_available_replicas() {
 #[test]
 fn absent_status_counts_as_zero_available() {
     let no_status = Deployment {
-        spec: Some(DeploymentSpec { replicas: Some(1), ..Default::default() }),
+        spec: Some(DeploymentSpec {
+            replicas: Some(1),
+            ..Default::default()
+        }),
         ..Default::default()
     };
     assert_eq!(

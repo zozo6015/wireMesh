@@ -163,7 +163,11 @@ pub enum ChangeEvent {
     /// gateway must learn the new IR, not just gateways that connect after
     /// the fact (those get it via `build_snapshot`). `ir` is the exact
     /// canonical-JSON bytes stored in `policy_version.compiled_ir`.
-    PolicyUpdated { version: u64, ir: Vec<u8>, revision: u64 },
+    PolicyUpdated {
+        version: u64,
+        ir: Vec<u8>,
+        revision: u64,
+    },
     /// (Cycle-3 Task 5) `Admin.Apply` REPLACED an existing segment's `cidr`
     /// rows (its declared CIDR set changed) — every OTHER already-connected
     /// gateway's peer view of `gateway_id` (the segment's own enrolled
@@ -362,7 +366,11 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             policy_version: 0,
             revoked_serials: vec![serial],
         },
-        ChangeEvent::PolicyUpdated { version, ir, revision } => Delta {
+        ChangeEvent::PolicyUpdated {
+            version,
+            ir,
+            revision,
+        } => Delta {
             revision,
             // No peer/revocation change — only the policy fields carry
             // anything, per this variant's doc comment.
@@ -399,7 +407,10 @@ pub fn delta_for_change(event: ChangeEvent) -> Delta {
             policy_version: 0,
             revoked_serials: Vec::new(),
         },
-        ChangeEvent::RelaysChanged { relay_infos, revision } => Delta {
+        ChangeEvent::RelaysChanged {
+            relay_infos,
+            revision,
+        } => Delta {
             revision,
             // No peer/revocation change — only `relay_infos` carries
             // anything, per this variant's doc comment. `relays_updated:
@@ -467,7 +478,10 @@ pub async fn build_snapshot(
         .active_relays()
         .await?
         .into_iter()
-        .map(|(id, endpoint)| RelayInfo { relay_id: id as u64, endpoint })
+        .map(|(id, endpoint)| RelayInfo {
+            relay_id: id as u64,
+            endpoint,
+        })
         .collect();
 
     let revoked_serials = db.revoked_serials().await?;
@@ -660,10 +674,9 @@ pub(crate) async fn emit_key_rotated(
     // already-open Sync.Watch stream's view of a previously reported/
     // observed candidate endpoint (mirroring EndpointObserved/
     // SegmentCidrsChanged's identical widening).
-    let candidate_endpoints = db
-        .candidates_for(gateway_id)
-        .await
-        .map_err(|e| Status::internal(format!("reading gateway candidates after key change: {e}")))?;
+    let candidate_endpoints = db.candidates_for(gateway_id).await.map_err(|e| {
+        Status::internal(format!("reading gateway candidates after key change: {e}"))
+    })?;
 
     let _ = change_tx.send(ChangeEvent::KeyRotated {
         gateway_id,

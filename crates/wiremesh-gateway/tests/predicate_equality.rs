@@ -179,19 +179,22 @@ const CURATED: &[&str] = &[
 /// predicate is an open decision this file does not take. What it DOES pin is
 /// that if someone tightens one side, they cannot leave the other behind.
 const KNOWN_GAP_ACCEPTED_BY_BOTH: &[&str] = &[
-    "10.0.0.5:0",             // port 0 is not a dialable UDP port
-    "0.0.0.0:51820",          // the unspecified address names no host
-    "0.0.0.0:0",              // both at once
-    "127.0.0.1:51820",        // loopback: on a PEER this points that peer at itself
-    "169.254.1.1:51820",      // link-local
-    "224.0.0.1:51820",        // multicast is not a unicast peer endpoint
-    "255.255.255.255:65535",  // the broadcast address
+    "10.0.0.5:0",            // port 0 is not a dialable UDP port
+    "0.0.0.0:51820",         // the unspecified address names no host
+    "0.0.0.0:0",             // both at once
+    "127.0.0.1:51820",       // loopback: on a PEER this points that peer at itself
+    "169.254.1.1:51820",     // link-local
+    "224.0.0.1:51820",       // multicast is not a unicast peer endpoint
+    "255.255.255.255:65535", // the broadcast address
 ];
 
 #[test]
 fn the_controller_filter_and_the_gateway_validator_are_the_same_predicate() {
-    let corpus: Vec<&str> =
-        CURATED.iter().chain(KNOWN_GAP_ACCEPTED_BY_BOTH.iter()).copied().collect();
+    let corpus: Vec<&str> = CURATED
+        .iter()
+        .chain(KNOWN_GAP_ACCEPTED_BY_BOTH.iter())
+        .copied()
+        .collect();
 
     // Positive/negative controls FIRST. Equality is trivially satisfiable by
     // two predicates that both say "no" to everything (or both say "yes"), and
@@ -261,7 +264,9 @@ fn the_two_predicates_agree_across_a_generated_cross_product() {
     ];
     // Each decoration is applied to the whole `addr:port` string. `{}` is the
     // undecorated control.
-    const WRAPS: &[&str] = &["{}", " {}", "{} ", "\t{}", "{}\n", "{}\r\n", "\n{}", "[{}]", "{}\0"];
+    const WRAPS: &[&str] = &[
+        "{}", " {}", "{} ", "\t{}", "{}\n", "{}\r\n", "\n{}", "[{}]", "{}\0",
+    ];
 
     let mut corpus: Vec<String> = Vec::new();
     for a in ADDRS {
@@ -294,7 +299,12 @@ fn the_two_predicates_agree_across_a_generated_cross_product() {
 /// silently.
 #[test]
 fn the_agreed_answer_is_the_right_one_for_the_load_bearing_cases() {
-    let must_accept = ["10.0.0.5:51820", "203.0.113.5:51820", "192.168.1.7:65535", "10.0.0.1:1"];
+    let must_accept = [
+        "10.0.0.5:51820",
+        "203.0.113.5:51820",
+        "192.168.1.7:65535",
+        "10.0.0.1:1",
+    ];
     let must_reject = [
         "abc:123",
         "[::ffff:10.0.0.5]:51820",
@@ -305,8 +315,10 @@ fn the_agreed_answer_is_the_right_one_for_the_load_bearing_cases() {
         "",
     ];
 
-    let wrongly_rejected: Vec<&str> =
-        must_accept.into_iter().filter(|ep| !is_dialable_endpoint(ep)).collect();
+    let wrongly_rejected: Vec<&str> = must_accept
+        .into_iter()
+        .filter(|ep| !is_dialable_endpoint(ep))
+        .collect();
     assert!(
         wrongly_rejected.is_empty(),
         "these are ordinary IPv4 socket addresses and BOTH sides must accept them, but the \
@@ -315,8 +327,10 @@ fn the_agreed_answer_is_the_right_one_for_the_load_bearing_cases() {
          that way its direct path, and does it silently."
     );
 
-    let wrongly_accepted: Vec<&str> =
-        must_reject.into_iter().filter(|ep| is_dialable_endpoint(ep)).collect();
+    let wrongly_accepted: Vec<&str> = must_reject
+        .into_iter()
+        .filter(|ep| is_dialable_endpoint(ep))
+        .collect();
     assert!(
         wrongly_accepted.is_empty(),
         "these must be rejected by BOTH sides but the gateway now accepts \

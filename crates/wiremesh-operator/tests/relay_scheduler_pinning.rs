@@ -57,10 +57,9 @@ fn relay_pinning_is_scheduler_aware() {
         "spec.nodeName must NOT be set directly — it bypasses the scheduler, so the relay's \
          WaitForFirstConsumer PVC would never bind (PVC Pending → pod Pending forever)"
     );
-    let sel = p
-        .node_selector
-        .as_ref()
-        .expect("nodeName must be folded into a nodeSelector so the scheduler still places the pod");
+    let sel = p.node_selector.as_ref().expect(
+        "nodeName must be folded into a nodeSelector so the scheduler still places the pod",
+    );
     assert_eq!(
         sel.get(HOSTNAME_KEY).map(String::as_str),
         Some("zolab-worker1"),
@@ -71,7 +70,10 @@ fn relay_pinning_is_scheduler_aware() {
     let p = relay_pod(None);
     assert_eq!(p.node_name, None, "no nodeName when the CR pins nothing");
     assert!(
-        p.node_selector.as_ref().map(|m| m.is_empty()).unwrap_or(true),
+        p.node_selector
+            .as_ref()
+            .map(|m| m.is_empty())
+            .unwrap_or(true),
         "no nodeSelector (and no synthesized hostname key) when the CR sets no nodeName; got {:?}",
         p.node_selector
     );
@@ -86,7 +88,10 @@ fn relay_node_pinning_and_identity_pvc_coexist() {
     let p = relay_pod(Some("zolab-worker1"));
     assert_eq!(p.node_name, None, "still scheduler-aware");
     assert_eq!(
-        p.node_selector.as_ref().and_then(|s| s.get(HOSTNAME_KEY)).map(String::as_str),
+        p.node_selector
+            .as_ref()
+            .and_then(|s| s.get(HOSTNAME_KEY))
+            .map(String::as_str),
         Some("zolab-worker1"),
     );
 
@@ -113,7 +118,11 @@ fn relay_node_pinning_and_identity_pvc_coexist() {
 
     // And the main container actually mounts it (a PVC volume nothing mounts
     // would bind but persist nothing).
-    let main = p.containers.iter().find(|c| c.name == "relay").expect("relay container");
+    let main = p
+        .containers
+        .iter()
+        .find(|c| c.name == "relay")
+        .expect("relay container");
     assert!(
         main.volume_mounts
             .as_ref()

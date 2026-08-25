@@ -1,0 +1,29 @@
+# This standalone workspace builds on NIGHTLY, and says so here so that the
+# repo-root `rust-toolchain.toml` (pinned to stable 1.97.1) cannot capture it.
+#
+# Two different callers build this crate set, and only one of them was already
+# safe. `crates/wiremesh-enforcer`'s build script goes through
+# `aya_build::build_ebpf(.., Toolchain::default())`, which shells out as
+# `rustup run nightly cargo build` and therefore sets `RUSTUP_TOOLCHAIN`,
+# outranking every toolchain file. But CLAUDE.md's execution rules say this
+# workspace is built and tested FROM ITS OWN DIRECTORY, and a plain `cargo
+# build` there walks up the tree, finds the root pin, and would try to compile
+# a `#![no_std] #![no_main]` BPF program on stable — which fails with
+# `unwinding panics are not supported without std`. This file makes that path
+# deterministic instead.
+#
+# The channel is UNDATED on purpose. Pinning a dated nightly needs its own
+# verification pass against `aya_build` and `bpf-linker` 0.10.4, and that is a
+# separate piece of work; `dev/Dockerfile` installs one nightly and this
+# resolves to it with no download.
+#
+# `rust-src` is required, not optional: the BPF target has no prebuilt std, so
+# `aya_build` cross-compiles `core` from source via `-Z build-std`. `rustfmt`
+# and `clippy` are listed because this file makes `cargo fmt`/`cargo clippy` in
+# THIS directory resolve to nightly's copies rather than stable's, and CI runs
+# both here (design 6.1 c7: the sub-workspace is invisible to root tooling, so
+# fmt and clippy each run twice). `dev/Dockerfile` installs all three on
+# nightly, so nothing is downloaded at runtime.
+[toolchain]
+channel = "nightly"
+components = ["rust-src", "rustfmt", "clippy"]

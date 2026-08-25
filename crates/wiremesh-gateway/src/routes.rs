@@ -4,16 +4,24 @@ use anyhow::{anyhow, Context};
 use std::process::Command;
 
 fn run(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
-    let out = Command::new(cmd).args(args).output()
+    let out = Command::new(cmd)
+        .args(args)
+        .output()
         .with_context(|| format!("spawning {cmd} {args:?}"))?;
     if !out.status.success() {
-        return Err(anyhow!("{cmd} {args:?} failed: {}", String::from_utf8_lossy(&out.stderr)));
+        return Err(anyhow!(
+            "{cmd} {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        ));
     }
     Ok(())
 }
 
 pub fn set_link_up_mtu(ifname: &str, mtu: u32) -> anyhow::Result<()> {
-    run("ip", &["link", "set", ifname, "up", "mtu", &mtu.to_string()])
+    run(
+        "ip",
+        &["link", "set", ifname, "up", "mtu", &mtu.to_string()],
+    )
 }
 
 pub fn enable_ip_forward() -> anyhow::Result<()> {
@@ -48,7 +56,9 @@ pub fn add_route(cidr: &str, ifname: &str) -> anyhow::Result<()> {
 }
 
 pub fn del_route(cidr: &str, ifname: &str) -> anyhow::Result<()> {
-    let out = Command::new("ip").args(["route", "del", cidr, "dev", ifname]).output()
+    let out = Command::new("ip")
+        .args(["route", "del", cidr, "dev", ifname])
+        .output()
         .with_context(|| format!("spawning ip route del {cidr}"))?;
     if out.status.success() {
         return Ok(());
@@ -66,7 +76,9 @@ pub fn del_route(cidr: &str, ifname: &str) -> anyhow::Result<()> {
 
 pub fn install_mss_clamp(ifname: &str, mss: u16) -> anyhow::Result<()> {
     // Idempotent: delete any prior table, then load a fresh one.
-    let _ = Command::new("nft").args(["delete", "table", "inet", "wiremesh_mss"]).output();
+    let _ = Command::new("nft")
+        .args(["delete", "table", "inet", "wiremesh_mss"])
+        .output();
     let ruleset = format!(
         "table inet wiremesh_mss {{\n\
          \tchain forward {{\n\
@@ -76,10 +88,12 @@ pub fn install_mss_clamp(ifname: &str, mss: u16) -> anyhow::Result<()> {
          \t}}\n\
          }}\n"
     );
-    let mut child = Command::new("nft").args(["-f", "-"])
+    let mut child = Command::new("nft")
+        .args(["-f", "-"])
         .stdin(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn().context("spawning nft -f -")?;
+        .spawn()
+        .context("spawning nft -f -")?;
     {
         use std::io::Write;
         // Drop the stdin handle before waiting, to avoid a pipe deadlock

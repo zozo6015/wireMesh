@@ -1,19 +1,33 @@
 #![allow(deprecated)] // constructing StateSnapshot/Delta requires setting deprecated_relays (field 4)
 use prost::Message;
 use wiremesh_proto::v1::{
-    StateSnapshot, Peer, sync_message::Body, SyncMessage, PunchDirective, ReportRequest,
-    RelayInfo, RelayHealth, Delta, EnrollRequest, RotateDirective, SubmitEpochKeyRequest,
-    EpochAck, PeerPath, WatchRequest,
+    sync_message::Body, Delta, EnrollRequest, EpochAck, Peer, PeerPath, PunchDirective,
+    RelayHealth, RelayInfo, ReportRequest, RotateDirective, StateSnapshot, SubmitEpochKeyRequest,
+    SyncMessage, WatchRequest,
 };
 
 #[test]
 fn snapshot_message_roundtrips() {
-    let snap = StateSnapshot { revision: 7, self_cert_pem: "PEM".into(),
-        peers: vec![Peer { gateway_id: 2, segment_name: "aws".into(), ..Default::default() }],
+    let snap = StateSnapshot {
+        revision: 7,
+        self_cert_pem: "PEM".into(),
+        peers: vec![Peer {
+            gateway_id: 2,
+            segment_name: "aws".into(),
+            ..Default::default()
+        }],
         deprecated_relays: vec![],
-        relay_infos: vec![RelayInfo { relay_id: 7, endpoint: "r1:4443".into() }], policy_ir: vec![], policy_version: 0,
-        revoked_serials: vec![] };
-    let msg = SyncMessage { body: Some(Body::Snapshot(snap.clone())) };
+        relay_infos: vec![RelayInfo {
+            relay_id: 7,
+            endpoint: "r1:4443".into(),
+        }],
+        policy_ir: vec![],
+        policy_version: 0,
+        revoked_serials: vec![],
+    };
+    let msg = SyncMessage {
+        body: Some(Body::Snapshot(snap.clone())),
+    };
 
     // A GENUINE wire roundtrip: encode to protobuf bytes and decode them
     // back, rather than just re-matching the same in-memory struct the
@@ -46,7 +60,9 @@ fn punch_directive_message_roundtrips() {
         candidates: vec!["198.51.100.2:51820".into()],
         go_unix_ms: 123,
     };
-    let msg = SyncMessage { body: Some(Body::Punch(punch.clone())) };
+    let msg = SyncMessage {
+        body: Some(Body::Punch(punch.clone())),
+    };
 
     // Genuine wire roundtrip (see rationale in snapshot_message_roundtrips
     // above): encode to protobuf bytes, decode them back, and assert
@@ -72,7 +88,8 @@ fn report_request_local_endpoints_roundtrips() {
         session_generation: 0,
     };
     let bytes = with_endpoints.encode_to_vec();
-    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    let decoded =
+        ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
     assert_eq!(decoded, with_endpoints);
 
     // Empty local_endpoints must still roundtrip cleanly (old-client behavior,
@@ -87,7 +104,8 @@ fn report_request_local_endpoints_roundtrips() {
         session_generation: 0,
     };
     let bytes = no_endpoints.encode_to_vec();
-    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    let decoded =
+        ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
     assert_eq!(decoded, no_endpoints);
 }
 
@@ -107,8 +125,14 @@ fn state_snapshot_relay_infos_roundtrips_multiple_relay_infos() {
         peers: vec![],
         deprecated_relays: vec![],
         relay_infos: vec![
-            RelayInfo { relay_id: 1, endpoint: "relay-a.example:4443".into() },
-            RelayInfo { relay_id: 2, endpoint: "relay-b.example:4443".into() },
+            RelayInfo {
+                relay_id: 1,
+                endpoint: "relay-a.example:4443".into(),
+            },
+            RelayInfo {
+                relay_id: 2,
+                endpoint: "relay-b.example:4443".into(),
+            },
         ],
         policy_ir: vec![],
         policy_version: 0,
@@ -116,7 +140,8 @@ fn state_snapshot_relay_infos_roundtrips_multiple_relay_infos() {
     };
 
     let bytes = snap.encode_to_vec();
-    let decoded = StateSnapshot::decode(bytes.as_slice()).expect("decoding the encoded StateSnapshot");
+    let decoded =
+        StateSnapshot::decode(bytes.as_slice()).expect("decoding the encoded StateSnapshot");
 
     assert_eq!(decoded.relay_infos.len(), 2);
     assert_eq!(decoded.relay_infos[0].relay_id, 1);
@@ -139,7 +164,10 @@ fn delta_relay_infos_roundtrips_relay_info() {
         upserted_peers: vec![],
         removed_peer_ids: vec![],
         deprecated_relays: vec![],
-        relay_infos: vec![RelayInfo { relay_id: 3, endpoint: "relay-c.example:4443".into() }],
+        relay_infos: vec![RelayInfo {
+            relay_id: 3,
+            endpoint: "relay-c.example:4443".into(),
+        }],
         relays_updated: true,
         policy_ir: vec![],
         policy_version: 0,
@@ -163,12 +191,18 @@ fn delta_relays_updated_roundtrips_true_and_false() {
     // authoritatively updates the relay set, possibly to empty" from "this
     // is a sparse, non-relay delta" — both values must survive the wire,
     // not just default-false.
-    let with_update = Delta { relays_updated: true, ..Default::default() };
+    let with_update = Delta {
+        relays_updated: true,
+        ..Default::default()
+    };
     let decoded = Delta::decode(with_update.encode_to_vec().as_slice())
         .expect("decoding the encoded Delta (relays_updated: true)");
     assert!(decoded.relays_updated);
 
-    let sparse = Delta { relays_updated: false, ..Default::default() };
+    let sparse = Delta {
+        relays_updated: false,
+        ..Default::default()
+    };
     let decoded = Delta::decode(sparse.encode_to_vec().as_slice())
         .expect("decoding the encoded Delta (relays_updated: false)");
     assert!(!decoded.relays_updated);
@@ -184,8 +218,14 @@ fn report_request_relay_health_roundtrips() {
         applied_version: 9,
         local_endpoints: vec!["10.0.0.5:51820".into()],
         relay_health: vec![
-            RelayHealth { relay_id: 1, healthy: true },
-            RelayHealth { relay_id: 2, healthy: false },
+            RelayHealth {
+                relay_id: 1,
+                healthy: true,
+            },
+            RelayHealth {
+                relay_id: 2,
+                healthy: false,
+            },
         ],
         epoch_acks: vec![],
         peer_paths: vec![],
@@ -194,7 +234,8 @@ fn report_request_relay_health_roundtrips() {
     };
 
     let bytes = report.encode_to_vec();
-    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    let decoded =
+        ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
 
     assert_eq!(decoded.relay_health.len(), 2);
     assert_eq!(decoded.relay_health[0].relay_id, 1);
@@ -216,7 +257,8 @@ fn enroll_request_endpoint_roundtrips() {
         endpoint: "203.0.113.9:51820".into(),
     };
     let bytes = with_endpoint.encode_to_vec();
-    let decoded = EnrollRequest::decode(bytes.as_slice()).expect("decoding the encoded EnrollRequest");
+    let decoded =
+        EnrollRequest::decode(bytes.as_slice()).expect("decoding the encoded EnrollRequest");
     assert_eq!(decoded.endpoint, "203.0.113.9:51820");
     assert_eq!(decoded.token, "tok");
     assert_eq!(decoded.csr_pem, "CSR");
@@ -234,7 +276,8 @@ fn enroll_request_endpoint_roundtrips() {
         endpoint: String::new(),
     };
     let bytes = no_endpoint.encode_to_vec();
-    let decoded = EnrollRequest::decode(bytes.as_slice()).expect("decoding the encoded EnrollRequest");
+    let decoded =
+        EnrollRequest::decode(bytes.as_slice()).expect("decoding the encoded EnrollRequest");
     assert_eq!(decoded.endpoint, "");
 }
 
@@ -245,7 +288,9 @@ fn rotate_directive_message_roundtrips() {
     // gateway to begin publishing/accepting a new key epoch. Genuine wire
     // roundtrip (see rationale in snapshot_message_roundtrips above).
     let rotate = RotateDirective { epoch: 5 };
-    let msg = SyncMessage { body: Some(Body::Rotate(rotate.clone())) };
+    let msg = SyncMessage {
+        body: Some(Body::Rotate(rotate.clone())),
+    };
 
     let bytes = msg.encode_to_vec();
     let decoded = SyncMessage::decode(bytes.as_slice()).expect("decoding the encoded SyncMessage");
@@ -287,8 +332,16 @@ fn report_request_epoch_acks_roundtrips() {
         local_endpoints: vec!["10.0.0.5:51820".into()],
         relay_health: vec![],
         epoch_acks: vec![
-            EpochAck { peer_gateway_id: 1, epoch: 6, live: true },
-            EpochAck { peer_gateway_id: 2, epoch: 6, live: false },
+            EpochAck {
+                peer_gateway_id: 1,
+                epoch: 6,
+                live: true,
+            },
+            EpochAck {
+                peer_gateway_id: 2,
+                epoch: 6,
+                live: false,
+            },
         ],
         peer_paths: vec![],
         peer_paths_snapshot: false,
@@ -296,7 +349,8 @@ fn report_request_epoch_acks_roundtrips() {
     };
 
     let bytes = with_acks.encode_to_vec();
-    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    let decoded =
+        ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
 
     assert_eq!(decoded.epoch_acks.len(), 2);
     assert_eq!(decoded.epoch_acks[0].peer_gateway_id, 1);
@@ -318,7 +372,8 @@ fn report_request_epoch_acks_roundtrips() {
         session_generation: 0,
     };
     let bytes = no_acks.encode_to_vec();
-    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    let decoded =
+        ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
     assert_eq!(decoded, no_acks);
 }
 
@@ -345,15 +400,22 @@ fn report_request_peer_paths_roundtrips() {
         relay_health: vec![],
         epoch_acks: vec![],
         peer_paths: vec![
-            PeerPath { peer_gateway_id: 2, state: "direct".into() },
-            PeerPath { peer_gateway_id: 3, state: "connecting".into() },
+            PeerPath {
+                peer_gateway_id: 2,
+                state: "direct".into(),
+            },
+            PeerPath {
+                peer_gateway_id: 3,
+                state: "connecting".into(),
+            },
         ],
         peer_paths_snapshot: true,
         session_generation: 0,
     };
 
     let bytes = with_paths.encode_to_vec();
-    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    let decoded =
+        ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
 
     assert_eq!(decoded.peer_paths.len(), 2);
     assert_eq!(decoded.peer_paths[0].peer_gateway_id, 2);
@@ -378,7 +440,8 @@ fn report_request_peer_paths_roundtrips() {
         session_generation: 0,
     };
     let bytes = no_paths.encode_to_vec();
-    let decoded = ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
+    let decoded =
+        ReportRequest::decode(bytes.as_slice()).expect("decoding the encoded ReportRequest");
     assert_eq!(decoded, no_paths);
     assert!(
         !decoded.peer_paths_snapshot,
@@ -419,7 +482,9 @@ fn session_generation_roundtrips_on_watch_report_and_submit_epoch_key() {
     // narrowed/truncated field would be caught rather than surviving by luck.
     let nonce: u64 = 0xDEAD_BEEF_CAFE_F00D;
 
-    let watch = WatchRequest { session_generation: nonce };
+    let watch = WatchRequest {
+        session_generation: nonce,
+    };
     let decoded = WatchRequest::decode(watch.encode_to_vec().as_slice())
         .expect("decoding the encoded WatchRequest");
     assert_eq!(
@@ -443,7 +508,10 @@ fn session_generation_roundtrips_on_watch_report_and_submit_epoch_key() {
         decoded.session_generation, nonce,
         "ReportRequest.session_generation must survive the wire intact"
     );
-    assert_eq!(decoded, report, "no other ReportRequest field may be disturbed");
+    assert_eq!(
+        decoded, report,
+        "no other ReportRequest field may be disturbed"
+    );
 
     let submit = SubmitEpochKeyRequest {
         epoch: 5,
@@ -458,7 +526,10 @@ fn session_generation_roundtrips_on_watch_report_and_submit_epoch_key() {
          lets the controller reject a pre-restart submission that would otherwise WIN \
          `Db::set_epoch_pubkey`'s swap onto the sentinel"
     );
-    assert_eq!(decoded, submit, "no other SubmitEpochKeyRequest field may be disturbed");
+    assert_eq!(
+        decoded, submit,
+        "no other SubmitEpochKeyRequest field may be disturbed"
+    );
 
     // Absent (legacy client) => 0, on all three messages.
     let decoded = WatchRequest::decode([].as_slice())
@@ -469,8 +540,7 @@ fn session_generation_roundtrips_on_watch_report_and_submit_epoch_key() {
          sentinel — the controller records 0 and its gate stays inert for that gateway"
     );
 
-    let decoded = ReportRequest::decode([].as_slice())
-        .expect("an empty ReportRequest must decode");
+    let decoded = ReportRequest::decode([].as_slice()).expect("an empty ReportRequest must decode");
     assert_eq!(
         decoded.session_generation, 0,
         "an absent ReportRequest.session_generation must decode as the 0 legacy/unknown \

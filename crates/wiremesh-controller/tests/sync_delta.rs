@@ -30,7 +30,9 @@ async fn second_gateway_triggers_a_delta_to_the_first() {
         .expect("Sync.Watch stream yielded an error instead of the initial snapshot");
     let snap_rev = match snap_msg.body {
         Some(sync_message::Body::Snapshot(s)) => s.revision,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
 
     // Enrolling a SECOND gateway is a projection-affecting mutation (it adds

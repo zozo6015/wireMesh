@@ -160,9 +160,13 @@ pub fn session_generation() -> u64 {
 /// crate, so having each stamp the nonce makes "every place it must be sent"
 /// structurally closed — a new call site cannot forget it, because there is
 /// no way to construct the request without going through here.
-pub async fn watch(client: &mut SyncClient<Channel>) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
+pub async fn watch(
+    client: &mut SyncClient<Channel>,
+) -> anyhow::Result<tonic::Streaming<SyncMessage>> {
     Ok(client
-        .watch(WatchRequest { session_generation: session_generation() })
+        .watch(WatchRequest {
+            session_generation: session_generation(),
+        })
         .await
         .map_err(|s| anyhow!("Sync.Watch failed: {s}"))?
         .into_inner())
@@ -281,7 +285,9 @@ pub async fn next_event(
     stream: &mut tonic::Streaming<SyncMessage>,
     current: &mut Option<DesiredState>,
 ) -> anyhow::Result<Option<SyncEvent>> {
-    let Some(msg) = stream.next().await else { return Ok(None) };
+    let Some(msg) = stream.next().await else {
+        return Ok(None);
+    };
     let msg = msg.map_err(|s| anyhow!("Sync stream error: {s}"))?;
     Ok(Some(classify(msg.body, current)?))
 }
@@ -298,7 +304,9 @@ fn classify(body: Option<Body>, current: &mut Option<DesiredState>) -> anyhow::R
             Ok(SyncEvent::State(ds))
         }
         Some(Body::Delta(d)) => {
-            let cur = current.as_mut().ok_or_else(|| anyhow!("delta before snapshot"))?;
+            let cur = current
+                .as_mut()
+                .ok_or_else(|| anyhow!("delta before snapshot"))?;
             cur.apply_delta(&d);
             Ok(SyncEvent::State(cur.clone()))
         }
@@ -336,7 +344,10 @@ mod tests {
             }
             other => panic!("expected State, got {other:?}"),
         }
-        assert!(current.is_some(), "snapshot must seed current desired state");
+        assert!(
+            current.is_some(),
+            "snapshot must seed current desired state"
+        );
     }
 
     #[test]
@@ -351,7 +362,10 @@ mod tests {
             SyncEvent::Punch(d) => assert_eq!(d, punch),
             other => panic!("expected Punch, got {other:?}"),
         }
-        assert!(current.is_none(), "a punch directive must not fold into desired state");
+        assert!(
+            current.is_none(),
+            "a punch directive must not fold into desired state"
+        );
     }
 
     #[test]
@@ -362,7 +376,10 @@ mod tests {
             SyncEvent::Rotate(d) => assert_eq!(d.epoch, 5),
             other => panic!("expected Rotate, got {other:?}"),
         }
-        assert!(current.is_none(), "a rotate directive must not fold into desired state");
+        assert!(
+            current.is_none(),
+            "a rotate directive must not fold into desired state"
+        );
     }
 
     #[test]

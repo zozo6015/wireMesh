@@ -132,14 +132,17 @@ async fn mid_rotation_gateway_ids(h: &TestController) -> String {
     let joined = tokio::task::spawn_blocking(move || {
         let db = wiremesh_controller::db::Db::open(&db_path)
             .map_err(|e| format!("<unavailable: opening the controller DB failed: {e}>"))?;
-        db.gateways_with_rotation_state()
-            .map_err(|e| format!("<unavailable: the gateways_with_rotation_state query failed: {e}>"))
+        db.gateways_with_rotation_state().map_err(|e| {
+            format!("<unavailable: the gateways_with_rotation_state query failed: {e}>")
+        })
     })
     .await;
     match joined {
         Ok(Ok(ids)) => format!("{ids:?}"),
         Ok(Err(rendered)) => rendered,
-        Err(e) => format!("<unavailable: the diagnostic DB read task panicked or was cancelled: {e}>"),
+        Err(e) => {
+            format!("<unavailable: the diagnostic DB read task panicked or was cancelled: {e}>")
+        }
     }
 }
 
@@ -157,7 +160,9 @@ async fn open_watch(gw: &StubGateway) -> tonic::Streaming<wiremesh_proto::v1::Sy
         .expect("Sync.Watch stream yielded an error instead of the initial snapshot");
     match first.body {
         Some(sync_message::Body::Snapshot(_)) => {}
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
     stream
 }
@@ -239,7 +244,10 @@ async fn promote_pending_epoch(
          live ack — this file's tests all build on a COMPLETED rotation, so nothing below is \
          meaningful without it; last observed: {states:?}"
     );
-    PromoteWindow { at_or_before, at_or_after }
+    PromoteWindow {
+        at_or_before,
+        at_or_after,
+    }
 }
 
 /// Runs one complete rotation of `a` (admin-initiated, real key submitted,
@@ -397,11 +405,9 @@ async fn promoted_rotation_retires_prior_epoch_with_no_second_rotation_and_no_re
 /// cover RETIRE_GRACE (30s, uncompressible) plus a timer tick, hence 60s.
 #[tokio::test]
 async fn timer_still_rotates_a_gateway_after_a_completed_rotation() {
-    let h = TestController::start_with_rotation_intervals(
-        Some(Duration::from_secs(2)),
-        SWEEP_INTERVAL,
-    )
-    .await;
+    let h =
+        TestController::start_with_rotation_intervals(Some(Duration::from_secs(2)), SWEEP_INTERVAL)
+            .await;
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
     let b = wiremesh_testkit::enroll_one(&h, "gcp", "10.1.0.0/16").await;
     let _b_stream = open_watch(&b).await;

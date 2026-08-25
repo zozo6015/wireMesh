@@ -306,7 +306,10 @@ pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<Enroll
     let mut certdir = None;
     let mut endpoint = None;
     while let Some(flag) = it.next() {
-        let mut val = || it.next().ok_or_else(|| anyhow!("flag {flag} needs a value"));
+        let mut val = || {
+            it.next()
+                .ok_or_else(|| anyhow!("flag {flag} needs a value"))
+        };
         match flag.as_str() {
             "--token" => token = Some(val()?),
             // `--token-file` avoids exposing the token in argv / a shell command
@@ -326,7 +329,9 @@ pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<Enroll
             .trim()
             .to_string(),
         (None, None) => return Err(anyhow!("one of --token or --token-file is required")),
-        (Some(_), Some(_)) => return Err(anyhow!("--token and --token-file are mutually exclusive")),
+        (Some(_), Some(_)) => {
+            return Err(anyhow!("--token and --token-file are mutually exclusive"))
+        }
     };
     Ok(EnrollArgs {
         token,

@@ -34,7 +34,10 @@ impl Drop for KillOnDrop {
 }
 
 fn unique_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("relay-impersonation-test-{tag}-{}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "relay-impersonation-test-{tag}-{}",
+        std::process::id()
+    ))
 }
 
 fn run_ok(bin: &str, args: &[&str]) {
@@ -96,11 +99,7 @@ async fn relay_rejects_registration_under_another_gateways_identity() {
     // finish_connect, same as the certless/denylist rejections in the sibling
     // tests).
     let impostor = wiremesh_relay::Client::connect_with_pems(
-        relay_addr,
-        &gwa_cert,
-        &gwa_key,
-        &ca_pem,
-        "gw-B", // asserting SOMEONE ELSE's identity
+        relay_addr, &gwa_cert, &gwa_key, &ca_pem, "gw-B", // asserting SOMEONE ELSE's identity
         "gw-A",
     )
     .await;

@@ -68,11 +68,13 @@ async fn relay_transport_bridges_datagrams_between_two_gateways() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create certdir");
 
-    wiremesh_relay::test_certs(&dir, &["gw-A", "gw-B"]).expect("test_certs must provision ca+gw-A+gw-B");
+    wiremesh_relay::test_certs(&dir, &["gw-A", "gw-B"])
+        .expect("test_certs must provision ca+gw-A+gw-B");
 
-    let (relay_addr, _relay_handle) = wiremesh_relay::spawn_server("127.0.0.1:0".parse().unwrap(), &dir)
-        .await
-        .expect("spawn_server must bind and return the actual ephemeral address");
+    let (relay_addr, _relay_handle) =
+        wiremesh_relay::spawn_server("127.0.0.1:0".parse().unwrap(), &dir)
+            .await
+            .expect("spawn_server must bind and return the actual ephemeral address");
 
     let ca_pem = std::fs::read_to_string(dir.join("ca.pem")).expect("read ca.pem");
     let gwa_cert = std::fs::read_to_string(dir.join("gw-A.pem")).expect("read gw-A.pem");
@@ -84,12 +86,16 @@ async fn relay_transport_bridges_datagrams_between_two_gateways() {
     // datagram path (throwaway sockets standing in for "unknown ahead of
     // time" local peers) — see `RelayTransport::start`'s doc comment on
     // `local_peer_hint`.
-    let a = RelayTransport::start(relay_addr, &gwa_cert, &gwa_key, &ca_pem, "gw-A", "gw-B", None)
-        .await
-        .expect("gw-A RelayTransport::start (connect+register+pumps)");
-    let b = RelayTransport::start(relay_addr, &gwb_cert, &gwb_key, &ca_pem, "gw-B", "gw-A", None)
-        .await
-        .expect("gw-B RelayTransport::start (connect+register+pumps)");
+    let a = RelayTransport::start(
+        relay_addr, &gwa_cert, &gwa_key, &ca_pem, "gw-A", "gw-B", None,
+    )
+    .await
+    .expect("gw-A RelayTransport::start (connect+register+pumps)");
+    let b = RelayTransport::start(
+        relay_addr, &gwb_cert, &gwb_key, &ca_pem, "gw-B", "gw-A", None,
+    )
+    .await
+    .expect("gw-B RelayTransport::start (connect+register+pumps)");
 
     // Give both transports' registration + pump tasks a moment to settle
     // before the socket dance below relies on them being live.
@@ -131,8 +137,14 @@ async fn relay_transport_bridges_datagrams_between_two_gateways() {
         "B->A payload must arrive at A's last-seen local peer unmodified"
     );
 
-    assert!(a.is_healthy(), "gw-A RelayTransport must report healthy after successful bridging");
-    assert!(b.is_healthy(), "gw-B RelayTransport must report healthy after successful bridging");
+    assert!(
+        a.is_healthy(),
+        "gw-A RelayTransport must report healthy after successful bridging"
+    );
+    assert!(
+        b.is_healthy(),
+        "gw-B RelayTransport must report healthy after successful bridging"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

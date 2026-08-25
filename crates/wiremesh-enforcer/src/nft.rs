@@ -214,7 +214,10 @@ impl NftEnforcer {
     /// separate "apply" step that could do it later for THAT backend's
     /// design).
     pub(crate) fn new(iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Self> {
-        Ok(Self { iface: iface.to_string(), cfg })
+        Ok(Self {
+            iface: iface.to_string(),
+            cfg,
+        })
     }
 }
 
@@ -296,7 +299,10 @@ fn parse_counters_json(bytes: &[u8], table: &str) -> anyhow::Result<Counters> {
         }
     }
 
-    Ok(Counters { by_rule, default_deny })
+    Ok(Counters {
+        by_rule,
+        default_deny,
+    })
 }
 
 /// Pipes `script` to `nft -f -` as a single subprocess invocation: the whole

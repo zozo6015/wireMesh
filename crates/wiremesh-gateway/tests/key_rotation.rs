@@ -162,7 +162,9 @@ impl Drop for RootNetGuard {
 fn attach_underlay(ns: &Ns, tag: &str, ip: &str) {
     let hostend = format!("wmu{tag}h");
     let nsend = format!("wmu{tag}n");
-    run_root(&["ip", "link", "add", &hostend, "type", "veth", "peer", "name", &nsend]);
+    run_root(&[
+        "ip", "link", "add", &hostend, "type", "veth", "peer", "name", &nsend,
+    ]);
     run_root(&["ip", "link", "set", &hostend, "master", BRIDGE]);
     run_root(&["ip", "link", "set", &hostend, "up"]);
     run_root(&["ip", "link", "set", &nsend, "netns", &ns.name]);
@@ -270,17 +272,30 @@ impl Drop for GwProc {
     }
 }
 
-fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, tag: &str) -> GwProc {
+fn spawn_gw(
+    ns: &Ns,
+    statedir: &Path,
+    sync: &str,
+    observe: &str,
+    logdir: &Path,
+    tag: &str,
+) -> GwProc {
     let metrics = format!("0.0.0.0:{METRICS_PORT}");
     let statedir_s = statedir.to_str().unwrap();
     let args = [
         GW_BIN,
-        "--controller-sync", sync,
-        "--observe", observe,
-        "--tun", "wg0",
-        "--wg-port", "51820",
-        "--state-dir", statedir_s,
-        "--metrics", &metrics,
+        "--controller-sync",
+        sync,
+        "--observe",
+        observe,
+        "--tun",
+        "wg0",
+        "--wg-port",
+        "51820",
+        "--state-dir",
+        statedir_s,
+        "--metrics",
+        &metrics,
     ];
     let mut child = ns.spawn(&args).expect("spawn wiremesh-gateway");
     let mut drains = vec![];
@@ -301,7 +316,11 @@ fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, 
             }
         }));
     }
-    GwProc { child, err_log, drains }
+    GwProc {
+        child,
+        err_log,
+        drains,
+    }
 }
 
 // --- traffic probes ----------------------------------------------------------
@@ -364,7 +383,8 @@ while True:
     c.close()
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn listener")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn listener")
 }
 
 fn tcp_connect(ns: &Ns, dst: &str, port: u16) -> bool {
@@ -528,10 +548,16 @@ async fn direct_rotation_is_zero_drop() {
     apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
 
     // Segment veths + workload default routes.
-    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
-        .expect("seg-b veth");
+    lab.veth(
+        (&gwa, "seg0", "10.10.1.1/24"),
+        (&wla, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.2.1/24"),
+        (&wlb, "eth0", "10.10.2.2/24"),
+    )
+    .expect("seg-b veth");
     wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
         .expect("wlA default route");
     wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
@@ -547,8 +573,22 @@ async fn direct_rotation_is_zero_drop() {
     let sync_addr = h.sync_tcp_addr().to_string();
     let observe_addr = h.observe_addr().to_string();
 
-    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let mut pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let mut pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
     let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
@@ -579,7 +619,9 @@ async fn direct_rotation_is_zero_drop() {
     // ===== Rotate gwA's key =====
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .rotate_key(RotateKeyRequest {
+            gateway_id: ga.id(),
+        })
         .await
         .expect("Admin.RotateKey");
     eprintln!("Admin.RotateKey submitted for gwA (epoch 0 -> 1)");
@@ -722,10 +764,16 @@ async fn denied_flow_stays_denied_across_rotation() {
     apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
 
     // Segment veths + workload default routes.
-    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
-        .expect("seg-b veth");
+    lab.veth(
+        (&gwa, "seg0", "10.10.1.1/24"),
+        (&wla, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.2.1/24"),
+        (&wlb, "eth0", "10.10.2.2/24"),
+    )
+    .expect("seg-b veth");
     wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
         .expect("wlA default route");
     wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
@@ -741,8 +789,22 @@ async fn denied_flow_stays_denied_across_rotation() {
     let sync_addr = h.sync_tcp_addr().to_string();
     let observe_addr = h.observe_addr().to_string();
 
-    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let mut pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let mut pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
     let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
@@ -776,7 +838,9 @@ async fn denied_flow_stays_denied_across_rotation() {
     // ===== Rotate gwA's key =====
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .rotate_key(RotateKeyRequest {
+            gateway_id: ga.id(),
+        })
         .await
         .expect("Admin.RotateKey");
     eprintln!("Admin.RotateKey submitted for gwA (epoch 0 -> 1)");
@@ -909,10 +973,16 @@ async fn policy_tighten_after_rotation_reaches_active_tun() {
     apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
 
     // Segment veths + workload default routes.
-    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
-        .expect("seg-b veth");
+    lab.veth(
+        (&gwa, "seg0", "10.10.1.1/24"),
+        (&wla, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.2.1/24"),
+        (&wlb, "eth0", "10.10.2.2/24"),
+    )
+    .expect("seg-b veth");
     wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
         .expect("wlA default route");
     wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
@@ -928,8 +998,22 @@ async fn policy_tighten_after_rotation_reaches_active_tun() {
     let sync_addr = h.sync_tcp_addr().to_string();
     let observe_addr = h.observe_addr().to_string();
 
-    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let mut pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let mut pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
     let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
@@ -957,7 +1041,9 @@ async fn policy_tighten_after_rotation_reaches_active_tun() {
     // ===== Rotate gwA's key =====
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .rotate_key(RotateKeyRequest {
+            gateway_id: ga.id(),
+        })
         .await
         .expect("Admin.RotateKey");
     eprintln!("Admin.RotateKey submitted for gwA (epoch 0 -> 1)");
@@ -1116,10 +1202,16 @@ async fn old_epoch_device_is_torn_down_after_rotation() {
     apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
 
     // Segment veths + workload default routes.
-    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
-        .expect("seg-b veth");
+    lab.veth(
+        (&gwa, "seg0", "10.10.1.1/24"),
+        (&wla, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.2.1/24"),
+        (&wlb, "eth0", "10.10.2.2/24"),
+    )
+    .expect("seg-b veth");
     wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
         .expect("wlA default route");
     wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
@@ -1135,8 +1227,22 @@ async fn old_epoch_device_is_torn_down_after_rotation() {
     let sync_addr = h.sync_tcp_addr().to_string();
     let observe_addr = h.observe_addr().to_string();
 
-    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let mut pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let mut pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
     let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
@@ -1164,7 +1270,9 @@ async fn old_epoch_device_is_torn_down_after_rotation() {
     // ===== Rotate gwA's key =====
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .rotate_key(RotateKeyRequest {
+            gateway_id: ga.id(),
+        })
         .await
         .expect("Admin.RotateKey");
     eprintln!("Admin.RotateKey submitted for gwA (epoch 0 -> 1)");
@@ -1217,9 +1325,7 @@ async fn old_epoch_device_is_torn_down_after_rotation() {
         );
         pa.kill();
         pb.kill();
-        panic!(
-            "old-epoch Device wg0 was not torn down after the rotation retired epoch 0"
-        );
+        panic!("old-epoch Device wg0 was not torn down after the rotation retired epoch 0");
     }
     eprintln!("TEARDOWN PASS: gwA's wg0 (epoch 0) is gone; wg0e1 (epoch 1) is present");
 
@@ -1250,7 +1356,9 @@ async fn old_epoch_device_is_torn_down_after_rotation() {
         "POST-TEARDOWN FAILED: tcp/8080 (policy-allowed) stopped passing after wg0 was torn down \
          — traffic is not actually being carried/enforced on the new tun"
     );
-    eprintln!("POST-TEARDOWN PASS: ICMP and tcp/8080 both still work on wg0e1 after wg0 was torn down");
+    eprintln!(
+        "POST-TEARDOWN PASS: ICMP and tcp/8080 both still work on wg0e1 after wg0 was torn down"
+    );
 
     // ===== POST-TEARDOWN: a policy tightening still reaches the LIVE tun =====
     // Push fabric v2, which removes the tcp/8080 allow. If `apply_state`
@@ -1312,7 +1420,10 @@ fn base64_decode_32(s: &str) -> [u8; 32] {
             _ => panic!("invalid base64 char in test pubkey: {:?}", c as char),
         }
     }
-    let bytes: Vec<u8> = s.bytes().filter(|&c| c != b'=' && !c.is_ascii_whitespace()).collect();
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|&c| c != b'=' && !c.is_ascii_whitespace())
+        .collect();
     let mut out = Vec::new();
     for chunk in bytes.chunks(4) {
         let mut n = 0u32;
@@ -1327,12 +1438,16 @@ fn base64_decode_32(s: &str) -> [u8; 32] {
             out.push(n as u8);
         }
     }
-    out.try_into().expect("WG pubkey must decode to exactly 32 bytes")
+    out.try_into()
+        .expect("WG pubkey must decode to exactly 32 bytes")
 }
 
 /// Lowercase hex of a base64-encoded 32-byte WG pubkey (the UAPI wire form).
 fn base64_pub_to_hex(b64: &str) -> String {
-    base64_decode_32(b64).iter().map(|b| format!("{b:02x}")).collect()
+    base64_decode_32(b64)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Panics loudly unless `python3` actually RUNS in `ns`. Called before every
@@ -1416,7 +1531,8 @@ sys.stdout.write(buf.decode())
 /// correct: boringtun emits the device header before any peer section.
 fn uapi_field(resp: &str, key: &str) -> Option<String> {
     let prefix = format!("{key}=");
-    resp.lines().find_map(|l| l.strip_prefix(prefix.as_str()).map(str::to_string))
+    resp.lines()
+        .find_map(|l| l.strip_prefix(prefix.as_str()).map(str::to_string))
 }
 
 /// BACKLOG 3 TASK 1 done bar (SECURITY): a completed rotation must SURVIVE a
@@ -1506,10 +1622,16 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
 
     // Segment veths + workload default routes.
-    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
-        .expect("seg-b veth");
+    lab.veth(
+        (&gwa, "seg0", "10.10.1.1/24"),
+        (&wla, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.2.1/24"),
+        (&wlb, "eth0", "10.10.2.2/24"),
+    )
+    .expect("seg-b veth");
     wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
         .expect("wlA default route");
     wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
@@ -1525,8 +1647,22 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     let sync_addr = h.sync_tcp_addr().to_string();
     let observe_addr = h.observe_addr().to_string();
 
-    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let mut pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let mut pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
     let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
@@ -1545,7 +1681,9 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     // ===== Rotate gwA's key (case-1 choreography) =====
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .rotate_key(RotateKeyRequest {
+            gateway_id: ga.id(),
+        })
         .await
         .expect("Admin.RotateKey");
     eprintln!("Admin.RotateKey submitted for gwA (epoch 0 -> 1)");
@@ -1659,8 +1797,8 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
         panic!("pkill -KILL -f {sda_str} matched no process — could not crash gwA");
     }
     pa.kill(); // reap the wrapper Child + drain threads
-    // The crash must actually take the data plane down (tun devices die with
-    // their owning process's fds) before the restart re-creates it.
+               // The crash must actually take the data plane down (tun devices die with
+               // their owning process's fds) before the restart re-creates it.
     let dead = wait_until(Duration::from_secs(10), || {
         gwa.exec(&["ip", "link", "show", "wg0e1"]).is_err()
     });
@@ -1674,7 +1812,14 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     eprintln!("CRASH: gwA SIGKILLed; data plane gone");
 
     // ===== Restart gwA from the SAME state dir =====
-    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a-restart");
+    let mut pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a-restart",
+    );
 
     // ===== (a) THE RED ASSERTION: the restarted Device runs the NEW key =====
     // Boot is controller-independent (fail-static), so the base tun must
@@ -1683,7 +1828,8 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     let mut resp = None;
     let probe_ok = wait_until(Duration::from_secs(30), || {
         resp = uapi_get_device(&gwa, "wg0");
-        resp.as_deref().map_or(false, |r| uapi_field(r, "own_public_key").is_some())
+        resp.as_deref()
+            .map_or(false, |r| uapi_field(r, "own_public_key").is_some())
     });
     if !probe_ok {
         dump_diag(
@@ -2159,7 +2305,10 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     let h = TestController::start_on(CTRL_IP.parse().unwrap()).await;
 
     let diff = h.apply(FABRIC_ICMP).await;
-    assert!(diff.policy_updated, "fabric apply must compile a real policy, got: {diff:?}");
+    assert!(
+        diff.policy_updated,
+        "fabric apply must compile a real policy, got: {diff:?}"
+    );
 
     let (a_priv, a_pub) = wg_keypair();
     let (b_priv, b_pub) = wg_keypair();
@@ -2177,10 +2326,16 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     apply_netem(&gwa, "und", 20).expect("netem on gwA underlay");
     apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
 
-    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
-        .expect("seg-b veth");
+    lab.veth(
+        (&gwa, "seg0", "10.10.1.1/24"),
+        (&wla, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.2.1/24"),
+        (&wlb, "eth0", "10.10.2.2/24"),
+    )
+    .expect("seg-b veth");
     wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
         .expect("wlA default route");
     wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
@@ -2194,13 +2349,31 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
 
     let sync_addr = h.sync_tcp_addr().to_string();
     let observe_addr = h.observe_addr().to_string();
-    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let mut pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let mut pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
     let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
     if !up {
-        dump_diag("mesh-not-up", &[("gwA", &gwa), ("gwB", &gwb)], &[("gwA", &pa), ("gwB", &pb)]);
+        dump_diag(
+            "mesh-not-up",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
         pa.kill();
         pb.kill();
         panic!("SETUP FAILED: workload A -> workload B ICMP (policy-permitted) never passed over the direct tunnel before rotation");
@@ -2246,11 +2419,15 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     // be in flight simultaneously for the collision window to open.
     let mut admin = h.admin_client().await;
     admin
-        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .rotate_key(RotateKeyRequest {
+            gateway_id: ga.id(),
+        })
         .await
         .expect("Admin.RotateKey for gwA");
     admin
-        .rotate_key(RotateKeyRequest { gateway_id: gb.id() })
+        .rotate_key(RotateKeyRequest {
+            gateway_id: gb.id(),
+        })
         .await
         .expect("Admin.RotateKey for gwB");
     eprintln!("Admin.RotateKey submitted for BOTH gwA and gwB (in step, epoch 0 -> 1 each)");
@@ -2282,8 +2459,12 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     eprintln!(
         "SAMPLING SUMMARY: gwA paired_peak={:?} max_extra_links={} max_enforcers={} | \
          gwB paired_peak={:?} max_extra_links={} max_enforcers={}",
-        obs_a.paired_peak, obs_a.max_extra_links, obs_a.max_enforcers,
-        obs_b.paired_peak, obs_b.max_extra_links, obs_b.max_enforcers,
+        obs_a.paired_peak,
+        obs_a.max_extra_links,
+        obs_a.max_enforcers,
+        obs_b.paired_peak,
+        obs_b.max_extra_links,
+        obs_b.max_enforcers,
     );
 
     if !done_a || !done_b {
@@ -2294,7 +2475,10 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
         );
         let _ = wla.exec(&["pkill", "-INT", "-x", "ping"]);
         if let Ok(o) = flood.wait_with_output() {
-            eprintln!("--- ping flood output at timeout ---\n{}", String::from_utf8_lossy(&o.stdout));
+            eprintln!(
+                "--- ping flood output at timeout ---\n{}",
+                String::from_utf8_lossy(&o.stdout)
+            );
         }
         pa.kill();
         pb.kill();
@@ -2354,7 +2538,9 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
 
     // ===== Traffic kept flowing across BOTH cutovers =====
     let _ = wla.exec(&["pkill", "-INT", "-x", "ping"]);
-    let flood_out = flood.wait_with_output().expect("wait for ping flood to exit after SIGINT");
+    let flood_out = flood
+        .wait_with_output()
+        .expect("wait for ping flood to exit after SIGINT");
     let flood_stdout = String::from_utf8_lossy(&flood_out.stdout).into_owned();
     eprintln!("--- ping flood summary ---\n{flood_stdout}");
     let (transmitted, received) = parse_ping_summary(&flood_stdout);
@@ -2404,10 +2590,10 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     // for a full `RETIRE_GRACE` (6s), so the window is comfortably wide — but
     // it is a window, and "was it ever right" is the honest question.
     const BASE_WG_PORT: u16 = 51820; // must match `spawn_gw`'s `--wg-port`
-    // The peer's active key lives at `base + OWN_TUN_PORT_OFFSET` between its
-    // cutover and its retire — a RESERVED port, derived from the constant that
-    // reserves it rather than written as `51821`, so a change to the
-    // reservation moves the test with the code instead of silently past it.
+                                     // The peer's active key lives at `base + OWN_TUN_PORT_OFFSET` between its
+                                     // cutover and its retire — a RESERVED port, derived from the constant that
+                                     // reserves it rather than written as `51821`, so a change to the
+                                     // reservation moves the test with the code instead of silently past it.
     let own_tun_port = BASE_WG_PORT + OWN_TUN_PORT_OFFSET;
 
     let a_e1_b64 = poll_epoch_pubkey(&h, ga.id(), 1, Duration::from_secs(10)).await;
@@ -2545,7 +2731,10 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     // ===== Both directions still work once both rotations have settled =====
     // Both sides rotated, so both directions are checked: a one-way check
     // could pass on a pair where only one gateway actually cut over.
-    for (from, dst, label) in [(&wla, "10.10.2.2", "wlA -> wlB"), (&wlb, "10.10.1.2", "wlB -> wlA")] {
+    for (from, dst, label) in [
+        (&wla, "10.10.2.2", "wlA -> wlB"),
+        (&wlb, "10.10.1.2", "wlB -> wlA"),
+    ] {
         if !wait_until(Duration::from_secs(20), || ping_ok(from, dst)) {
             dump_diag(
                 "post-in-step-rotation",
@@ -2713,9 +2902,10 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     // check so that a failure HERE — correct endpoints, no traffic — reads as
     // what it would be: routes, policy or the enforcer, not the rotation
     // endpoint model.
-    for (from, dst, label) in
-        [(&wla, "10.10.2.2", "wlA -> wlB"), (&wlb, "10.10.1.2", "wlB -> wlA")]
-    {
+    for (from, dst, label) in [
+        (&wla, "10.10.2.2", "wlA -> wlB"),
+        (&wlb, "10.10.1.2", "wlB -> wlA"),
+    ] {
         if !wait_until(Duration::from_secs(15), || ping_ok(from, dst)) {
             dump_diag(
                 "post-settle-unreachable",
@@ -2779,7 +2969,10 @@ struct DevSnap {
 /// that, so a peer's own `endpoint=`/port fields can never be mistaken for the
 /// device's.
 fn parse_dev_snap(ifname: &str, resp: &str) -> DevSnap {
-    let mut d = DevSnap { ifname: ifname.to_string(), ..Default::default() };
+    let mut d = DevSnap {
+        ifname: ifname.to_string(),
+        ..Default::default()
+    };
     for line in resp.lines() {
         if let Some(hex) = line.strip_prefix("public_key=") {
             d.peers.push((hex.to_string(), None));
@@ -2871,8 +3064,13 @@ fn fmt_snaps(snaps: &[DevSnap]) -> String {
         s.push_str(&format!(
             "  {} listen_port={} own_pub={}\n",
             d.ifname,
-            d.listen_port.map(|p| p.to_string()).unwrap_or_else(|| "?".into()),
-            d.own_pub_hex.as_deref().map(short_key).unwrap_or_else(|| "?".into()),
+            d.listen_port
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "?".into()),
+            d.own_pub_hex
+                .as_deref()
+                .map(short_key)
+                .unwrap_or_else(|| "?".into()),
         ));
         for (k, ep) in &d.peers {
             s.push_str(&format!(
@@ -3012,7 +3210,10 @@ fn sample_mech(
 ) {
     let devs = uapi_dump_all(ns);
     let hs = latest_handshakes(ns);
-    for d in devs.iter().filter(|d| d.own_pub_hex.as_deref() == Some(own_epoch_hex)) {
+    for d in devs
+        .iter()
+        .filter(|d| d.own_pub_hex.as_deref() == Some(own_epoch_hex))
+    {
         obs.own_epoch_ifnames.insert(d.ifname.clone());
         for (k, ep) in &d.peers {
             if k == peer_epoch_hex {
@@ -3039,10 +3240,17 @@ fn settled_view(
     own_hex: &str,
     peer_hex: &str,
 ) -> (Option<String>, Option<u16>, Option<String>) {
-    let Some(d) = devs.iter().find(|d| d.own_pub_hex.as_deref() == Some(own_hex)) else {
+    let Some(d) = devs
+        .iter()
+        .find(|d| d.own_pub_hex.as_deref() == Some(own_hex))
+    else {
         return (None, None, None);
     };
-    let ep = d.peers.iter().find(|(k, _)| k == peer_hex).and_then(|(_, ep)| ep.clone());
+    let ep = d
+        .peers
+        .iter()
+        .find(|(k, _)| k == peer_hex)
+        .and_then(|(_, ep)| ep.clone());
     (Some(d.ifname.clone()), d.listen_port, ep)
 }
 
@@ -3055,8 +3263,10 @@ fn settled_view(
 fn dump_rot_diag(label: &str, gws: &[(&str, &Ns)], procs: &[(&str, &GwProc)]) {
     eprintln!("\n========== DIAGNOSTICS: {label} ==========");
     for (name, ns) in gws {
-        let devs: Vec<String> =
-            link_names(ns).into_iter().filter(|n| n.starts_with("wg")).collect();
+        let devs: Vec<String> = link_names(ns)
+            .into_iter()
+            .filter(|n| n.starts_with("wg"))
+            .collect();
         eprintln!("--- {name} wireguard devices: {devs:?} ---");
         for d in &devs {
             match ns.exec(&["wg", "show", d]) {
@@ -3067,7 +3277,10 @@ fn dump_rot_diag(label: &str, gws: &[(&str, &Ns)], procs: &[(&str, &GwProc)]) {
                 Err(e) => eprintln!("--- {name} wg show {d} ERR: {e} ---"),
             }
         }
-        eprintln!("--- {name} UAPI get=1 (all devices) ---\n{}", fmt_snaps(&uapi_dump_all(ns)));
+        eprintln!(
+            "--- {name} UAPI get=1 (all devices) ---\n{}",
+            fmt_snaps(&uapi_dump_all(ns))
+        );
         for cmd in [vec!["ip", "route"], vec!["ip", "-br", "addr"]] {
             match ns.exec(&cmd) {
                 Ok(o) => eprintln!(
@@ -3161,7 +3374,10 @@ impl PortObs {
         self.a_listen.iter().map(|(_, p)| *p).collect()
     }
     fn dial_ports(&self) -> BTreeSet<u16> {
-        self.b_dial.iter().filter_map(|(_, ep)| endpoint_port(ep)).collect()
+        self.b_dial
+            .iter()
+            .filter_map(|(_, ep)| endpoint_port(ep))
+            .collect()
     }
     fn summary(&self) -> String {
         format!(
@@ -3275,7 +3491,10 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
     let h = TestController::start_on(CTRL_IP.parse().unwrap()).await;
 
     let diff = h.apply(FABRIC_ICMP).await;
-    assert!(diff.policy_updated, "fabric apply must compile a real policy, got: {diff:?}");
+    assert!(
+        diff.policy_updated,
+        "fabric apply must compile a real policy, got: {diff:?}"
+    );
 
     let (a_priv, a_pub) = wg_keypair();
     let (b_priv, b_pub) = wg_keypair();
@@ -3293,10 +3512,16 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
     apply_netem(&gwa, "und", 20).expect("netem on gwA underlay");
     apply_netem(&gwb, "und", 20).expect("netem on gwB underlay");
 
-    lab.veth((&gwa, "seg0", "10.10.1.1/24"), (&wla, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.2.1/24"), (&wlb, "eth0", "10.10.2.2/24"))
-        .expect("seg-b veth");
+    lab.veth(
+        (&gwa, "seg0", "10.10.1.1/24"),
+        (&wla, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.2.1/24"),
+        (&wlb, "eth0", "10.10.2.2/24"),
+    )
+    .expect("seg-b veth");
     wla.exec(&["ip", "route", "add", "default", "via", "10.10.1.1"])
         .expect("wlA default route");
     wlb.exec(&["ip", "route", "add", "default", "via", "10.10.2.1"])
@@ -3310,8 +3535,22 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
 
     let sync_addr = h.sync_tcp_addr().to_string();
     let observe_addr = h.observe_addr().to_string();
-    let mut pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let mut pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let mut pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let mut pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     let metrics_a = format!("10.9.0.1:{METRICS_PORT}");
     let metrics_b = format!("10.9.0.2:{METRICS_PORT}");
@@ -3319,7 +3558,11 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
     // ===== Wait until the mesh is up (an allowed ICMP flow passes) =====
     let up = wait_until(Duration::from_secs(45), || ping_ok(&wla, "10.10.2.2"));
     if !up {
-        dump_rot_diag("mesh-not-up", &[("gwA", &gwa), ("gwB", &gwb)], &[("gwA", &pa), ("gwB", &pb)]);
+        dump_rot_diag(
+            "mesh-not-up",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
         pa.kill();
         pb.kill();
         panic!("SETUP FAILED: workload A -> workload B ICMP (policy-permitted) never passed over the direct tunnel before any rotation");
@@ -3340,7 +3583,9 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
     // =====================================================================
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .rotate_key(RotateKeyRequest {
+            gateway_id: ga.id(),
+        })
         .await
         .expect("Admin.RotateKey #1");
     eprintln!("Admin.RotateKey #1 submitted for gwA (epoch 0 -> 1)");
@@ -3408,7 +3653,9 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
         std::thread::sleep(Duration::from_secs(1));
     };
     let settled_b = scrape_live_enforcers(&metrics_b);
-    eprintln!("POST-ROTATION-1 live_enforcers: gwA={settled_a:?} gwB={settled_b:?} (only gwA is gated)");
+    eprintln!(
+        "POST-ROTATION-1 live_enforcers: gwA={settled_a:?} gwB={settled_b:?} (only gwA is gated)"
+    );
     if settled_a != Some(1) {
         let links_a = link_names(&gwa);
         dump_rot_diag(
@@ -3458,7 +3705,9 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
     // =====================================================================
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest { gateway_id: ga.id() })
+        .rotate_key(RotateKeyRequest {
+            gateway_id: ga.id(),
+        })
         .await
         .expect("Admin.RotateKey #2");
     eprintln!("Admin.RotateKey #2 submitted for gwA (epoch 1 -> 2) — THE SUBJECT OF THIS TEST");
@@ -3482,7 +3731,10 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
         );
     };
     let epoch2_hex = base64_pub_to_hex(&epoch2_pub_b64);
-    eprintln!("epoch-2 pubkey submitted: {epoch2_pub_b64} (hex {})", short_key(&epoch2_hex));
+    eprintln!(
+        "epoch-2 pubkey submitted: {epoch2_pub_b64} (hex {})",
+        short_key(&epoch2_hex)
+    );
 
     // Sample both sides' ports for the whole rotation-2 window while driving
     // it to completion. 500ms cadence: the epoch-2 own tun and gwB's overlap
@@ -3539,9 +3791,10 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
     // product bar, and if it is dead that is the headline. Both directions,
     // because a one-way check can pass on the residual state of a session that
     // predates the second rotation.
-    for (from, dst, label) in
-        [(&wla, "10.10.2.2", "wlA -> wlB"), (&wlb, "10.10.1.2", "wlB -> wlA")]
-    {
+    for (from, dst, label) in [
+        (&wla, "10.10.2.2", "wlA -> wlB"),
+        (&wlb, "10.10.1.2", "wlB -> wlA"),
+    ] {
         if !wait_until(Duration::from_secs(30), || ping_ok(from, dst)) {
             dump_rot_diag(
                 "post-second-rotation-traffic-dead",
@@ -3759,8 +4012,10 @@ async fn second_rotation_of_same_gateway_keeps_traffic_flowing() {
         }
     }
     let listen_ports: BTreeSet<u16> = settled_listen.iter().map(|(_, p)| *p).collect();
-    let dial_ports: BTreeSet<u16> =
-        settled_dial.iter().filter_map(|(_, ep)| endpoint_port(ep)).collect();
+    let dial_ports: BTreeSet<u16> = settled_dial
+        .iter()
+        .filter_map(|(_, ep)| endpoint_port(ep))
+        .collect();
     eprintln!(
         "\n===== SETTLED PORT STATE (after rotation 2) =====\n\
          gwA listens for epoch 2 on {settled_listen:?} (ports {listen_ports:?})\n\

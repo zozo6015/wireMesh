@@ -294,8 +294,8 @@ async fn policy_rule_rows(
 ) -> Vec<(i64, i64, String, String, String, String, Option<String>)> {
     let path = db_path(h);
     tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open(&path)
-            .expect("opening controller DB for policy_rule_rows");
+        let conn =
+            rusqlite::Connection::open(&path).expect("opening controller DB for policy_rule_rows");
         conn.busy_timeout(Duration::from_secs(5))
             .expect("setting busy_timeout on policy_rule_rows connection");
         let mut stmt = conn
@@ -375,8 +375,8 @@ async fn segment_cidrs(h: &TestController, name: &str) -> Vec<String> {
     let path = db_path(h);
     let name = name.to_string();
     tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open(&path)
-            .expect("opening controller DB for segment_cidrs");
+        let conn =
+            rusqlite::Connection::open(&path).expect("opening controller DB for segment_cidrs");
         conn.busy_timeout(Duration::from_secs(5))
             .expect("setting busy_timeout on segment_cidrs connection");
         let mut stmt = conn
@@ -400,7 +400,9 @@ async fn segment_cidrs(h: &TestController, name: &str) -> Vec<String> {
 /// the common "consume one live delta" step tests (a)/(b) both need,
 /// factored out since (a) must do it twice (peer-upsert + policy update, in
 /// either order).
-async fn recv_delta(stream: &mut tonic::Streaming<wiremesh_proto::v1::SyncMessage>) -> wiremesh_proto::v1::Delta {
+async fn recv_delta(
+    stream: &mut tonic::Streaming<wiremesh_proto::v1::SyncMessage>,
+) -> wiremesh_proto::v1::Delta {
     let msg = tokio::time::timeout(WATCH_TIMEOUT, stream.next())
         .await
         .expect("timed out waiting for a live Sync.Watch delta")
@@ -441,7 +443,9 @@ async fn apply_compiles_real_policy_and_snapshot_carries_it() {
 
     let snap = match msg.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
 
     assert_eq!(
@@ -502,7 +506,9 @@ async fn already_connected_gateway_receives_policy_delta_on_live_apply() {
         .expect("Sync.Watch stream yielded an error instead of the initial snapshot");
     match snap_msg.body {
         Some(sync_message::Body::Snapshot(_)) => {}
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 
     // Same 2 segments (a no-op) PLUS the policy stanza, for the first time —
@@ -620,11 +626,9 @@ async fn reordering_rule_keys_does_not_create_a_new_version() {
 async fn policy_referencing_unknown_segment_is_rejected_and_stores_nothing() {
     let h = TestController::start().await;
 
-    let err = try_apply(&h, FABRIC_UNKNOWN_SEGMENT)
-        .await
-        .expect_err(
-            "applying a policy block that references an undeclared segment ('prod-db') must fail",
-        );
+    let err = try_apply(&h, FABRIC_UNKNOWN_SEGMENT).await.expect_err(
+        "applying a policy block that references an undeclared segment ('prod-db') must fail",
+    );
     assert!(
         err.message().contains("prod-db"),
         "the compile-error status must name the unknown segment 'prod-db', got: {}",
@@ -664,7 +668,10 @@ async fn policy_rule_rows_are_populated_with_correct_ordinals() {
     // Row 0: `deny: { ports: [22], proto: tcp }` — the ssh carve-out, first
     // in written order.
     let (block0, rule0, action0, _src0, _dst0, proto0, ports0) = &rows[0];
-    assert_eq!(*block0, 0, "row 0 must belong to the only (and first) block");
+    assert_eq!(
+        *block0, 0,
+        "row 0 must belong to the only (and first) block"
+    );
     assert_eq!(*rule0, 0, "row 0 must be the first rule in its block");
     assert_eq!(action0, "deny", "row 0 is the deny carve-out");
     assert_eq!(proto0, "tcp");
@@ -754,7 +761,9 @@ async fn cidr_change_updates_segment_and_fans_out_peer_and_policy_deltas() {
         .expect("A's Sync.Watch stream yielded an error instead of the initial snapshot");
     match snap_msg.body {
         Some(sync_message::Body::Snapshot(_)) => {}
-        other => panic!("expected A's first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected A's first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 
     let d1 = h.apply(FABRIC_AWS_PROD_CIDR_GROWN).await;
@@ -771,12 +780,20 @@ async fn cidr_change_updates_segment_and_fans_out_peer_and_policy_deltas() {
         d1
     );
 
-    let deltas = vec![recv_delta(&mut a_stream).await, recv_delta(&mut a_stream).await];
+    let deltas = vec![
+        recv_delta(&mut a_stream).await,
+        recv_delta(&mut a_stream).await,
+    ];
 
     let policy_delta = deltas
         .iter()
         .find(|d| d.policy_version != 0)
-        .unwrap_or_else(|| panic!("expected one of the two deltas to carry a new policy_version, got: {:?}", deltas));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected one of the two deltas to carry a new policy_version, got: {:?}",
+                deltas
+            )
+        });
     assert_eq!(
         policy_delta.policy_version, 2,
         "the CIDR-triggered recompilation must produce version 2, got: {:?}",
@@ -800,7 +817,12 @@ async fn cidr_change_updates_segment_and_fans_out_peer_and_policy_deltas() {
     let peer_delta = deltas
         .iter()
         .find(|d| !d.upserted_peers.is_empty())
-        .unwrap_or_else(|| panic!("expected one of the two deltas to carry B's peer upsert, got: {:?}", deltas));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected one of the two deltas to carry B's peer upsert, got: {:?}",
+                deltas
+            )
+        });
     let peer = &peer_delta.upserted_peers[0];
     assert_eq!(
         peer.gateway_id,
@@ -852,7 +874,9 @@ async fn cidr_change_on_a_policy_unrelated_segment_does_not_recompile() {
         .expect("A's Sync.Watch stream yielded an error instead of the initial snapshot");
     match snap_msg.body {
         Some(sync_message::Body::Snapshot(_)) => {}
-        other => panic!("expected A's first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected A's first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 
     let d1 = h.apply(FABRIC_3SEG_EXTRA_CIDR_GROWN).await;
@@ -880,9 +904,18 @@ async fn cidr_change_on_a_policy_unrelated_segment_does_not_recompile() {
         "this delta must be the CIDR-change peer-upsert only, carrying no policy update, got: {:?}",
         delta
     );
-    assert_eq!(delta.upserted_peers.len(), 1, "expected exactly one upserted peer, got: {:?}", delta);
+    assert_eq!(
+        delta.upserted_peers.len(),
+        1,
+        "expected exactly one upserted peer, got: {:?}",
+        delta
+    );
     let peer = &delta.upserted_peers[0];
-    assert_eq!(peer.gateway_id, d_gw.id(), "the upserted peer must be D (extra-net's gateway)");
+    assert_eq!(
+        peer.gateway_id,
+        d_gw.id(),
+        "the upserted peer must be D (extra-net's gateway)"
+    );
     assert_eq!(peer.segment_name, "extra-net");
     assert!(
         peer.allowed_ips.iter().any(|c| c == "10.20.0.0/16")

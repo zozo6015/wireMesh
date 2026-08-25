@@ -66,7 +66,10 @@ async fn first_run_with_no_legacy_ca_mints_a_working_ca() {
     // Deliberately never created: models a host that has never had a
     // pre-split WireMesh installation.
     let legacy_dir = tmp.path().join("legacy-absent");
-    assert!(!legacy_dir.exists(), "precondition: legacy dir must not exist");
+    assert!(
+        !legacy_dir.exists(),
+        "precondition: legacy dir must not exist"
+    );
 
     let trust = EmbeddedTrust::open_with_legacy_dir(&data_dir, &legacy_dir)
         .expect("a genuine first run with no legacy state must mint, not bail");
@@ -126,8 +129,16 @@ async fn legacy_dir_holding_only_public_material_does_not_block_a_first_run() {
     let donor = tmp.path().join("donor");
     mint_ca_into(&donor);
     std::fs::copy(donor.join("ca.pem"), legacy_dir.join("ca.pem")).unwrap();
-    std::fs::write(legacy_dir.join("relay.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
-    std::fs::write(legacy_dir.join("relay.key"), "-----BEGIN PRIVATE KEY-----\n").unwrap();
+    std::fs::write(
+        legacy_dir.join("relay.pem"),
+        "-----BEGIN CERTIFICATE-----\n",
+    )
+    .unwrap();
+    std::fs::write(
+        legacy_dir.join("relay.key"),
+        "-----BEGIN PRIVATE KEY-----\n",
+    )
+    .unwrap();
     assert!(
         !legacy_dir.join("ca.key").exists(),
         "precondition: the legacy dir must hold no controller CA key"
@@ -171,7 +182,10 @@ fn guard_refuses_and_mints_nothing_when_legacy_ca_key_exists() {
     let data_dir = tmp.path().join("controller-state");
     let legacy_dir = tmp.path().join("legacy");
     mint_ca_into(&legacy_dir);
-    assert!(legacy_dir.join("ca.key").is_file(), "precondition: legacy CA planted");
+    assert!(
+        legacy_dir.join("ca.key").is_file(),
+        "precondition: legacy CA planted"
+    );
 
     let err = EmbeddedTrust::open_with_legacy_dir(&data_dir, &legacy_dir)
         .err()
@@ -351,8 +365,14 @@ fn empty_data_dir_equal_to_legacy_dir_still_mints() {
     EmbeddedTrust::open_with_legacy_dir(&dir, &dir)
         .expect("a fresh PVC mounted at the legacy path is a first run — it must mint, not bail");
 
-    assert!(dir.join("ca.pem").is_file(), "first run must persist ca.pem");
-    assert!(dir.join("ca.key").is_file(), "first run must persist ca.key");
+    assert!(
+        dir.join("ca.pem").is_file(),
+        "first run must persist ca.pem"
+    );
+    assert!(
+        dir.join("ca.key").is_file(),
+        "first run must persist ca.key"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -536,7 +556,9 @@ fn file_mode(path: &Path) -> u32 {
 fn gateway_csr(cn: &str) -> String {
     let kp = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
-    params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
     params.serialize_request(&kp).unwrap().pem().unwrap()
 }
 

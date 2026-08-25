@@ -18,7 +18,10 @@ use std::process::Command;
 /// call site) — a report round with no discoverable local addresses is a
 /// legitimate, non-fatal outcome, not a reason to crash the gateway.
 pub fn local_wg_endpoints(wg_port: u16) -> Vec<String> {
-    let out = match Command::new("ip").args(["-4", "-o", "addr", "show"]).output() {
+    let out = match Command::new("ip")
+        .args(["-4", "-o", "addr", "show"])
+        .output()
+    {
         Ok(out) => out,
         Err(e) => {
             eprintln!("wiremesh-gateway: spawning ip -4 -o addr show failed: {e}");
@@ -111,7 +114,10 @@ mod tests {
 3: eth1    inet 10.1.0.5/24 scope global eth1
 ";
         let got = parse_ip_addr_output(text, 51820);
-        assert_eq!(got, vec!["10.0.0.5:51820".to_string(), "10.1.0.5:51820".to_string()]);
+        assert_eq!(
+            got,
+            vec!["10.0.0.5:51820".to_string(), "10.1.0.5:51820".to_string()]
+        );
     }
 
     #[test]

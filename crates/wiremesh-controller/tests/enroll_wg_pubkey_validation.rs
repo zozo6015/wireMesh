@@ -75,7 +75,11 @@ const VALID_32_BYTE_KEY: &str = "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiI=";
 /// fresh segment — the same setup `wiremesh_testkit::enroll_one` does, but
 /// exposing the raw token/cidr instead of redeeming it immediately, so a
 /// test can attempt (and re-attempt) `Enrollment.Enroll` itself.
-async fn mint_gateway_token(h: &wiremesh_testkit::TestController, segment_name: &str, cidr: &str) -> String {
+async fn mint_gateway_token(
+    h: &wiremesh_testkit::TestController,
+    segment_name: &str,
+    cidr: &str,
+) -> String {
     let mut admin = h.admin_client().await;
     admin
         .create_segment(wiremesh_proto::v1::CreateSegmentRequest {
@@ -141,7 +145,10 @@ async fn enroll_with_a_non_base64_wg_pubkey_is_rejected_and_does_not_consume_the
             "retrying the SAME token with a valid wg_pubkey must succeed — a rejected \
              enroll attempt must not have already spent the single-use token",
         );
-    assert!(resp.into_inner().gateway_id > 0, "expected a real gateway_id to be assigned");
+    assert!(
+        resp.into_inner().gateway_id > 0,
+        "expected a real gateway_id to be assigned"
+    );
 }
 
 #[tokio::test]
@@ -166,7 +173,11 @@ async fn enroll_with_a_wrong_length_wg_pubkey_is_rejected_and_does_not_consume_t
              validates the base64 alphabet and not the decoded length would miss exactly \
              this input.",
         );
-    assert_eq!(status.code(), tonic::Code::InvalidArgument, "got: {status:?}");
+    assert_eq!(
+        status.code(),
+        tonic::Code::InvalidArgument,
+        "got: {status:?}"
+    );
 
     let (good_csr, _kp2) = gen_csr("stub-gw");
     enr.enroll(EnrollRequest {

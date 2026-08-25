@@ -27,7 +27,11 @@
 use wiremesh_controller::cli::{cli_action, CliAction};
 
 fn argv(tokens: &[&str]) -> impl Iterator<Item = String> {
-    tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    tokens
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 #[test]
@@ -39,7 +43,10 @@ fn long_version_flag_yields_crate_version() {
                 "version output must contain CARGO_PKG_VERSION {:?}, got {s:?}",
                 env!("CARGO_PKG_VERSION")
             );
-            assert!(s.contains("wiremesh-controller"), "version line names the binary, got {s:?}");
+            assert!(
+                s.contains("wiremesh-controller"),
+                "version line names the binary, got {s:?}"
+            );
         }
         other => panic!("--version must yield Version, got {:?}", ActionDbg(&other)),
     }
@@ -73,7 +80,10 @@ fn short_help_flag_documents_env_config() {
 /// boot proceeds unchanged.
 #[test]
 fn plain_args_yield_run() {
-    assert!(matches!(cli_action(argv(&["wiremesh-controller"])), CliAction::Run));
+    assert!(matches!(
+        cli_action(argv(&["wiremesh-controller"])),
+        CliAction::Run
+    ));
 }
 
 /// The manual is operator-facing documentation shipped INSIDE the binary, so
@@ -136,8 +146,15 @@ fn assert_manual(m: &str) {
     assert!(!m.trim().is_empty(), "help manual must be non-empty");
     // The controller is env-configured; the manual must document the real
     // WIREMESH_* variables an operator sets (the env-file mechanism note).
-    for needle in ["WIREMESH_DATA_DIR", "WIREMESH_SYNC_TCP_PORT", "WIREMESH_BIND_IP"] {
-        assert!(m.contains(needle), "controller manual must document {needle:?}; got:\n{m}");
+    for needle in [
+        "WIREMESH_DATA_DIR",
+        "WIREMESH_SYNC_TCP_PORT",
+        "WIREMESH_BIND_IP",
+    ] {
+        assert!(
+            m.contains(needle),
+            "controller manual must document {needle:?}; got:\n{m}"
+        );
     }
 }
 

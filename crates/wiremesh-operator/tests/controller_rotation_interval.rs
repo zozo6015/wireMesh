@@ -119,7 +119,11 @@ const BASELINE_ENV: &[(&str, &str)] = &[
 fn controller_container_env(spec: &WiremeshControllerSpec) -> Vec<(String, Option<String>)> {
     let d = controller_deployment("wm", spec, "ghcr.io/x/wiremesh-operator:test");
     let pod = d.spec.unwrap().template.spec.unwrap();
-    let c = pod.containers.iter().find(|c| c.name == "controller").expect("controller container");
+    let c = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "controller")
+        .expect("controller container");
     c.env
         .as_ref()
         .expect("controller container always sets env")
@@ -171,7 +175,10 @@ fn field_compiles_and_round_trips_through_serde() {
 #[test]
 fn the_off_literal_round_trips_unchanged() {
     let v = serde_json::to_value(ctrl_spec(Some("off".into()))).unwrap();
-    assert_eq!(v.get("rotationInterval").and_then(|x| x.as_str()), Some("off"));
+    assert_eq!(
+        v.get("rotationInterval").and_then(|x| x.as_str()),
+        Some("off")
+    );
     let spec: WiremeshControllerSpec = serde_json::from_value(v).unwrap();
     assert_eq!(spec.rotation_interval.as_deref(), Some("off"));
 }
@@ -219,8 +226,10 @@ fn legacy_controller_cr_without_the_field_still_deserializes() {
 #[test]
 fn none_emits_off_explicitly_not_omitted() {
     let env = controller_container_env(&ctrl_spec(None));
-    let matches: Vec<&(String, Option<String>)> =
-        env.iter().filter(|(n, _)| n == "WIREMESH_ROTATION_INTERVAL").collect();
+    let matches: Vec<&(String, Option<String>)> = env
+        .iter()
+        .filter(|(n, _)| n == "WIREMESH_ROTATION_INTERVAL")
+        .collect();
     assert_eq!(
         matches.len(),
         1,
@@ -242,7 +251,11 @@ fn none_emits_off_explicitly_not_omitted() {
          not any other default — anything else either leaves rotation armed or \
          fails closed for the wrong reason: {env:?}"
     );
-    assert_eq!(env.len(), 8, "the env vec is always eight entries now, never seven: {env:?}");
+    assert_eq!(
+        env.len(),
+        8,
+        "the env vec is always eight entries now, never seven: {env:?}"
+    );
     assert_baseline_present(&env);
 }
 
@@ -252,15 +265,21 @@ fn none_emits_off_explicitly_not_omitted() {
 #[test]
 fn some_emits_exactly_one_entry_with_the_value_verbatim() {
     let env = controller_container_env(&ctrl_spec(Some("12h".into())));
-    let matches: Vec<&(String, Option<String>)> =
-        env.iter().filter(|(n, _)| n == "WIREMESH_ROTATION_INTERVAL").collect();
+    let matches: Vec<&(String, Option<String>)> = env
+        .iter()
+        .filter(|(n, _)| n == "WIREMESH_ROTATION_INTERVAL")
+        .collect();
     assert_eq!(
         matches.len(),
         1,
         "exactly one WIREMESH_ROTATION_INTERVAL entry must appear when \
          spec.rotation_interval is Some, never zero or duplicated: {env:?}"
     );
-    assert_eq!(matches[0].1.as_deref(), Some("12h"), "the entry's value must be the CR's value verbatim");
+    assert_eq!(
+        matches[0].1.as_deref(),
+        Some("12h"),
+        "the entry's value must be the CR's value verbatim"
+    );
     assert_eq!(env.len(), 8, "exactly one eighth entry, no more: {env:?}");
     assert_baseline_present(&env);
 }
@@ -302,11 +321,21 @@ fn rotation_env_entry_carries_the_off_literal_verbatim() {
 /// in the container's env, in either name or value, in either order.
 #[test]
 fn the_other_seven_entries_are_byte_identical_across_every_case() {
-    for spec in [ctrl_spec(None), ctrl_spec(Some("off".into())), ctrl_spec(Some("45m".into()))] {
+    for spec in [
+        ctrl_spec(None),
+        ctrl_spec(Some("off".into())),
+        ctrl_spec(Some("45m".into())),
+    ] {
         let env = controller_container_env(&spec);
-        let non_rotation: Vec<&(String, Option<String>)> =
-            env.iter().filter(|(n, _)| n != "WIREMESH_ROTATION_INTERVAL").collect();
-        assert_eq!(non_rotation.len(), 7, "seven non-rotation entries expected: {env:?}");
+        let non_rotation: Vec<&(String, Option<String>)> = env
+            .iter()
+            .filter(|(n, _)| n != "WIREMESH_ROTATION_INTERVAL")
+            .collect();
+        assert_eq!(
+            non_rotation.len(),
+            7,
+            "seven non-rotation entries expected: {env:?}"
+        );
         for (name, value) in BASELINE_ENV {
             let found = non_rotation.iter().find(|(n, _)| n == name);
             assert_eq!(

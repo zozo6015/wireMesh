@@ -181,9 +181,17 @@ pub fn compile(
     let mut distinct_dst: BTreeSet<&str> = BTreeSet::new();
     for block in &blocks {
         for rule in &block.rules {
-            let src = if rule.src.is_empty() { &block.src_cidrs } else { &rule.src };
+            let src = if rule.src.is_empty() {
+                &block.src_cidrs
+            } else {
+                &rule.src
+            };
             distinct_src.extend(src.iter().map(String::as_str));
-            let dst = if rule.dst.is_empty() { &block.dst_cidrs } else { &rule.dst };
+            let dst = if rule.dst.is_empty() {
+                &block.dst_cidrs
+            } else {
+                &rule.dst
+            };
             distinct_dst.extend(dst.iter().map(String::as_str));
         }
     }
@@ -251,8 +259,12 @@ fn normalize_port(spec: &PortSpec) -> (u16, u16) {
                 .split_once('-')
                 .unwrap_or_else(|| unreachable!("compile() requires an already-validated PolicySource: malformed port range '{s}'"));
             (
-                lo.trim().parse().unwrap_or_else(|_| unreachable!("invalid port '{lo}'")),
-                hi.trim().parse().unwrap_or_else(|_| unreachable!("invalid port '{hi}'")),
+                lo.trim()
+                    .parse()
+                    .unwrap_or_else(|_| unreachable!("invalid port '{lo}'")),
+                hi.trim()
+                    .parse()
+                    .unwrap_or_else(|_| unreachable!("invalid port '{hi}'")),
             )
         }
     }

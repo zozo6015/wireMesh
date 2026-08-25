@@ -35,16 +35,14 @@ async fn drain_withdraws_the_gateway_from_its_peers() {
         .expect("Sync.Watch stream yielded an error instead of A's initial snapshot");
     match snap_msg.body {
         Some(sync_message::Body::Snapshot(_)) => {}
-        other => panic!(
-            "expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"
-        ),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 
     h.admin_client()
         .await
-        .drain(DrainRequest {
-            gateway_id: b.id(),
-        })
+        .drain(DrainRequest { gateway_id: b.id() })
         .await
         .expect("Admin.Drain(gateway_id = b.id()) must succeed");
 

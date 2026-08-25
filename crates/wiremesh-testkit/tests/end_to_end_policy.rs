@@ -153,7 +153,10 @@ async fn report_applied_version(gw: &StubGateway, sync_addr: SocketAddr, version
 /// duplicated from `wiremesh_testkit::netns`'s private `wg_keypair` (not
 /// exported; see that module's `wg_lab` for the original).
 fn wg_keypair() -> (String, String) {
-    let priv_out = Command::new("wg").arg("genkey").output().expect("wg genkey");
+    let priv_out = Command::new("wg")
+        .arg("genkey")
+        .output()
+        .expect("wg genkey");
     let privkey = String::from_utf8(priv_out.stdout)
         .expect("wg genkey stdout must be utf8")
         .trim()
@@ -200,8 +203,22 @@ fn design_lab(prefix: &str) -> (Lab, Ns, Ns) {
     let (bpriv, bpub) = wg_keypair();
 
     for (ns, privkey, peer_pub, my_addr, peer_allowed_ips, peer_ep) in [
-        (&a, &apriv, &bpub, "10.10.9.9/16", "172.16.0.0/12", "10.9.20.2:51820"),
-        (&b, &bpriv, &apub, "172.16.1.50/12", "10.10.0.0/16", "10.9.20.1:51820"),
+        (
+            &a,
+            &apriv,
+            &bpub,
+            "10.10.9.9/16",
+            "172.16.0.0/12",
+            "10.9.20.2:51820",
+        ),
+        (
+            &b,
+            &bpriv,
+            &apub,
+            "172.16.1.50/12",
+            "10.10.0.0/16",
+            "10.9.20.1:51820",
+        ),
     ] {
         ns.exec(&["ip", "link", "add", "wg0", "type", "wireguard"])
             .expect("ip link add wg0");
@@ -228,7 +245,8 @@ fn design_lab(prefix: &str) -> (Lab, Ns, Ns) {
                 .mode(0o600)
                 .open(&kf)
                 .expect("create wg private key file with 0600 perms");
-            f.write_all(privkey.as_bytes()).expect("write wg private key");
+            f.write_all(privkey.as_bytes())
+                .expect("write wg private key");
         }
         ns.exec(&[
             "wg",
@@ -282,7 +300,8 @@ while True:
     c.close()
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn accept-only listener")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn accept-only listener")
 }
 
 fn tcp_connect(ns: &Ns, dst_addr: &str, port: u16, timeout_s: u32) -> bool {
@@ -382,7 +401,9 @@ async fn full_pipeline_apply_sync_enforce_report() {
         .expect("Sync.Watch stream yielded an error instead of a message");
     let snap = match msg.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
     assert_eq!(
         snap.policy_version, 1,
@@ -397,7 +418,10 @@ async fn full_pipeline_apply_sync_enforce_report() {
     // 3. Parse those EXACT bytes with PolicyIR::from_json.
     let ir = PolicyIR::from_json(&snap.policy_ir)
         .expect("snapshot policy_ir must parse as a real PolicyIR");
-    assert_eq!(ir.version, 1, "parsed IR version must match the snapshot's policy_version");
+    assert_eq!(
+        ir.version, 1,
+        "parsed IR version must match the snapshot's policy_version"
+    );
     assert_eq!(
         ir.blocks.len(),
         1,
@@ -418,16 +442,32 @@ async fn full_pipeline_apply_sync_enforce_report() {
         "expected the design-§5 example's 3 first-match-wins rules, got: {:?}",
         block.rules
     );
-    assert_eq!(block.rules[0].action, IrAction::Deny, "rule 0 is the ssh carve-out");
+    assert_eq!(
+        block.rules[0].action,
+        IrAction::Deny,
+        "rule 0 is the ssh carve-out"
+    );
     assert_eq!(block.rules[0].proto, IrProto::Tcp);
-    assert!(block.rules[0].ports.contains(&(22, 22)), "rule 0 must be scoped to port 22, got: {:?}", block.rules[0].ports);
-    assert_eq!(block.rules[1].action, IrAction::Allow, "rule 1 is the postgres allow");
+    assert!(
+        block.rules[0].ports.contains(&(22, 22)),
+        "rule 0 must be scoped to port 22, got: {:?}",
+        block.rules[0].ports
+    );
+    assert_eq!(
+        block.rules[1].action,
+        IrAction::Allow,
+        "rule 1 is the postgres allow"
+    );
     assert_eq!(
         block.rules[1].dst,
         vec!["172.16.1.50/32".to_string()],
         "rule 1's dst must be the single postgres host"
     );
-    assert!(block.rules[1].ports.contains(&(5432, 5432)), "rule 1 must be scoped to port 5432, got: {:?}", block.rules[1].ports);
+    assert!(
+        block.rules[1].ports.contains(&(5432, 5432)),
+        "rule 1 must be scoped to port 5432, got: {:?}",
+        block.rules[1].ports
+    );
 
     // 4. Feed that SAME PolicyIR into a real enforcer in a netns lab; send
     //    one packet the policy ALLOWS (tcp/5432 to 172.16.1.50, rule 1) and
@@ -435,7 +475,10 @@ async fn full_pipeline_apply_sync_enforce_report() {
     //    carve-out ahead of any allow); assert the verdicts match the
     //    policy. Run on eBPF (required by design §1's done bar) and
     //    nftables (cheap to also exercise, same lab/apply/probe machinery).
-    for (kind, prefix) in [(BackendKind::Ebpf, "aeth14e"), (BackendKind::Nftables, "aeth14n")] {
+    for (kind, prefix) in [
+        (BackendKind::Ebpf, "aeth14e"),
+        (BackendKind::Nftables, "aeth14n"),
+    ] {
         let ir_for_backend = ir.clone();
         // (Review finding) `enforce_and_probe` -> `join_netns` calls
         // `setns(2)`, which mutates the CALLING OS thread's network
@@ -448,8 +491,7 @@ async fn full_pipeline_apply_sync_enforce_report() {
         // torn down after `.join()`), and only bridge the blocking
         // `.join()` call itself onto `spawn_blocking` -- joining a thread
         // doesn't touch namespaces, so that part is safe to share.
-        let handle =
-            std::thread::spawn(move || enforce_and_probe(&ir_for_backend, kind, prefix));
+        let handle = std::thread::spawn(move || enforce_and_probe(&ir_for_backend, kind, prefix));
         let (delivered_5432, delivered_22) = tokio::task::spawn_blocking(move || handle.join())
             .await
             .unwrap_or_else(|e| panic!("{kind:?} enforcement join-bridging task panicked: {e}"))
@@ -484,7 +526,12 @@ async fn full_pipeline_apply_sync_enforce_report() {
     let gw_info = gateways
         .into_iter()
         .find(|g| g.id == gw.id())
-        .unwrap_or_else(|| panic!("expected the enrolled gateway (id={}) in ListGateways", gw.id()));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the enrolled gateway (id={}) in ListGateways",
+                gw.id()
+            )
+        });
     assert_eq!(
         gw_info.applied_version, 1,
         "ListGateways must reflect the stub gateway's Sync.Report-acked applied_version, got: {:?}",

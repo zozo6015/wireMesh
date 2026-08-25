@@ -72,10 +72,7 @@ fn segments() -> Vec<SegmentDef> {
 /// controller's `apply::compile_policy`) run both stages back-to-back, so
 /// "the pipeline rejects it" is the stable behavioral pin, not which stage
 /// fired.
-fn compile_pipeline(
-    yaml: &str,
-    segments: &[SegmentDef],
-) -> Result<PolicyIR, Vec<CompileError>> {
+fn compile_pipeline(yaml: &str, segments: &[SegmentDef]) -> Result<PolicyIR, Vec<CompileError>> {
     let src = parse_policy(yaml, segments)?;
     compile(&src, segments, 1)
 }
@@ -128,8 +125,9 @@ fn assert_names_lpm_limit(errors: &[CompileError], side: &str) {
 #[test]
 fn compile_ok_at_exactly_1024_distinct_cidrs_on_one_rule_side() {
     let yaml = yaml_with_rule_src(&quoted_slash32s("10.0", LPM_CAP));
-    let ir = compile_pipeline(&yaml, &segments())
-        .unwrap_or_else(|e| panic!("exactly {LPM_CAP} distinct src CIDRs must compile Ok, got: {e:?}"));
+    let ir = compile_pipeline(&yaml, &segments()).unwrap_or_else(|e| {
+        panic!("exactly {LPM_CAP} distinct src CIDRs must compile Ok, got: {e:?}")
+    });
     assert_eq!(ir.blocks[0].rules[0].src.len(), LPM_CAP);
 }
 
@@ -182,7 +180,8 @@ fn compile_errs_when_segment_fallback_side_carries_1025_distinct_cidrs() {
             cidrs: vec!["10.1.0.0/16".parse().unwrap()],
         },
     ];
-    let yaml = "policy:\n  - from: seg-big\n    to: seg-b\n    rules:\n      - allow: { proto: tcp }\n";
+    let yaml =
+        "policy:\n  - from: seg-big\n    to: seg-b\n    rules:\n      - allow: { proto: tcp }\n";
     let errors = compile_pipeline(yaml, &segments).expect_err(
         "a src-less rule falls back to its 1025-CIDR from-segment, overflowing \
          the 1024-entry LPM trie — must be a compile-time error",
@@ -235,7 +234,8 @@ fn referenced_segment_with_no_cidrs_is_a_compile_error() {
             cidrs: vec!["10.1.0.0/16".parse().unwrap()],
         },
     ];
-    let yaml = "policy:\n  - from: empty-seg\n    to: seg-b\n    rules:\n      - allow: { proto: icmp }\n";
+    let yaml =
+        "policy:\n  - from: empty-seg\n    to: seg-b\n    rules:\n      - allow: { proto: icmp }\n";
     let errors = compile_pipeline(yaml, &segments).expect_err(
         "a policy referencing a zero-CIDR segment must fail compilation, not \
          produce an IR block whose side matches nothing",

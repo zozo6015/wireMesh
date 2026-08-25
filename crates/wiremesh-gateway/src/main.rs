@@ -156,8 +156,9 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
                 {
                     continue; // nothing would be written; nothing to gate on
                 }
-                if let Some(left) =
-                    enforcer.apply_ready_at().map(|t| t.saturating_duration_since(now))
+                if let Some(left) = enforcer
+                    .apply_ready_at()
+                    .map(|t| t.saturating_duration_since(now))
                 {
                     if !left.is_zero() {
                         deferred.push((*id, left));
@@ -204,9 +205,15 @@ impl wiremesh_gateway::policy_apply::PolicyApplyTarget for EnforcerApplyTarget {
             // the worker only sees an opaque `anyhow::Error`, so no test can
             // assert its contents. It must therefore say, on its own, what
             // happened, what is stale right now, and what will fix it.
-            let longest = deferred.iter().map(|(_, left)| *left).max().unwrap_or_default();
-            let tuns: Vec<String> =
-                deferred.iter().map(|(id, left)| format!("{id:?} ({left:?} left)")).collect();
+            let longest = deferred
+                .iter()
+                .map(|(_, left)| *left)
+                .max()
+                .unwrap_or_default();
+            let tuns: Vec<String> = deferred
+                .iter()
+                .map(|(id, left)| format!("{id:?} ({left:?} left)"))
+                .collect();
             anyhow::bail!(
                 "policy version {} was installed on tun(s) {installed:?} but NOT on {} of \
                  them — tun(s) [{}] are still inside their post-flip reap grace. They were \
@@ -488,7 +495,9 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // `tunnelset::TunnelId`). Not planned via `plan_tunnel`: the boot tun IS
     // the base tun at the base port by definition (OD-1), which is exactly
     // why the planner has to be handed the live set rather than deriving it.
-    let boot_tun_id = TunnelId::Own { epoch: boot_key.epoch };
+    let boot_tun_id = TunnelId::Own {
+        epoch: boot_key.epoch,
+    };
     let mut tunnels = TunnelSet::new();
     tunnels.bring_up(
         boot_tun_id,
@@ -609,7 +618,10 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // `FailStaticWriter` for what it refuses to persist and why.
     let mut fail_static = FailStaticWriter::seeded_from(applied.as_ref());
     if let Some(ds) = &applied {
-        eprintln!("wiremesh-gateway: fail-static boot from state.json rev {}", ds.revision);
+        eprintln!(
+            "wiremesh-gateway: fail-static boot from state.json rev {}",
+            ds.revision
+        );
         apply_state(None, ds, &active, &wg0_pins, &live_endpoints).await?;
         // The enforcer half goes through the worker here too, so boot and
         // steady state share one install path. No reap is pending at boot
@@ -648,7 +660,9 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     }
                 };
                 let k = key.clone();
-                let res = tokio::task::spawn_blocking(move || observe::report_once(port, a, &k, gid)).await;
+                let res =
+                    tokio::task::spawn_blocking(move || observe::report_once(port, a, &k, gid))
+                        .await;
                 match res {
                     Ok(Ok(addr)) => eprintln!("wiremesh-gateway: observed endpoint {addr}"),
                     Ok(Err(e)) => eprintln!("wiremesh-gateway: observe failed: {e}"),
@@ -693,9 +707,13 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // (review finding: these were rendered/tested in `metrics.rs` but never
     // actually reached the HTTP scrape).
     {
-        let metrics_listener =
-            TcpListener::bind(cfg.metrics_addr).await.context("binding metrics listener")?;
-        eprintln!("wiremesh-gateway: metrics listening on {}", metrics_listener.local_addr()?);
+        let metrics_listener = TcpListener::bind(cfg.metrics_addr)
+            .await
+            .context("binding metrics listener")?;
+        eprintln!(
+            "wiremesh-gateway: metrics listening on {}",
+            metrics_listener.local_addr()?
+        );
         let enforcers = enforcers.clone();
         let applied_version = applied_version.clone();
         let ctx = ctx.clone();
@@ -748,8 +766,13 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         .iter()
                         .map(|(gid, path)| (gid.to_string(), path.state))
                         .collect();
-                    let transitions: Vec<((PathState, PathState), u64)> =
-                        ctx.transitions.lock().unwrap().iter().map(|(k, v)| (*k, *v)).collect();
+                    let transitions: Vec<((PathState, PathState), u64)> = ctx
+                        .transitions
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .map(|(k, v)| (*k, *v))
+                        .collect();
                     // Per-peer rx/tx/handshake-age gauges (fix T5, finding
                     // §6): rendered from the snapshot `run_path_ticks`
                     // published off the SAME UAPI fetch the path SM diffed
@@ -766,9 +789,9 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         .unwrap()
                         .iter()
                         .map(|(gid, pl)| {
-                            let age = pl.latest_handshake.map(|t| {
-                                reported_handshake_age(t, SystemTime::now()).as_secs()
-                            });
+                            let age = pl
+                                .latest_handshake
+                                .map(|t| reported_handshake_age(t, SystemTime::now()).as_secs());
                             (
                                 gid.to_string(),
                                 metrics::PeerStats {
@@ -939,9 +962,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         )
                         .await
                         {
-                            eprintln!(
-                                "wiremesh-gateway: prompt path-snapshot report failed: {e}"
-                            );
+                            eprintln!("wiremesh-gateway: prompt path-snapshot report failed: {e}");
                         }
                     }
 
@@ -1145,8 +1166,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                             // storm re-fired every few seconds, so
                             // once-per-directive would flood the log).
                             let should_punch = {
-                                let state =
-                                    ctx.paths.lock().unwrap().get(&gid).map(|p| p.state);
+                                let state = ctx.paths.lock().unwrap().get(&gid).map(|p| p.state);
                                 let pointed = ctx
                                     .relay_pointed
                                     .lock()
@@ -1450,7 +1470,12 @@ impl PathCtx {
         if before == after {
             return;
         }
-        *self.transitions.lock().unwrap().entry((before, after)).or_insert(0) += 1;
+        *self
+            .transitions
+            .lock()
+            .unwrap()
+            .entry((before, after))
+            .or_insert(0) += 1;
         eprintln!(
             "wiremesh-gateway: path peer={gid} {} -> {}",
             before.as_str(),
@@ -1493,9 +1518,7 @@ impl PathCtx {
             let was_backed_off = backoff.backoff_until().is_some();
             backoff.record_success();
             if was_backed_off {
-                eprintln!(
-                    "wiremesh-gateway: peer={gid} punch back-off cleared (punch confirmed)"
-                );
+                eprintln!("wiremesh-gateway: peer={gid} punch back-off cleared (punch confirmed)");
             }
         } else {
             let now = Instant::now();
@@ -1533,8 +1556,18 @@ impl PathCtx {
             return None;
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        slots.insert(gid, PunchSlot { origin, cancel: cancel.clone() });
-        Some(PunchGuard { punching: self.punching.clone(), gid, cancel })
+        slots.insert(
+            gid,
+            PunchSlot {
+                origin,
+                cancel: cancel.clone(),
+            },
+        );
+        Some(PunchGuard {
+            punching: self.punching.clone(),
+            gid,
+            cancel,
+        })
     }
 
     /// (Round 5, directive preemption) If peer `gid`'s in-flight punch slot
@@ -1568,7 +1601,10 @@ impl PathCtx {
         if !set.insert(gid) {
             return None;
         }
-        Some(RelayConnectGuard { connecting: self.relay_connecting.clone(), gid })
+        Some(RelayConnectGuard {
+            connecting: self.relay_connecting.clone(),
+            gid,
+        })
     }
 
     /// Snapshot the gateway's current per-relay health for `Sync.Report`
@@ -1587,7 +1623,10 @@ impl PathCtx {
             let healthy = by_relay.entry(peer_relay.relay_id).or_insert(false);
             *healthy = *healthy || peer_relay.transport.is_healthy();
         }
-        by_relay.into_iter().map(|(relay_id, healthy)| RelayHealth { relay_id, healthy }).collect()
+        by_relay
+            .into_iter()
+            .map(|(relay_id, healthy)| RelayHealth { relay_id, healthy })
+            .collect()
     }
 }
 
@@ -1639,8 +1678,9 @@ impl PunchGuard {
 impl Drop for PunchGuard {
     fn drop(&mut self) {
         let mut slots = self.punching.lock().unwrap();
-        let still_ours =
-            slots.get(&self.gid).is_some_and(|s| Arc::ptr_eq(&s.cancel, &self.cancel));
+        let still_ours = slots
+            .get(&self.gid)
+            .is_some_and(|s| Arc::ptr_eq(&s.cancel, &self.cancel));
         if still_ours {
             slots.remove(&self.gid);
         }
@@ -1752,7 +1792,8 @@ impl punch::NudgeSink for TunNudgeSink {
         let sock = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))
             .context("binding ephemeral nudge socket")?;
         let dst = SocketAddr::from((overlay_ip, NUDGE_DST_PORT));
-        sock.send_to(&[0u8; 1], dst).with_context(|| format!("sending nudge to {dst}"))?;
+        sock.send_to(&[0u8; 1], dst)
+            .with_context(|| format!("sending nudge to {dst}"))?;
         Ok(())
     }
 }
@@ -1786,9 +1827,15 @@ async fn poke_peer_overlay(ctx: &PathCtx, gid: u64) {
         .lock()
         .unwrap()
         .as_ref()
-        .and_then(|ds| ds.peers.iter().find(|p| p.gateway_id == gid).map(|p| p.allowed_ips.clone()))
+        .and_then(|ds| {
+            ds.peers
+                .iter()
+                .find(|p| p.gateway_id == gid)
+                .map(|p| p.allowed_ips.clone())
+        })
         .unwrap_or_default();
-    match tokio::task::spawn_blocking(move || punch::nudge_peer(&TunNudgeSink, &allowed_ips)).await {
+    match tokio::task::spawn_blocking(move || punch::nudge_peer(&TunNudgeSink, &allowed_ips)).await
+    {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => eprintln!("wiremesh-gateway: overlay poke to peer={gid} failed: {e}"),
         Err(e) => eprintln!("wiremesh-gateway: overlay poke task for peer={gid} panicked: {e}"),
@@ -1885,7 +1932,9 @@ async fn punch_and_apply(
     // Connecting. Guard dropped before the first await below.
     {
         let mut paths = ctx.paths.lock().unwrap();
-        paths.entry(gid).or_insert_with(|| Path::new(Instant::now()));
+        paths
+            .entry(gid)
+            .or_insert_with(|| Path::new(Instant::now()));
     }
 
     let mut trial = punch::CandidateTrial::new(&candidates, Instant::now());
@@ -1964,8 +2013,17 @@ async fn punch_and_apply(
         // mid-trial), and punching a de-rostered peer must yield.
         let (connecting, relay_pointed_now) = {
             let state = ctx.paths.lock().unwrap().get(&gid).map(|p| p.state);
-            let pointed = ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
-            (state.is_some() && directive_should_punch(state, pointed), pointed)
+            let pointed = ctx
+                .relay_pointed
+                .lock()
+                .unwrap()
+                .get(&gid)
+                .copied()
+                .unwrap_or(false);
+            (
+                state.is_some() && directive_should_punch(state, pointed),
+                pointed,
+            )
         };
         if !connecting {
             // Low-noise, and deliberately NOT worded with any of the four
@@ -2144,8 +2202,13 @@ async fn directive_punch_handoff(ctx: PathCtx, gid: u64, candidates: Vec<String>
         if let Some(guard) = ctx.try_start_punch(gid, PunchOrigin::Directive) {
             let should_punch = {
                 let state = ctx.paths.lock().unwrap().get(&gid).map(|p| p.state);
-                let pointed =
-                    ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+                let pointed = ctx
+                    .relay_pointed
+                    .lock()
+                    .unwrap()
+                    .get(&gid)
+                    .copied()
+                    .unwrap_or(false);
                 directive_should_punch(state, pointed)
             };
             if should_punch && ctx.punch_allowed(gid, &candidates) {
@@ -2266,8 +2329,13 @@ async fn set_peer_endpoint(
             .get(&gid)
             .map(|p| p.state == PathState::Connecting)
             .unwrap_or(false);
-        let relay_installed =
-            ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+        let relay_installed = ctx
+            .relay_pointed
+            .lock()
+            .unwrap()
+            .get(&gid)
+            .copied()
+            .unwrap_or(false);
         if !connecting || relay_installed {
             return Ok(false);
         }
@@ -2281,7 +2349,10 @@ async fn set_peer_endpoint(
     // ever materializes.) Deliberately recorded AFTER the MAJOR-1 yield check:
     // a yielded direct punch must NOT leave a stale direct pin behind, or a
     // later `apply_state` rebuild would use it to clobber the relay endpoint.
-    ctx.live_endpoints.lock().unwrap().insert(gid, endpoint.to_string());
+    ctx.live_endpoints
+        .lock()
+        .unwrap()
+        .insert(gid, endpoint.to_string());
     // Publish the pin mutation to the path tick's endpoint read-through
     // (port-authority fix, piece 1): bumped HERE — under `endpoint_commit`,
     // immediately after the pin write and BEFORE the device write — so a tick
@@ -2314,11 +2385,11 @@ async fn set_peer_endpoint(
         // exists for it, else its advertised active key — the SAME resolution
         // `device_config_pinned` used to build the target's block, so it always
         // matches a block in `dev.peers`.
-        let target_pubkey = ds
-            .peers
-            .iter()
-            .find(|p| p.gateway_id == gid)
-            .and_then(|p| pins.get(&gid).cloned().or_else(|| p.active_pubkey_b64.clone()));
+        let target_pubkey = ds.peers.iter().find(|p| p.gateway_id == gid).and_then(|p| {
+            pins.get(&gid)
+                .cloned()
+                .or_else(|| p.active_pubkey_b64.clone())
+        });
         (dev, target_pubkey)
     };
     // SCOPED apply (session-continuity fix): re-point ONLY this peer via
@@ -2369,8 +2440,8 @@ async fn apply_peer_endpoint_scoped(
     // unlike the old code — DON'T fabricate guard state for the whole device:
     // leave `applied_config`/`applied_peers` untouched so a later reconcile
     // sees the true drift.
-    let Some(peer) = target_pubkey
-        .and_then(|pk| dev.peers.iter().find(|p| p.public_key_b64 == pk).cloned())
+    let Some(peer) =
+        target_pubkey.and_then(|pk| dev.peers.iter().find(|p| p.public_key_b64 == pk).cloned())
     else {
         return Ok(());
     };
@@ -2403,7 +2474,11 @@ async fn apply_peer_endpoint_scoped(
     // `apply_state` reconciles the peer that was left removed.
     {
         let mut a = active.lock().unwrap();
-        match a.applied_peers.iter_mut().find(|p| p.public_key_b64 == peer.public_key_b64) {
+        match a
+            .applied_peers
+            .iter_mut()
+            .find(|p| p.public_key_b64 == peer.public_key_b64)
+        {
             Some(existing) => *existing = peer.clone(),
             None => a.applied_peers.push(peer.clone()),
         }
@@ -2436,7 +2511,11 @@ async fn apply_peer_endpoint_scoped(
 /// concurrent attempt for the same peer via
 /// [`PathCtx::try_start_relay_connect`], mirroring [`punch_and_apply`]'s
 /// `punching` guard.
-async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_proto::v1::RelayInfo>) {
+async fn ensure_relay_transport(
+    ctx: PathCtx,
+    gid: u64,
+    relays: Vec<wiremesh_proto::v1::RelayInfo>,
+) {
     if relays.is_empty() {
         return;
     }
@@ -2497,8 +2576,10 @@ async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_pro
     // (Cycle 4c Task 9 fix) rather than waiting to learn it from the first
     // datagram, which would otherwise silently drop the very first relayed
     // handshake packet on whichever side hasn't sent anything locally yet.
-    let local_peer_hint =
-        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, ctx.active.lock().unwrap().wg_port));
+    let local_peer_hint = SocketAddr::from((
+        std::net::Ipv4Addr::LOCALHOST,
+        ctx.active.lock().unwrap().wg_port,
+    ));
     let transport = match RelayTransport::start(
         addr,
         &identity.cert_pem,
@@ -2526,7 +2607,13 @@ async fn ensure_relay_transport(ctx: PathCtx, gid: u64, relays: Vec<wiremesh_pro
     // QUIC connection — see `RelayTransport::Drop`).
     {
         let mut map = ctx.relay_transports.lock().await;
-        map.insert(gid, PeerRelay { transport, relay_id });
+        map.insert(
+            gid,
+            PeerRelay {
+                transport,
+                relay_id,
+            },
+        );
     }
 
     // The relay path never yields (is_relay=true → always `Ok(true)` or `Err`).
@@ -2594,8 +2681,15 @@ async fn send_paths_snapshot_report(
             state: p.state.as_str().to_string(),
         })
         .collect();
-    sync::report(client, applied_version, local_endpoints, relay_health, vec![], Some(peer_paths))
-        .await
+    sync::report(
+        client,
+        applied_version,
+        local_endpoints,
+        relay_health,
+        vec![],
+        Some(peer_paths),
+    )
+    .await
 }
 
 /// Minimum spacing between PROMPT (notify-triggered) path-snapshot reports —
@@ -2741,24 +2835,23 @@ async fn run_path_ticks(ctx: PathCtx) {
         // commit landed while this fetch was in flight (see
         // `PathCtx::endpoint_commit_gen` for the interleaving this closes).
         let commit_gen_at_read = ctx.endpoint_commit_gen.load(Ordering::SeqCst);
-        let liveness = match tokio::task::spawn_blocking(move || {
-            uapi::get_peer_liveness(&ifname)
-        })
-        .await
-        {
-            Ok(Ok(m)) => m,
-            Ok(Err(e)) => {
-                eprintln!("wiremesh-gateway: path-tick handshake read failed: {e}");
-                continue;
-            }
-            Err(e) => {
-                eprintln!("wiremesh-gateway: path-tick handshake task panicked: {e}");
-                continue;
-            }
-        };
+        let liveness =
+            match tokio::task::spawn_blocking(move || uapi::get_peer_liveness(&ifname)).await {
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => {
+                    eprintln!("wiremesh-gateway: path-tick handshake read failed: {e}");
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("wiremesh-gateway: path-tick handshake task panicked: {e}");
+                    continue;
+                }
+            };
 
         // Snapshot desired state (guard dropped immediately).
-        let Some(ds) = ctx.desired.lock().unwrap().clone() else { continue };
+        let Some(ds) = ctx.desired.lock().unwrap().clone() else {
+            continue;
+        };
         let desired_gids: HashSet<u64> = ds.peers.iter().map(|p| p.gateway_id).collect();
 
         // Review/debug cleanup (Cycle 4c Task 9 minor): a peer dropped from
@@ -2769,14 +2862,26 @@ async fn run_path_ticks(ctx: PathCtx) {
         // tasks) leaked open for a peer nothing references anymore. Prune
         // both, closing any stale transport exactly like the make-before-break
         // teardown does elsewhere in this function.
-        ctx.relay_pointed.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
-        ctx.relay_next_idx.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
+        ctx.relay_pointed
+            .lock()
+            .unwrap()
+            .retain(|gid, _| desired_gids.contains(gid));
+        ctx.relay_next_idx
+            .lock()
+            .unwrap()
+            .retain(|gid, _| desired_gids.contains(gid));
         // Same rationale for the T4 endpoint pins and T3 back-off state: a
         // peer removed from the fabric must not leave a stale pin (which
         // could otherwise resurface if the id were ever reused) or an
         // orphaned back-off entry behind.
-        ctx.live_endpoints.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
-        ctx.punch_backoff.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
+        ctx.live_endpoints
+            .lock()
+            .unwrap()
+            .retain(|gid, _| desired_gids.contains(gid));
+        ctx.punch_backoff
+            .lock()
+            .unwrap()
+            .retain(|gid, _| desired_gids.contains(gid));
         // Same rationale again for the path map (directive-storm fix
         // review): a peer dropped from the fabric otherwise kept its `Path`
         // entry forever — unbounded growth, AND the sync loop's Report would
@@ -2785,7 +2890,10 @@ async fn run_path_ticks(ctx: PathCtx) {
         // pair that no longer exists). The tick loop below re-creates
         // entries for every desired peer anyway (`paths.entry(..)
         // .or_insert_with`), so pruning here is always safe.
-        ctx.paths.lock().unwrap().retain(|gid, _| desired_gids.contains(gid));
+        ctx.paths
+            .lock()
+            .unwrap()
+            .retain(|gid, _| desired_gids.contains(gid));
         // MINOR-6: this loop's OWN per-peer bookkeeping maps must be pruned on
         // the same desired-peer set too — unlike the `ctx`-level maps above they
         // are task-local, but a peer dropped from the fabric (or a reused gid)
@@ -2805,8 +2913,11 @@ async fn run_path_ticks(ctx: PathCtx) {
         let relays_advertised = !ds.relays.is_empty();
         let healthy_relay: HashMap<u64, bool> = {
             let mut map = ctx.relay_transports.lock().await;
-            let stale: Vec<u64> =
-                map.keys().copied().filter(|gid| !desired_gids.contains(gid)).collect();
+            let stale: Vec<u64> = map
+                .keys()
+                .copied()
+                .filter(|gid| !desired_gids.contains(gid))
+                .collect();
             for gid in stale {
                 if let Some(peer_relay) = map.remove(&gid) {
                     peer_relay.transport.close();
@@ -2820,7 +2931,9 @@ async fn run_path_ticks(ctx: PathCtx) {
             ds.peers
                 .iter()
                 .map(|p| {
-                    let healthy = map.get(&p.gateway_id).is_some_and(|pr| pr.transport.is_healthy());
+                    let healthy = map
+                        .get(&p.gateway_id)
+                        .is_some_and(|pr| pr.transport.is_healthy());
                     (p.gateway_id, healthy)
                 })
                 .collect()
@@ -2853,8 +2966,12 @@ async fn run_path_ticks(ctx: PathCtx) {
         {
             let mut paths = ctx.paths.lock().unwrap();
             for peer in &ds.peers {
-                let Some(b64) = peer.active_pubkey_b64.as_deref() else { continue };
-                let Some(hex) = pubkey_b64_to_hex(b64) else { continue };
+                let Some(b64) = peer.active_pubkey_b64.as_deref() else {
+                    continue;
+                };
+                let Some(hex) = pubkey_b64_to_hex(b64) else {
+                    continue;
+                };
                 let gid = peer.gateway_id;
                 let path = paths.entry(gid).or_insert_with(|| Path::new(now));
                 let before = path.state;
@@ -2914,8 +3031,7 @@ async fn run_path_ticks(ctx: PathCtx) {
                         // every tick between handshakes and false at the
                         // genuine event).
                         let age = reported_handshake_age(t, SystemTime::now());
-                        let new_handshake =
-                            last_hs_age.get(&gid).map_or(true, |prev| age < *prev);
+                        let new_handshake = last_hs_age.get(&gid).map_or(true, |prev| age < *prev);
                         last_hs_age.insert(gid, age);
 
                         // Mesh-convergence fix T2: a handshake event is ONLY
@@ -2950,8 +3066,13 @@ async fn run_path_ticks(ctx: PathCtx) {
                             // Corroborated in the same tick — the genuine
                             // completed-handshake case (data resumed with it).
                             pending_hs.remove(&gid);
-                            let relay_pointed =
-                                ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+                            let relay_pointed = ctx
+                                .relay_pointed
+                                .lock()
+                                .unwrap()
+                                .get(&gid)
+                                .copied()
+                                .unwrap_or(false);
                             if relay_pointed {
                                 path.on_authenticated_inbound(now);
                             } else {
@@ -2976,8 +3097,13 @@ async fn run_path_ticks(ctx: PathCtx) {
                                 Some(hs_at) if now.saturating_duration_since(hs_at)
                                     <= HANDSHAKE_CORROBORATION_WINDOW
                             );
-                            let relay_pointed =
-                                ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false);
+                            let relay_pointed = ctx
+                                .relay_pointed
+                                .lock()
+                                .unwrap()
+                                .get(&gid)
+                                .copied()
+                                .unwrap_or(false);
                             if promoted && !relay_pointed {
                                 path.on_handshake(now, true);
                             } else {
@@ -2991,9 +3117,7 @@ async fn run_path_ticks(ctx: PathCtx) {
                     relays_advertised && *healthy_relay.get(&gid).unwrap_or(&false);
                 let action = path.tick(now, relay_available);
                 match action {
-                    Some(PathAction::StartPunch) => {
-                        to_punch.push((gid, peer.candidates.clone()))
-                    }
+                    Some(PathAction::StartPunch) => to_punch.push((gid, peer.candidates.clone())),
                     // Deliberate no-op: `ProbeDirect` only fires while
                     // `Relayed`, and `punch_and_apply`'s MAJOR-1 make-before-
                     // break guard yields the moment the path isn't
@@ -3042,7 +3166,13 @@ async fn run_path_ticks(ctx: PathCtx) {
                 if !matches!(action, Some(PathAction::RelayDied))
                     && path.state != PathState::Relayed
                     && !*healthy_relay.get(&gid).unwrap_or(&false)
-                    && ctx.relay_pointed.lock().unwrap().get(&gid).copied().unwrap_or(false)
+                    && ctx
+                        .relay_pointed
+                        .lock()
+                        .unwrap()
+                        .get(&gid)
+                        .copied()
+                        .unwrap_or(false)
                 {
                     to_sweep_pin.push(gid);
                 }
@@ -3058,9 +3188,9 @@ async fn run_path_ticks(ctx: PathCtx) {
                 // already nudged by the punch, and a `Degraded`/`Disconnected`
                 // peer recovers via the punch/relay path, not a probe.
                 if matches!(path.state, PathState::Direct | PathState::Relayed) {
-                    let due = last_probe
-                        .get(&gid)
-                        .map_or(true, |t| now.saturating_duration_since(*t) >= LIVENESS_PROBE_INTERVAL);
+                    let due = last_probe.get(&gid).map_or(true, |t| {
+                        now.saturating_duration_since(*t) >= LIVENESS_PROBE_INTERVAL
+                    });
                     if due {
                         last_probe.insert(gid, now);
                         to_probe.push(gid);
@@ -3407,13 +3537,18 @@ enum PeerSetDelta {
 /// yield [`PeerSetDelta::PureAdditions`].
 fn classify_peer_delta(prev: &[uapi::PeerConfig], next: &[uapi::PeerConfig]) -> PeerSetDelta {
     use std::collections::HashMap;
-    let prev_by_key: HashMap<&str, &uapi::PeerConfig> =
-        prev.iter().map(|p| (p.public_key_b64.as_str(), p)).collect();
+    let prev_by_key: HashMap<&str, &uapi::PeerConfig> = prev
+        .iter()
+        .map(|p| (p.public_key_b64.as_str(), p))
+        .collect();
     let next_keys: std::collections::HashSet<&str> =
         next.iter().map(|p| p.public_key_b64.as_str()).collect();
 
     // Any peer removed (present before, absent now) forces a full apply.
-    if prev.iter().any(|p| !next_keys.contains(p.public_key_b64.as_str())) {
+    if prev
+        .iter()
+        .any(|p| !next_keys.contains(p.public_key_b64.as_str()))
+    {
         return PeerSetDelta::NeedsFullApply;
     }
 
@@ -3527,7 +3662,9 @@ async fn apply_state(
     // which is deliberately only ever held in tight non-await scopes.
     let snapshot: Option<(String, Vec<uapi::PeerConfig>)> = {
         let a = active.lock().unwrap();
-        a.applied_config.clone().map(|cfg| (cfg, a.applied_peers.clone()))
+        a.applied_config
+            .clone()
+            .map(|cfg| (cfg, a.applied_peers.clone()))
     };
     // Encode the freshly built device up front: needed both for the non-peer
     // header compare below and (on the PureAdditions path) for the guard
@@ -3543,7 +3680,9 @@ async fn apply_state(
     let header_matches = snapshot
         .as_ref()
         .is_some_and(|(cfg, _)| device_header(cfg) == device_header(&encoded_dev));
-    let delta = snapshot.as_ref().map(|(_, prev)| classify_peer_delta(prev, &dev.peers));
+    let delta = snapshot
+        .as_ref()
+        .map(|(_, prev)| classify_peer_delta(prev, &dev.peers));
     match delta {
         Some(PeerSetDelta::Unchanged) if header_matches => {
             // No peer change AND the header (private_key/listen_port) matches —
@@ -3566,8 +3705,9 @@ async fn apply_state(
             // reconcile re-derive (our incremental add is already on the
             // device; the byte-guard/classify on the next apply reconciles any
             // drift). The uncontended fast path is unchanged.
-            let (snap_cfg, snap_peers) =
-                snapshot.as_ref().expect("PureAdditions implies a Some snapshot");
+            let (snap_cfg, snap_peers) = snapshot
+                .as_ref()
+                .expect("PureAdditions implies a Some snapshot");
             let mut a = active.lock().unwrap();
             if a.applied_config.as_ref() == Some(snap_cfg) && a.applied_peers == *snap_peers {
                 a.applied_config = Some(encoded);
@@ -3748,14 +3888,14 @@ async fn retarget_relay_transports(
 /// `set_peer_endpoint` snapshots `wg_port`, we publish, and it then writes back
 /// a guard rendered at the OLD port — reintroducing the very header mismatch
 /// this re-seed exists to prevent.
-async fn renormalize_active_listen_port(
-    tunnels: &mut TunnelSet,
-    ctx: &PathCtx,
-    base_wg_port: u16,
-) {
+async fn renormalize_active_listen_port(tunnels: &mut TunnelSet, ctx: &PathCtx, base_wg_port: u16) {
     let (id, ifname, from) = {
         let a = ctx.active.lock().unwrap();
-        (TunnelId::Own { epoch: a.epoch }, a.ifname.clone(), a.wg_port)
+        (
+            TunnelId::Own { epoch: a.epoch },
+            a.ifname.clone(),
+            a.wg_port,
+        )
     };
     if from == base_wg_port {
         return; // never left the base port (no cutover happened) — nothing to do
@@ -3806,8 +3946,12 @@ async fn renormalize_active_listen_port(
         };
     }
     // Relayed peers: the downlink's delivery address is the port we just left.
-    retarget_relay_transports(&ctx.relay_transports, base_wg_port, "listen port renormalized")
-        .await;
+    retarget_relay_transports(
+        &ctx.relay_transports,
+        base_wg_port,
+        "listen port renormalized",
+    )
+    .await;
     eprintln!(
         "wiremesh-gateway: renormalized {ifname} from listen port {from} back to the base port \
          {base_wg_port} — the active key is addressable at its advertised port again"
@@ -3935,7 +4079,10 @@ async fn service_role_b_collapse(
         // so reconstructing it here cannot drift from what `maybe_start_role_b`
         // brought up — and it can never alias our OWN tun at the same epoch
         // number, which is the whole point of `TunnelId` (T3).
-        let id = TunnelId::Overlap { gateway_id: aid, epoch };
+        let id = TunnelId::Overlap {
+            gateway_id: aid,
+            epoch,
+        };
         if let Err(e) = tunnels.tear_down(id) {
             eprintln!(
                 "wiremesh-gateway: tearing down collapsed Role-B overlap epoch {epoch} (peer \
@@ -3957,7 +4104,10 @@ async fn service_role_b_collapse(
 /// Aggregating (rather than reading only epoch 0) means a deny recorded on a
 /// rotation's new-epoch tun is still counted post-cutover.
 fn aggregate_counters(all: impl IntoIterator<Item = Counters>) -> Counters {
-    let mut agg = Counters { by_rule: std::collections::BTreeMap::new(), default_deny: 0 };
+    let mut agg = Counters {
+        by_rule: std::collections::BTreeMap::new(),
+        default_deny: 0,
+    };
     for c in all {
         agg.default_deny = agg.default_deny.saturating_add(c.default_deny);
         for (rule, hits) in c.by_rule {
@@ -4170,13 +4320,19 @@ struct RoleB {
 impl RoleB {
     /// This overlap as [`rotation::route_owner`] sees it.
     fn claim(&self) -> OverlapClaim {
-        OverlapClaim { built_at_own_epoch: self.built_at_own_epoch, cut_over: self.cut_over }
+        OverlapClaim {
+            built_at_own_epoch: self.built_at_own_epoch,
+            cut_over: self.cut_over,
+        }
     }
 
     /// This overlap as [`rotation::overlap_write_back`] sees it — the identity
     /// a deferred write-back must still match before it is applied.
     fn identity(&self) -> OverlapIdentity {
-        OverlapIdentity { pending_epoch: self.pending_epoch, new_tun: self.new_tun.clone() }
+        OverlapIdentity {
+            pending_epoch: self.pending_epoch,
+            new_tun: self.new_tun.clone(),
+        }
     }
 }
 
@@ -4202,7 +4358,9 @@ async fn handle_rotate(
         return Ok(());
     };
     let ds = applied.ok_or_else(|| {
-        anyhow::anyhow!("RotateDirective arrived before any desired state; no peer set to mint against")
+        anyhow::anyhow!(
+            "RotateDirective arrived before any desired state; no peer set to mint against"
+        )
     })?;
 
     // Mint + persist under one guard (no `.await` in scope) so the persisted
@@ -4253,7 +4411,13 @@ async fn handle_rotate(
     let new_tun = plan.ifname.clone();
     let new_port = plan.listen_port;
 
-    tunnels.bring_up(plan.id, &new_tun, &new_key.private_key_b64, new_port, TUN_MTU)?;
+    tunnels.bring_up(
+        plan.id,
+        &new_tun,
+        &new_key.private_key_b64,
+        new_port,
+        TUN_MTU,
+    )?;
 
     // SECURITY (fail-closed): attach the L4 enforcer to the new epoch tun with
     // the current policy BEFORE the device is made session-capable (peer
@@ -4286,8 +4450,12 @@ async fn handle_rotate(
     // its tc-BPF/nft program from a tun that is still carrying traffic.
     enforcers.lock().await.insert(plan.id, ke);
 
-    let dev =
-        reconcile::device_config_at_port(ds, &new_key.private_key_b64, new_port, ROTATION_KEEPALIVE);
+    let dev = reconcile::device_config_at_port(
+        ds,
+        &new_key.private_key_b64,
+        new_port,
+        ROTATION_KEEPALIVE,
+    );
     uapi::apply(&new_tun, &dev)?;
 
     let peers: Vec<RoleAPeer> = ds
@@ -4375,7 +4543,10 @@ async fn maybe_start_role_b(
                 continue;
             }
             RoleBDecision::Start { pending_epoch } => pending_epoch,
-            RoleBDecision::Restart { stale_epoch, pending_epoch } => {
+            RoleBDecision::Restart {
+                stale_epoch,
+                pending_epoch,
+            } => {
                 // The peer has moved past the epoch we overlapped toward (it
                 // re-rotated, or the entry leaked from an aborted rotation).
                 // Retire the stale overlap before standing up the new one, so
@@ -4431,7 +4602,10 @@ async fn maybe_start_role_b(
         // since piece 3 an overlap free-lists from `base +
         // OWN_TUN_PORT_OFFSET + 1`, so it cannot land on the slot reserved for
         // OUR own new-epoch tun even at the instant we hold no such tun.
-        let id = TunnelId::Overlap { gateway_id: aid, epoch: pending_epoch };
+        let id = TunnelId::Overlap {
+            gateway_id: aid,
+            epoch: pending_epoch,
+        };
         let plan = match plan_tunnel(id, &rot.base_tun, rot.base_wg_port, &tunnels.plans()) {
             Ok(p) => p,
             Err(e) => {
@@ -4517,7 +4691,11 @@ async fn maybe_start_role_b(
 
         if let Err(e) = uapi::apply(
             &new_tun,
-            &DeviceConfig { private_key_b64: own_priv, listen_port, peers },
+            &DeviceConfig {
+                private_key_b64: own_priv,
+                listen_port,
+                peers,
+            },
         ) {
             // The peer-apply is what makes the Device session-capable, so a
             // failure here leaves a tun that cannot carry traffic. Unwind BOTH
@@ -4536,7 +4714,10 @@ async fn maybe_start_role_b(
         // Pin this peer's `wg0` entry to its CURRENT (old) epoch key for the
         // overlap, so its later promote delta can't rekey `wg0` and reset the
         // still-in-use old session (make-before-break on the base tun).
-        rot.wg0_pins.lock().unwrap().insert(aid, active.pubkey_b64.clone());
+        rot.wg0_pins
+            .lock()
+            .unwrap()
+            .insert(aid, active.pubkey_b64.clone());
         rot.role_b.lock().unwrap().insert(
             aid,
             RoleB {
@@ -4649,7 +4830,10 @@ async fn retire_stale_overlap(
             "Role B restart",
         );
     }
-    let id = TunnelId::Overlap { gateway_id: aid, epoch: stale_epoch };
+    let id = TunnelId::Overlap {
+        gateway_id: aid,
+        epoch: stale_epoch,
+    };
     if let Err(e) = tunnels.tear_down(id) {
         eprintln!(
             "wiremesh-gateway: Role B restart — tearing down peer {aid}'s stale overlap (epoch \
@@ -4794,7 +4978,11 @@ fn first_host_of(cidr: &str) -> Option<String> {
         return None;
     }
     let base = u32::from(addr);
-    let mask = if prefix == 0 { 0 } else { u32::MAX << (32 - prefix) };
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
     let network = base & mask;
     Some(std::net::Ipv4Addr::from(network.wrapping_add(1)).to_string())
 }
@@ -4815,11 +5003,19 @@ fn first_host_of(cidr: &str) -> Option<String> {
 /// keepalive keeps the session live.
 fn probe_overlap_handshake(new_tun: &str, cidr: &str, src_ip: &str) {
     use std::process::Command;
-    let Some(target) = first_host_of(cidr) else { return };
+    let Some(target) = first_host_of(cidr) else {
+        return;
+    };
     let route = format!("{target}/32");
-    let _ = Command::new("ip").args(["route", "replace", &route, "dev", new_tun]).status();
-    let _ = Command::new("ping").args(["-c", "1", "-W", "1", "-I", src_ip, &target]).status();
-    let _ = Command::new("ip").args(["route", "del", &route, "dev", new_tun]).status();
+    let _ = Command::new("ip")
+        .args(["route", "replace", &route, "dev", new_tun])
+        .status();
+    let _ = Command::new("ping")
+        .args(["-c", "1", "-W", "1", "-I", src_ip, &target])
+        .status();
+    let _ = Command::new("ip")
+        .args(["route", "del", &route, "dev", new_tun])
+        .status();
 }
 
 /// Kick the overlap handshake for `new_tun` toward each of `cidrs`, sourced
@@ -4831,7 +5027,9 @@ fn probe_overlap_handshake(new_tun: &str, cidr: &str, src_ip: &str) {
 async fn kick_overlap(new_tun: String, cidrs: Vec<String>, base_wg_port: u16) {
     let _ = tokio::task::spawn_blocking(move || {
         let locals = netif::local_wg_endpoints(base_wg_port);
-        let Some(src) = locals.first().and_then(|e| e.rsplit_once(':').map(|(ip, _)| ip.to_string()))
+        let Some(src) = locals
+            .first()
+            .and_then(|e| e.rsplit_once(':').map(|(ip, _)| ip.to_string()))
         else {
             return;
         };
@@ -4993,8 +5191,11 @@ async fn run_rotation_ticks(rot: RotationShared) {
             // bit-for-bit what it was; only the post-cutover retire arm sees a
             // refreshed answer.
             let watch: Vec<(u64, String)> = {
-                let snapshot: Vec<(u64, String)> =
-                    a.peers.iter().map(|p| (p.gateway_id, p.active_hex.clone())).collect();
+                let snapshot: Vec<(u64, String)> = a
+                    .peers
+                    .iter()
+                    .map(|p| (p.gateway_id, p.active_hex.clone()))
+                    .collect();
                 let cut_over = matches!(phase, RotationPhase::CutOver { .. });
                 let ds = rot.desired.lock().unwrap();
                 let pins = rot.wg0_pins.lock().unwrap();
@@ -5010,8 +5211,9 @@ async fn run_rotation_ticks(rot: RotationShared) {
                     .collect()
             };
             let live = read_live_peers(&a.new_tun, watch.iter().map(|(_, h)| h.clone())).await;
-            let any_live =
-                live.as_ref().map_or(false, |l| watch.iter().any(|(_, hex)| l.contains(hex)));
+            let any_live = live
+                .as_ref()
+                .map_or(false, |l| watch.iter().any(|(_, hex)| l.contains(hex)));
             // An EMPTY watch set is NOT "all live" (F4). `.all()` on an empty
             // iterator is vacuously true, and the watch set can now SHRINK: it
             // starts as the directive-time snapshot and every peer that has
@@ -5041,7 +5243,9 @@ async fn run_rotation_ticks(rot: RotationShared) {
                 warned_empty_watch = false;
             }
             let all_live = !watch.is_empty()
-                && live.as_ref().map_or(false, |l| watch.iter().all(|(_, hex)| l.contains(hex)));
+                && live
+                    .as_ref()
+                    .map_or(false, |l| watch.iter().all(|(_, hex)| l.contains(hex)));
             match phase {
                 RotationPhase::Overlapping { .. } => {
                     if any_live {
@@ -5076,7 +5280,8 @@ async fn run_rotation_ticks(rot: RotationShared) {
                                     &p.cidrs,
                                     &a.new_tun,
                                     epoch,
-                                    held.as_ref().map(|(ifname, claim)| (ifname.as_str(), *claim)),
+                                    held.as_ref()
+                                        .map(|(ifname, claim)| (ifname.as_str(), *claim)),
                                     "Role A cutover",
                                 );
                             }
@@ -5115,7 +5320,11 @@ async fn run_rotation_ticks(rot: RotationShared) {
                                         // use (fix T4) — seed must match exactly.
                                         let live = rot.live_endpoints.lock().unwrap();
                                         let dev = reconcile::device_config_pinned(
-                                            ds, &a.new_priv, a.new_port, &pins, &live,
+                                            ds,
+                                            &a.new_priv,
+                                            a.new_port,
+                                            &pins,
+                                            &live,
                                         );
                                         // Seed BOTH guard fields (T8): the
                                         // structured peers keep `apply_state`'s
@@ -5369,8 +5578,10 @@ async fn run_rotation_ticks(rot: RotationShared) {
                 let a = rot.active.lock().unwrap();
                 (a.ifname.clone(), a.epoch)
             };
-            let claim =
-                OverlapClaim { built_at_own_epoch: b.built_at_own_epoch, cut_over: true };
+            let claim = OverlapClaim {
+                built_at_own_epoch: b.built_at_own_epoch,
+                cut_over: true,
+            };
             let owner = place_peer_routes(
                 aid,
                 &b.peer_cidrs,
@@ -5383,7 +5594,11 @@ async fn run_rotation_ticks(rot: RotationShared) {
             // the peer's new epoch has a live session with us, which the
             // overlap just proved either way, and it is what advances the
             // controller's promote SM.
-            let ack = EpochAck { peer_gateway_id: aid, epoch: b.pending_epoch, live: true };
+            let ack = EpochAck {
+                peer_gateway_id: aid,
+                epoch: b.pending_epoch,
+                live: true,
+            };
             match send_epoch_ack(&rot, ack).await {
                 Ok(()) => {
                     // `send_epoch_ack` opens a fresh mTLS channel, so this is
@@ -5502,8 +5717,12 @@ async fn run_rotation_ticks(rot: RotationShared) {
                 // temporary /32 (make-before-break preserved,
                 // `probe_overlap_handshake`).
                 if b.built_at_own_epoch != active_epoch {
-                    kick_overlap(active_ifname.clone(), b.peer_cidrs.clone(), rot.base_wg_port)
-                        .await;
+                    kick_overlap(
+                        active_ifname.clone(),
+                        b.peer_cidrs.clone(),
+                        rot.base_wg_port,
+                    )
+                    .await;
                 }
                 continue; // active tun not live yet — keep the overlap intact
             }
@@ -5556,7 +5775,10 @@ async fn run_rotation_ticks(rot: RotationShared) {
             // enforcer (`service_role_b_collapse`; the tick can't touch the
             // non-`Send` `tunnels`). `wg0_pins` was already unpinned at the
             // trigger; the live-endpoint pin is left to the path SM.
-            rot.collapse_ready.lock().unwrap().push((aid, b.pending_epoch));
+            rot.collapse_ready
+                .lock()
+                .unwrap()
+                .push((aid, b.pending_epoch));
             eprintln!(
                 "wiremesh-gateway: Role B collapse — peer {aid} live on {active_ifname} with its \
                  new key; routes re-derived onto it, overlap {} teardown signalled",

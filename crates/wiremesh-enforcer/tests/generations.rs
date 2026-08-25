@@ -45,8 +45,14 @@ use wiremesh_testkit::netns::{join_netns, wg_lab, Ns};
 /// between the lab's two actual hosts, not segment-CIDR-width semantics.
 fn segments_exact() -> Vec<SegmentDef> {
     vec![
-        SegmentDef { name: "seg-a".into(), cidrs: vec!["10.10.0.1/32".parse().unwrap()] },
-        SegmentDef { name: "seg-b".into(), cidrs: vec!["10.10.0.2/32".parse().unwrap()] },
+        SegmentDef {
+            name: "seg-a".into(),
+            cidrs: vec!["10.10.0.1/32".parse().unwrap()],
+        },
+        SegmentDef {
+            name: "seg-b".into(),
+            cidrs: vec!["10.10.0.2/32".parse().unwrap()],
+        },
     ]
 }
 
@@ -56,8 +62,14 @@ fn segments_exact() -> Vec<SegmentDef> {
 /// LPM-prefix-width mechanics are actually exercised, not just point /32s.
 fn segments_wide() -> Vec<SegmentDef> {
     vec![
-        SegmentDef { name: "seg-a-wide".into(), cidrs: vec!["10.10.0.0/24".parse().unwrap()] },
-        SegmentDef { name: "seg-b-wide".into(), cidrs: vec!["10.10.0.0/24".parse().unwrap()] },
+        SegmentDef {
+            name: "seg-a-wide".into(),
+            cidrs: vec!["10.10.0.0/24".parse().unwrap()],
+        },
+        SegmentDef {
+            name: "seg-b-wide".into(),
+            cidrs: vec!["10.10.0.0/24".parse().unwrap()],
+        },
     ]
 }
 
@@ -83,7 +95,9 @@ fn compile_with(yaml: &str, segs: &[SegmentDef], version: u64) -> PolicyIR {
 fn pad_rules_yaml(start_port: u16, n: u16) -> String {
     let mut s = String::new();
     for p in start_port..start_port + n {
-        s.push_str(&format!("      - deny:\n          proto: tcp\n          ports: [{p}]\n"));
+        s.push_str(&format!(
+            "      - deny:\n          proto: tcp\n          ports: [{p}]\n"
+        ));
     }
     s
 }
@@ -108,7 +122,8 @@ while True:
     c.close()
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn accept-only listener")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn accept-only listener")
 }
 
 /// `connect()`s to `dst_addr:port` from local address `bind_addr` (use
@@ -160,7 +175,8 @@ except socket.timeout:
 print(count)
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn udp counting receiver")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn udp counting receiver")
 }
 
 /// Sends `count` UDP datagrams to `dst_addr:port`, `interval_s` seconds
@@ -177,7 +193,8 @@ for i in range(n):
 print(n)
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn udp sender")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn udp sender")
 }
 
 /// Accepts ONE connection and echoes a fixed `b"ack"` reply for every
@@ -202,7 +219,8 @@ except Exception:
     pass
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn ack-echo listener")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn ack-echo listener")
 }
 
 /// Connects to 10.10.0.2:9100, exchanges one request/ack, sleeps 11s
@@ -224,7 +242,8 @@ s.sendall(b"hello-after-grace")
 second = s.recv(64)
 sys.exit(0 if second == b"ack" else 1)
 "#;
-    ns.spawn(&["python3", "-c", script]).expect("spawn persistent 9100 client")
+    ns.spawn(&["python3", "-c", script])
+        .expect("spawn persistent 9100 client")
 }
 
 // --- (a) first-match-wins + per-rule counters --------------------------
@@ -246,8 +265,9 @@ fn first_match_wins_denies_ssh_carve_out_allows_the_rest_with_correct_rule_count
     let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
-        .expect("probe should load + attach eBPF on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+            .expect("probe should load + attach eBPF on wg0");
 
     let segs = segments_exact();
     let mut yaml = String::from(
@@ -296,7 +316,12 @@ policy:
         counters.by_rule
     );
     assert!(
-        counters.by_rule.get(&allow_all_rule_id).copied().unwrap_or(0) > 0,
+        counters
+            .by_rule
+            .get(&allow_all_rule_id)
+            .copied()
+            .unwrap_or(0)
+            > 0,
         "allow-all-tcp rule's own by_rule counter should have incremented for the allowed \
          connection: {:?}",
         counters.by_rule
@@ -325,8 +350,9 @@ fn whole_segment_fallback_enforces_against_block_cidrs_not_a_bare_host_match() {
     let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
-        .expect("probe should load + attach eBPF on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+            .expect("probe should load + attach eBPF on wg0");
 
     let segs = segments_wide();
     let mut yaml = String::from(
@@ -398,8 +424,9 @@ fn lpm_first_match_denies_narrow_carve_out_allows_the_wider_covering_cidr() {
         .expect("add secondary source address .9 on a's wg0");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
-        .expect("probe should load + attach eBPF on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+            .expect("probe should load + attach eBPF on wg0");
 
     let segs = segments_wide();
     let mut yaml = String::from(
@@ -483,8 +510,9 @@ fn lpm_cumulative_bitset_first_match_allows_narrow_host_via_earlier_wide_allow_d
         .expect("add secondary source address .9 on a's wg0");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
-        .expect("probe should load + attach eBPF on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+            .expect("probe should load + attach eBPF on wg0");
 
     let segs = segments_wide();
     let mut yaml = String::from(
@@ -607,21 +635,29 @@ policy:
     // is now the CALLER-side honoring of the 50ms grace configured above
     // (see that comment), not merely a pacing choice.
     for i in 0..20 {
-        enforcer
-            .apply(&ir)
-            .unwrap_or_else(|e| panic!("flip #{i} (re-applying the same allow policy) failed: {e:#}"));
+        enforcer.apply(&ir).unwrap_or_else(|e| {
+            panic!("flip #{i} (re-applying the same allow policy) failed: {e:#}")
+        });
         std::thread::sleep(Duration::from_millis(175));
     }
 
     let sender_out = sender.wait_with_output().expect("udp sender should exit");
-    assert!(sender_out.status.success(), "udp sender exited non-zero: {sender_out:?}");
+    assert!(
+        sender_out.status.success(),
+        "udp sender exited non-zero: {sender_out:?}"
+    );
     let sent: u64 = String::from_utf8_lossy(&sender_out.stdout)
         .trim()
         .parse()
         .expect("sender should print its packet count");
 
-    let receiver_out = receiver.wait_with_output().expect("udp receiver should exit after its idle timeout");
-    assert!(receiver_out.status.success(), "udp receiver exited non-zero: {receiver_out:?}");
+    let receiver_out = receiver
+        .wait_with_output()
+        .expect("udp receiver should exit after its idle timeout");
+    assert!(
+        receiver_out.status.success(),
+        "udp receiver exited non-zero: {receiver_out:?}"
+    );
     let received: u64 = String::from_utf8_lossy(&receiver_out.stdout)
         .trim()
         .parse()
@@ -659,8 +695,9 @@ fn old_generation_reap_does_not_break_in_flight_allowed_flow_and_new_gen_matches
     let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
-        .expect("probe should load + attach eBPF on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+            .expect("probe should load + attach eBPF on wg0");
 
     let segs = segments_exact();
     let v1_yaml = "
@@ -721,7 +758,9 @@ policy:
     // The client sleeps 11s inside its own script (past the >=10s reap
     // grace) before its second round-trip -- wait for it rather than
     // sleeping here ourselves.
-    let out = client_9100.wait_with_output().expect("persistent 9100 client should exit");
+    let out = client_9100
+        .wait_with_output()
+        .expect("persistent 9100 client should exit");
     assert!(
         out.status.success(),
         "in-flight flow established under v1 must still pass traffic after v2's generation \
@@ -773,8 +812,9 @@ fn counters_survive_rule_insertion_keyed_by_rule_id() {
     let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
-        .expect("probe should load + attach eBPF on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+            .expect("probe should load + attach eBPF on wg0");
 
     let segs = segments_exact();
     let v1_yaml = "
@@ -812,7 +852,9 @@ policy:
             "connection matching rule A (port 9200) should succeed under v1"
         );
     }
-    let snapshot = enforcer.counters().expect("counters() should succeed after v1 traffic");
+    let snapshot = enforcer
+        .counters()
+        .expect("counters() should succeed after v1 traffic");
     assert_eq!(
         snapshot.by_rule.get(&rule_a_id).copied().unwrap_or(0),
         k,
@@ -839,7 +881,10 @@ policy:
 ";
     let v2 = compile_with(v2_yaml, &segs, 2);
     let rule_c_id = v2.blocks[0].rules[0].rule_id.clone();
-    assert_ne!(rule_c_id, rule_a_id, "C must be a genuinely distinct rule from A");
+    assert_ne!(
+        rule_c_id, rule_a_id,
+        "C must be a genuinely distinct rule from A"
+    );
     assert_eq!(
         v2.blocks[0].rules[1].rule_id, rule_a_id,
         "rule_id is a content hash independent of position -- A's rule_id must be unchanged \
@@ -859,7 +904,9 @@ policy:
          small policies apply fast) must apply",
     );
 
-    let after_v2 = enforcer.counters().expect("counters() should succeed after v2 apply");
+    let after_v2 = enforcer
+        .counters()
+        .expect("counters() should succeed after v2 apply");
     assert!(
         after_v2.by_rule.get(&rule_a_id).copied().unwrap_or(0) >= k,
         "rule A's pre-v2 history (k={k} hits) must survive being re-homed to a new idx, keyed \
@@ -883,7 +930,9 @@ policy:
             "connection matching rule C (port 9202) should succeed under v2"
         );
     }
-    let final_counters = enforcer.counters().expect("counters() should succeed after C's traffic");
+    let final_counters = enforcer
+        .counters()
+        .expect("counters() should succeed after C's traffic");
     assert_eq!(
         final_counters.by_rule.get(&rule_c_id).copied().unwrap_or(0),
         k2,
@@ -932,8 +981,9 @@ fn counters_for_removed_rules_are_pruned_at_apply() {
     let (lab, a, b) = wg_lab("aeth8");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
-        .expect("probe should load + attach eBPF on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe("wg0", wiremesh_enforcer::EnforcerConfig::default())
+            .expect("probe should load + attach eBPF on wg0");
 
     let segs = segments_exact();
     let v1_yaml = "
@@ -978,7 +1028,9 @@ policy:
             "connection matching rule B (port 9301) should succeed under v1"
         );
     }
-    let snapshot = enforcer.counters().expect("counters() should succeed after v1 traffic");
+    let snapshot = enforcer
+        .counters()
+        .expect("counters() should succeed after v1 traffic");
     assert!(
         snapshot.by_rule.get(&rule_a_id).copied().unwrap_or(0) > 0,
         "rule A should show a nonzero hit count before v2 removes it: {:?}",
@@ -1018,7 +1070,9 @@ policy:
         "v2 (B only, A removed -- no padding needed, small policies apply fast) must apply",
     );
 
-    let after_v2 = enforcer.counters().expect("counters() should succeed after v2 apply");
+    let after_v2 = enforcer
+        .counters()
+        .expect("counters() should succeed after v2 apply");
     assert!(
         !after_v2.by_rule.contains_key(&rule_a_id),
         "rule A was removed entirely in v2 -- its counter must be pruned from by_rule, not kept \

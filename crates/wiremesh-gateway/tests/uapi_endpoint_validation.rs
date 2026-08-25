@@ -52,7 +52,11 @@ fn peer(pubkey_b64: &str, endpoint: Option<&str>) -> PeerConfig {
 }
 
 fn device(peers: Vec<PeerConfig>) -> DeviceConfig {
-    DeviceConfig { private_key_b64: PRIV_B64.to_string(), listen_port: 51820, peers }
+    DeviceConfig {
+        private_key_b64: PRIV_B64.to_string(),
+        listen_port: 51820,
+        peers,
+    }
 }
 
 /// Endpoints that MUST encode. The predicate is exactly "parses as
@@ -74,7 +78,10 @@ const ACCEPTED: &[&str] = &[
 /// this list — i.e. that lets one of these through — is a live crash-loop
 /// path, because reaching here means the process dies.
 const REJECTED: &[(&str, &str)] = &[
-    ("", "empty string: sorts before every real address, so it wins candidates[0]"),
+    (
+        "",
+        "empty string: sorts before every real address, so it wins candidates[0]",
+    ),
     ("not-an-endpoint", "unstructured garbage"),
     (
         "abc:123",
@@ -84,22 +91,37 @@ const REJECTED: &[(&str, &str)] = &[
          is fatal. v1 dial targets are IPv4 literals; nothing resolves names at this \
          layer",
     ),
-    ("controller.example.com:51820", "the plausible-hostname form of the same trap"),
-    ("10.0.0.5", "no port — the UAPI `endpoint=` line requires ip:port"),
+    (
+        "controller.example.com:51820",
+        "the plausible-hostname form of the same trap",
+    ),
+    (
+        "10.0.0.5",
+        "no port — the UAPI `endpoint=` line requires ip:port",
+    ),
     ("10.0.0.5:", "empty port"),
     (":51820", "no address"),
     ("10.0.0.5:70000", "port above u16 range"),
     ("10.0.0.5:-1", "negative port"),
-    ("999.1.1.1:51820", "out-of-range octet: dotted-quad SHAPE is not enough"),
+    (
+        "999.1.1.1:51820",
+        "out-of-range octet: dotted-quad SHAPE is not enough",
+    ),
     ("10.0.0.5.6:51820", "five octets"),
-    (" 10.0.0.5:51820", "leading whitespace — `SocketAddr`'s FromStr does not trim"),
+    (
+        " 10.0.0.5:51820",
+        "leading whitespace — `SocketAddr`'s FromStr does not trim",
+    ),
     ("10.0.0.5:51820 ", "trailing whitespace, same reason"),
     (
         "[::1]:51820",
         "bracketed IPv6: parses as SocketAddr::V6 and is a HARD error here — v1 is \
          IPv4-only end to end (spec §1), matching `config.rs`'s IPv6-reject-at-boot",
     ),
-    ("[2001:db8::1]:51820", "a routable IPv6 literal, same rejection"),
+    (
+        "[2001:db8::1]:51820",
+        "a routable IPv6 literal, same rejection",
+    ),
     ("[fe80::1%eth0]:51820", "link-local IPv6 with a zone index"),
     (
         "10.0.0.5:51820\nendpoint=1.2.3.4:1",
@@ -171,12 +193,19 @@ fn a_peer_with_no_endpoint_encodes_fine() {
     // dropped, a peer may legitimately have NO endpoint. That must be a
     // normal, encodable configuration — otherwise "filter the bad candidate"
     // just relocates the crash.
-    let out = encode_set(&device(vec![peer(PUB_B64, None)]))
-        .expect("a peer with no endpoint must encode: WireGuard peers without `endpoint=` \
+    let out = encode_set(&device(vec![peer(PUB_B64, None)])).expect(
+        "a peer with no endpoint must encode: WireGuard peers without `endpoint=` \
                  are legal and are the correct resting state for a peer this gateway \
-                 cannot dial yet");
-    assert!(out.contains(&format!("public_key={PUB_HEX}\n")), "peer must be present:\n{out}");
-    assert!(!out.contains("endpoint="), "no endpoint line may be emitted:\n{out}");
+                 cannot dial yet",
+    );
+    assert!(
+        out.contains(&format!("public_key={PUB_HEX}\n")),
+        "peer must be present:\n{out}"
+    );
+    assert!(
+        !out.contains("endpoint="),
+        "no endpoint line may be emitted:\n{out}"
+    );
 }
 
 /// (Part E) **Today's behaviour, pinned as-is — the fail-open/fail-closed

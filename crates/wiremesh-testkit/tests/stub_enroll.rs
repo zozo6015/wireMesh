@@ -85,7 +85,9 @@ async fn stub_gateway_cert_serial_is_16_hex_bytes() {
 
     let serial = gw.cert_serial().unwrap();
     assert!(
-        serial.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        serial
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "cert_serial() must be lowercase hex only, got: {serial:?}"
     );
     assert_eq!(

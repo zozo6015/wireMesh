@@ -76,7 +76,10 @@ impl Drop for KillOnDrop {
 }
 
 fn unique_dir(tag: &str) -> PathBuf {
-    std::env::temp_dir().join(format!("relay-paircollision-test-{tag}-{}", std::process::id()))
+    std::env::temp_dir().join(format!(
+        "relay-paircollision-test-{tag}-{}",
+        std::process::id()
+    ))
 }
 
 fn run_ok(bin: &str, args: &[&str]) {
@@ -149,7 +152,10 @@ async fn same_owner_colliding_registration_must_not_silently_replace() {
                 registration_key("gw-A", &peer2),
                 "search invariant: the two peers must actually collide"
             );
-            assert_ne!(peer1, peer2, "search invariant: the two peers must be distinct");
+            assert_ne!(
+                peer1, peer2,
+                "search invariant: the two peers must be distinct"
+            );
             // The key is a raw 8-byte digest prefix, NOT printable ASCII, so
             // it is rendered as hex — the relay's own `key=<16 hex chars>`
             // stderr format, so this line can be correlated against the relay
@@ -171,8 +177,7 @@ async fn same_owner_colliding_registration_must_not_silently_replace() {
             // the duplicate check does not fire and `reg.insert` replaces the
             // incumbent's slot with no log and no error — the connect below
             // succeeds and peer1's traffic starts landing on this connection.
-            let colliding =
-                wiremesh_relay::Client::connect(relay_addr, &dir, "gw-A", &peer2).await;
+            let colliding = wiremesh_relay::Client::connect(relay_addr, &dir, "gw-A", &peer2).await;
             match &colliding {
                 Err(e) => eprintln!("colliding registration correctly rejected: {e:#}"),
                 Ok(_) => eprintln!(
@@ -226,7 +231,10 @@ async fn same_owner_colliding_registration_must_not_silently_replace() {
                 "two different pairs from the same owner must occupy different slots"
             );
             assert!(first.is_alive(), "the first pair's connection must stay up");
-            assert!(second.is_alive(), "the second pair's connection must stay up");
+            assert!(
+                second.is_alive(),
+                "the second pair's connection must stay up"
+            );
         }
     }
 }
@@ -268,8 +276,10 @@ async fn same_owner_same_pair_reconnect_is_accepted_and_replaces() {
 
     let (src, data) = tokio::time::timeout(Duration::from_secs(3), reconnect.recv())
         .await
-        .expect("the reconnected registration received nothing — the same-owner replace did not \
-                 take effect")
+        .expect(
+            "the reconnected registration received nothing — the same-owner replace did not \
+                 take effect",
+        )
         .expect("recv errored");
     assert_eq!(
         data,
@@ -323,7 +333,10 @@ async fn relay_and_client_agree_on_the_key_derivation_for_asymmetric_length_iden
 
     // short -> long: the relay must have keyed `long`'s slot with exactly the
     // dest `short` addresses.
-    short.send(b"short-to-long").await.expect("send short->long");
+    short
+        .send(b"short-to-long")
+        .await
+        .expect("send short->long");
     let (src, data) = tokio::time::timeout(Duration::from_secs(3), long.recv())
         .await
         .expect(

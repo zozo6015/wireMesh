@@ -41,9 +41,7 @@ async fn admin_register_relay_rejects_non_ipv4_endpoint() {
             endpoint: "[::1]:4443".into(),
         })
         .await
-        .expect_err(
-            "Admin.RegisterRelay must reject an IPv6 endpoint — v1 is IPv4-only",
-        );
+        .expect_err("Admin.RegisterRelay must reject an IPv6 endpoint — v1 is IPv4-only");
 
     // A wholly malformed endpoint must also be rejected outright.
     admin
@@ -52,9 +50,7 @@ async fn admin_register_relay_rejects_non_ipv4_endpoint() {
             endpoint: "not-an-address".into(),
         })
         .await
-        .expect_err(
-            "Admin.RegisterRelay must reject a malformed (non ip:port) endpoint",
-        );
+        .expect_err("Admin.RegisterRelay must reject a malformed (non ip:port) endpoint");
 
     // Neither rejected call may have left a relay row behind.
     let after_rejections = admin

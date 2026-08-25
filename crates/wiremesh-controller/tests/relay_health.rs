@@ -71,13 +71,17 @@ const SYNC_TIMEOUT: Duration = Duration::from_secs(5);
 /// `tests/report_local_endpoints.rs` each duplicate (each `tests/*.rs` file
 /// is its own binary, so this is the established convention rather than a
 /// shared crate dependency).
-fn expect_snapshot(msg: Option<Result<wiremesh_proto::v1::SyncMessage, tonic::Status>>) -> StateSnapshot {
+fn expect_snapshot(
+    msg: Option<Result<wiremesh_proto::v1::SyncMessage, tonic::Status>>,
+) -> StateSnapshot {
     let msg = msg
         .expect("Sync.Watch stream ended before delivering a message")
         .expect("Sync.Watch stream yielded an error instead of a message");
     match msg.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 }
 
@@ -276,15 +280,13 @@ async fn one_gateway_unhealthy_does_not_evict_a_relay_another_vouches_for() {
     let gw_b = wiremesh_testkit::enroll_one(&h, "gcp", "10.1.0.0/16").await;
 
     // gwB vouches for R1 as healthy first...
-    gw_b
-        .report_with_relay_health(0, &[], &[(r1_id, true)])
+    gw_b.report_with_relay_health(0, &[], &[(r1_id, true)])
         .await
         .expect("Sync.Report: gwB marks R1 healthy");
     // ...then gwA reports R1 unhealthy. Per the healthy-override rule, the
     // aggregate must stay HEALTHY (gwB's vote still stands), so R1 must
     // remain active/advertised.
-    gw_a
-        .report_with_relay_health(0, &[], &[(r1_id, false)])
+    gw_a.report_with_relay_health(0, &[], &[(r1_id, false)])
         .await
         .expect("Sync.Report: gwA marks R1 unhealthy");
 
@@ -308,11 +310,9 @@ async fn one_gateway_unhealthy_does_not_evict_a_relay_another_vouches_for() {
     let status = tokio::task::spawn_blocking(move || {
         let conn = rusqlite::Connection::open(&db_path)
             .expect("opening controller.db for relay-status inspection");
-        conn.query_row(
-            "SELECT status FROM relay WHERE id = ?1",
-            [r1_id],
-            |row| row.get::<_, String>(0),
-        )
+        conn.query_row("SELECT status FROM relay WHERE id = ?1", [r1_id], |row| {
+            row.get::<_, String>(0)
+        })
         .expect("querying R1's relay.status")
     })
     .await

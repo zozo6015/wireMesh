@@ -26,7 +26,12 @@ fn run(args: &[&str]) -> std::process::Output {
 fn version_flag_prints_crate_version() {
     for flag in ["--version", "-V"] {
         let out = run(&[flag]);
-        assert!(out.status.success(), "{flag} must exit 0, got {:?}\nstderr: {}", out.status, String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{flag} must exit 0, got {:?}\nstderr: {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(
             stdout.contains(env!("CARGO_PKG_VERSION")),
@@ -40,9 +45,16 @@ fn version_flag_prints_crate_version() {
 fn help_flag_prints_nonempty_usage() {
     for flag in ["--help", "-h"] {
         let out = run(&[flag]);
-        assert!(out.status.success(), "{flag} must exit 0, got {:?}", out.status);
+        assert!(
+            out.status.success(),
+            "{flag} must exit 0, got {:?}",
+            out.status
+        );
         let stdout = String::from_utf8_lossy(&out.stdout);
         assert!(!stdout.trim().is_empty(), "{flag} stdout must be non-empty");
-        assert!(stdout.to_lowercase().contains("usage"), "{flag} must render a usage line, got {stdout:?}");
+        assert!(
+            stdout.to_lowercase().contains("usage"),
+            "{flag} must render a usage line, got {stdout:?}"
+        );
     }
 }

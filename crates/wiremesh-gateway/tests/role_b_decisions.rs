@@ -101,7 +101,11 @@ fn settled_peer(gid: u64, active_epoch: u32) -> PeerState {
         gateway_id: gid,
         segment_name: format!("seg-{gid}"),
         active_pubkey_b64: Some(active.clone()),
-        keys: vec![PeerKeyInfo { epoch: active_epoch, pubkey_b64: active, state: "active".into() }],
+        keys: vec![PeerKeyInfo {
+            epoch: active_epoch,
+            pubkey_b64: active,
+            state: "active".into(),
+        }],
         // A reachable endpoint: `reconcile::pending_peer_configs` needs
         // `primary_endpoint()` to parse as `ip:port` before it can derive the
         // peer's offset endpoint, and `main.rs:3782` skips a peer whose config
@@ -124,7 +128,11 @@ fn rotating_peer(gid: u64, active_epoch: u32, pending_epoch: u32) -> PeerState {
 }
 
 fn ds(peers: Vec<PeerState>) -> DesiredState {
-    DesiredState { revision: 1, peers, ..Default::default() }
+    DesiredState {
+        revision: 1,
+        peers,
+        ..Default::default()
+    }
 }
 
 fn ids(decisions: &[(u64, RoleBDecision)]) -> Vec<u64> {
@@ -143,11 +151,23 @@ fn decision_for(decisions: &[(u64, RoleBDecision)], gid: u64) -> &RoleBDecision 
 /// The baseline the other cases are read against.
 #[test]
 fn settled_peers_are_all_skipped() {
-    let state = ds(vec![settled_peer(11, 3), settled_peer(12, 3), settled_peer(13, 3)]);
+    let state = ds(vec![
+        settled_peer(11, 3),
+        settled_peer(12, 3),
+        settled_peer(13, 3),
+    ]);
     let d = role_b_decisions(&state, &BTreeMap::new());
-    assert_eq!(ids(&d), vec![11, 12, 13], "one decision per peer, in roster order");
+    assert_eq!(
+        ids(&d),
+        vec![11, 12, 13],
+        "one decision per peer, in roster order"
+    );
     for (gid, dec) in &d {
-        assert_eq!(*dec, RoleBDecision::Skip, "settled peer {gid} must not be overlapped");
+        assert_eq!(
+            *dec,
+            RoleBDecision::Skip,
+            "settled peer {gid} must not be overlapped"
+        );
     }
 }
 
@@ -184,7 +204,12 @@ fn one_unusable_peer_does_not_starve_the_peers_behind_it() {
     // `!` is outside the base64 alphabet, so `pubkey_b64_to_hex` returns None.
     bad.keys.last_mut().unwrap().pubkey_b64 = "this-is-not-base64!!".to_string();
 
-    let state = ds(vec![rotating_peer(11, 3, 4), bad, rotating_peer(13, 3, 4), rotating_peer(14, 3, 4)]);
+    let state = ds(vec![
+        rotating_peer(11, 3, 4),
+        bad,
+        rotating_peer(13, 3, 4),
+        rotating_peer(14, 3, 4),
+    ]);
     let d = role_b_decisions(&state, &BTreeMap::new());
 
     assert_eq!(
@@ -219,7 +244,11 @@ fn sentinel_pending_key_is_skipped_without_disturbing_other_peers() {
     let mut sentinel = rotating_peer(12, 3, 4);
     sentinel.keys.last_mut().unwrap().pubkey_b64 = "awaiting-submission".to_string();
 
-    let state = ds(vec![rotating_peer(11, 3, 4), sentinel, rotating_peer(13, 3, 4)]);
+    let state = ds(vec![
+        rotating_peer(11, 3, 4),
+        sentinel,
+        rotating_peer(13, 3, 4),
+    ]);
     let d = role_b_decisions(&state, &BTreeMap::new());
 
     assert_eq!(ids(&d), vec![11, 12, 13]);
@@ -229,7 +258,10 @@ fn sentinel_pending_key_is_skipped_without_disturbing_other_peers() {
         "a pending row still bearing the sentinel has no real WG key to overlap toward"
     );
     for gid in [11u64, 13] {
-        assert_eq!(*decision_for(&d, gid), RoleBDecision::Start { pending_epoch: 4 });
+        assert_eq!(
+            *decision_for(&d, gid),
+            RoleBDecision::Start { pending_epoch: 4 }
+        );
     }
 }
 
@@ -275,13 +307,18 @@ fn a_peer_rotating_again_to_a_newer_epoch_is_acted_on() {
     assert!(
         matches!(
             got,
-            RoleBDecision::Restart { stale_epoch: 4, pending_epoch: 5 }
-                | RoleBDecision::Start { pending_epoch: 5 }
+            RoleBDecision::Restart {
+                stale_epoch: 4,
+                pending_epoch: 5
+            } | RoleBDecision::Start { pending_epoch: 5 }
         ),
         "peer 11 has re-rotated to pending epoch 5 while our overlap still targets epoch 4; it \
          must be acted on, not skipped (got {got:?})"
     );
-    assert_eq!(*decision_for(&d, 12), RoleBDecision::Start { pending_epoch: 4 });
+    assert_eq!(
+        *decision_for(&d, 12),
+        RoleBDecision::Start { pending_epoch: 4 }
+    );
 }
 
 /// The same trap, one step further out: our overlap targets an epoch the peer
@@ -300,8 +337,10 @@ fn a_stale_overlap_two_epochs_behind_does_not_veto_a_new_rotation() {
     assert!(
         matches!(
             got,
-            RoleBDecision::Restart { stale_epoch: 4, pending_epoch: 6 }
-                | RoleBDecision::Start { pending_epoch: 6 }
+            RoleBDecision::Restart {
+                stale_epoch: 4,
+                pending_epoch: 6
+            } | RoleBDecision::Start { pending_epoch: 6 }
         ),
         "a leaked/stale overlap toward epoch 4 must not block overlapping toward epoch 6 \
          (got {got:?})"

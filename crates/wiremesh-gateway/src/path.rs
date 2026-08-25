@@ -15,8 +15,7 @@ use std::time::{Duration, Instant};
 /// so this liveness assumption can never drift from what the device is
 /// actually configured to send. Still comfortably inside [`DEGRADED_AFTER`]
 /// (45s), so a healthy path's keepalives always refresh liveness in time.
-pub const KEEPALIVE: Duration =
-    Duration::from_secs(crate::uapi::PERSISTENT_KEEPALIVE_SECS as u64);
+pub const KEEPALIVE: Duration = Duration::from_secs(crate::uapi::PERSISTENT_KEEPALIVE_SECS as u64);
 
 /// How long `Connecting` waits for a first WG handshake before deciding it
 /// needs relay help (spec §6.1: "no handshake within 10s").
@@ -469,7 +468,10 @@ mod tests {
         p.on_handshake(t0, true);
         // A keepalive arrives inside the window, refreshing liveness.
         p.on_authenticated_inbound(t0 + KEEPALIVE);
-        let action = p.tick(t0 + KEEPALIVE + DEGRADED_AFTER - Duration::from_secs(1), false);
+        let action = p.tick(
+            t0 + KEEPALIVE + DEGRADED_AFTER - Duration::from_secs(1),
+            false,
+        );
         assert_eq!(p.state, PathState::Direct);
         assert_eq!(action, None);
     }
@@ -569,7 +571,10 @@ mod tests {
         // to actually carry traffic (e.g. complete the WG handshake).
         for secs in [1, 5, 10, 19] {
             let action = p.tick(t0 + CONNECT_TIMEOUT + Duration::from_secs(secs), true);
-            assert_eq!(action, None, "must not probe before the grace period elapses ({secs}s)");
+            assert_eq!(
+                action, None,
+                "must not probe before the grace period elapses ({secs}s)"
+            );
             assert_eq!(p.state, PathState::Relayed);
         }
     }
@@ -594,16 +599,24 @@ mod tests {
 
         // Immediately after: must NOT fire again (would otherwise stack a
         // fresh punch attempt on top of the one just requested).
-        let action = p.tick(entered + PROBE_DIRECT_INTERVAL + Duration::from_secs(1), true);
+        let action = p.tick(
+            entered + PROBE_DIRECT_INTERVAL + Duration::from_secs(1),
+            true,
+        );
         assert_eq!(action, None);
 
         // Still quiet just short of the next interval.
-        let action =
-            p.tick(entered + PROBE_DIRECT_INTERVAL + PROBE_DIRECT_INTERVAL - Duration::from_secs(1), true);
+        let action = p.tick(
+            entered + PROBE_DIRECT_INTERVAL + PROBE_DIRECT_INTERVAL - Duration::from_secs(1),
+            true,
+        );
         assert_eq!(action, None);
 
         // A full interval after the last probe: fires again.
-        let action = p.tick(entered + PROBE_DIRECT_INTERVAL + PROBE_DIRECT_INTERVAL, true);
+        let action = p.tick(
+            entered + PROBE_DIRECT_INTERVAL + PROBE_DIRECT_INTERVAL,
+            true,
+        );
         assert_eq!(action, Some(PathAction::ProbeDirect));
         assert_eq!(p.state, PathState::Relayed);
     }

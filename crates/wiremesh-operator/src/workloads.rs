@@ -20,17 +20,16 @@
 //! is plaintext-bearer and binds loopback-only by design. The operator's admin
 //! channel is resolved in the reconciler phase.
 
-use anyhow::Context;
 use crate::crd::{
-    WiremeshControllerSpec, WiremeshGateway, WiremeshGatewaySpec, WiremeshRelay,
-    WiremeshRelaySpec,
+    WiremeshControllerSpec, WiremeshGateway, WiremeshGatewaySpec, WiremeshRelay, WiremeshRelaySpec,
 };
+use anyhow::Context;
 use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec, DeploymentStrategy};
 use k8s_openapi::api::core::v1::{
     Container, ContainerPort, EmptyDirVolumeSource, EnvVar, HostPathVolumeSource, KeyToPath,
-    PodSpec, PodTemplateSpec, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-    PersistentVolumeClaimVolumeSource, SecretVolumeSource, SecurityContext, Service, ServicePort,
-    ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
+    PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource, PodSpec,
+    PodTemplateSpec, SecretVolumeSource, SecurityContext, Service, ServicePort, ServiceSpec,
+    Volume, VolumeMount, VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, ObjectMeta};
@@ -81,7 +80,11 @@ fn labels(name: &str) -> BTreeMap<String, String> {
 }
 
 fn env(name: &str, value: impl Into<String>) -> EnvVar {
-    EnvVar { name: name.to_string(), value: Some(value.into()), ..Default::default() }
+    EnvVar {
+        name: name.to_string(),
+        value: Some(value.into()),
+        ..Default::default()
+    }
 }
 
 /// The `Recreate` Deployment strategy: kill the old pod before starting the new
@@ -89,7 +92,11 @@ fn env(name: &str, value: impl Into<String>) -> EnvVar {
 /// hostNetwork), so a default RollingUpdate would surge a second pod that cannot
 /// mount the RWO PVC (or bind the host net), wedging the rollout.
 fn recreate_strategy() -> DeploymentStrategy {
-    DeploymentStrategy { type_: Some("Recreate".into()), rolling_update: None, ..Default::default() }
+    DeploymentStrategy {
+        type_: Some("Recreate".into()),
+        rolling_update: None,
+        ..Default::default()
+    }
 }
 
 /// `spec.replicas` for every workload Deployment: **deliberately released.**
@@ -176,8 +183,8 @@ fn released_replicas() -> Option<i32> {
 /// same null, and a Deployment on some other strategy is passed through
 /// untouched.
 pub fn deployment_apply_body(dep: &Deployment) -> serde_json::Value {
-    let mut body = serde_json::to_value(dep)
-        .expect("a k8s-openapi Deployment always serializes to JSON");
+    let mut body =
+        serde_json::to_value(dep).expect("a k8s-openapi Deployment always serializes to JSON");
     let is_recreate = body
         .get("spec")
         .and_then(|s| s.get("strategy"))
@@ -310,7 +317,8 @@ fn safe_ifname(tun: Option<&str>) -> String {
             if !t.is_empty()
                 && t.len() <= 15
                 && !t.starts_with('-')
-                && t.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
+                && t.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') =>
         {
             t.to_string()
         }
@@ -327,7 +335,11 @@ pub fn controller_pvc(name: &str, spec: &WiremeshControllerSpec) -> PersistentVo
     let mut requests = BTreeMap::new();
     requests.insert(
         "storage".to_string(),
-        Quantity(spec.storage_size.clone().unwrap_or_else(|| "1Gi".to_string())),
+        Quantity(
+            spec.storage_size
+                .clone()
+                .unwrap_or_else(|| "1Gi".to_string()),
+        ),
     );
     PersistentVolumeClaim {
         metadata: ObjectMeta {
@@ -351,8 +363,14 @@ pub fn controller_pvc(name: &str, spec: &WiremeshControllerSpec) -> PersistentVo
 /// The controller Service. Exposes the ports gateways/relays dial — enroll-tcp,
 /// sync-tcp, observe-udp — but NOT admin-tcp (loopback-only by design).
 pub fn controller_service(name: &str, spec: &WiremeshControllerSpec) -> Service {
-    let sync = spec.sync_tcp_port.map(|p| p as i32).unwrap_or(SYNC_TCP_PORT);
-    let observe = spec.observe_udp_port.map(|p| p as i32).unwrap_or(OBSERVE_UDP_PORT);
+    let sync = spec
+        .sync_tcp_port
+        .map(|p| p as i32)
+        .unwrap_or(SYNC_TCP_PORT);
+    let observe = spec
+        .observe_udp_port
+        .map(|p| p as i32)
+        .unwrap_or(OBSERVE_UDP_PORT);
     Service {
         metadata: ObjectMeta {
             name: Some(name.to_string()),
@@ -454,11 +472,27 @@ pub fn admin_exec_sidecar(operator_image: &str) -> Container {
 /// `off` when `spec.rotation_interval` is unset, the verbatim value when
 /// set), listener ports, and the admin-exec sidecar (running `operator_image`)
 /// the operator execs admin ops into over the shared UDS.
-pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator_image: &str) -> Deployment {
-    let image = spec.image.clone().unwrap_or_else(|| DEFAULT_CONTROLLER_IMAGE.to_string());
-    let sync = spec.sync_tcp_port.map(|p| p as i32).unwrap_or(SYNC_TCP_PORT);
-    let admin = spec.admin_tcp_port.map(|p| p as i32).unwrap_or(ADMIN_TCP_PORT);
-    let observe = spec.observe_udp_port.map(|p| p as i32).unwrap_or(OBSERVE_UDP_PORT);
+pub fn controller_deployment(
+    name: &str,
+    spec: &WiremeshControllerSpec,
+    operator_image: &str,
+) -> Deployment {
+    let image = spec
+        .image
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CONTROLLER_IMAGE.to_string());
+    let sync = spec
+        .sync_tcp_port
+        .map(|p| p as i32)
+        .unwrap_or(SYNC_TCP_PORT);
+    let admin = spec
+        .admin_tcp_port
+        .map(|p| p as i32)
+        .unwrap_or(ADMIN_TCP_PORT);
+    let observe = spec
+        .observe_udp_port
+        .map(|p| p as i32)
+        .unwrap_or(OBSERVE_UDP_PORT);
 
     let container_env = vec![
         env("WIREMESH_DATA_DIR", DATA_DIR),
@@ -485,7 +519,10 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
         // from `wiremesh-controller::ROTATION_DISABLED_LITERAL` (private,
         // and this crate has no production dependency on that crate) — keep
         // the two in sync by hand.
-        env("WIREMESH_ROTATION_INTERVAL", spec.rotation_interval.as_deref().unwrap_or("off")),
+        env(
+            "WIREMESH_ROTATION_INTERVAL",
+            spec.rotation_interval.as_deref().unwrap_or("off"),
+        ),
     ];
 
     let container = Container {
@@ -497,13 +534,24 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
             tcp_port("sync-tcp", sync),
         ]),
         volume_mounts: Some(vec![
-            VolumeMount { name: "data".to_string(), mount_path: DATA_DIR.to_string(), ..Default::default() },
-            VolumeMount { name: "run".to_string(), mount_path: RUN_DIR.to_string(), ..Default::default() },
+            VolumeMount {
+                name: "data".to_string(),
+                mount_path: DATA_DIR.to_string(),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "run".to_string(),
+                mount_path: RUN_DIR.to_string(),
+                ..Default::default()
+            },
         ]),
         ..Default::default()
     };
 
-    let image = spec.image.clone().unwrap_or_else(|| DEFAULT_CONTROLLER_IMAGE.to_string());
+    let image = spec
+        .image
+        .clone()
+        .unwrap_or_else(|| DEFAULT_CONTROLLER_IMAGE.to_string());
     let pod = PodSpec {
         // Seed the controller's CA from the cert-manager `Certificate` Secret
         // (tls.crt/tls.key → the data-dir ca.pem/ca.key) BEFORE the controller
@@ -547,7 +595,10 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
     // selector is immutable after create, and it still matches the pod (a
     // selector is a subset match), so this is safe against an existing Deployment.
     let mut pod_labels = labels(name);
-    pod_labels.insert(CONTROLLER_COMPONENT_LABEL.0.to_string(), CONTROLLER_COMPONENT_LABEL.1.to_string());
+    pod_labels.insert(
+        CONTROLLER_COMPONENT_LABEL.0.to_string(),
+        CONTROLLER_COMPONENT_LABEL.1.to_string(),
+    );
 
     Deployment {
         metadata: ObjectMeta {
@@ -559,9 +610,15 @@ pub fn controller_deployment(name: &str, spec: &WiremeshControllerSpec, operator
             // Released, never force-applied — see `released_replicas`.
             replicas: released_replicas(),
             strategy: Some(recreate_strategy()),
-            selector: LabelSelector { match_labels: Some(labels(name)), ..Default::default() },
+            selector: LabelSelector {
+                match_labels: Some(labels(name)),
+                ..Default::default()
+            },
             template: PodTemplateSpec {
-                metadata: Some(ObjectMeta { labels: Some(pod_labels), ..Default::default() }),
+                metadata: Some(ObjectMeta {
+                    labels: Some(pod_labels),
+                    ..Default::default()
+                }),
                 spec: Some(pod),
             },
             ..Default::default()
@@ -602,7 +659,8 @@ fn scheduler_aware_node_selector(
     let mut sel = node_selector.cloned().unwrap_or_default();
     if let Some(n) = node_name {
         // `or_insert`: an explicit hostname key in the CR's nodeSelector wins.
-        sel.entry("kubernetes.io/hostname".to_string()).or_insert_with(|| n.to_string());
+        sel.entry("kubernetes.io/hostname".to_string())
+            .or_insert_with(|| n.to_string());
     }
     if sel.is_empty() {
         None
@@ -622,7 +680,11 @@ pub fn gateway_pvc(name: &str, spec: &WiremeshGatewaySpec) -> PersistentVolumeCl
     let mut requests = BTreeMap::new();
     requests.insert(
         "storage".to_string(),
-        Quantity(spec.storage_size.clone().unwrap_or_else(|| "128Mi".to_string())),
+        Quantity(
+            spec.storage_size
+                .clone()
+                .unwrap_or_else(|| "128Mi".to_string()),
+        ),
     );
     PersistentVolumeClaim {
         metadata: ObjectMeta {
@@ -674,8 +736,16 @@ pub fn gateway_deployment(
     token_secret: &str,
     cidrs: &[String],
 ) -> Deployment {
-    let name = gw.metadata.name.clone().unwrap_or_else(|| "wiremesh-gateway".to_string());
-    let image = gw.spec.image.clone().unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_string());
+    let name = gw
+        .metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| "wiremesh-gateway".to_string());
+    let image = gw
+        .spec
+        .image
+        .clone()
+        .unwrap_or_else(|| DEFAULT_GATEWAY_IMAGE.to_string());
     let tun = safe_ifname(gw.spec.tun.as_deref());
     let wg_port = gw.spec.wg_port.unwrap_or(51820);
 
@@ -687,10 +757,14 @@ pub fn gateway_deployment(
     // to (the controller rejects an empty/mismatched cidrs list).
     let mut enroll_args = vec![
         "enroll".to_string(),
-        "--token-file".to_string(), "/etc/wiremesh-token/token".to_string(),
-        "--controller".to_string(), controller_enroll.to_string(),
-        "--ca".to_string(), "/etc/wiremesh-ca/ca.pem".to_string(),
-        "--state-dir".to_string(), DATA_DIR.to_string(),
+        "--token-file".to_string(),
+        "/etc/wiremesh-token/token".to_string(),
+        "--controller".to_string(),
+        controller_enroll.to_string(),
+        "--ca".to_string(),
+        "/etc/wiremesh-ca/ca.pem".to_string(),
+        "--state-dir".to_string(),
+        DATA_DIR.to_string(),
     ];
     for c in cidrs {
         enroll_args.push("--cidr".to_string());
@@ -702,9 +776,23 @@ pub fn gateway_deployment(
         command: Some(vec!["wiremesh-gateway".to_string()]),
         args: Some(enroll_args),
         volume_mounts: Some(vec![
-            VolumeMount { name: "state".to_string(), mount_path: DATA_DIR.to_string(), ..Default::default() },
-            VolumeMount { name: "token".to_string(), mount_path: "/etc/wiremesh-token".to_string(), read_only: Some(true), ..Default::default() },
-            VolumeMount { name: "ca".to_string(), mount_path: "/etc/wiremesh-ca".to_string(), read_only: Some(true), ..Default::default() },
+            VolumeMount {
+                name: "state".to_string(),
+                mount_path: DATA_DIR.to_string(),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "token".to_string(),
+                mount_path: "/etc/wiremesh-token".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "ca".to_string(),
+                mount_path: "/etc/wiremesh-ca".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
         ]),
         ..Default::default()
     };
@@ -713,23 +801,44 @@ pub fn gateway_deployment(
     // UDP path; sync: external LB / DDNS). Passed through verbatim — the
     // builder's no-shell invariant keeps them single argv elements.
     let sync_target = gw.spec.sync_endpoint.as_deref().unwrap_or(controller_sync);
-    let observe_target = gw.spec.observe_endpoint.as_deref().unwrap_or(controller_observe);
+    let observe_target = gw
+        .spec
+        .observe_endpoint
+        .as_deref()
+        .unwrap_or(controller_observe);
     let metrics_target = gw.spec.metrics_bind.as_deref().unwrap_or("0.0.0.0:9090");
     let main = Container {
         name: "gateway".to_string(),
         image: Some(image),
         args: Some(vec![
-            "--controller-sync".to_string(), sync_target.to_string(),
-            "--observe".to_string(), observe_target.to_string(),
-            "--tun".to_string(), tun,
-            "--wg-port".to_string(), wg_port.to_string(),
-            "--state-dir".to_string(), DATA_DIR.to_string(),
-            "--metrics".to_string(), metrics_target.to_string(),
+            "--controller-sync".to_string(),
+            sync_target.to_string(),
+            "--observe".to_string(),
+            observe_target.to_string(),
+            "--tun".to_string(),
+            tun,
+            "--wg-port".to_string(),
+            wg_port.to_string(),
+            "--state-dir".to_string(),
+            DATA_DIR.to_string(),
+            "--metrics".to_string(),
+            metrics_target.to_string(),
         ]),
-        security_context: Some(SecurityContext { privileged: Some(true), ..Default::default() }),
+        security_context: Some(SecurityContext {
+            privileged: Some(true),
+            ..Default::default()
+        }),
         volume_mounts: Some(vec![
-            VolumeMount { name: "state".to_string(), mount_path: DATA_DIR.to_string(), ..Default::default() },
-            VolumeMount { name: "tun".to_string(), mount_path: "/dev/net/tun".to_string(), ..Default::default() },
+            VolumeMount {
+                name: "state".to_string(),
+                mount_path: DATA_DIR.to_string(),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "tun".to_string(),
+                mount_path: "/dev/net/tun".to_string(),
+                ..Default::default()
+            },
         ]),
         ..Default::default()
     };
@@ -766,12 +875,18 @@ pub fn gateway_deployment(
             },
             Volume {
                 name: "tun".to_string(),
-                host_path: Some(HostPathVolumeSource { path: "/dev/net/tun".to_string(), type_: Some("CharDevice".to_string()) }),
+                host_path: Some(HostPathVolumeSource {
+                    path: "/dev/net/tun".to_string(),
+                    type_: Some("CharDevice".to_string()),
+                }),
                 ..Default::default()
             },
             Volume {
                 name: "token".to_string(),
-                secret: Some(SecretVolumeSource { secret_name: Some(token_secret.to_string()), ..Default::default() }),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(token_secret.to_string()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             Volume {
@@ -795,14 +910,24 @@ pub fn gateway_deployment(
     };
 
     Deployment {
-        metadata: ObjectMeta { name: Some(name.clone()), labels: Some(labels(&name)), ..Default::default() },
+        metadata: ObjectMeta {
+            name: Some(name.clone()),
+            labels: Some(labels(&name)),
+            ..Default::default()
+        },
         spec: Some(DeploymentSpec {
             // Released, never force-applied — see `released_replicas`.
             replicas: released_replicas(),
             strategy: Some(recreate_strategy()),
-            selector: LabelSelector { match_labels: Some(labels(&name)), ..Default::default() },
+            selector: LabelSelector {
+                match_labels: Some(labels(&name)),
+                ..Default::default()
+            },
             template: PodTemplateSpec {
-                metadata: Some(ObjectMeta { labels: Some(labels(&name)), ..Default::default() }),
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels(&name)),
+                    ..Default::default()
+                }),
                 spec: Some(pod),
             },
             ..Default::default()
@@ -827,7 +952,11 @@ pub fn relay_pvc(name: &str, spec: &WiremeshRelaySpec) -> PersistentVolumeClaim 
     let mut requests = BTreeMap::new();
     requests.insert(
         "storage".to_string(),
-        Quantity(spec.storage_size.clone().unwrap_or_else(|| "128Mi".to_string())),
+        Quantity(
+            spec.storage_size
+                .clone()
+                .unwrap_or_else(|| "128Mi".to_string()),
+        ),
     );
     PersistentVolumeClaim {
         metadata: ObjectMeta {
@@ -872,13 +1001,23 @@ pub fn relay_deployment(
     ca_secret: &str,
     token_secret: &str,
 ) -> anyhow::Result<Deployment> {
-    let name = r.metadata.name.clone().unwrap_or_else(|| "wiremesh-relay".to_string());
-    let image = r.spec.image.clone().unwrap_or_else(|| DEFAULT_RELAY_IMAGE.to_string());
+    let name = r
+        .metadata
+        .name
+        .clone()
+        .unwrap_or_else(|| "wiremesh-relay".to_string());
+    let image = r
+        .spec
+        .image
+        .clone()
+        .unwrap_or_else(|| DEFAULT_RELAY_IMAGE.to_string());
     let endpoint = r.spec.endpoint.clone();
     // Validate the advertised endpoint (IPv4 host:port) up front — no silent
     // fallback. The QUIC bridge binds all interfaces on this port.
     let addr: std::net::SocketAddrV4 = endpoint.parse().with_context(|| {
-        format!("WiremeshRelay endpoint {endpoint:?} must be a valid IPv4 host:port (v1 is IPv4-only)")
+        format!(
+            "WiremeshRelay endpoint {endpoint:?} must be a valid IPv4 host:port (v1 is IPv4-only)"
+        )
     })?;
     // Port 0 parses but means "OS-assigned/any" — a relay that bound :0 would
     // advertise an unusable endpoint, so reject it explicitly.
@@ -891,7 +1030,12 @@ pub fn relay_deployment(
     // here. Validation lives solely in the reconciler's `validate_dial_target`
     // gate (mirroring the gateway's observe/sync overrides); duplicating it in
     // the builder would give this one value two validation call sites.
-    let sync = r.spec.controller_endpoint.as_deref().unwrap_or(controller_sync).to_string();
+    let sync = r
+        .spec
+        .controller_endpoint
+        .as_deref()
+        .unwrap_or(controller_sync)
+        .to_string();
 
     // enroll init-container: `--token-file` (no shell), invoked directly so the
     // CRD-supplied `endpoint` reaches the binary as one argv element (never
@@ -901,16 +1045,35 @@ pub fn relay_deployment(
         image: Some(image.clone()),
         command: Some(vec!["wiremesh-relay-enroll".to_string()]),
         args: Some(vec![
-            "--token-file".to_string(), "/etc/wiremesh-token/token".to_string(),
-            "--controller".to_string(), controller_enroll.to_string(),
-            "--ca".to_string(), "/etc/wiremesh-ca/ca.pem".to_string(),
-            "--certdir".to_string(), DATA_DIR.to_string(),
-            "--endpoint".to_string(), endpoint.clone(),
+            "--token-file".to_string(),
+            "/etc/wiremesh-token/token".to_string(),
+            "--controller".to_string(),
+            controller_enroll.to_string(),
+            "--ca".to_string(),
+            "/etc/wiremesh-ca/ca.pem".to_string(),
+            "--certdir".to_string(),
+            DATA_DIR.to_string(),
+            "--endpoint".to_string(),
+            endpoint.clone(),
         ]),
         volume_mounts: Some(vec![
-            VolumeMount { name: "certs".to_string(), mount_path: DATA_DIR.to_string(), ..Default::default() },
-            VolumeMount { name: "token".to_string(), mount_path: "/etc/wiremesh-token".to_string(), read_only: Some(true), ..Default::default() },
-            VolumeMount { name: "ca".to_string(), mount_path: "/etc/wiremesh-ca".to_string(), read_only: Some(true), ..Default::default() },
+            VolumeMount {
+                name: "certs".to_string(),
+                mount_path: DATA_DIR.to_string(),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "token".to_string(),
+                mount_path: "/etc/wiremesh-token".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
+            VolumeMount {
+                name: "ca".to_string(),
+                mount_path: "/etc/wiremesh-ca".to_string(),
+                read_only: Some(true),
+                ..Default::default()
+            },
         ]),
         ..Default::default()
     };
@@ -966,7 +1129,10 @@ pub fn relay_deployment(
             },
             Volume {
                 name: "token".to_string(),
-                secret: Some(SecretVolumeSource { secret_name: Some(token_secret.to_string()), ..Default::default() }),
+                secret: Some(SecretVolumeSource {
+                    secret_name: Some(token_secret.to_string()),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             Volume {
@@ -990,14 +1156,24 @@ pub fn relay_deployment(
     };
 
     Ok(Deployment {
-        metadata: ObjectMeta { name: Some(name.clone()), labels: Some(labels(&name)), ..Default::default() },
+        metadata: ObjectMeta {
+            name: Some(name.clone()),
+            labels: Some(labels(&name)),
+            ..Default::default()
+        },
         spec: Some(DeploymentSpec {
             // Released, never force-applied — see `released_replicas`.
             replicas: released_replicas(),
             strategy: Some(recreate_strategy()),
-            selector: LabelSelector { match_labels: Some(labels(&name)), ..Default::default() },
+            selector: LabelSelector {
+                match_labels: Some(labels(&name)),
+                ..Default::default()
+            },
             template: PodTemplateSpec {
-                metadata: Some(ObjectMeta { labels: Some(labels(&name)), ..Default::default() }),
+                metadata: Some(ObjectMeta {
+                    labels: Some(labels(&name)),
+                    ..Default::default()
+                }),
                 spec: Some(pod),
             },
             ..Default::default()
@@ -1023,7 +1199,11 @@ mod tests {
         }
     }
 
-    fn gw_spec(segment: &str, storage_class: Option<String>, storage_size: Option<String>) -> WiremeshGatewaySpec {
+    fn gw_spec(
+        segment: &str,
+        storage_class: Option<String>,
+        storage_size: Option<String>,
+    ) -> WiremeshGatewaySpec {
         WiremeshGatewaySpec {
             segment_ref: segment.into(),
             node_name: None,
@@ -1071,7 +1251,12 @@ mod tests {
         let build = |spec: WiremeshGatewaySpec| {
             let gw = WiremeshGateway::new("gw-aws", spec);
             let d = gateway_deployment(
-                &gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token",
+                &gw,
+                "10.0.0.1:9500",
+                "10.0.0.1:9400",
+                "10.0.0.1:9600",
+                "wm-ca",
+                "gw-aws-token",
                 &["10.10.0.0/16".to_string()],
             );
             d.spec.unwrap().template.spec.unwrap()
@@ -1084,7 +1269,9 @@ mod tests {
             p.node_name, None,
             "spec.nodeName must NOT be set directly (it bypasses the scheduler → a WaitForFirstConsumer PVC never binds)"
         );
-        let sel = p.node_selector.expect("nodeName must be folded into a nodeSelector");
+        let sel = p
+            .node_selector
+            .expect("nodeName must be folded into a nodeSelector");
         assert_eq!(
             sel.get(HOSTNAME_KEY).map(String::as_str),
             Some("zolab-worker1"),
@@ -1126,7 +1313,10 @@ mod tests {
         let p = build(gw_spec_pinned(None, None));
         assert_eq!(p.node_name, None, "no nodeName");
         assert!(
-            p.node_selector.as_ref().map(|m| m.is_empty()).unwrap_or(true),
+            p.node_selector
+                .as_ref()
+                .map(|m| m.is_empty())
+                .unwrap_or(true),
             "no nodeSelector when the CR pins nothing"
         );
     }
@@ -1150,8 +1340,15 @@ mod tests {
             "gateway identity PVC is RWO (node-local, single writer)"
         );
         let req = spec.resources.as_ref().unwrap().requests.as_ref().unwrap();
-        assert_eq!(req.get("storage").unwrap().0, "128Mi", "default gateway PVC size is 128Mi");
-        assert!(spec.storage_class_name.is_none(), "no storageClass unless the CR sets one");
+        assert_eq!(
+            req.get("storage").unwrap().0,
+            "128Mi",
+            "default gateway PVC size is 128Mi"
+        );
+        assert!(
+            spec.storage_class_name.is_none(),
+            "no storageClass unless the CR sets one"
+        );
         // Instance label parity with controller_pvc (GC/selection).
         let labels = pvc.metadata.labels.as_ref().expect("labels");
         assert_eq!(
@@ -1161,11 +1358,27 @@ mod tests {
         );
 
         // storageClass / storageSize overrides flow through from the CR.
-        let pvc2 = gateway_pvc("gw-aws", &gw_spec("aws", Some("fast-ssd".into()), Some("256Mi".into())));
+        let pvc2 = gateway_pvc(
+            "gw-aws",
+            &gw_spec("aws", Some("fast-ssd".into()), Some("256Mi".into())),
+        );
         let spec2 = pvc2.spec.as_ref().unwrap();
-        assert_eq!(spec2.storage_class_name.as_deref(), Some("fast-ssd"), "storageClass override honored");
         assert_eq!(
-            spec2.resources.as_ref().unwrap().requests.as_ref().unwrap().get("storage").unwrap().0,
+            spec2.storage_class_name.as_deref(),
+            Some("fast-ssd"),
+            "storageClass override honored"
+        );
+        assert_eq!(
+            spec2
+                .resources
+                .as_ref()
+                .unwrap()
+                .requests
+                .as_ref()
+                .unwrap()
+                .get("storage")
+                .unwrap()
+                .0,
             "256Mi",
             "storageSize override honored"
         );
@@ -1179,7 +1392,12 @@ mod tests {
         // (emptyDir is destroyed on every pod recreation → forced re-enroll).
         let gw = WiremeshGateway::new("gw-aws", gw_spec("aws", None, None));
         let d = gateway_deployment(
-            &gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token",
+            &gw,
+            "10.0.0.1:9500",
+            "10.0.0.1:9400",
+            "10.0.0.1:9600",
+            "wm-ca",
+            "gw-aws-token",
             &["10.10.0.0/16".to_string()],
         );
         let pod = d.spec.unwrap().template.spec.unwrap();
@@ -1209,19 +1427,50 @@ mod tests {
         let d = controller_deployment("wm", &ctrl_spec(), "ghcr.io/x/wiremesh-operator:test");
         let pod = d.spec.unwrap().template.spec.unwrap();
         // PVC mounted at /var/lib/wiremesh on the controller container.
-        let ctr = pod.containers.iter().find(|c| c.name == "controller").unwrap();
+        let ctr = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "controller")
+            .unwrap();
         let mounts = ctr.volume_mounts.as_ref().unwrap();
         assert!(
-            mounts.iter().any(|m| m.name == "data" && m.mount_path == "/var/lib/wiremesh"),
+            mounts
+                .iter()
+                .any(|m| m.name == "data" && m.mount_path == "/var/lib/wiremesh"),
             "controller must mount its PVC at /var/lib/wiremesh"
         );
-        let data_vol = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == "data").unwrap();
-        assert_eq!(data_vol.persistent_volume_claim.as_ref().unwrap().claim_name, "wm-data");
+        let data_vol = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "data")
+            .unwrap();
+        assert_eq!(
+            data_vol
+                .persistent_volume_claim
+                .as_ref()
+                .unwrap()
+                .claim_name,
+            "wm-data"
+        );
         // admin-exec sidecar (operator image) sharing the UDS run-dir.
-        let sidecar = pod.containers.iter().find(|c| c.name == "admin-exec").expect("admin-exec sidecar");
-        assert_eq!(sidecar.image.as_deref(), Some("ghcr.io/x/wiremesh-operator:test"));
+        let sidecar = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "admin-exec")
+            .expect("admin-exec sidecar");
+        assert_eq!(
+            sidecar.image.as_deref(),
+            Some("ghcr.io/x/wiremesh-operator:test")
+        );
         assert!(
-            sidecar.volume_mounts.as_ref().unwrap().iter().any(|m| m.mount_path == "/run/wiremesh"),
+            sidecar
+                .volume_mounts
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|m| m.mount_path == "/run/wiremesh"),
             "admin-exec sidecar must share the controller UDS run-dir"
         );
     }
@@ -1241,7 +1490,10 @@ mod tests {
         assert!(names.contains(&"sync-tcp"), "gateways/relays dial sync-tcp");
         assert!(names.contains(&"enroll-tcp"), "enroll-tcp must be exposed");
         // admin-tcp is loopback-only by design and must NOT be exposed.
-        assert!(!names.contains(&"admin-tcp"), "admin-tcp must not be on the Service");
+        assert!(
+            !names.contains(&"admin-tcp"),
+            "admin-tcp must not be on the Service"
+        );
     }
 
     #[test]
@@ -1252,7 +1504,12 @@ mod tests {
         // wedging the rollout. Kill the old pod first, then start the new one.
         let gw = WiremeshGateway::new("gw-aws", gw_spec("aws", None, None));
         let gd = gateway_deployment(
-            &gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token",
+            &gw,
+            "10.0.0.1:9500",
+            "10.0.0.1:9400",
+            "10.0.0.1:9600",
+            "wm-ca",
+            "gw-aws-token",
             &["10.10.0.0/16".to_string()],
         );
         let cd = controller_deployment("wm", &ctrl_spec(), "op:test");
@@ -1288,15 +1545,25 @@ mod tests {
                 metrics_bind: None,
             },
         );
-        let d = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token", &["10.10.0.0/16".to_string()]);
+        let d = gateway_deployment(
+            &gw,
+            "10.0.0.1:9500",
+            "10.0.0.1:9400",
+            "10.0.0.1:9600",
+            "wm-ca",
+            "gw-aws-token",
+            &["10.10.0.0/16".to_string()],
+        );
         let pod = d.spec.unwrap().template.spec.unwrap();
-        assert_eq!(pod.host_network, Some(true), "gateway pod must be hostNetwork");
+        assert_eq!(
+            pod.host_network,
+            Some(true),
+            "gateway pod must be hostNetwork"
+        );
         assert!(
-            pod.containers.iter().any(|c| c
-                .security_context
-                .as_ref()
-                .and_then(|s| s.privileged)
-                == Some(true)),
+            pod.containers
+                .iter()
+                .any(|c| c.security_context.as_ref().and_then(|s| s.privileged) == Some(true)),
             "a gateway container must be privileged"
         );
         let vols = pod.volumes.as_ref().unwrap();
@@ -1309,11 +1576,9 @@ mod tests {
             "gateway must expose /dev/net/tun"
         );
         assert!(
-            vols.iter().any(|v| v
-                .secret
-                .as_ref()
-                .and_then(|s| s.secret_name.as_deref())
-                == Some("gw-aws-token")),
+            vols.iter()
+                .any(|v| v.secret.as_ref().and_then(|s| s.secret_name.as_deref())
+                    == Some("gw-aws-token")),
             "gateway must mount the enrollment-token secret"
         );
     }
@@ -1339,7 +1604,15 @@ mod tests {
                 metrics_bind: None,
             },
         );
-        let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
+        let gd = gateway_deployment(
+            &gw,
+            "10.0.0.1:9500",
+            "10.0.0.1:9400",
+            "10.0.0.1:9600",
+            "wm-ca",
+            "gw-token",
+            &["10.0.0.0/8".to_string()],
+        );
         let r = WiremeshRelay::new(
             "r",
             WiremeshRelaySpec {
@@ -1355,14 +1628,28 @@ mod tests {
 
         for d in [gd, rd] {
             let pod = d.spec.unwrap().template.spec.unwrap();
-            let enroll = pod.init_containers.as_ref().unwrap().iter().find(|c| c.name == "enroll").unwrap();
+            let enroll = pod
+                .init_containers
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|c| c.name == "enroll")
+                .unwrap();
             let cmd = enroll.command.as_ref().unwrap();
-            assert!(!cmd.iter().any(|c| c == "/bin/sh" || c == "sh" || c == "-c"), "no shell wrapper: {cmd:?}");
+            assert!(
+                !cmd.iter().any(|c| c == "/bin/sh" || c == "sh" || c == "-c"),
+                "no shell wrapper: {cmd:?}"
+            );
             for a in enroll.args.as_ref().unwrap() {
                 assert!(!a.contains("$("), "no command substitution in {a:?}");
             }
             // `--token-file` is used (token never in argv/shell).
-            assert!(enroll.args.as_ref().unwrap().iter().any(|a| a == "--token-file"));
+            assert!(enroll
+                .args
+                .as_ref()
+                .unwrap()
+                .iter()
+                .any(|a| a == "--token-file"));
         }
     }
 
@@ -1370,9 +1657,21 @@ mod tests {
     fn safe_ifname_rejects_flag_smuggling() {
         assert_eq!(safe_ifname(Some("wg0")), "wg0");
         assert_eq!(safe_ifname(Some("wg-eth1")), "wg-eth1");
-        assert_eq!(safe_ifname(Some("--metrics")), "wg0", "leading-dash rejected");
-        assert_eq!(safe_ifname(Some("a; rm -rf /")), "wg0", "metachars rejected");
-        assert_eq!(safe_ifname(Some("waytoolonginterfacename")), "wg0", "over-length rejected");
+        assert_eq!(
+            safe_ifname(Some("--metrics")),
+            "wg0",
+            "leading-dash rejected"
+        );
+        assert_eq!(
+            safe_ifname(Some("a; rm -rf /")),
+            "wg0",
+            "metachars rejected"
+        );
+        assert_eq!(
+            safe_ifname(Some("waytoolonginterfacename")),
+            "wg0",
+            "over-length rejected"
+        );
         assert_eq!(safe_ifname(None), "wg0");
     }
 
@@ -1380,24 +1679,53 @@ mod tests {
     fn relay_enrolls_and_binds_endpoint_port() {
         let r = WiremeshRelay::new(
             "relay-eu",
-            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None },
+            WiremeshRelaySpec {
+                endpoint: "203.0.113.9:4443".into(),
+                node_name: None,
+                image: None,
+                storage_class: None,
+                storage_size: None,
+                controller_endpoint: None,
+            },
         );
         let d = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "relay-eu-token").unwrap();
         let pod = d.spec.unwrap().template.spec.unwrap();
         // enroll init container present.
-        assert!(pod.init_containers.as_ref().unwrap().iter().any(|c| c.name == "enroll"));
+        assert!(pod
+            .init_containers
+            .as_ref()
+            .unwrap()
+            .iter()
+            .any(|c| c.name == "enroll"));
         // main relay binds the advertised endpoint's port.
         let main = pod.containers.iter().find(|c| c.name == "relay").unwrap();
         let args = main.args.as_ref().unwrap();
-        assert!(args.iter().any(|a| a == "0.0.0.0:4443"), "relay binds the endpoint port: {args:?}");
+        assert!(
+            args.iter().any(|a| a == "0.0.0.0:4443"),
+            "relay binds the endpoint port: {args:?}"
+        );
     }
 
     #[test]
     fn relay_deployment_fails_closed_on_invalid_endpoint() {
-        for bad in ["not-an-endpoint", "203.0.113.9", "example.com:4443", "[::1]:4443", "203.0.113.9:4443; rm -rf /", "203.0.113.9:0"] {
+        for bad in [
+            "not-an-endpoint",
+            "203.0.113.9",
+            "example.com:4443",
+            "[::1]:4443",
+            "203.0.113.9:4443; rm -rf /",
+            "203.0.113.9:0",
+        ] {
             let r = WiremeshRelay::new(
                 "r",
-                WiremeshRelaySpec { endpoint: bad.into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None },
+                WiremeshRelaySpec {
+                    endpoint: bad.into(),
+                    node_name: None,
+                    image: None,
+                    storage_class: None,
+                    storage_size: None,
+                    controller_endpoint: None,
+                },
             );
             assert!(
                 relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").is_err(),
@@ -1413,10 +1741,21 @@ mod tests {
         // otherwise gateways get `Connection refused` (the bug found on-cluster).
         let d = controller_deployment("wm", &ctrl_spec(), "op:test");
         let pod = d.spec.unwrap().template.spec.unwrap();
-        let ctr = pod.containers.iter().find(|c| c.name == "controller").unwrap();
+        let ctr = pod
+            .containers
+            .iter()
+            .find(|c| c.name == "controller")
+            .unwrap();
         let env = ctr.env.as_ref().unwrap();
-        let bind = env.iter().find(|e| e.name == "WIREMESH_BIND_IP").expect("WIREMESH_BIND_IP env");
-        assert_eq!(bind.value.as_deref(), Some("0.0.0.0"), "controller must bind all interfaces");
+        let bind = env
+            .iter()
+            .find(|e| e.name == "WIREMESH_BIND_IP")
+            .expect("WIREMESH_BIND_IP env");
+        assert_eq!(
+            bind.value.as_deref(),
+            Some("0.0.0.0"),
+            "controller must bind all interfaces"
+        );
     }
 
     #[test]
@@ -1436,17 +1775,27 @@ mod tests {
         // Mounts BOTH the data volume (dest) and the CA-secret volume (source, RO).
         let mounts = seed.volume_mounts.as_ref().unwrap();
         assert!(
-            mounts.iter().any(|m| m.name == "data" && m.mount_path == "/var/lib/wiremesh"),
+            mounts
+                .iter()
+                .any(|m| m.name == "data" && m.mount_path == "/var/lib/wiremesh"),
             "ca-seed must mount the controller data dir"
         );
         assert!(
-            mounts.iter().any(|m| m.name == "ca-secret" && m.read_only == Some(true)),
+            mounts
+                .iter()
+                .any(|m| m.name == "ca-secret" && m.read_only == Some(true)),
             "ca-seed must mount the CA secret read-only"
         );
         // Args seed BOTH ca.pem (from tls.crt) and ca.key (from tls.key).
         let args = seed.args.as_ref().unwrap().join(" ");
-        assert!(args.contains("tls.crt") && args.contains("ca.pem"), "seeds ca.pem from tls.crt: {args:?}");
-        assert!(args.contains("tls.key") && args.contains("ca.key"), "seeds ca.key from tls.key: {args:?}");
+        assert!(
+            args.contains("tls.crt") && args.contains("ca.pem"),
+            "seeds ca.pem from tls.crt: {args:?}"
+        );
+        assert!(
+            args.contains("tls.key") && args.contains("ca.key"),
+            "seeds ca.key from tls.key: {args:?}"
+        );
         // Seed ONCE: never clobber an existing CA on the PVC (guards a restart/
         // rotation from invalidating already-issued identities).
         assert!(
@@ -1460,14 +1809,27 @@ mod tests {
         );
         // The pod sources the CA-secret volume from CONTROLLER_CA_SECRET, and the
         // volume is OPTIONAL so an absent Secret does not block controller boot.
-        let ca_vol = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == "ca-secret").expect("ca-secret volume");
-        let ca_src = ca_vol.secret.as_ref().expect("ca-secret is a Secret source");
+        let ca_vol = pod
+            .volumes
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|v| v.name == "ca-secret")
+            .expect("ca-secret volume");
+        let ca_src = ca_vol
+            .secret
+            .as_ref()
+            .expect("ca-secret is a Secret source");
         assert_eq!(
             ca_src.secret_name.as_deref(),
             Some(CONTROLLER_CA_SECRET),
             "ca-secret volume must source the cert-manager CA Secret"
         );
-        assert_eq!(ca_src.optional, Some(true), "the CA secret volume must be optional (no hard startup dependency)");
+        assert_eq!(
+            ca_src.optional,
+            Some(true),
+            "the CA secret volume must be optional (no hard startup dependency)"
+        );
     }
 
     #[test]
@@ -1490,19 +1852,46 @@ mod tests {
                 metrics_bind: None,
             },
         );
-        let gd = gateway_deployment(&gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-token", &["10.0.0.0/8".to_string()]);
+        let gd = gateway_deployment(
+            &gw,
+            "10.0.0.1:9500",
+            "10.0.0.1:9400",
+            "10.0.0.1:9600",
+            "wm-ca",
+            "gw-token",
+            &["10.0.0.0/8".to_string()],
+        );
         let r = WiremeshRelay::new(
             "r",
-            WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None },
+            WiremeshRelaySpec {
+                endpoint: "203.0.113.9:4443".into(),
+                node_name: None,
+                image: None,
+                storage_class: None,
+                storage_size: None,
+                controller_endpoint: None,
+            },
         );
         let rd = relay_deployment(&r, "wm:9500", "wm:9400", "wm-ca", "r-token").unwrap();
 
         for d in [gd, rd] {
             let pod = d.spec.unwrap().template.spec.unwrap();
-            let ca_vol = pod.volumes.as_ref().unwrap().iter().find(|v| v.name == "ca").expect("ca volume");
-            let src = ca_vol.secret.as_ref().expect("ca volume is a Secret source");
+            let ca_vol = pod
+                .volumes
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|v| v.name == "ca")
+                .expect("ca volume");
+            let src = ca_vol
+                .secret
+                .as_ref()
+                .expect("ca volume is a Secret source");
             assert_eq!(src.secret_name.as_deref(), Some("wm-ca"));
-            let items = src.items.as_ref().expect("CA volume MUST use explicit items (never project the whole Secret)");
+            let items = src
+                .items
+                .as_ref()
+                .expect("CA volume MUST use explicit items (never project the whole Secret)");
             // Exactly one projected item: tls.crt -> ca.pem.
             assert_eq!(items.len(), 1, "CA volume must project exactly one key");
             assert_eq!(items[0].key, "tls.crt");
@@ -1572,7 +1961,12 @@ mod tests {
         // no-op).
         let gw = WiremeshGateway::new("gw-aws", gw_spec("aws", None, None));
         let d = gateway_deployment(
-            &gw, "10.0.0.1:9500", "10.0.0.1:9400", "10.0.0.1:9600", "wm-ca", "gw-aws-token",
+            &gw,
+            "10.0.0.1:9500",
+            "10.0.0.1:9400",
+            "10.0.0.1:9600",
+            "wm-ca",
+            "gw-aws-token",
             &["10.10.0.0/16".to_string()],
         );
         let body = deployment_apply_body(&d);

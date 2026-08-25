@@ -92,7 +92,10 @@ struct DatagramDropLog {
 
 impl DatagramDropLog {
     fn new() -> DatagramDropLog {
-        DatagramDropLog { count: 0, last_logged: None }
+        DatagramDropLog {
+            count: 0,
+            last_logged: None,
+        }
     }
 
     /// Records one event. Returns `Some(total_so_far)` when a line is due
@@ -206,7 +209,10 @@ fn decode_registration(buf: &[u8]) -> Result<(String, String)> {
     }
     let my_len = u16::from_be_bytes([buf[0], buf[1]]) as usize;
     if buf.len() < 2 + my_len {
-        bail!("registration payload truncated: my_len={my_len}, have {} bytes", buf.len() - 2);
+        bail!(
+            "registration payload truncated: my_len={my_len}, have {} bytes",
+            buf.len() - 2
+        );
     }
     let my = std::str::from_utf8(&buf[2..2 + my_len])
         .context("registration my_identity is not valid UTF-8")?
@@ -446,10 +452,7 @@ impl Client {
         // wait until the relay has processed (and ACCEPTED) the registration
         // — an identity-mismatch/duplicate rejection instead closes the
         // connection, surfacing here as an `Err` on the ack read.
-        let (mut send, mut recv) = conn
-            .open_bi()
-            .await
-            .context("open registration stream")?;
+        let (mut send, mut recv) = conn.open_bi().await.context("open registration stream")?;
         send.write_all(&encode_registration(my_identity, peer_identity))
             .await
             .context("write registration")?;
@@ -637,7 +640,10 @@ fn identity_from_client_cert(conn: &Connection) -> Result<String> {
         .context("client cert has no SAN extension (no gw-<id> to bind to)")?;
     for gn in &san.value.general_names {
         if let x509_parser::extensions::GeneralName::DNSName(name) = gn {
-            if name.strip_prefix("gw-").is_some_and(|rest| !rest.is_empty()) {
+            if name
+                .strip_prefix("gw-")
+                .is_some_and(|rest| !rest.is_empty())
+            {
                 return Ok((*name).to_string());
             }
         }
@@ -652,10 +658,11 @@ fn identity_from_client_cert(conn: &Connection) -> Result<String> {
 /// — sending the ack any earlier would reopen the race `ack_registration`'s
 /// doc comment describes (client proceeds on ack before the registry insert
 /// actually happened).
-async fn read_registration(
-    conn: &Connection,
-) -> Result<(quinn::SendStream, String, String)> {
-    let (send, mut recv) = conn.accept_bi().await.context("accept registration stream")?;
+async fn read_registration(conn: &Connection) -> Result<(quinn::SendStream, String, String)> {
+    let (send, mut recv) = conn
+        .accept_bi()
+        .await
+        .context("accept registration stream")?;
     let buf = recv
         .read_to_end(MAX_REGISTRATION_BYTES)
         .await
@@ -668,7 +675,9 @@ async fn read_registration(
 /// inserted into the registry — see [`read_registration`] and the comment on
 /// `Client::finish_connect` for why the ack ordering matters.
 pub async fn ack_registration(mut send: quinn::SendStream) -> Result<()> {
-    send.write_all(&[1]).await.context("write registration ack")?;
+    send.write_all(&[1])
+        .await
+        .context("write registration ack")?;
     send.finish().context("finish registration ack stream")?;
     Ok(())
 }
@@ -970,8 +979,11 @@ pub async fn spawn_server(
     certdir: &Path,
 ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
     let cfg = server_config(certdir)?;
-    let endpoint = Endpoint::server(cfg, bind).with_context(|| format!("binding relay endpoint on {bind}"))?;
-    let local_addr = endpoint.local_addr().context("reading bound relay endpoint address")?;
+    let endpoint =
+        Endpoint::server(cfg, bind).with_context(|| format!("binding relay endpoint on {bind}"))?;
+    let local_addr = endpoint
+        .local_addr()
+        .context("reading bound relay endpoint address")?;
     let handle = tokio::spawn(serve(endpoint));
     Ok((local_addr, handle))
 }
@@ -1020,7 +1032,9 @@ pub fn test_certs(dir: &Path, gateway_ids: &[&str]) -> Result<()> {
     let ca_key = KeyPair::generate().context("generating CA key")?;
     let mut ca_params = CertificateParams::new(vec![]).context("building CA cert params")?;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    let ca_cert = ca_params.self_signed(&ca_key).context("self-signing CA cert")?;
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .context("self-signing CA cert")?;
     std::fs::write(dir.join("ca.pem"), ca_cert.pem()).context("writing ca.pem")?;
 
     // SANs include the loopback-adjacent test addresses used by natlab labs
@@ -1037,7 +1051,9 @@ pub fn test_certs(dir: &Path, gateway_ids: &[&str]) -> Result<()> {
             "198.51.100.1".to_string(),
         ])
         .with_context(|| format!("building cert params for {name}"))?;
-        params.distinguished_name.push(DnType::CommonName, name.as_str());
+        params
+            .distinguished_name
+            .push(DnType::CommonName, name.as_str());
         let serial = test_cert_random_serial();
         params.serial_number = Some(SerialNumber::from_slice(&serial));
         let cert = params
@@ -1079,7 +1095,9 @@ impl Default for Denylist {
 
 impl Denylist {
     pub fn new() -> Denylist {
-        Denylist { inner: Arc::new(RwLock::new(HashSet::new())) }
+        Denylist {
+            inner: Arc::new(RwLock::new(HashSet::new())),
+        }
     }
 
     /// Loads a denylist from `path` (a JSON array of lowercase-hex serial
@@ -1207,9 +1225,16 @@ fn extract_serial_hex(end_entity: &CertificateDer<'_>) -> Result<String> {
     // one 0x00 pad re-added when the high bit is set. Undo the pad, then left-pad
     // back to the original fixed 16-byte width so the hex matches wiremesh-trust's
     // IssuedCert.serial (hex_encode of the raw 16 bytes, leading zeros included).
-    let content: &[u8] = if raw.len() == 17 && raw[0] == 0x00 { &raw[1..] } else { raw };
+    let content: &[u8] = if raw.len() == 17 && raw[0] == 0x00 {
+        &raw[1..]
+    } else {
+        raw
+    };
     if content.len() > 16 {
-        anyhow::bail!("cert serial DER content longer than 16 bytes: {}", content.len());
+        anyhow::bail!(
+            "cert serial DER content longer than 16 bytes: {}",
+            content.len()
+        );
     }
     let mut serial16 = [0u8; 16];
     serial16[16 - content.len()..].copy_from_slice(content);
@@ -1249,13 +1274,17 @@ impl rustls::server::danger::ClientCertVerifier for DenyingVerifier {
     ) -> std::result::Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
         // Chain validation FIRST: an untrusted/malformed/expired cert must
         // fail for that reason, never be shadowed by the denylist check.
-        let verified = self.inner.verify_client_cert(end_entity, intermediates, now)?;
+        let verified = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
 
         let serial_hex = extract_serial_hex(end_entity).map_err(|e| {
             rustls::Error::General(format!("denylist: could not read client cert serial: {e}"))
         })?;
         if self.denylist.contains(&serial_hex) {
-            return Err(rustls::Error::InvalidCertificate(rustls::CertificateError::Revoked));
+            return Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::Revoked,
+            ));
         }
         Ok(verified)
     }
@@ -1291,7 +1320,10 @@ impl rustls::server::danger::ClientCertVerifier for DenyingVerifier {
 /// Task-2 bridge-test parity is preserved via the fail-static empty-denylist
 /// path: when no `denylist.json` is present, the denylist is simply empty,
 /// so no client is ever rejected on that basis.
-pub fn server_config_with_denylist(certdir: &Path, denylist: Denylist) -> Result<QuinnServerConfig> {
+pub fn server_config_with_denylist(
+    certdir: &Path,
+    denylist: Denylist,
+) -> Result<QuinnServerConfig> {
     ensure_crypto_provider();
 
     let relay_certs = load_certs(&certdir.join("relay.pem"))?;
@@ -1303,7 +1335,10 @@ pub fn server_config_with_denylist(certdir: &Path, denylist: Denylist) -> Result
     }
     let inner_verifier = WebPkiClientVerifier::builder(Arc::new(roots)).build()?;
     let client_verifier: Arc<dyn rustls::server::danger::ClientCertVerifier> =
-        Arc::new(DenyingVerifier { inner: inner_verifier, denylist });
+        Arc::new(DenyingVerifier {
+            inner: inner_verifier,
+            denylist,
+        });
 
     let mut tls = rustls::ServerConfig::builder()
         .with_client_cert_verifier(client_verifier)
@@ -1399,8 +1434,10 @@ pub async fn run_sync(
     // IPv6-only target fails fast instead of ever being dialed.
     let resolved = resolve_host_port(sync_addr).await?;
 
-    let cert_pem = std::fs::read_to_string(certdir.join("relay.pem")).context("reading relay.pem")?;
-    let key_pem = std::fs::read_to_string(certdir.join("relay.key")).context("reading relay.key")?;
+    let cert_pem =
+        std::fs::read_to_string(certdir.join("relay.pem")).context("reading relay.pem")?;
+    let key_pem =
+        std::fs::read_to_string(certdir.join("relay.key")).context("reading relay.key")?;
     let ca_pem = std::fs::read_to_string(certdir.join("ca.pem")).context("reading ca.pem")?;
 
     let uri = format!("https://{resolved}");
@@ -1439,7 +1476,9 @@ pub async fn run_sync(
     // ignores this field entirely (only `watch_gateway` records it). 0 is the
     // wire's legacy/unknown sentinel — see `sync.proto`.
     let mut stream = client
-        .watch(WatchRequest { session_generation: 0 })
+        .watch(WatchRequest {
+            session_generation: 0,
+        })
         .await
         .map_err(|s| anyhow::anyhow!("Sync.Watch failed: {s}"))?
         .into_inner();
@@ -1451,7 +1490,9 @@ pub async fn run_sync(
                 let n = s.revoked_serials.len();
                 denylist.replace_all(s.revoked_serials);
                 if let Err(e) = denylist.persist(&persist_path) {
-                    eprintln!("relay: denylist persist failed (continuing with in-memory update): {e}");
+                    eprintln!(
+                        "relay: denylist persist failed (continuing with in-memory update): {e}"
+                    );
                 }
                 eprintln!("relay: sync[{relay_id}] snapshot: {n} revoked serial(s)");
             }
@@ -1535,7 +1576,10 @@ mod denylist_tests {
     #[test]
     fn contains_reflects_current_membership() {
         let dl = Denylist::new();
-        assert!(!dl.contains("aa"), "empty denylist must not contain anything");
+        assert!(
+            !dl.contains("aa"),
+            "empty denylist must not contain anything"
+        );
         dl.replace_all(["aa".to_string()]);
         assert!(dl.contains("aa"));
         assert!(!dl.contains("bb"));
@@ -1631,9 +1675,8 @@ mod denylist_tests {
         for serial in cases {
             let expected: String = serial.iter().map(|b| format!("{b:02x}")).collect();
             let der = cert_der_with_serial(&serial);
-            let got = extract_serial_hex(&der).unwrap_or_else(|e| {
-                panic!("extract_serial_hex failed for serial {expected}: {e}")
-            });
+            let got = extract_serial_hex(&der)
+                .unwrap_or_else(|e| panic!("extract_serial_hex failed for serial {expected}: {e}"));
             assert_eq!(
                 got, expected,
                 "extract_serial_hex must reconstruct the full original 16-byte serial \
@@ -1669,10 +1712,7 @@ mod registration_tests {
         );
         // Length-prefix hygiene: concatenation-ambiguous inputs must not
         // collide.
-        assert_ne!(
-            registration_key("gwa", "b"),
-            registration_key("gw", "ab")
-        );
+        assert_ne!(registration_key("gwa", "b"), registration_key("gw", "ab"));
         // Deterministic.
         assert_eq!(
             registration_key("gw-1", "gw-2"),
@@ -1897,7 +1937,11 @@ mod datagram_drop_log_tests {
         // Their totals are independent too.
         set_last_logged_ago(&mut loud, DATAGRAM_LOG_INTERVAL);
         set_last_logged_ago(&mut quiet, DATAGRAM_LOG_INTERVAL);
-        assert_eq!(loud.record(), Some(10_002), "loud branch's own running total");
+        assert_eq!(
+            loud.record(),
+            Some(10_002),
+            "loud branch's own running total"
+        );
         assert_eq!(quiet.record(), Some(2), "quiet branch's own running total");
     }
 

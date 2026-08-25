@@ -109,7 +109,11 @@ fn exec_transport_rebind_args_use_rebind_kind_and_no_cidrs() {
     let args = rebind_mint_args(42);
     let pos = |flag: &str| args.iter().position(|a| a == flag);
 
-    assert_eq!(args.first().map(String::as_str), Some("mint-token"), "op is mint-token: {args:?}");
+    assert_eq!(
+        args.first().map(String::as_str),
+        Some("mint-token"),
+        "op is mint-token: {args:?}"
+    );
     let k = pos("--kind").expect("argv must carry --kind");
     assert_eq!(
         args.get(k + 1).map(String::as_str),

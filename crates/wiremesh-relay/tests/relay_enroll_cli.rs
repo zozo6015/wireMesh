@@ -26,7 +26,11 @@
 use wiremesh_relay::enroll::{cli_action, CliAction};
 
 fn argv(tokens: &[&str]) -> impl Iterator<Item = String> {
-    tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    tokens
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 #[test]
@@ -39,7 +43,10 @@ fn version_flags_yield_crate_version() {
                     "{flag} output must contain CARGO_PKG_VERSION {:?}, got {s:?}",
                     env!("CARGO_PKG_VERSION")
                 );
-                assert!(s.contains("wiremesh-relay-enroll"), "version line names the binary, got {s:?}");
+                assert!(
+                    s.contains("wiremesh-relay-enroll"),
+                    "version line names the binary, got {s:?}"
+                );
             }
             other => panic!("{flag} must yield Version, got {:?}", ActionDbg(&other)),
         }
@@ -53,7 +60,10 @@ fn help_flags_yield_full_manual() {
             CliAction::Help(m) => {
                 assert!(!m.trim().is_empty(), "help manual must be non-empty");
                 for needle in ["--token", "--controller", "--ca", "--certdir", "--endpoint"] {
-                    assert!(m.contains(needle), "relay-enroll manual must mention {needle:?}; got:\n{m}");
+                    assert!(
+                        m.contains(needle),
+                        "relay-enroll manual must mention {needle:?}; got:\n{m}"
+                    );
                 }
             }
             other => panic!("{flag} must yield Help, got {:?}", ActionDbg(&other)),
@@ -66,7 +76,10 @@ fn help_flags_yield_full_manual() {
 #[test]
 fn normal_args_yield_run() {
     assert!(
-        matches!(cli_action(argv(&["--token", "t", "--controller", "c:1"])), CliAction::Run),
+        matches!(
+            cli_action(argv(&["--token", "t", "--controller", "c:1"])),
+            CliAction::Run
+        ),
         "non-help/version argv must yield Run so parse_args still handles it"
     );
 }

@@ -265,7 +265,11 @@ pub fn device_config_pinned(
             })
         })
         .collect();
-    DeviceConfig { private_key_b64: private_key_b64.to_string(), listen_port, peers }
+    DeviceConfig {
+        private_key_b64: private_key_b64.to_string(),
+        listen_port,
+        peers,
+    }
 }
 
 /// A device config for a NEW own-epoch Device (key-rotation Task 9, Role A):
@@ -331,7 +335,11 @@ pub fn device_config_at_port(
             })
         })
         .collect();
-    DeviceConfig { private_key_b64: private_key_b64.to_string(), listen_port: port, peers }
+    DeviceConfig {
+        private_key_b64: private_key_b64.to_string(),
+        listen_port: port,
+        peers,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -341,7 +349,10 @@ pub struct RouteDiff {
 }
 
 fn all_cidrs(ds: &DesiredState) -> std::collections::BTreeSet<String> {
-    ds.peers.iter().flat_map(|p| p.allowed_ips.iter().cloned()).collect()
+    ds.peers
+        .iter()
+        .flat_map(|p| p.allowed_ips.iter().cloned())
+        .collect()
 }
 
 pub fn route_diff(old: &DesiredState, new: &DesiredState) -> RouteDiff {
@@ -375,11 +386,16 @@ mod tests {
     const VALID_PENDING_KEY: &str = "3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0=";
 
     fn ds_with(peers: Vec<PeerState>, ver: u64) -> DesiredState {
-        DesiredState { peers, policy_version: ver, ..Default::default() }
+        DesiredState {
+            peers,
+            policy_version: ver,
+            ..Default::default()
+        }
     }
     fn p(id: u64, key: Option<&str>, cidr: &str) -> PeerState {
         PeerState {
-            gateway_id: id, segment_name: format!("s{id}"),
+            gateway_id: id,
+            segment_name: format!("s{id}"),
             active_pubkey_b64: key.map(String::from),
             keys: vec![],
             candidates: vec![format!("10.9.0.{id}:51820")],
@@ -392,7 +408,10 @@ mod tests {
     /// from the shared `p(...)` helper above (which existing tests rely on
     /// and does not carry a `keys` vec) so those tests are left untouched.
     fn peer_full(id: u64, candidate: &str, keys: Vec<PeerKeyInfo>, cidr: &str) -> PeerState {
-        let active_pubkey_b64 = keys.iter().find(|k| k.state == "active").map(|k| k.pubkey_b64.clone());
+        let active_pubkey_b64 = keys
+            .iter()
+            .find(|k| k.state == "active")
+            .map(|k| k.pubkey_b64.clone());
         PeerState {
             gateway_id: id,
             segment_name: format!("s{id}"),
@@ -405,7 +424,10 @@ mod tests {
 
     #[test]
     fn peer_configs_skip_peers_without_active_key() {
-        let ds = ds_with(vec![p(2, Some("K2"), "10.10.2.0/24"), p(3, None, "10.10.3.0/24")], 0);
+        let ds = ds_with(
+            vec![p(2, Some("K2"), "10.10.2.0/24"), p(3, None, "10.10.3.0/24")],
+            0,
+        );
         let cfgs = peer_configs(&ds);
         assert_eq!(cfgs.len(), 1);
         assert_eq!(cfgs[0].public_key_b64, "K2");
@@ -417,8 +439,20 @@ mod tests {
 
     #[test]
     fn route_diff_adds_and_removes() {
-        let old = ds_with(vec![p(2, Some("K2"), "10.10.2.0/24"), p(3, Some("K3"), "10.10.3.0/24")], 0);
-        let new = ds_with(vec![p(2, Some("K2"), "10.10.2.0/24"), p(4, Some("K4"), "10.10.4.0/24")], 0);
+        let old = ds_with(
+            vec![
+                p(2, Some("K2"), "10.10.2.0/24"),
+                p(3, Some("K3"), "10.10.3.0/24"),
+            ],
+            0,
+        );
+        let new = ds_with(
+            vec![
+                p(2, Some("K2"), "10.10.2.0/24"),
+                p(4, Some("K4"), "10.10.4.0/24"),
+            ],
+            0,
+        );
         let diff = route_diff(&old, &new);
         assert_eq!(diff.to_add, vec!["10.10.4.0/24".to_string()]);
         assert_eq!(diff.to_del, vec!["10.10.3.0/24".to_string()]);
@@ -435,9 +469,20 @@ mod tests {
     /// rather than against a literal it copied from the same formula it is
     /// trying to check.
     fn dialled_port(cfgs: &[PeerConfig]) -> u16 {
-        assert_eq!(cfgs.len(), 1, "expected exactly one pending peer config, got {cfgs:?}");
-        let ep = cfgs[0].endpoint.as_deref().expect("a pending peer config carries an endpoint");
-        ep.rsplit_once(':').expect("endpoint is ip:port").1.parse().expect("port is a u16")
+        assert_eq!(
+            cfgs.len(),
+            1,
+            "expected exactly one pending peer config, got {cfgs:?}"
+        );
+        let ep = cfgs[0]
+            .endpoint
+            .as_deref()
+            .expect("a pending peer config carries an endpoint");
+        ep.rsplit_once(':')
+            .expect("endpoint is ip:port")
+            .1
+            .parse()
+            .expect("port is a u16")
     }
 
     /// **Epoch-independence by RESERVATION, not by epoch arithmetic.** The
@@ -501,8 +546,12 @@ mod tests {
             );
             let ds = ds_with(vec![peer], 0);
             let cfgs = pending_peer_configs(&ds, 25);
-            let candidate_port: u16 =
-                candidate.rsplit_once(':').unwrap().1.parse().expect("test candidate port");
+            let candidate_port: u16 = candidate
+                .rsplit_once(':')
+                .unwrap()
+                .1
+                .parse()
+                .expect("test candidate port");
             assert_eq!(
                 dialled_port(&cfgs),
                 candidate_port + OWN_TUN_PORT_OFFSET,
@@ -516,9 +565,18 @@ mod tests {
             );
             // Plumbing the old `..._builds_offset_endpoint` also covered, kept
             // here so deleting it costs nothing.
-            assert_eq!(cfgs[0].public_key_b64, VALID_PENDING_KEY, "the overlap peers the PENDING key");
             assert_eq!(
-                cfgs[0].endpoint.as_deref().unwrap().rsplit_once(':').unwrap().0,
+                cfgs[0].public_key_b64, VALID_PENDING_KEY,
+                "the overlap peers the PENDING key"
+            );
+            assert_eq!(
+                cfgs[0]
+                    .endpoint
+                    .as_deref()
+                    .unwrap()
+                    .rsplit_once(':')
+                    .unwrap()
+                    .0,
                 candidate.rsplit_once(':').unwrap().0,
                 "the IP is the peer's advertised candidate IP, unmodified"
             );
@@ -540,8 +598,16 @@ mod tests {
             6,
             "10.9.0.6:51820",
             vec![
-                PeerKeyInfo { epoch: 9, pubkey_b64: "KA".into(), state: "active".into() },
-                PeerKeyInfo { epoch: 4, pubkey_b64: VALID_PENDING_KEY.into(), state: "pending".into() },
+                PeerKeyInfo {
+                    epoch: 9,
+                    pubkey_b64: "KA".into(),
+                    state: "active".into(),
+                },
+                PeerKeyInfo {
+                    epoch: 4,
+                    pubkey_b64: VALID_PENDING_KEY.into(),
+                    state: "pending".into(),
+                },
             ],
             "10.10.6.0/24",
         );
@@ -562,7 +628,11 @@ mod tests {
         let peer = peer_full(
             3,
             "10.9.0.3:51820",
-            vec![PeerKeyInfo { epoch: 0, pubkey_b64: "KA".into(), state: "active".into() }],
+            vec![PeerKeyInfo {
+                epoch: 0,
+                pubkey_b64: "KA".into(),
+                state: "active".into(),
+            }],
             "10.10.3.0/24",
         );
         let ds = ds_with(vec![peer], 0);
@@ -575,8 +645,16 @@ mod tests {
             4,
             "10.9.0.4:51820",
             vec![
-                PeerKeyInfo { epoch: 0, pubkey_b64: "KA".into(), state: "active".into() },
-                PeerKeyInfo { epoch: 1, pubkey_b64: "awaiting-submission".into(), state: "pending".into() },
+                PeerKeyInfo {
+                    epoch: 0,
+                    pubkey_b64: "KA".into(),
+                    state: "active".into(),
+                },
+                PeerKeyInfo {
+                    epoch: 1,
+                    pubkey_b64: "awaiting-submission".into(),
+                    state: "pending".into(),
+                },
             ],
             "10.10.4.0/24",
         );
@@ -611,7 +689,11 @@ mod tests {
     fn pending_peer_configs_drops_a_peer_whose_candidate_has_no_own_tun_endpoint() {
         let keys = || {
             vec![
-                PeerKeyInfo { epoch: 0, pubkey_b64: "KA".into(), state: "active".into() },
+                PeerKeyInfo {
+                    epoch: 0,
+                    pubkey_b64: "KA".into(),
+                    state: "active".into(),
+                },
                 PeerKeyInfo {
                     epoch: 1,
                     pubkey_b64: VALID_PENDING_KEY.into(),
@@ -621,7 +703,10 @@ mod tests {
         };
 
         for (candidate, why) in [
-            ("10.9.0.2:65535", "65535 + OWN_TUN_PORT_OFFSET overflows a u16"),
+            (
+                "10.9.0.2:65535",
+                "65535 + OWN_TUN_PORT_OFFSET overflows a u16",
+            ),
             ("10.9.0.2", "no colon"),
             ("10.9.0.2:", "empty port"),
             ("10.9.0.2:abc", "non-numeric port"),
@@ -646,7 +731,11 @@ mod tests {
             0,
         );
         let cfgs = pending_peer_configs(&ds, 25);
-        assert_eq!(cfgs.len(), 1, "peer 3 is well-formed and must survive peer 2, got {cfgs:?}");
+        assert_eq!(
+            cfgs.len(),
+            1,
+            "peer 3 is well-formed and must survive peer 2, got {cfgs:?}"
+        );
         assert_eq!(
             cfgs[0].endpoint.as_deref(),
             Some(format!("10.9.0.3:{}", 51820 + OWN_TUN_PORT_OFFSET).as_str()),
@@ -685,7 +774,9 @@ mod tests {
                 // --- Side 1: the rotating gateway G allocates its new epoch. ---
                 // G's active key is back on its base port (piece 2).
                 let mut live = vec![TunnelPlan {
-                    id: TunnelId::Own { epoch: active_epoch },
+                    id: TunnelId::Own {
+                        epoch: active_epoch,
+                    },
                     ifname: BASE_TUN.to_string(),
                     listen_port: base_port,
                 }];
@@ -694,12 +785,17 @@ mod tests {
                 // Planned BEFORE its own new tun, which is the ordering that
                 // used to steal `base + 1`.
                 for gid in [21u64, 22, 23] {
-                    let id = TunnelId::Overlap { gateway_id: gid, epoch: pending_epoch };
+                    let id = TunnelId::Overlap {
+                        gateway_id: gid,
+                        epoch: pending_epoch,
+                    };
                     let plan = plan_tunnel(id, BASE_TUN, base_port, &live)
                         .unwrap_or_else(|e| panic!("overlap toward {gid}: {e:#}"));
                     live.push(plan);
                 }
-                let own_id = TunnelId::Own { epoch: pending_epoch };
+                let own_id = TunnelId::Own {
+                    epoch: pending_epoch,
+                };
                 let own = plan_tunnel(own_id, BASE_TUN, base_port, &live)
                     .unwrap_or_else(|e| panic!("G's own new epoch {pending_epoch}: {e:#}"));
 
@@ -766,7 +862,10 @@ mod tests {
         // the allocator refuses rather than hard-coding a count.
         let mut allocated = 0usize;
         while let Ok(plan) = plan_tunnel(
-            TunnelId::Overlap { gateway_id: 100 + allocated as u64, epoch: 4 },
+            TunnelId::Overlap {
+                gateway_id: 100 + allocated as u64,
+                epoch: 4,
+            },
             BASE_TUN,
             BASE_PORT,
             &live,

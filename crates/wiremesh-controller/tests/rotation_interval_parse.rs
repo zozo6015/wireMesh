@@ -788,7 +788,9 @@ fn env_non_utf8_value_is_a_hard_error_not_the_default() {
 /// otherwise until it fired.
 #[test]
 fn env_present_malformed_is_a_startup_error_not_a_silent_default() {
-    for raw in ["of", "0", "30", "30dd", "30D", "abc", "", "   ", "-1d", "30w"] {
+    for raw in [
+        "of", "0", "30", "30dd", "30D", "abc", "", "   ", "-1d", "30w",
+    ] {
         match rotation_interval_from_env(|_| Ok(raw.to_string())) {
             Ok(v) => panic!(
                 "{ROTATION_INTERVAL_ENV}={raw:?} is malformed and MUST be a startup error. \

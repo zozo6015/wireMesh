@@ -1,5 +1,6 @@
+use ipnet::Ipv4Net;
+use std::str::FromStr;
 use wiremesh_controller::db::{Db, OverlapError};
-use ipnet::Ipv4Net; use std::str::FromStr;
 
 #[test]
 fn migration_is_idempotent_and_sets_user_version() {
@@ -17,12 +18,16 @@ fn migration_is_idempotent_and_sets_user_version() {
 #[test]
 fn overlapping_cidr_is_rejected_naming_the_conflict() {
     let db = Db::open_memory().unwrap();
-    db.insert_segment("aws", &[Ipv4Net::from_str("10.0.0.0/16").unwrap()]).unwrap();
-    let err = db.insert_segment("gcp", &[Ipv4Net::from_str("10.0.5.0/24").unwrap()]).unwrap_err();
+    db.insert_segment("aws", &[Ipv4Net::from_str("10.0.0.0/16").unwrap()])
+        .unwrap();
+    let err = db
+        .insert_segment("gcp", &[Ipv4Net::from_str("10.0.5.0/24").unwrap()])
+        .unwrap_err();
     let overlap = err.downcast::<OverlapError>().unwrap();
     assert_eq!(overlap.conflicting_segment, "aws");
     // non-overlapping is accepted
-    db.insert_segment("lab", &[Ipv4Net::from_str("192.168.0.0/24").unwrap()]).unwrap();
+    db.insert_segment("lab", &[Ipv4Net::from_str("192.168.0.0/24").unwrap()])
+        .unwrap();
 }
 
 #[test]
@@ -48,7 +53,8 @@ fn same_call_overlapping_cidrs_are_rejected() {
 #[test]
 fn audit_row_is_appended() {
     let db = Db::open_memory().unwrap();
-    db.audit("token:ci", "create", "segment/aws", r#"{"name":"aws"}"#).unwrap();
+    db.audit("token:ci", "create", "segment/aws", r#"{"name":"aws"}"#)
+        .unwrap();
     assert_eq!(db.count_audit().unwrap(), 1);
 }
 
@@ -71,9 +77,13 @@ fn revision_is_persistent_and_monotonic_across_reopen() {
     let r0 = db.current_revision().unwrap();
 
     // A projection-affecting mutation must advance the revision.
-    db.insert_segment("aws", &[Ipv4Net::from_str("10.0.0.0/16").unwrap()]).unwrap();
+    db.insert_segment("aws", &[Ipv4Net::from_str("10.0.0.0/16").unwrap()])
+        .unwrap();
     let r1 = db.current_revision().unwrap();
-    assert!(r1 > r0, "insert_segment must bump the revision: r1={r1} r0={r0}");
+    assert!(
+        r1 > r0,
+        "insert_segment must bump the revision: r1={r1} r0={r0}"
+    );
 
     // Reopen the SAME file: the revision must have persisted (non-decreasing).
     drop(db);
@@ -85,7 +95,8 @@ fn revision_is_persistent_and_monotonic_across_reopen() {
     );
 
     // And it must keep incrementing after the reopen, not restart from a base.
-    db2.insert_segment("gcp", &[Ipv4Net::from_str("10.1.0.0/16").unwrap()]).unwrap();
+    db2.insert_segment("gcp", &[Ipv4Net::from_str("10.1.0.0/16").unwrap()])
+        .unwrap();
     assert!(
         db2.current_revision().unwrap() > r1,
         "mutation after reopen must bump the revision above {r1}, got {}",

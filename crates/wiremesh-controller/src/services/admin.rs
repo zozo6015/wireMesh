@@ -433,9 +433,10 @@ impl Admin for AdminSvc {
         // `send` errors only when there are currently no `Sync.Watch`
         // subscribers — nobody to notify, which is not a failure (mirrors
         // `RotateKey`/`Drain`/`RevokeCert`/`Apply`'s identical `let _ =`).
-        let _ = self
-            .change_tx
-            .send(ChangeEvent::RelaysChanged { relay_infos, revision });
+        let _ = self.change_tx.send(ChangeEvent::RelaysChanged {
+            relay_infos,
+            revision,
+        });
 
         Ok(Response::new(Relay {
             id: relay_id as u64,
@@ -617,14 +618,18 @@ impl Admin for AdminSvc {
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
 
-        let outcome = self.db.rotate_key(gateway_id, actor, now).await.map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("no ACTIVE gateway row") {
-                Status::not_found(msg)
-            } else {
-                Status::internal(format!("rotating key: {e}"))
-            }
-        })?;
+        let outcome = self
+            .db
+            .rotate_key(gateway_id, actor, now)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("no ACTIVE gateway row") {
+                    Status::not_found(msg)
+                } else {
+                    Status::internal(format!("rotating key: {e}"))
+                }
+            })?;
 
         // Publish so already-connected peers see the new pending key —
         // shared re-read-and-fan-out helper (also used by
@@ -692,14 +697,18 @@ impl Admin for AdminSvc {
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
 
-        let outcome = self.db.drain_gateway(gateway_id, actor, now).await.map_err(|e| {
-            let msg = e.to_string();
-            if msg.contains("no gateway row") {
-                Status::not_found(msg)
-            } else {
-                Status::internal(format!("draining gateway: {e}"))
-            }
-        })?;
+        let outcome = self
+            .db
+            .drain_gateway(gateway_id, actor, now)
+            .await
+            .map_err(|e| {
+                let msg = e.to_string();
+                if msg.contains("no gateway row") {
+                    Status::not_found(msg)
+                } else {
+                    Status::internal(format!("draining gateway: {e}"))
+                }
+            })?;
 
         let revision = self
             .db
@@ -818,14 +827,12 @@ impl Admin for AdminSvc {
                 .cidrs
                 .iter()
                 .map(|c| {
-                    Ipv4Net::from_str(c)
-                        .map(|net| net.trunc())
-                        .map_err(|e| {
-                            Status::invalid_argument(format!(
-                                "invalid IPv4 CIDR {c:?} in segment {:?}: {e}",
-                                s.name
-                            ))
-                        })
+                    Ipv4Net::from_str(c).map(|net| net.trunc()).map_err(|e| {
+                        Status::invalid_argument(format!(
+                            "invalid IPv4 CIDR {c:?} in segment {:?}: {e}",
+                            s.name
+                        ))
+                    })
                 })
                 .collect::<Result<_, _>>()?;
             // (Backlog 10 PR-A Item 2b) Same empty-cidrs boundary guard as
@@ -871,22 +878,21 @@ impl Admin for AdminSvc {
                     ))
                 })?
             {
-                let keys = self.db.all_keys_for_gateway(gateway_id).await.map_err(|e| {
-                    Status::internal(format!(
-                        "reading gateway keys after CIDR change: {e}"
-                    ))
-                })?;
+                let keys = self
+                    .db
+                    .all_keys_for_gateway(gateway_id)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("reading gateway keys after CIDR change: {e}"))
+                    })?;
                 // (Review finding; widened in cycle-4b Task 3) Same
                 // `Db::candidates_for` lookup `build_snapshot`/
                 // `routes::peers_of` use for a peer's FULL
                 // `candidate_endpoints` set (observed + locals) — without it
                 // this delta would erase already-known candidate(s) from
                 // every open `Sync.Watch` stream's view of this peer.
-                let candidate_endpoints = self
-                    .db
-                    .candidates_for(gateway_id)
-                    .await
-                    .map_err(|e| {
+                let candidate_endpoints =
+                    self.db.candidates_for(gateway_id).await.map_err(|e| {
                         Status::internal(format!(
                             "reading candidate endpoints after CIDR change: {e}"
                         ))
@@ -916,11 +922,10 @@ impl Admin for AdminSvc {
             // a restarted controller) also uses, so this broadcasts exactly
             // the same bytes a reconnecting gateway would see — no separate
             // code path that could drift from it.
-            if let Some((version, compiled_ir_json)) = self
-                .db
-                .latest_policy()
-                .await
-                .map_err(|e| Status::internal(format!("reading latest policy after apply: {e}")))?
+            if let Some((version, compiled_ir_json)) =
+                self.db.latest_policy().await.map_err(|e| {
+                    Status::internal(format!("reading latest policy after apply: {e}"))
+                })?
             {
                 let revision = self.db.current_revision().await.map_err(|e| {
                     Status::internal(format!("reading revision after policy apply: {e}"))

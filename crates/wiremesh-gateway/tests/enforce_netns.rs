@@ -13,12 +13,25 @@ fn apply_if_changed_applies_once_per_version() {
     let mut enf = GatewayEnforcer::attach("wg0").expect("probe wg0");
 
     // First apply: an allow-nothing IR (default deny).
-    let mut ds = DesiredState { policy_version: 1, policy_ir: br#"{"schema":1,"version":1,"blocks":[]}"#.to_vec(), ..Default::default() };
-    assert!(enf.apply_if_changed(&mut ds).unwrap(), "first apply happens");
-    assert!(!enf.apply_if_changed(&mut ds).unwrap(), "same version is a no-op");
+    let mut ds = DesiredState {
+        policy_version: 1,
+        policy_ir: br#"{"schema":1,"version":1,"blocks":[]}"#.to_vec(),
+        ..Default::default()
+    };
+    assert!(
+        enf.apply_if_changed(&mut ds).unwrap(),
+        "first apply happens"
+    );
+    assert!(
+        !enf.apply_if_changed(&mut ds).unwrap(),
+        "same version is a no-op"
+    );
 
     // Bump version -> applies again.
     ds.policy_version = 2;
-    assert!(enf.apply_if_changed(&mut ds).unwrap(), "new version re-applies");
+    assert!(
+        enf.apply_if_changed(&mut ds).unwrap(),
+        "new version re-applies"
+    );
     drop(lab);
 }

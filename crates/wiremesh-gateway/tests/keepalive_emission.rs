@@ -53,12 +53,24 @@ fn b64(bytes: &[u8; 32]) -> String {
     const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::new();
     for chunk in bytes.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { T[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { T[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            T[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            T[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -75,7 +87,10 @@ fn peer(id: u64, key: Option<&str>, cidr: &str) -> PeerState {
 }
 
 fn ds_with(peers: Vec<PeerState>) -> DesiredState {
-    DesiredState { peers, ..Default::default() }
+    DesiredState {
+        peers,
+        ..Default::default()
+    }
 }
 
 /// T1: the steady-state keepalive is 25 seconds, exposed as a lib constant
@@ -132,7 +147,10 @@ fn t1_encode_set_emits_keepalive_25_for_every_peer() {
 /// and not a per-call-site choice (target signature: `peer_configs(&ds)`).
 #[test]
 fn t1_peer_configs_always_carry_25s_keepalive() {
-    let ds = ds_with(vec![peer(2, Some("K2"), "10.10.2.0/24"), peer(3, Some("K3"), "10.10.3.0/24")]);
+    let ds = ds_with(vec![
+        peer(2, Some("K2"), "10.10.2.0/24"),
+        peer(3, Some("K3"), "10.10.3.0/24"),
+    ]);
     let cfgs = peer_configs(&ds);
     assert_eq!(cfgs.len(), 2);
     for cfg in &cfgs {

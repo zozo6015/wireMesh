@@ -19,9 +19,7 @@
 //! `Sync.Watch` at all. See `sync_identity_active_only.rs` for that
 //! coverage.
 use tokio_stream::StreamExt;
-use wiremesh_proto::v1::{
-    sync_message, CreateSegmentRequest, EnrollRequest, MintTokenRequest,
-};
+use wiremesh_proto::v1::{sync_message, CreateSegmentRequest, EnrollRequest, MintTokenRequest};
 
 #[tokio::test]
 async fn rebind_replaces_gateway_without_overlap_and_revokes_old_cert() {
@@ -77,7 +75,9 @@ async fn rebind_replaces_gateway_without_overlap_and_revokes_old_cert() {
         .expect("Sync.Watch stream yielded an error instead of a message");
     let snap = match msg.body {
         Some(sync_message::Body::Snapshot(snap)) => snap,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
 
     assert!(

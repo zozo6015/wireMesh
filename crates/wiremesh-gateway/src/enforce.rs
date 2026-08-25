@@ -15,7 +15,10 @@ impl GatewayEnforcer {
     pub fn attach(ifname: &str) -> anyhow::Result<Self> {
         let inner = probe(ifname, EnforcerConfig::default())
             .with_context(|| format!("probing enforcer backend on {ifname}"))?;
-        Ok(GatewayEnforcer { inner, applied_version: None })
+        Ok(GatewayEnforcer {
+            inner,
+            applied_version: None,
+        })
     }
 
     pub fn kind(&self) -> BackendKind {
@@ -50,11 +53,17 @@ impl GatewayEnforcer {
             return Ok(false);
         }
         let ir = if ds.policy_ir.is_empty() {
-            PolicyIR { schema: 1, version: ds.policy_version, blocks: vec![] }
+            PolicyIR {
+                schema: 1,
+                version: ds.policy_version,
+                blocks: vec![],
+            }
         } else {
             PolicyIR::from_json(&ds.policy_ir).context("deserializing policy_ir from snapshot")?
         };
-        self.inner.apply(&ir).context("applying policy IR to enforcer")?;
+        self.inner
+            .apply(&ir)
+            .context("applying policy IR to enforcer")?;
         self.applied_version = Some(ds.policy_version);
         Ok(true)
     }

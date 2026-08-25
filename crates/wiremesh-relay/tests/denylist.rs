@@ -102,7 +102,9 @@ fn write_denylist(certdir: &Path, revoked_serials_hex: &[&str]) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut perms = std::fs::metadata(&path).expect("stat denylist.json").permissions();
+        let mut perms = std::fs::metadata(&path)
+            .expect("stat denylist.json")
+            .permissions();
         perms.set_mode(0o600);
         std::fs::set_permissions(&path, perms).expect("chmod denylist.json 0600");
     }
@@ -163,10 +165,7 @@ async fn offline_denylist_rejects_revoked_serial_but_keeps_mutual_tls_and_good_c
         .await
         .expect("gw-good (2nd connection) must also connect: same non-revoked identity");
 
-    good_a
-        .send(b"still-good")
-        .await
-        .expect("send to gw-good");
+    good_a.send(b"still-good").await.expect("send to gw-good");
     let (src, data) = tokio::time::timeout(Duration::from_secs(3), good_b.recv())
         .await
         .expect("recv timed out")

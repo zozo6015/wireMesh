@@ -89,7 +89,9 @@ use std::env::VarError;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use wiremesh_controller::{config_from_env, parse_rotation_interval, Config, ROTATION_INTERVAL_ENV};
+use wiremesh_controller::{
+    config_from_env, parse_rotation_interval, Config, ROTATION_INTERVAL_ENV,
+};
 
 // ---------------------------------------------------------------------------
 // The operator-facing variable names.
@@ -487,8 +489,18 @@ fn explicit_ports_land_in_their_own_fields() {
     ]);
     for (var, field, got, want) in [
         (TCP_PORT_ENV, "tcp_port", config.tcp_port, 18441u16),
-        (SYNC_TCP_PORT_ENV, "sync_tcp_port", config.sync_tcp_port, 18442),
-        (ADMIN_TCP_PORT_ENV, "admin_tcp_port", config.admin_tcp_port, 18443),
+        (
+            SYNC_TCP_PORT_ENV,
+            "sync_tcp_port",
+            config.sync_tcp_port,
+            18442,
+        ),
+        (
+            ADMIN_TCP_PORT_ENV,
+            "admin_tcp_port",
+            config.admin_tcp_port,
+            18443,
+        ),
         (
             OBSERVE_UDP_PORT_ENV,
             "observe_udp_port",

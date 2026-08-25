@@ -38,8 +38,12 @@ async fn apply_fabric(ctx: &Context) -> Result<(), Error> {
 /// The body of [`apply_fabric`]; the caller MUST hold `ctx.fabric_apply_lock`.
 async fn apply_fabric_locked(ctx: &Context) -> Result<(), Error> {
     let client = ctx.client.clone();
-    let segs = Api::<WiremeshSegment>::all(client.clone()).list(&ListParams::default()).await?;
-    let pols = Api::<WiremeshPolicy>::all(client.clone()).list(&ListParams::default()).await?;
+    let segs = Api::<WiremeshSegment>::all(client.clone())
+        .list(&ListParams::default())
+        .await?;
+    let pols = Api::<WiremeshPolicy>::all(client.clone())
+        .list(&ListParams::default())
+        .await?;
     // Exclude objects being deleted: during a Segment finalizer the object still
     // appears in the list (it has a deletionTimestamp but isn't gone yet), so
     // including it would re-add the very segment the finalizer just deleted.
@@ -60,7 +64,9 @@ async fn apply_fabric_locked(ctx: &Context) -> Result<(), Error> {
         .iter()
         .filter(|p| p.metadata.deletion_timestamp.is_none())
         .map(|p| p.spec.clone())
-        .filter(|p| live_segments.contains(p.from.as_str()) && live_segments.contains(p.to.as_str()))
+        .filter(|p| {
+            live_segments.contains(p.from.as_str()) && live_segments.contains(p.to.as_str())
+        })
         .collect();
     let yaml = crate::fabric::render_fabric_yaml(&seg_specs, &pol_specs);
     ctx.admin.apply(&yaml).await.map_err(Error::Admin)?;
@@ -120,7 +126,9 @@ async fn reconcile(seg: Arc<WiremeshSegment>, ctx: Arc<Context>) -> Result<Actio
         }
     })
     .await
-    .map_err(|e: kube::runtime::finalizer::Error<Error>| Error::Admin(anyhow::anyhow!("finalizer: {e}")))
+    .map_err(|e: kube::runtime::finalizer::Error<Error>| {
+        Error::Admin(anyhow::anyhow!("finalizer: {e}"))
+    })
 }
 
 fn error_policy(_seg: Arc<WiremeshSegment>, err: &Error, _ctx: Arc<Context>) -> Action {
@@ -133,14 +141,25 @@ fn error_policy(_seg: Arc<WiremeshSegment>, err: &Error, _ctx: Arc<Context>) -> 
 pub async fn run(ctx: Arc<Context>) {
     use kube::runtime::reflector::ObjectRef;
     let client = ctx.client.clone();
-    let controller = Controller::new(Api::<WiremeshSegment>::all(client.clone()), watcher::Config::default());
+    let controller = Controller::new(
+        Api::<WiremeshSegment>::all(client.clone()),
+        watcher::Config::default(),
+    );
     // The primary store lets a Policy change enqueue a reconcile for every
     // Segment, so the aggregate fabric re-renders (the runtime dedups).
     let store = controller.store();
     controller
-        .watches(Api::<WiremeshPolicy>::all(client.clone()), watcher::Config::default(), move |_pol| {
-            store.state().into_iter().map(|s| ObjectRef::from_obj(&*s)).collect::<Vec<_>>()
-        })
+        .watches(
+            Api::<WiremeshPolicy>::all(client.clone()),
+            watcher::Config::default(),
+            move |_pol| {
+                store
+                    .state()
+                    .into_iter()
+                    .map(|s| ObjectRef::from_obj(&*s))
+                    .collect::<Vec<_>>()
+            },
+        )
         .run(reconcile, error_policy, ctx)
         .for_each(|res| async move {
             if let Err(e) = res {

@@ -68,7 +68,10 @@ fn pod_of(s: WiremeshRelaySpec) -> k8s_openapi::api::core::v1::PodSpec {
 
 /// The value following `flag` in an argv list (flag/value pairs).
 fn arg_after(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 #[test]
@@ -76,7 +79,11 @@ fn controller_endpoint_override_flows_into_relay_arg() {
     // DNS hostname override (external LB / DDNS controller — the px host
     // topology), mirroring the gateway's syncEndpoint test.
     let pod = pod_of(spec(Some("wg.zozotk.go.ro:9500".into())));
-    let main = pod.containers.iter().find(|c| c.name == "relay").expect("relay container");
+    let main = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "relay")
+        .expect("relay container");
     let args = main.args.as_ref().expect("relay args");
     assert_eq!(
         arg_after(args, "--controller").as_deref(),
@@ -131,7 +138,10 @@ fn controller_endpoint_serializes_camel_case_and_omits_when_unset() {
     );
 
     let bare = serde_json::to_value(spec(None)).unwrap();
-    assert!(bare.get("controllerEndpoint").is_none(), "omitted when unset");
+    assert!(
+        bare.get("controllerEndpoint").is_none(),
+        "omitted when unset"
+    );
 
     // A legacy CR without the field still deserializes (additive change —
     // required for `crd_manifest_freshness.rs`'s no-conversion-webhook,

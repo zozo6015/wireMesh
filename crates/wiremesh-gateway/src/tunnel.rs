@@ -17,7 +17,12 @@ pub struct Tunnel {
 }
 
 impl Tunnel {
-    pub fn up(ifname: &str, private_key_b64: &str, listen_port: u16, mtu: u32) -> anyhow::Result<Tunnel> {
+    pub fn up(
+        ifname: &str,
+        private_key_b64: &str,
+        listen_port: u16,
+        mtu: u32,
+    ) -> anyhow::Result<Tunnel> {
         let mut cfg = BtDeviceConfig::default();
         cfg.n_threads = 2;
         let handle = DeviceHandle::new(ifname, cfg)

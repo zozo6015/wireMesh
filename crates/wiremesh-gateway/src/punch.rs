@@ -67,9 +67,15 @@ use std::time::{Duration, Instant};
 ///   an empty or all-malformed list yields `None` (nothing to nudge toward).
 pub fn nudge_target(allowed_ips: &[String]) -> Option<Ipv4Addr> {
     for cidr in allowed_ips {
-        let Some((ip, prefix)) = cidr.split_once('/') else { continue };
-        let Ok(addr) = ip.parse::<Ipv4Addr>() else { continue };
-        let Ok(prefix) = prefix.parse::<u32>() else { continue };
+        let Some((ip, prefix)) = cidr.split_once('/') else {
+            continue;
+        };
+        let Ok(addr) = ip.parse::<Ipv4Addr>() else {
+            continue;
+        };
+        let Ok(prefix) = prefix.parse::<u32>() else {
+            continue;
+        };
         if prefix > 32 {
             continue;
         }
@@ -183,7 +189,13 @@ impl CandidateTrial {
             })
             .collect();
         let exhausted = candidates.is_empty();
-        CandidateTrial { candidates, idx: 0, punched_current: false, current_started: now, exhausted }
+        CandidateTrial {
+            candidates,
+            idx: 0,
+            punched_current: false,
+            current_started: now,
+            exhausted,
+        }
     }
 
     /// Advance the trial. Returns `Punch(addr)` the first time each candidate is

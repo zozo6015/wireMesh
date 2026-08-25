@@ -1292,11 +1292,13 @@ impl StubGateway {
             relay_health: vec![],
             epoch_acks: acks
                 .iter()
-                .map(|(peer_gateway_id, epoch, live)| wiremesh_proto::v1::EpochAck {
-                    peer_gateway_id: *peer_gateway_id,
-                    epoch: *epoch,
-                    live: *live,
-                })
+                .map(
+                    |(peer_gateway_id, epoch, live)| wiremesh_proto::v1::EpochAck {
+                        peer_gateway_id: *peer_gateway_id,
+                        epoch: *epoch,
+                        live: *live,
+                    },
+                )
                 .collect(),
             peer_paths: vec![],
             peer_paths_snapshot: false,
@@ -1319,8 +1321,11 @@ impl StubGateway {
     pub fn persist_state(&self) {
         std::fs::write(self.state_dir_path.join("cert.pem"), &self.cert_pem)
             .expect("persisting cert.pem in StubGateway::persist_state");
-        std::fs::write(self.state_dir_path.join("ca_bundle.pem"), &self.ca_bundle_pem)
-            .expect("persisting ca_bundle.pem in StubGateway::persist_state");
+        std::fs::write(
+            self.state_dir_path.join("ca_bundle.pem"),
+            &self.ca_bundle_pem,
+        )
+        .expect("persisting ca_bundle.pem in StubGateway::persist_state");
 
         let key_path = self.state_dir_path.join("key.pem");
         std::fs::write(&key_path, &self.key_pem)
@@ -1511,7 +1516,10 @@ mod serial_normalization_tests {
     /// 16 bytes.
     #[test]
     fn over_length_sign_pad_is_stripped() {
-        let inner: [u8; 16] = [0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f];
+        let inner: [u8; 16] = [
+            0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
         let mut raw = vec![0x00u8];
         raw.extend_from_slice(&inner);
         assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), inner);
@@ -1523,7 +1531,10 @@ mod serial_normalization_tests {
     /// Must be restored to 16 bytes via a single left-padding `0x00`.
     #[test]
     fn under_length_by_one_is_left_padded() {
-        let raw: [u8; 15] = [0x7f, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e];
+        let raw: [u8; 15] = [
+            0x7f, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e,
+        ];
         let mut expected = [0u8; 16];
         expected[1..].copy_from_slice(&raw);
         assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), expected);
@@ -1534,7 +1545,9 @@ mod serial_normalization_tests {
     /// `0x00` bytes.
     #[test]
     fn under_length_by_two_is_left_padded() {
-        let raw: [u8; 14] = [0x03, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d];
+        let raw: [u8; 14] = [
+            0x03, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+        ];
         let mut expected = [0u8; 16];
         expected[2..].copy_from_slice(&raw);
         assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), expected);
@@ -1709,7 +1722,9 @@ pub async fn next_punch(
             Ok(Ok(None)) => anyhow::bail!("Sync.Watch stream ended before any PunchDirective"),
             Ok(Err(status)) => anyhow::bail!("Sync.Watch stream yielded an error: {status}"),
             Err(_) => {
-                anyhow::bail!("no PunchDirective arrived on the Sync.Watch stream within the timeout")
+                anyhow::bail!(
+                    "no PunchDirective arrived on the Sync.Watch stream within the timeout"
+                )
             }
         }
     }
@@ -1724,8 +1739,8 @@ pub async fn next_punch(
 /// key material (unused by the Task 5 test beyond being generated).
 pub fn gen_csr(cn: &str) -> (String, rcgen::KeyPair) {
     let key_pair = rcgen::KeyPair::generate().expect("generating gateway key pair");
-    let mut params = rcgen::CertificateParams::new(Vec::<String>::new())
-        .expect("building CSR params");
+    let mut params =
+        rcgen::CertificateParams::new(Vec::<String>::new()).expect("building CSR params");
     params
         .distinguished_name
         .push(rcgen::DnType::CommonName, cn);

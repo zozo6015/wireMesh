@@ -53,7 +53,9 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     // this open itself fails, no temp exists yet — nothing to clean up.
     let mut opts = fs::OpenOptions::new();
     opts.write(true).create_new(true).mode(0o600);
-    let mut f = opts.open(&tmp).with_context(|| format!("creating temp {}", tmp.display()))?;
+    let mut f = opts
+        .open(&tmp)
+        .with_context(|| format!("creating temp {}", tmp.display()))?;
 
     // Once the temp exists, ANY subsequent failure (chmod / write / fsync /
     // rename) must best-effort unlink it so a crash-free error path leaves no
@@ -68,10 +70,12 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         // visible at `path`.
         f.set_permissions(std::fs::Permissions::from_mode(0o600))
             .with_context(|| format!("chmod 0600 {}", tmp.display()))?;
-        f.write_all(bytes).with_context(|| format!("writing {}", tmp.display()))?;
+        f.write_all(bytes)
+            .with_context(|| format!("writing {}", tmp.display()))?;
         // PROPAGATE fsync failures — swallowing them (`.ok()`) would let a rename
         // publish data the kernel never durably committed.
-        f.sync_all().with_context(|| format!("fsync {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("fsync {}", tmp.display()))?;
         drop(f);
         fs::rename(&tmp, path)
             .with_context(|| format!("renaming {} -> {}", tmp.display(), path.display()))
@@ -90,7 +94,10 @@ fn write_atomic_0600(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
 impl Identity {
     pub fn store(&self, state_dir: &Path) -> anyhow::Result<()> {
         fs::create_dir_all(state_dir)?;
-        write_atomic_0600(&state_dir.join("wg_private.key"), self.wg_private_key_b64.as_bytes())?;
+        write_atomic_0600(
+            &state_dir.join("wg_private.key"),
+            self.wg_private_key_b64.as_bytes(),
+        )?;
         let json = serde_json::to_vec_pretty(self)?;
         write_atomic_0600(&state_dir.join("identity.json"), &json)?;
         Ok(())
@@ -122,8 +129,9 @@ impl Identity {
             // Genuinely absent → not present (enroll).
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
             // Any other IO failure must propagate, never be read as "absent".
-            Err(e) => Err(e)
-                .with_context(|| format!("probing identity.json in {}", state_dir.display())),
+            Err(e) => {
+                Err(e).with_context(|| format!("probing identity.json in {}", state_dir.display()))
+            }
         }
     }
 }
@@ -209,11 +217,17 @@ mod tests {
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n.contains(".tmp") || n.ends_with('~'))
             .collect();
-        assert!(residue.is_empty(), "store must leave no temp residue, found: {residue:?}");
+        assert!(
+            residue.is_empty(),
+            "store must leave no temp residue, found: {residue:?}"
+        );
 
         // The final file is complete and reflects the latest store.
         let loaded = Identity::load(dir.path()).unwrap();
-        assert_eq!(loaded.gateway_id, 2, "final identity.json is the fully-written latest one");
+        assert_eq!(
+            loaded.gateway_id, 2,
+            "final identity.json is the fully-written latest one"
+        );
     }
 
     #[test]
@@ -245,7 +259,10 @@ mod tests {
         id.store(dir.path())
             .expect("store must succeed with a unique temp even when the fixed `<name>.tmp` path is occupied");
         let loaded = Identity::load(dir.path()).unwrap();
-        assert_eq!(loaded.gateway_id, 9, "final identity.json is the just-stored one");
+        assert_eq!(
+            loaded.gateway_id, 9,
+            "final identity.json is the just-stored one"
+        );
     }
 
     #[test]

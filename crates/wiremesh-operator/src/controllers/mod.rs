@@ -208,7 +208,11 @@ where
     K: Resource + Serialize + DeserializeOwned + Clone + Debug,
     K::DynamicType: Default,
 {
-    let name = obj.meta().name.clone().ok_or(Error::MissingField(".metadata.name"))?;
+    let name = obj
+        .meta()
+        .name
+        .clone()
+        .ok_or(Error::MissingField(".metadata.name"))?;
     let pp = PatchParams::apply(FIELD_MANAGER).force();
     Ok(api.patch(&name, &pp, &Patch::Apply(obj)).await?)
 }
@@ -221,7 +225,11 @@ where
 /// 422s (`rollingUpdate: Forbidden ... when type is 'Recreate'`). See
 /// `docs/research/ops-finding-pvc-adoption-migration.md` (bug 1).
 pub async fn apply_deployment(api: &Api<Deployment>, dep: &Deployment) -> Result<(), Error> {
-    let name = dep.meta().name.clone().ok_or(Error::MissingField(".metadata.name"))?;
+    let name = dep
+        .meta()
+        .name
+        .clone()
+        .ok_or(Error::MissingField(".metadata.name"))?;
     let pp = PatchParams::apply(FIELD_MANAGER).force();
     let body = crate::workloads::deployment_apply_body(dep);
     api.patch(&name, &pp, &Patch::Apply(body)).await?;
@@ -279,7 +287,10 @@ pub fn workload_readiness(desired: Option<i32>, available: i32) -> Readiness {
 pub fn deployment_readiness(live: &Deployment) -> Readiness {
     workload_readiness(
         live.spec.as_ref().and_then(|s| s.replicas),
-        live.status.as_ref().and_then(|s| s.available_replicas).unwrap_or(0),
+        live.status
+            .as_ref()
+            .and_then(|s| s.available_replicas)
+            .unwrap_or(0),
     )
 }
 
@@ -311,18 +322,25 @@ pub async fn controller_endpoints(ctx: &Context) -> Result<ControllerAddrs, Erro
     let ctrls = Api::<WiremeshController>::all(ctx.client.clone())
         .list(&ListParams::default())
         .await?;
-    let c = ctrls.items.first().ok_or(Error::MissingField("WiremeshController (none exists)"))?;
+    let c = ctrls
+        .items
+        .first()
+        .ok_or(Error::MissingField("WiremeshController (none exists)"))?;
     let name = c.name_any();
     let sync_port = c.spec.sync_tcp_port.unwrap_or(9500);
     let observe_port = c.spec.observe_udp_port.unwrap_or(9600);
     let enroll_port = 9400; // WIREMESH_TCP_PORT (enrollment listener)
 
-    let svc = Api::<Service>::namespaced(ctx.client.clone(), &ctx.namespace).get(&name).await?;
+    let svc = Api::<Service>::namespaced(ctx.client.clone(), &ctx.namespace)
+        .get(&name)
+        .await?;
     let ip = svc
         .spec
         .and_then(|s| s.cluster_ip)
         .filter(|ip| !ip.is_empty() && ip != "None")
-        .ok_or(Error::MissingField("controller Service clusterIP (not assigned yet)"))?;
+        .ok_or(Error::MissingField(
+            "controller Service clusterIP (not assigned yet)",
+        ))?;
     // v1 is IPv4-only, and `ip:port` (unbracketed) is only well-formed for IPv4.
     // On a dual-stack cluster with an IPv6-primary Service, reject clearly rather
     // than emit a malformed address the gateway/relay can't parse.
@@ -345,6 +363,9 @@ mod tests {
 
     #[test]
     fn service_dns_is_cluster_fqdn() {
-        assert_eq!(service_dns("wiremesh-controller", "wiremesh", 9500), "wiremesh-controller.wiremesh.svc:9500");
+        assert_eq!(
+            service_dns("wiremesh-controller", "wiremesh", 9500),
+            "wiremesh-controller.wiremesh.svc:9500"
+        );
     }
 }

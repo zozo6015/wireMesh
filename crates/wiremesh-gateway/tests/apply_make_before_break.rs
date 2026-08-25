@@ -87,7 +87,10 @@ fn peer(id: u64, key: &str, candidate: &str, cidr: &str) -> PeerState {
 }
 
 fn ds_with(peers: Vec<PeerState>) -> DesiredState {
-    DesiredState { peers, ..Default::default() }
+    DesiredState {
+        peers,
+        ..Default::default()
+    }
 }
 
 fn find<'a>(dev: &'a DeviceConfig, key: &str) -> &'a PeerConfig {
@@ -171,7 +174,11 @@ fn t4_removed_peer_disappears_despite_stale_pin() {
 
     let dev = device_config_pinned(&ds, "PRIV", 51820, &NO_KEY_PINS(), &live);
 
-    assert_eq!(dev.peers.len(), 1, "only desired-state peers may be emitted");
+    assert_eq!(
+        dev.peers.len(),
+        1,
+        "only desired-state peers may be emitted"
+    );
     assert_eq!(dev.peers[0].public_key_b64, "K2");
 }
 

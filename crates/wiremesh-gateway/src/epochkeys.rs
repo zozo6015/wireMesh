@@ -76,7 +76,12 @@ impl EpochKeys {
         let private_key_b64 = crate::uapi::base64_encode(&raw);
         let pubkey_b64 = crate::uapi::base64_pub_from_priv(&private_key_b64)
             .context("deriving pubkey for newly generated epoch key")?;
-        let epoch = self.epochs.iter().map(|k| k.epoch).max().map_or(0, |m| m + 1);
+        let epoch = self
+            .epochs
+            .iter()
+            .map(|k| k.epoch)
+            .max()
+            .map_or(0, |m| m + 1);
         self.epochs.push(EpochKey {
             epoch,
             private_key_b64,

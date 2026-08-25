@@ -53,8 +53,7 @@ use wiremesh_gateway::uapi::pubkey_b64_to_hex;
 /// because the crate's own encoder is `pub(crate)` and invisible from an
 /// integration-test crate.
 fn key_b64(seed: u8) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let raw = [seed; 32];
     let mut out = String::new();
     for chunk in raw.chunks(3) {
@@ -64,8 +63,16 @@ fn key_b64(seed: u8) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         out.push(ALPHABET[(n >> 18) as usize & 63] as char);
         out.push(ALPHABET[(n >> 12) as usize & 63] as char);
-        out.push(if chunk.len() > 1 { ALPHABET[(n >> 6) as usize & 63] as char } else { '=' });
-        out.push(if chunk.len() > 2 { ALPHABET[n as usize & 63] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -151,7 +158,11 @@ fn post_cutover_peer_with_no_selectable_key_is_gone() {
 /// direction (the watch set would empty and, under F4, the retire is withheld).
 #[test]
 fn post_cutover_only_the_keyless_peer_is_gone() {
-    let snapshot = vec![(7u64, key_hex(0x11)), (8u64, key_hex(0x22)), (9u64, key_hex(0x33))];
+    let snapshot = vec![
+        (7u64, key_hex(0x11)),
+        (8u64, key_hex(0x22)),
+        (9u64, key_hex(0x33)),
+    ];
     let ds = desired(vec![
         peer(7, Some(&key_b64(0x11))),
         peer(8, None),
@@ -295,28 +306,40 @@ fn post_cutover_without_desired_state_keeps_the_snapshot() {
 #[test]
 fn post_cutover_key_iff_device_config_pinned_keeps_the_peer() {
     let roster = vec![
-        peer(1, Some(&key_b64(0x01))),          // plain active key
-        peer(2, None),                          // dropped by the writer -> Gone
-        peer(3, Some(UNDECODABLE_KEY)),         // kept by the writer -> Key(snapshot)
-        peer(4, None),                          // rescued by a pin below
-        peer(5, Some(&key_b64(0x05))),          // pin overrides the roster key
+        peer(1, Some(&key_b64(0x01))),  // plain active key
+        peer(2, None),                  // dropped by the writer -> Gone
+        peer(3, Some(UNDECODABLE_KEY)), // kept by the writer -> Key(snapshot)
+        peer(4, None),                  // rescued by a pin below
+        peer(5, Some(&key_b64(0x05))),  // pin overrides the roster key
     ];
     let ds = desired(roster);
     let p = pins(&[(4, key_b64(0x44)), (5, key_b64(0x55))]);
-    let snapshot: Vec<(u64, String)> =
-        (1u64..=6).map(|gid| (gid, key_hex(gid as u8 + 0x60))).collect();
+    let snapshot: Vec<(u64, String)> = (1u64..=6)
+        .map(|gid| (gid, key_hex(gid as u8 + 0x60)))
+        .collect();
 
     let out = new_epoch_watch_keys(&snapshot, true, Some(&ds), &p);
-    assert_eq!(out.len(), snapshot.len(), "one verdict per snapshot entry, in snapshot order");
+    assert_eq!(
+        out.len(),
+        snapshot.len(),
+        "one verdict per snapshot entry, in snapshot order"
+    );
 
     let cfg = device_config_pinned(&ds, &key_b64(0xAA), 51820, &p, &HashMap::new());
     // `device_config_pinned` does not carry gateway ids through, so correlate
     // by the selected pubkey: a peer is on the device iff the key the selection
     // rule picks for it appears in the emitted peer list.
-    let on_device: Vec<&str> = cfg.peers.iter().map(|pc| pc.public_key_b64.as_str()).collect();
+    let on_device: Vec<&str> = cfg
+        .peers
+        .iter()
+        .map(|pc| pc.public_key_b64.as_str())
+        .collect();
     let selected_for = |gid: u64| -> Option<String> {
         p.get(&gid).cloned().or_else(|| {
-            ds.peers.iter().find(|q| q.gateway_id == gid).and_then(|q| q.active_pubkey_b64.clone())
+            ds.peers
+                .iter()
+                .find(|q| q.gateway_id == gid)
+                .and_then(|q| q.active_pubkey_b64.clone())
         })
     };
 
@@ -373,8 +396,10 @@ fn pre_cutover_returns_the_snapshot_verbatim() {
 
     let out = new_epoch_watch_keys(&snapshot, false, Some(&ds), &p);
 
-    let expected: Vec<(u64, EpochWatch)> =
-        snapshot.iter().map(|(g, h)| (*g, EpochWatch::Key(h.clone()))).collect();
+    let expected: Vec<(u64, EpochWatch)> = snapshot
+        .iter()
+        .map(|(g, h)| (*g, EpochWatch::Key(h.clone())))
+        .collect();
     assert_eq!(
         out, expected,
         "pre-cutover the answer is the directive-time snapshot verbatim, in order, for EVERY \
@@ -389,14 +414,20 @@ fn pre_cutover_returns_the_snapshot_verbatim() {
 fn pre_cutover_ignores_roster_and_pins_entirely() {
     let snapshot = vec![(7u64, key_hex(0x11)), (8u64, key_hex(0x22))];
     let empty = desired(vec![]);
-    let full = desired(vec![peer(7, Some(&key_b64(0xAA))), peer(8, Some(&key_b64(0xBB)))]);
+    let full = desired(vec![
+        peer(7, Some(&key_b64(0xAA))),
+        peer(8, Some(&key_b64(0xBB))),
+    ]);
 
     let a = new_epoch_watch_keys(&snapshot, false, None, &HashMap::new());
     let b = new_epoch_watch_keys(&snapshot, false, Some(&empty), &HashMap::new());
     let c = new_epoch_watch_keys(&snapshot, false, Some(&full), &pins(&[(7, key_b64(0xCC))]));
 
     assert_eq!(a, b, "pre-cutover must not consult the desired state");
-    assert_eq!(b, c, "pre-cutover must not consult the roster keys or the pins");
+    assert_eq!(
+        b, c,
+        "pre-cutover must not consult the roster keys or the pins"
+    );
 }
 
 /// An empty snapshot yields an empty result on both sides of the cutover —

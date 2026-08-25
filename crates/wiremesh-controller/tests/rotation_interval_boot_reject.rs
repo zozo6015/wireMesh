@@ -41,7 +41,10 @@ fn malformed_rotation_interval_aborts_the_boot() {
         // the boot ever regressed to proceeding past the malformed value, it
         // must not be able to write into the host's /var/lib/wiremesh.
         .env("WIREMESH_DATA_DIR", data_dir.path())
-        .env("WIREMESH_SOCKET_PATH", data_dir.path().join("controller.sock"))
+        .env(
+            "WIREMESH_SOCKET_PATH",
+            data_dir.path().join("controller.sock"),
+        )
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

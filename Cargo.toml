@@ -6,6 +6,37 @@ members = ["crates/wiremesh-proto", "crates/wiremesh-trust", "crates/wiremesh-co
 # nesting inside this one -- see CLAUDE.md's "Execution rules".
 exclude = ["crates/wiremesh-enforcer-ebpf"]
 
+# Minimum supported Rust version, declared once and inherited by the eleven
+# members via `rust-version.workspace = true`. Before this it was undeclared
+# anywhere, so "which rustc does WireMesh need" had no answer in the repo.
+#
+# 1.91 is MEASURED, not derived. The obvious derivation -- edition 2024 in the
+# sibling `crates/wiremesh-enforcer-ebpf` workspace, plus aya 0.14's own 1.87
+# floor -- gives 1.85/1.87 and is WRONG, because it stops at the first
+# plausible number instead of taking the maximum over the whole build graph.
+# `cargo +1.85 check --workspace --all-targets` fails, binding on
+# `cargo-platform` 0.3.3 (reached via `cargo_metadata`, which
+# `crates/wiremesh-enforcer/build.rs` uses to locate that sibling workspace),
+# which declares rustc 1.91. `cargo +1.91 check --workspace --all-targets -j 1`
+# then passes a real compile, clean. Verified once at PR0 by that run, and
+# re-verified nightly by the scheduled `cold-build` workflow, which installs
+# this exact version and fails closed.
+#
+# WHAT THE NUMBER CLAIMS, precisely. `cargo +1.91 check` still runs
+# `wiremesh-enforcer/build.rs`, which builds the eBPF program on the UNDATED
+# nightly. So this means "the userspace crates build on 1.91, given a nightly
+# toolchain present for the eBPF build step" -- not "the whole tree builds on
+# 1.91". The eBPF half has no MSRV and cannot have one.
+#
+# HOW IT MOVES. The floor is dependency-derived and `Cargo.lock`-pinned (both
+# lockfiles are committed), so it changes only on a deliberate `cargo update`
+# or a dependency-bump PR -- Dependabot security bumps included, which need no
+# config file to land. The nightly check is DETECTION LATENCY, not a gate: if
+# the scheduled MSRV step reds, a dependency raised the floor -- bump
+# `rust-version`, do not go hunting for a code change.
+[workspace.package]
+rust-version = "1.91"
+
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
 tonic = { version = "0.12", features = ["tls"] }
