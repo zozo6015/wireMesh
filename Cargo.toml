@@ -29,10 +29,15 @@ exclude = ["crates/wiremesh-enforcer-ebpf"]
 # `rust-version` here is a DECLARATION for humans and packagers -- cargo will
 # still happily resolve a dependency that raises the real floor above it.
 #
-# CI never builds AT this floor. Every job runs inside `dev/Dockerfile`,
-# whose default toolchain is 1.97.1 -- that image pin, not a root
-# `rust-toolchain.toml`, is where this repo states its compiler. See that
-# Dockerfile's comment for why a root toolchain file could not be used.
+# CI never builds AT this floor, and the compiler it does build with is
+# stated per-platform rather than repo-wide. The Linux/containerised jobs
+# -- B4's CI jobs and `deploy/docker/Dockerfile`'s release builder -- run in
+# a pinned image whose default toolchain is 1.97.1; that image pin, not a
+# root `rust-toolchain.toml`, is where this repo states its compiler. The
+# macOS and Windows release jobs in `release.yml` are NOT covered: they run
+# on their own runners under a floating `dtolnay/rust-toolchain@stable`.
+# See `dev/Dockerfile`'s comment for why a root toolchain file could not be
+# used to cover them, and why trying broke the macOS cross-build.
 #
 # WHAT THE NUMBER CLAIMS, precisely. `cargo +1.91 check` still runs
 # `wiremesh-enforcer/build.rs`, which builds the eBPF program on the UNDATED
