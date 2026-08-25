@@ -29,6 +29,10 @@ pub enum RotationDecision {
     Wait,
     Promote { epoch: u32 },
     Retire { epoch: u32 }, // the OLD (prior-active) epoch to delete
+    // Rule 1 with nothing to retire: rotation complete, drop the tracker with
+    // NO DB call. A variant of its own rather than a `Wait` deliberately —
+    // `Wait` leaves the tracker in place forever, which is the bug (item 5).
+    Finished,
     Abort { epoch: u32, reason: String }, // the pending epoch to drop
 }
 
@@ -38,7 +42,12 @@ pub enum RotationDecision {
 pub struct RotationState {
     pub pending_epoch: u32,
     pub pending_has_real_key: bool, // pubkey != "awaiting-submission"
-    pub prior_active_epoch: u32,
+    /// The epoch that was `active` when this rotation's tracker was seeded, or
+    /// `None` if that key snapshot held no `active` row at all (the legacy/gap
+    /// row set `crate::db::Db::rotate_key` deliberately tolerates). `None`
+    /// means "there is no prior epoch" — never "unknown", and never "epoch 0".
+    /// Coercing it to 0 is BACKLOG item 5, the `Retire{0}` wedge.
+    pub prior_active_epoch: Option<u32>,
     pub started_at: Instant,
     pub promoted_at: Option<Instant>,  // Some once promote executed
     pub expected_peers: BTreeSet<u64>, // currently-connected peers that must ack
@@ -56,9 +65,19 @@ pub fn decide(s: &RotationState, now: Instant) -> RotationDecision {
     // Rule 1: already promoted — only remaining question is whether the
     // prior active epoch's retire grace has elapsed.
     if let Some(promoted_at) = s.promoted_at {
+        // (S3, BACKLOG item 5) Nothing to retire -> the rotation is complete.
+        // This yields `Finished` REGARDLESS OF ELAPSED TIME, deliberately:
+        // `RETIRE_GRACE` buys make-before-break time for peers still finishing
+        // a handshake on the PRIOR key, and when there is no prior key there is
+        // no such peer and nothing for a grace to protect. Do not "restore" a
+        // grace here, and do not fall through to `Wait` — waiting leaves the
+        // tracker in place forever, which IS the bug item 5 describes.
+        let Some(prior_active_epoch) = s.prior_active_epoch else {
+            return RotationDecision::Finished;
+        };
         return if now.saturating_duration_since(promoted_at) >= RETIRE_GRACE {
             RotationDecision::Retire {
-                epoch: s.prior_active_epoch,
+                epoch: prior_active_epoch,
             }
         } else {
             RotationDecision::Wait
