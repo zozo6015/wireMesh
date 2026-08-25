@@ -23,8 +23,13 @@ impl Tunnel {
         listen_port: u16,
         mtu: u32,
     ) -> anyhow::Result<Tunnel> {
-        let mut cfg = BtDeviceConfig::default();
-        cfg.n_threads = 2;
+        // `..Default::default()` is required, not decorative: `DeviceConfig` has
+        // `#[cfg(target_os = "linux")]` fields (`use_multi_queue`, `uapi_fd`),
+        // so the set of fields is platform-dependent and cannot be written out.
+        let cfg = BtDeviceConfig {
+            n_threads: 2,
+            ..Default::default()
+        };
         let handle = DeviceHandle::new(ifname, cfg)
             .map_err(|e| anyhow!("creating boringtun device {ifname}: {e:?}"))?;
 

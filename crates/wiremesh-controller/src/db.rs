@@ -1690,6 +1690,10 @@ impl Db {
     /// persisted revision must advance in this same transaction, and an
     /// early `InvalidToken` return above must NOT reach here (it rolls back
     /// instead).
+    // The argument list mirrors the `relay` table's columns. Grouping them into
+    // a struct to satisfy the lint would add an indirection whose only purpose
+    // is the lint, in the crate whose history says cleanups introduce bugs.
+    #[allow(clippy::too_many_arguments)]
     pub fn enroll_relay(
         &self,
         secret_hash: &str,
@@ -2817,6 +2821,10 @@ impl Db {
     /// match is unambiguous and lets a caller filter precisely (e.g.
     /// `action = "revoke"` — see `tests/revoke_audit.rs`) without a wildcard
     /// character convention this cycle doesn't otherwise need.
+    // The tuple mirrors the SELECT's column list one-for-one. A `type` alias
+    // would name the shape but hide which column is which, which is the thing
+    // a reader of this function actually needs.
+    #[allow(clippy::type_complexity)]
     pub fn audit_query(
         &self,
         limit: i64,
@@ -2871,6 +2879,10 @@ impl Db {
     /// `Admin.ListGateways`, making T8's `Sync.Report` bookkeeping
     /// (`Db::set_applied_version`) observable from the Admin surface for the
     /// first time. Ordered by id.
+    // The tuple mirrors the SELECT's column list one-for-one. A `type` alias
+    // would name the shape but hide which column is which, which is the thing
+    // a reader of this function actually needs.
+    #[allow(clippy::type_complexity)]
     pub fn list_gateways(&self) -> Result<Vec<(i64, String, String, String, Option<i64>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

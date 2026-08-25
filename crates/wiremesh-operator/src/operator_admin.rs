@@ -24,7 +24,7 @@
 use anyhow::{anyhow, Context};
 use hyper_util::rt::TokioIo;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tokio::net::UnixStream;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
@@ -37,8 +37,8 @@ use wiremesh_proto::v1::{
 /// Default UDS path (matches the controller's `WIREMESH_SOCKET_PATH` default).
 pub const DEFAULT_SOCKET: &str = "/run/wiremesh/controller.sock";
 
-async fn connect(socket: &PathBuf) -> anyhow::Result<AdminClient<Channel>> {
-    let path = socket.clone();
+async fn connect(socket: &Path) -> anyhow::Result<AdminClient<Channel>> {
+    let path = socket.to_path_buf();
     // The authority is a required-but-ignored placeholder — the custom
     // connector always dials the Unix socket. (Same pattern as wiremesh-testkit.)
     let channel = Endpoint::try_from("http://[::]:50051")?

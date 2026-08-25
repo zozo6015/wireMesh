@@ -330,12 +330,7 @@ async fn rotate_and_pending_epoch(h: &TestController, gateway_id: u64) -> u32 {
 /// Reads `stream` until it has been quiet for `quiet`, discarding everything.
 /// Breaks on stream end/error too, so a closed stream can never spin.
 async fn drain_quiet(stream: &mut tonic::Streaming<SyncMessage>, quiet: Duration) {
-    loop {
-        match tokio::time::timeout(quiet, stream.message()).await {
-            Ok(Ok(Some(_))) => continue,
-            _ => break,
-        }
-    }
+    while let Ok(Ok(Some(_))) = tokio::time::timeout(quiet, stream.message()).await {}
 }
 
 /// The first `Delta` on `stream` within `window` that upserts `gateway_id` as

@@ -468,6 +468,10 @@ except Exception:
     ns.exec(&["python3", "-c", &script]).is_ok()
 }
 
+// The spawned child is a long-lived netns helper (traffic generator /
+// listener) that this harness kills at teardown; `wait()`ing on it here
+// would block the test forever, which is what clippy's fix would do.
+#[allow(clippy::zombie_processes)]
 fn check_tcp(from_ns: &Ns, to_ns: &Ns, to_addr: &str, dst_port: u16) -> bool {
     let mut listener = spawn_accept_only_listener(to_ns, dst_port);
     std::thread::sleep(Duration::from_millis(200));
@@ -716,6 +720,10 @@ fn check_raw_ip_proto(from_ns: &Ns, to_ns: &Ns, to_addr: &str, proto_num: u8) ->
 /// against BOTH backends from the same call site rather than being
 /// duplicated per-backend. Callers (this crate's `tests/conformance.rs`)
 /// call this once per `BackendKind`, alongside the `SCENARIOS` table.
+// The spawned child is a long-lived netns helper (traffic generator /
+// listener) that this harness kills at teardown; `wait()`ing on it here
+// would block the test forever, which is what clippy's fix would do.
+#[allow(clippy::zombie_processes)]
 pub fn flip_under_traffic_zero_loss(kind: BackendKind) -> anyhow::Result<()> {
     let (lab, a, b) = wg_lab("aeth13");
     join_netns(&b.name).context("join b's netns before probing wg0 in-process")?;

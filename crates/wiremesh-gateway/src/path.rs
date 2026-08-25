@@ -353,7 +353,7 @@ impl Path {
                     // traffic, not just wasted effort). Stay `Relayed`
                     // either way — only a real handshake (`on_handshake`)
                     // cuts over to `Direct`.
-                    let due = self.relayed_probe_last.map_or(true, |last| {
+                    let due = self.relayed_probe_last.is_none_or(|last| {
                         now.saturating_duration_since(last) >= PROBE_DIRECT_INTERVAL
                     });
                     if due {

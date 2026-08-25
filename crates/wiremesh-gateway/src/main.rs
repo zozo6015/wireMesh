@@ -1010,8 +1010,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                     // controller's roster rather than waiting for an
                     // unrelated event.
                     if prompt_report_pending
-                        && last_prompt_report
-                            .map_or(true, |t| t.elapsed() >= PROMPT_REPORT_DEBOUNCE)
+                        && last_prompt_report.is_none_or(|t| t.elapsed() >= PROMPT_REPORT_DEBOUNCE)
                     {
                         prompt_report_pending = false;
                         last_prompt_report = Some(Instant::now());
@@ -2612,7 +2611,7 @@ async fn apply_peer_endpoint_scoped(
     // `applied_peers`, the device already holds it — skip the write.
     {
         let a = active.lock().unwrap();
-        if a.applied_peers.iter().any(|p| *p == peer) {
+        if a.applied_peers.contains(&peer) {
             return Ok(());
         }
     }
@@ -3273,7 +3272,7 @@ async fn run_path_ticks(ctx: PathCtx) {
                         // every tick between handshakes and false at the
                         // genuine event).
                         let age = reported_handshake_age(t, SystemTime::now());
-                        let new_handshake = last_hs_age.get(&gid).map_or(true, |prev| age < *prev);
+                        let new_handshake = last_hs_age.get(&gid).is_none_or(|prev| age < *prev);
                         last_hs_age.insert(gid, age);
 
                         // Mesh-convergence fix T2: a handshake event is ONLY
@@ -3430,7 +3429,7 @@ async fn run_path_ticks(ctx: PathCtx) {
                 // already nudged by the punch, and a `Degraded`/`Disconnected`
                 // peer recovers via the punch/relay path, not a probe.
                 if matches!(path.state, PathState::Direct | PathState::Relayed) {
-                    let due = last_probe.get(&gid).map_or(true, |t| {
+                    let due = last_probe.get(&gid).is_none_or(|t| {
                         now.saturating_duration_since(*t) >= LIVENESS_PROBE_INTERVAL
                     });
                     if due {
@@ -5743,7 +5742,7 @@ async fn run_rotation_ticks(rot: RotationShared) {
             let live = read_live_peers(&a.new_tun, watch.iter().map(|(_, h)| h.clone())).await;
             let any_live = live
                 .as_ref()
-                .map_or(false, |l| watch.iter().any(|(_, hex)| l.contains(hex)));
+                .is_some_and(|l| watch.iter().any(|(_, hex)| l.contains(hex)));
             // An EMPTY watch set is NOT "all live" (F4). `.all()` on an empty
             // iterator is vacuously true, and the watch set can now SHRINK: it
             // starts as the directive-time snapshot and every peer that has
@@ -5775,7 +5774,7 @@ async fn run_rotation_ticks(rot: RotationShared) {
             let all_live = !watch.is_empty()
                 && live
                     .as_ref()
-                    .map_or(false, |l| watch.iter().all(|(_, hex)| l.contains(hex)));
+                    .is_some_and(|l| watch.iter().all(|(_, hex)| l.contains(hex)));
             // R2 stall detection (B2). Tracked off the phase itself so it
             // covers the whole `Overlapping` spell, and reset on any other
             // phase so a completed or aborted rotation starts the next one
@@ -6091,7 +6090,7 @@ async fn run_rotation_ticks(rot: RotationShared) {
             let taken = b.identity();
             let live =
                 read_live_peers(&b.new_tun, std::iter::once(b.peer_pending_hex.clone())).await;
-            if !live.map_or(false, |l| l.contains(&b.peer_pending_hex)) {
+            if !live.is_some_and(|l| l.contains(&b.peer_pending_hex)) {
                 // Not live yet: kick the overlap handshake toward the rotating
                 // peer (same rationale as Role A above).
                 kick_overlap(b.new_tun.clone(), b.peer_cidrs.clone(), rot.base_wg_port).await;
@@ -6257,7 +6256,7 @@ async fn run_rotation_ticks(rot: RotationShared) {
             };
             let live =
                 read_live_peers(&active_ifname, std::iter::once(b.peer_pending_hex.clone())).await;
-            if !live.map_or(false, |l| l.contains(&b.peer_pending_hex)) {
+            if !live.is_some_and(|l| l.contains(&b.peer_pending_hex)) {
                 // IN-STEP ONLY (the same predicate `rotation::collapse_dial`
                 // gates its dial on, and the exact complement of
                 // `route_owner`'s): our own Role-A cutover has run, so this

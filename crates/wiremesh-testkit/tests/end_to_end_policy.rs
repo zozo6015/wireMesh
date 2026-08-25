@@ -323,6 +323,10 @@ except Exception:
 /// `true` iff a TCP SYN from `from_ns` to `to_ns:dst_port` is actually
 /// delivered (the listener accepts the connection) — `false` means the
 /// enforcer dropped it before it ever reached the listener.
+// The spawned child is a long-lived netns helper (traffic generator /
+// listener) that this harness kills at teardown; `wait()`ing on it here
+// would block the test forever, which is what clippy's fix would do.
+#[allow(clippy::zombie_processes)]
 fn check_tcp(from_ns: &Ns, to_ns: &Ns, to_addr: &str, dst_port: u16) -> bool {
     let mut listener = spawn_accept_only_listener(to_ns, dst_port);
     std::thread::sleep(Duration::from_millis(200));

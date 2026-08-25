@@ -550,7 +550,7 @@ enum Side {
     Dst,
 }
 
-fn side_cidrs<'a>(f: &'a FlatRule, side: Side) -> &'a [Ipv4Net] {
+fn side_cidrs(f: &FlatRule, side: Side) -> &[Ipv4Net] {
     match side {
         Side::Src => &f.src_cidrs,
         Side::Dst => &f.dst_cidrs,

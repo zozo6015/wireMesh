@@ -113,6 +113,10 @@ impl AdminSvc {
 
 #[tonic::async_trait]
 impl Admin for AdminSvc {
+    // `tonic::Status` is the error type of EVERY gRPC handler in this service,
+    // and it is ~176 bytes. Boxing it to satisfy the lint would change the
+    // service signature for a lint, so the size is accepted and recorded here.
+    #[allow(clippy::result_large_err)]
     async fn create_segment(
         &self,
         request: Request<CreateSegmentRequest>,
@@ -223,12 +227,12 @@ impl Admin for AdminSvc {
 
         let mut secret = [0u8; SECRET_LEN];
         OsRng.fill_bytes(&mut secret);
-        let secret_hex = hex_encode(&secret);
-        let secret_hash_hex = hex_encode(&Sha256::digest(secret));
+        let secret_hex = hex_encode(secret);
+        let secret_hash_hex = hex_encode(Sha256::digest(secret));
 
         let mut id_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut id_bytes);
-        let token_id = hex_encode(&id_bytes);
+        let token_id = hex_encode(id_bytes);
 
         let rebind_segment_id = if req.rebind_segment_id == 0 {
             None
@@ -495,12 +499,12 @@ impl Admin for AdminSvc {
 
         let mut secret = [0u8; SECRET_LEN];
         OsRng.fill_bytes(&mut secret);
-        let secret_hex = hex_encode(&secret);
-        let secret_hash_hex = hex_encode(&Sha256::digest(secret));
+        let secret_hex = hex_encode(secret);
+        let secret_hash_hex = hex_encode(Sha256::digest(secret));
 
         let mut id_bytes = [0u8; 16];
         OsRng.fill_bytes(&mut id_bytes);
-        let token_id = hex_encode(&id_bytes);
+        let token_id = hex_encode(id_bytes);
 
         let now = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -804,6 +808,10 @@ impl Admin for AdminSvc {
     /// `RotateKey`/`Drain`/`RevokeCert` use — so every ALREADY-connected
     /// gateway's open `Sync.Watch` stream gets the new IR / CIDR refresh
     /// without waiting for a reconnect.
+    // `tonic::Status` is the error type of EVERY gRPC handler in this service,
+    // and it is ~176 bytes. Boxing it to satisfy the lint would change the
+    // service signature for a lint, so the size is accepted and recorded here.
+    #[allow(clippy::result_large_err)]
     async fn apply(&self, request: Request<ApplyRequest>) -> Result<Response<ApplyDiff>, Status> {
         let actor = actor_of(&request);
         let req = request.into_inner();

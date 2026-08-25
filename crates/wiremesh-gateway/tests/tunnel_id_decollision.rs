@@ -156,7 +156,13 @@ fn own_active_and_overlap_at_the_same_epoch_number_coexist() {
         gateway_id: 7,
         epoch: 1,
     };
-    let overlap = plan_tunnel(overlap_id, BASE_TUN, BASE_PORT, &[own_active.clone()]).expect(
+    let overlap = plan_tunnel(
+        overlap_id,
+        BASE_TUN,
+        BASE_PORT,
+        std::slice::from_ref(&own_active),
+    )
+    .expect(
         "planning a Role-B overlap toward peer 7's pending epoch 1 must succeed even \
                  though this gateway's OWN active epoch is also 1",
     );
@@ -317,14 +323,16 @@ fn plan_order_does_not_change_the_outcome() {
     };
 
     // Role A first, then Role B.
-    let a1 = plan_tunnel(own_id, BASE_TUN, BASE_PORT, &[boot.clone()]).expect("A first: own");
+    let a1 = plan_tunnel(own_id, BASE_TUN, BASE_PORT, std::slice::from_ref(&boot))
+        .expect("A first: own");
     let b1 = plan_tunnel(ovl_id, BASE_TUN, BASE_PORT, &[boot.clone(), a1.clone()])
         .expect("A first: overlap");
     assert_three_way_distinct(&a1, &b1, "Role A planned first");
     assert_three_way_distinct(&boot, &b1, "Role A planned first, overlap vs boot tun");
 
     // Role B first, then Role A.
-    let b2 = plan_tunnel(ovl_id, BASE_TUN, BASE_PORT, &[boot.clone()]).expect("B first: overlap");
+    let b2 = plan_tunnel(ovl_id, BASE_TUN, BASE_PORT, std::slice::from_ref(&boot))
+        .expect("B first: overlap");
     let a2 = plan_tunnel(own_id, BASE_TUN, BASE_PORT, &[boot.clone(), b2.clone()])
         .expect("B first: own");
     assert_three_way_distinct(&a2, &b2, "Role B planned first");
@@ -451,7 +459,8 @@ fn own_and_overlap_stay_distinct_across_different_epoch_numbers() {
         listen_port: BASE_PORT,
     };
     let own_id = TunnelId::Own { epoch: 6 };
-    let own = plan_tunnel(own_id, BASE_TUN, BASE_PORT, &[boot.clone()]).expect("own epoch 6");
+    let own =
+        plan_tunnel(own_id, BASE_TUN, BASE_PORT, std::slice::from_ref(&boot)).expect("own epoch 6");
     // Peer 8 is a laggard: it is only now rotating 5 -> 6 while we are already
     // planning our own 6, and peer 9 is further behind still (4 -> 5).
     let o6_id = TunnelId::Overlap {

@@ -115,8 +115,8 @@ impl Lab {
         let (na, ia, addra) = a;
         let (nb, ib, addrb) = b;
         // unique temp names to avoid collisions across parallel labs
-        let ta = format!("{}0", &self.prefix);
-        let tb = format!("{}1", &self.prefix);
+        let ta = format!("{}0", self.prefix);
+        let tb = format!("{}1", self.prefix);
         run(&[
             "ip", "link", "add", &ta, "type", "veth", "peer", "name", &tb,
         ])?;

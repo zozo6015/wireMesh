@@ -1785,15 +1785,15 @@ pub async fn run_sync(
                 }
                 eprintln!("relay: sync[{relay_id}] snapshot: {n} revoked serial(s)");
             }
-            Some(Body::Delta(d)) => {
-                if !d.revoked_serials.is_empty() {
-                    let n = d.revoked_serials.len();
-                    denylist.union(d.revoked_serials);
-                    if let Err(e) = denylist.persist(&persist_path) {
-                        eprintln!("relay: denylist persist failed (continuing with in-memory update): {e}");
-                    }
-                    eprintln!("relay: sync[{relay_id}] delta: +{n} revoked serial(s)");
+            Some(Body::Delta(d)) if !d.revoked_serials.is_empty() => {
+                let n = d.revoked_serials.len();
+                denylist.union(d.revoked_serials);
+                if let Err(e) = denylist.persist(&persist_path) {
+                    eprintln!(
+                        "relay: denylist persist failed (continuing with in-memory update): {e}"
+                    );
                 }
+                eprintln!("relay: sync[{relay_id}] delta: +{n} revoked serial(s)");
             }
             _ => {}
         }

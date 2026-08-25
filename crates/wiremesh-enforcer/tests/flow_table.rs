@@ -587,6 +587,10 @@ for s in socks:
 /// brief's explicit list and as this task's TCP/security-group-framed
 /// regression guard alongside (c)'s UDP variant.
 #[test]
+// The spawned child is a long-lived netns helper (traffic generator /
+// listener) that this harness kills at teardown; `wait()`ing on it here
+// would block the test forever, which is what clippy's fix would do.
+#[allow(clippy::zombie_processes)]
 fn live_tcp_flow_survives_apply_removing_its_rule_but_not_a_subsequent_flush() {
     let (lab, a, b) = wg_lab("aeth9");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");

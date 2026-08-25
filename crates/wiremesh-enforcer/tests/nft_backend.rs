@@ -661,6 +661,10 @@ policy:
 /// counter) -- so `by_rule[id]` is an EXACT count of connections made, not
 /// just "> 0".
 #[test]
+// The spawned child is a long-lived netns helper (traffic generator /
+// listener) that this harness kills at teardown; `wait()`ing on it here
+// would block the test forever, which is what clippy's fix would do.
+#[allow(clippy::zombie_processes)]
 fn counters_survive_a_policy_reapply_via_the_offset_accumulator() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
@@ -754,6 +758,10 @@ policy:
 /// `src/lib.rs` doc comment on `probe_with`) is implementer-verified by
 /// code inspection/the task report, not by an automated test here.
 #[test]
+// The spawned child is a long-lived netns helper (traffic generator /
+// listener) that this harness kills at teardown; `wait()`ing on it here
+// would block the test forever, which is what clippy's fix would do.
+#[allow(clippy::zombie_processes)]
 fn probe_with_nftables_returns_a_functional_nftables_backend() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");

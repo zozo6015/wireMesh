@@ -239,9 +239,9 @@ fn report_request_relay_health_roundtrips() {
 
     assert_eq!(decoded.relay_health.len(), 2);
     assert_eq!(decoded.relay_health[0].relay_id, 1);
-    assert_eq!(decoded.relay_health[0].healthy, true);
+    assert!(decoded.relay_health[0].healthy);
     assert_eq!(decoded.relay_health[1].relay_id, 2);
-    assert_eq!(decoded.relay_health[1].healthy, false);
+    assert!(!decoded.relay_health[1].healthy);
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn rotate_directive_message_roundtrips() {
     // roundtrip (see rationale in snapshot_message_roundtrips above).
     let rotate = RotateDirective { epoch: 5 };
     let msg = SyncMessage {
-        body: Some(Body::Rotate(rotate.clone())),
+        body: Some(Body::Rotate(rotate)),
     };
 
     let bytes = msg.encode_to_vec();
@@ -355,10 +355,10 @@ fn report_request_epoch_acks_roundtrips() {
     assert_eq!(decoded.epoch_acks.len(), 2);
     assert_eq!(decoded.epoch_acks[0].peer_gateway_id, 1);
     assert_eq!(decoded.epoch_acks[0].epoch, 6);
-    assert_eq!(decoded.epoch_acks[0].live, true);
+    assert!(decoded.epoch_acks[0].live);
     assert_eq!(decoded.epoch_acks[1].peer_gateway_id, 2);
     assert_eq!(decoded.epoch_acks[1].epoch, 6);
-    assert_eq!(decoded.epoch_acks[1].live, false);
+    assert!(!decoded.epoch_acks[1].live);
 
     // Empty epoch_acks must still roundtrip cleanly (additive field,
     // old-client behavior).
