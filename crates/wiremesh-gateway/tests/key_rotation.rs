@@ -354,12 +354,12 @@ fn parse_ping_summary(stdout: &str) -> (u64, u64) {
             let parts: Vec<&str> = line.split(',').collect();
             let transmitted: u64 = parts
                 .first()
-                .and_then(|s| s.trim().split_whitespace().next())
+                .and_then(|s| s.split_whitespace().next())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_else(|| panic!("could not parse transmitted count from: {line:?}"));
             let received: u64 = parts
                 .get(1)
-                .and_then(|s| s.trim().split_whitespace().next())
+                .and_then(|s| s.split_whitespace().next())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or_else(|| panic!("could not parse received count from: {line:?}"));
             return (transmitted, received);
@@ -1829,7 +1829,7 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     let probe_ok = wait_until(Duration::from_secs(30), || {
         resp = uapi_get_device(&gwa, "wg0");
         resp.as_deref()
-            .map_or(false, |r| uapi_field(r, "own_public_key").is_some())
+            .is_some_and(|r| uapi_field(r, "own_public_key").is_some())
     });
     if !probe_ok {
         dump_diag(

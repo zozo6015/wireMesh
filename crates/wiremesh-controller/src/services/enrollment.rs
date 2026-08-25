@@ -69,7 +69,10 @@ impl Enrollment for EnrollmentSvc {
     // `tonic::Status` is the error type of EVERY gRPC handler in this service,
     // and it is ~176 bytes. Boxing it to satisfy the lint would change the
     // service signature for a lint, so the size is accepted and recorded here.
-    #[allow(clippy::result_large_err)]
+    #[expect(
+        clippy::result_large_err,
+        reason = "`tonic::Status` is the error type of every gRPC handler; boxing it would change the service signature for a lint"
+    )]
     async fn enroll(
         &self,
         request: Request<EnrollRequest>,

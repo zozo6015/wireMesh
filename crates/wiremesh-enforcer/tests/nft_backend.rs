@@ -666,7 +666,10 @@ policy:
 // does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
 // `ip netns del`, which takes every process in the namespace with it -- so
 // there is no orphan to reap and nothing for a `wait()` to accomplish.
-#[allow(clippy::zombie_processes)]
+#[expect(
+    clippy::zombie_processes,
+    reason = "long-lived netns harness process; teardown is `ip netns del` in `Lab`'s Drop, and `wait()`ing here would block the suite"
+)]
 fn counters_survive_a_policy_reapply_via_the_offset_accumulator() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
@@ -765,7 +768,10 @@ policy:
 // does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
 // `ip netns del`, which takes every process in the namespace with it -- so
 // there is no orphan to reap and nothing for a `wait()` to accomplish.
-#[allow(clippy::zombie_processes)]
+#[expect(
+    clippy::zombie_processes,
+    reason = "long-lived netns harness process; teardown is `ip netns del` in `Lab`'s Drop, and `wait()`ing here would block the suite"
+)]
 fn probe_with_nftables_returns_a_functional_nftables_backend() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");

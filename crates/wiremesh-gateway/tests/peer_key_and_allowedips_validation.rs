@@ -219,7 +219,10 @@ fn a_snapshot_peer_with_a_wrong_length_active_pubkey_is_dropped_not_fatal() {
 }
 
 #[test]
-#[allow(deprecated)] // `Delta::deprecated_relays` — kept only to hold its wire slot.
+#[expect(
+    deprecated,
+    reason = "`Delta::deprecated_relays` is kept only to hold its wire slot"
+)]
 fn a_delta_upserting_a_peer_with_a_bad_active_pubkey_is_filtered_too() {
     // The live path: apply_delta is what runs while the fabric is up, so a
     // fix that only covered the initial snapshot would leave the
@@ -465,7 +468,10 @@ fn a_snapshot_peer_whose_allowed_ips_are_all_malformed_still_configures_with_no_
 }
 
 #[test]
-#[allow(deprecated)] // `Delta::deprecated_relays` — kept only to hold its wire slot.
+#[expect(
+    deprecated,
+    reason = "`Delta::deprecated_relays` is kept only to hold its wire slot"
+)]
 fn a_delta_upserting_a_peer_with_a_malformed_allowed_ip_is_filtered_too() {
     let mut ds = DesiredState::from_snapshot(&snapshot_with(vec![peer_proto(
         2,

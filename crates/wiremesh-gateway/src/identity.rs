@@ -125,7 +125,10 @@ impl Identity {
     // item they belong to. Clippy wants them at the minimum indent, which
     // ragged-edges a table a human laid out on purpose, so the disagreement is
     // recorded here rather than resolved against the reader.
-    #[allow(clippy::doc_overindented_list_items)]
+    #[expect(
+        clippy::doc_overindented_list_items,
+        reason = "the doc comment aligns its continuation lines on purpose; the lint's fix ragged-edges a hand-aligned table"
+    )]
     pub fn probe(state_dir: &Path) -> anyhow::Result<bool> {
         match fs::read(state_dir.join("identity.json")) {
             // Present and parseable → skip. Present but unparseable → treat as

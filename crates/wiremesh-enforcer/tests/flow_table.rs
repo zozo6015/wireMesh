@@ -592,7 +592,10 @@ for s in socks:
 // does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
 // `ip netns del`, which takes every process in the namespace with it -- so
 // there is no orphan to reap and nothing for a `wait()` to accomplish.
-#[allow(clippy::zombie_processes)]
+#[expect(
+    clippy::zombie_processes,
+    reason = "long-lived netns harness process; teardown is `ip netns del` in `Lab`'s Drop, and `wait()`ing here would block the suite"
+)]
 fn live_tcp_flow_survives_apply_removing_its_rule_but_not_a_subsequent_flush() {
     let (lab, a, b) = wg_lab("aeth9");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");

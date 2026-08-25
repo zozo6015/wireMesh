@@ -145,7 +145,10 @@ fn max_local_candidates_is_pinned_pending_a_conscious_gateway_cap_check() {
 // `1 + MAX_LOCAL_CANDIDATES < GATEWAY_MAX_PEER_CANDIDATES_MIRROR` at
 // compile time so that moving either constant forces a human to re-check
 // it. A constant value is the guarantee here, not a defect.
-#[allow(clippy::assertions_on_constants)]
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "pins the relation `1 + MAX_LOCAL_CANDIDATES < GATEWAY_MAX_PEER_CANDIDATES_MIRROR` at compile time; constant IS the guarantee"
+)]
 fn the_cap_relation_holds_against_the_mirrored_gateway_value() {
     assert!(
         1 + MAX_LOCAL_CANDIDATES < GATEWAY_MAX_PEER_CANDIDATES_MIRROR,

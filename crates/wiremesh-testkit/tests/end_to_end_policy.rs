@@ -328,7 +328,10 @@ except Exception:
 // does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
 // `ip netns del`, which takes every process in the namespace with it -- so
 // there is no orphan to reap and nothing for a `wait()` to accomplish.
-#[allow(clippy::zombie_processes)]
+#[expect(
+    clippy::zombie_processes,
+    reason = "long-lived netns harness process; teardown is `ip netns del` in `Lab`'s Drop, and `wait()`ing here would block the suite"
+)]
 fn check_tcp(from_ns: &Ns, to_ns: &Ns, to_addr: &str, dst_port: u16) -> bool {
     let mut listener = spawn_accept_only_listener(to_ns, dst_port);
     std::thread::sleep(Duration::from_millis(200));

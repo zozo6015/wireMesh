@@ -1693,7 +1693,10 @@ impl Db {
     // The argument list mirrors the `relay` table's columns. Grouping them into
     // a struct to satisfy the lint would add an indirection whose only purpose
     // is the lint, in the crate whose history says cleanups introduce bugs.
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the argument list mirrors the `relay` table's columns"
+    )]
     pub fn enroll_relay(
         &self,
         secret_hash: &str,
@@ -2824,7 +2827,10 @@ impl Db {
     // The tuple mirrors the SELECT's column list one-for-one. A `type` alias
     // would name the shape but hide which column is which, which is the thing
     // a reader of this function actually needs.
-    #[allow(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "the tuple mirrors the SELECT's column list; a type alias would hide which column is which"
+    )]
     pub fn audit_query(
         &self,
         limit: i64,
@@ -2882,7 +2888,10 @@ impl Db {
     // The tuple mirrors the SELECT's column list one-for-one. A `type` alias
     // would name the shape but hide which column is which, which is the thing
     // a reader of this function actually needs.
-    #[allow(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "the tuple mirrors the SELECT's column list; a type alias would hide which column is which"
+    )]
     pub fn list_gateways(&self) -> Result<Vec<(i64, String, String, String, Option<i64>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

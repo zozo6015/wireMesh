@@ -68,7 +68,10 @@
 // list item they belong to. Clippy reads that alignment as a missing indent
 // and its fix flattens a table a human laid out on purpose, so the
 // disagreement is recorded here rather than resolved against the reader.
-#![allow(clippy::doc_lazy_continuation)]
+#![expect(
+    clippy::doc_lazy_continuation,
+    reason = "the doc comment aligns its continuation lines on purpose; the lint's fix ragged-edges a hand-aligned table"
+)]
 
 use wiremesh_policy::{
     compile, parse_policy, IrAction, IrBlock, IrProto, IrRule, PolicyIR, SegmentDef,
