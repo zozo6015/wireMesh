@@ -2659,18 +2659,23 @@ async fn ensure_relay_transport(
     let addr: SocketAddr = match relay_info.endpoint.parse() {
         Ok(a) => a,
         Err(e) => {
-            // A malformed advertisement is DATA, not a peer rejection — the
-            // relay never got the chance to reject us — so it is TRANSIENT
-            // (`Other`, threshold 3), not permanent: a controller that
-            // re-advertises a corrected endpoint recovers on the next tick
-            // instead of waiting out a window earned by something already
-            // fixed.
+            // TRANSIENT (`Other`, threshold 3), not permanent — and the
+            // reason is sharper than "it is data, not a peer rejection":
+            // this is the one failure cause whose INPUT can change while the
+            // back-off key cannot. The controller can correct a malformed
+            // advertisement via a `RelaysChanged` delta, but the key stays
+            // `(gid, relay_id)`, so the accumulated history follows the
+            // relay id across the correction. Threshold 3 is what lets a
+            // corrected advertisement land promptly; threshold 1 would open
+            // a window on the first bad string and push an already-fixed
+            // relay toward the 300s cap for a fault that no longer exists.
             //
             // But it MUST be recorded. This arm sits AFTER
-            // `relay_connect_allowed` has already consumed a decide, so
-            // returning without an outcome leaves the counter at zero, no
-            // window ever opens, and the line below repeats every tick
-            // forever — precisely the defect this back-off exists to stop.
+            // `relay_connect_allowed` has consumed a `decide()`, and
+            // returning without an outcome is a WIRING GAP, not merely a
+            // slow path: the counter never increments, `window_until` stays
+            // `None`, and `decide()` therefore returns `Allow` on every
+            // subsequent tick. The back-off is INERT here — not lenient.
             if ctx.record_relay_connect_outcome(
                 gid,
                 relay_info.relay_id,

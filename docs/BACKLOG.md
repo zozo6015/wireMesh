@@ -620,6 +620,17 @@ What shipped (`wiremesh_relay::{ALPN_V0, ALPN_SUPPORTED}`):
   relay used to be retried every tick forever, indistinguishably. Permanent causes back
   off from the first failure, transient ones after three.
 
+**Two follow-ups from PR5's review, both narrow:**
+
+* `ensure_relay_transport`'s unparseable-endpoint arm records `Err(Other)` &mdash;
+  **review-verified (PR5 CodeRabbit), not test-pinned**; pin it when a controller-side
+  `RelayInfo` fixture exists that can feed a malformed `endpoint` through a real Sync
+  stream.
+* A `RelaysChanged` delta that alters relay R's endpoint should **clear the `(gid, R)`
+  back-off entry** &mdash; the accumulated failure history is about a string that no
+  longer exists, and the key `(gid, relay_id)` survives the correction. Needs a decision
+  on which `RelayInfo` fields count as "changed" for this purpose.
+
 The `/1` mux wire itself remains deferred on decisions F and G. **Follow-up filed:** the
 relay's application-level registration rejections (identity mismatch, id in use, id
 collision) close the connection *after* a successful TLS handshake, so they classify as
