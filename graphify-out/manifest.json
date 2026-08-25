@@ -1,1856 +1,1856 @@
 {
   "crates/fabricctl/src/lib.rs": {
-    "mtime": 1787684002.968346,
+    "mtime": 1787691836.814426,
     "ast_hash": "68b329da9893e34099c7d8ad5cb9c940",
     "semantic_hash": ""
   },
   "crates/fabricctl/src/main.rs": {
-    "mtime": 1787684002.9737227,
+    "mtime": 1787691836.8148248,
     "ast_hash": "8a981e94ad4cc1e28ef912610502737a",
     "semantic_hash": ""
   },
   "crates/fabricctl/tests/cli.rs": {
-    "mtime": 1787684002.9754114,
+    "mtime": 1787691836.8153129,
     "ast_hash": "4a2a5bd1927b54024137081a21ffb502",
     "semantic_hash": ""
   },
   "crates/fabricctl/tests/cli_help_version.rs": {
-    "mtime": 1787684002.9760165,
+    "mtime": 1787691836.815503,
     "ast_hash": "d81a9aec21d21194556a0e2120f59f98",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/apply.rs": {
-    "mtime": 1787680547.2863472,
+    "mtime": 1787691836.816005,
     "ast_hash": "1de90793cf967bffa2328b9f2c956a31",
     "semantic_hash": "1de90793cf967bffa2328b9f2c956a31"
   },
   "crates/wiremesh-controller/src/auth.rs": {
-    "mtime": 1787680547.2864819,
+    "mtime": 1787691836.8161576,
     "ast_hash": "a83bf1e9b578225bf9538d4bc8ab85b0",
     "semantic_hash": "a83bf1e9b578225bf9538d4bc8ab85b0"
   },
   "crates/wiremesh-controller/src/broker.rs": {
-    "mtime": 1787684002.9958382,
+    "mtime": 1787691836.8167958,
     "ast_hash": "033858f2a2f2362a17a9190ef8468391",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/cli.rs": {
-    "mtime": 1787680547.2878265,
+    "mtime": 1787691836.8170815,
     "ast_hash": "26ebd9a0d6d8fe3c8bc97dedaca8cfb0",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/db.rs": {
-    "mtime": 1787684003.0127869,
+    "mtime": 1787691836.818063,
     "ast_hash": "1bb1e47ef6569c19f57f39083c01470c",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/db_async.rs": {
-    "mtime": 1787684003.0146701,
+    "mtime": 1787691836.8184206,
     "ast_hash": "408bdaed5a65009b76ab2342125a2a41",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/lib.rs": {
-    "mtime": 1787684003.0187469,
+    "mtime": 1787691836.8190305,
     "ast_hash": "ad315ff140e72d0f96bbccac8f78da84",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/main.rs": {
-    "mtime": 1787680547.290767,
+    "mtime": 1787691836.8192978,
     "ast_hash": "1cac865df2960be105ffb4bcb1234940",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/observe.rs": {
-    "mtime": 1787680547.2911072,
+    "mtime": 1787691836.8195553,
     "ast_hash": "fd0a43819b2364661a91eff95081a88d",
     "semantic_hash": "fd0a43819b2364661a91eff95081a88d"
   },
   "crates/wiremesh-controller/src/projection.rs": {
-    "mtime": 1787684003.0211594,
+    "mtime": 1787691836.8198662,
     "ast_hash": "5a9373553a674ed118f231b9b7963bec",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/rotation.rs": {
-    "mtime": 1787684003.0219808,
-    "ast_hash": "e13cf744dd94867217d0b3d92f4ef629",
+    "mtime": 1787693173.3885746,
+    "ast_hash": "db5d86d8a858e65523f3db02bbf0eef8",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/routes.rs": {
-    "mtime": 1787680547.2915678,
+    "mtime": 1787691836.8204706,
     "ast_hash": "9b12bcc1884d5ec0a50dcb07c4129ddc",
     "semantic_hash": "9b12bcc1884d5ec0a50dcb07c4129ddc"
   },
   "crates/wiremesh-controller/src/services/admin.rs": {
-    "mtime": 1787684003.0274792,
+    "mtime": 1787691836.8210244,
     "ast_hash": "d98509585385131990c96024aedcce10",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/services/enrollment.rs": {
-    "mtime": 1787684003.0299783,
+    "mtime": 1787691836.8213394,
     "ast_hash": "b38540ea09dd4ef3721ad2b32601c23a",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/services/mod.rs": {
-    "mtime": 1787680547.2925646,
+    "mtime": 1787691836.8214364,
     "ast_hash": "a0094c8abed95c8e00123f64042aa624",
     "semantic_hash": "a0094c8abed95c8e00123f64042aa624"
   },
   "crates/wiremesh-controller/src/services/sync.rs": {
-    "mtime": 1787684003.04095,
-    "ast_hash": "f3fc53bafba12f3b977806d00c21bca1",
+    "mtime": 1787695629.5390089,
+    "ast_hash": "91cf9750f676b76c2a2e89c2aa930919",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/admin.rs": {
-    "mtime": 1787680547.2940931,
+    "mtime": 1787691836.8224761,
     "ast_hash": "7f6ce60897f524501423ed5ac2b36a6a",
     "semantic_hash": "7f6ce60897f524501423ed5ac2b36a6a"
   },
   "crates/wiremesh-controller/tests/admin_auth.rs": {
-    "mtime": 1787680547.2942111,
+    "mtime": 1787691836.822743,
     "ast_hash": "ed9c6cca3fd9d47a0d59893dc9970bdd",
     "semantic_hash": "ed9c6cca3fd9d47a0d59893dc9970bdd"
   },
   "crates/wiremesh-controller/tests/apply.rs": {
-    "mtime": 1787680547.2943113,
+    "mtime": 1787691836.8228543,
     "ast_hash": "c7082c3c8abc17fac6620cfc03621f03",
     "semantic_hash": "c7082c3c8abc17fac6620cfc03621f03"
   },
   "crates/wiremesh-controller/tests/audit_actor.rs": {
-    "mtime": 1787680547.2947178,
+    "mtime": 1787691836.823174,
     "ast_hash": "144e1793a98a3edb7aed4cd8383632bb",
     "semantic_hash": "144e1793a98a3edb7aed4cd8383632bb"
   },
   "crates/wiremesh-controller/tests/boot_leaves_no_residue.rs": {
-    "mtime": 1787680547.2951603,
+    "mtime": 1787691836.8234851,
     "ast_hash": "9e3b694228f209f83b9a8fa7b5356b96",
     "semantic_hash": "9e3b694228f209f83b9a8fa7b5356b96"
   },
   "crates/wiremesh-controller/tests/broker.rs": {
-    "mtime": 1787684003.047792,
+    "mtime": 1787691836.823699,
     "ast_hash": "4a4d91b24586477618d289249e0c8534",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/broker_pathstate.rs": {
-    "mtime": 1787684003.0528986,
+    "mtime": 1787691836.824185,
     "ast_hash": "0cd970287c0247a6f671a57285493a9e",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/candidates.rs": {
-    "mtime": 1787684003.0550268,
+    "mtime": 1787691836.8247845,
     "ast_hash": "b1774fe4619232d2b61cb1d332850455",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/cli_help_version.rs": {
-    "mtime": 1787684003.0559058,
+    "mtime": 1787691836.8250678,
     "ast_hash": "3a07fa4e70c1fbfe53673270f5de234f",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/db.rs": {
-    "mtime": 1787684003.059472,
+    "mtime": 1787691836.825595,
     "ast_hash": "962bcc00dc3bb02aa0d5cf185eab6f44",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/drain.rs": {
-    "mtime": 1787684003.0601532,
+    "mtime": 1787691836.8258004,
     "ast_hash": "960678f30243a2e3ca1e4bb18b1fd264",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/enroll.rs": {
-    "mtime": 1787680547.29788,
+    "mtime": 1787691836.8259435,
     "ast_hash": "d2ab0e2a3950e6ae60d608925d843a7b",
     "semantic_hash": "d2ab0e2a3950e6ae60d608925d843a7b"
   },
   "crates/wiremesh-controller/tests/enroll_token_kind.rs": {
-    "mtime": 1787684003.0636759,
+    "mtime": 1787691836.826252,
     "ast_hash": "8f46fd325bb76a82e643db78bd163f1f",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/epoch_key_submit.rs": {
-    "mtime": 1787684003.0673363,
+    "mtime": 1787691836.8285208,
     "ast_hash": "070694e60c1e44d0ad3fbf2add891e48",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/fail_static.rs": {
-    "mtime": 1787680547.2993655,
+    "mtime": 1787691836.8286402,
     "ast_hash": "b417c50c276b7cc1bf792dc1349fa287",
     "semantic_hash": "b417c50c276b7cc1bf792dc1349fa287"
   },
   "crates/wiremesh-controller/tests/get_policy.rs": {
-    "mtime": 1787680547.2994685,
+    "mtime": 1787691836.8287787,
     "ast_hash": "b29037ab2c181d4e73b4daa3ee77689e",
     "semantic_hash": "b29037ab2c181d4e73b4daa3ee77689e"
   },
   "crates/wiremesh-controller/tests/keys.rs": {
-    "mtime": 1787684003.069997,
+    "mtime": 1787691836.8290293,
     "ast_hash": "0a7ac5804f1d9dd490c113e1417687a7",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/observe.rs": {
-    "mtime": 1787684003.0712051,
+    "mtime": 1787691836.8292434,
     "ast_hash": "27287fcb82e8cb63d035cfa08a1d2d10",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/policy_pipeline.rs": {
-    "mtime": 1787684003.075362,
+    "mtime": 1787691836.8296382,
     "ast_hash": "09f66e7e667ea27b5a125ed0e83d7ee0",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/projection_guard.rs": {
-    "mtime": 1787684003.077658,
+    "mtime": 1787691836.8299415,
     "ast_hash": "2e15dd9824ff36811c3dbbe4b038cce6",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/rebind.rs": {
-    "mtime": 1787684003.0787814,
+    "mtime": 1787691836.830119,
     "ast_hash": "06e17e7e5d98c3e077b2ce6dae2b21c4",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/register_relay_ipv4.rs": {
-    "mtime": 1787684003.0795166,
+    "mtime": 1787691836.8303206,
     "ast_hash": "4cd9cdc4c20b76edb516ee03ee268500",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/relay_enroll.rs": {
-    "mtime": 1787684003.0810323,
+    "mtime": 1787691836.8306968,
     "ast_hash": "19d12272e66aaf75e9dd41ec5a467990",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/relay_health.rs": {
-    "mtime": 1787684003.0828032,
+    "mtime": 1787691836.831092,
     "ast_hash": "e09c9ce94f627a1e705824e6f423c598",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/relay_sync_watch.rs": {
-    "mtime": 1787684003.0857403,
+    "mtime": 1787691836.8313334,
     "ast_hash": "741f1dbd468cd8d331009b3686412333",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/report_local_endpoints.rs": {
-    "mtime": 1787684003.0870612,
+    "mtime": 1787691836.8315833,
     "ast_hash": "3de946fab9d1b832b4161d65fdce58dc",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/revoke_audit.rs": {
-    "mtime": 1787684003.0897818,
+    "mtime": 1787691836.8322227,
     "ast_hash": "daa46aa09feed050132f8065e4306e5f",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/rotation.rs": {
-    "mtime": 1787684003.0907626,
+    "mtime": 1787691836.8324287,
     "ast_hash": "6f9a94ea43fb706e872f6b92436325a8",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/rotation_disabled.rs": {
-    "mtime": 1787684003.0932467,
+    "mtime": 1787691836.832678,
     "ast_hash": "997282f7b3f3fa682dcc0dd621ce796b",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/rotation_interval_boot_reject.rs": {
-    "mtime": 1787684003.095173,
+    "mtime": 1787691836.8332705,
     "ast_hash": "3f683c72c4a09cb3f99d8fdc6155c9ca",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/rotation_interval_parse.rs": {
-    "mtime": 1787684003.0980399,
+    "mtime": 1787691836.833713,
     "ast_hash": "d0f250f8728fd2c54a3e1841f85316f1",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/rotation_timer.rs": {
-    "mtime": 1787684003.1028433,
+    "mtime": 1787691836.8341906,
     "ast_hash": "d601c60a13f8c4dfcaad67fd0159fec0",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/sync_delta.rs": {
-    "mtime": 1787684003.1034522,
+    "mtime": 1787691836.8343375,
     "ast_hash": "3ee24c0708e8a5f0192fd896e8e69415",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/sync_identity_active_only.rs": {
-    "mtime": 1787684003.1040199,
+    "mtime": 1787691836.8345425,
     "ast_hash": "1b9f3f4bb4405b80c2040065a92ea9cb",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/sync_relays.rs": {
-    "mtime": 1787684003.1055403,
+    "mtime": 1787691836.834782,
     "ast_hash": "3d872843ff60784f09f9ad11d1000b29",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/sync_server_keepalive.rs": {
-    "mtime": 1787680547.305332,
+    "mtime": 1787691836.8363419,
     "ast_hash": "81464668de507c6308cbe5c22ad7f8fd",
     "semantic_hash": "81464668de507c6308cbe5c22ad7f8fd"
   },
   "crates/wiremesh-controller/tests/sync_snapshot.rs": {
-    "mtime": 1787684003.1064088,
+    "mtime": 1787691836.836553,
     "ast_hash": "8325c5e432cb240f0c7be2c09545f594",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/wg_pubkey_enrollment.rs": {
-    "mtime": 1787684003.1074164,
+    "mtime": 1787691836.836764,
     "ast_hash": "9a9d9035b34efd59ea443b5a67565fb2",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer-ebpf/common/src/lib.rs": {
-    "mtime": 1787680547.3068,
+    "mtime": 1787691836.8382483,
     "ast_hash": "f113054585792b12b5b8bce44b057126",
     "semantic_hash": "f113054585792b12b5b8bce44b057126"
   },
   "crates/wiremesh-enforcer-ebpf/program/build.rs": {
-    "mtime": 1787680547.3069813,
+    "mtime": 1787691836.8384242,
     "ast_hash": "9a50ed55f9da245f7439127d0b4bf322",
     "semantic_hash": "9a50ed55f9da245f7439127d0b4bf322"
   },
   "crates/wiremesh-enforcer-ebpf/program/src/lib.rs": {
-    "mtime": 1787680547.307088,
+    "mtime": 1787691836.8385496,
     "ast_hash": "244de63b311bac40d44d3bebce75e195",
     "semantic_hash": "244de63b311bac40d44d3bebce75e195"
   },
   "crates/wiremesh-enforcer-ebpf/program/src/main.rs": {
-    "mtime": 1787684003.4699235,
+    "mtime": 1787691836.839571,
     "ast_hash": "c3950f0adb11872ad3663b2d09d974d6",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/build.rs": {
-    "mtime": 1787680547.3075905,
+    "mtime": 1787691836.841196,
     "ast_hash": "86db169e47f92532e3f101d279e95f9d",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/src/ebpf.rs": {
-    "mtime": 1787684003.1133327,
+    "mtime": 1787691836.8416772,
     "ast_hash": "b10c0303e83d5188819ab9c613fff02b",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/src/flatten.rs": {
-    "mtime": 1787684003.1141455,
+    "mtime": 1787691836.8419268,
     "ast_hash": "3a865fee896fa0ef4c619f24010b8328",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/src/lib.rs": {
-    "mtime": 1787684003.1147625,
+    "mtime": 1787691836.8422334,
     "ast_hash": "7b8b512f2b4d79814689d3b8187b1e08",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/src/nft.rs": {
-    "mtime": 1787684003.1159065,
+    "mtime": 1787691836.8425007,
     "ast_hash": "0c0601542bd8ebc0491e12e95158665c",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/deny_events.rs": {
-    "mtime": 1787684003.1172848,
+    "mtime": 1787691836.8427436,
     "ast_hash": "a071e2c86d46cbc88617a75d79f3f4e1",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/ebpf_backend.rs": {
-    "mtime": 1787684003.1181018,
+    "mtime": 1787691836.8430278,
     "ast_hash": "6af6d1d6ce6160ff5f6064f7717b0a8f",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/flatten.rs": {
-    "mtime": 1787684003.1193495,
+    "mtime": 1787691836.843597,
     "ast_hash": "251add72801bb42a7711711419afc83e",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/flow_table.rs": {
-    "mtime": 1787684003.1216757,
+    "mtime": 1787691836.8441553,
     "ast_hash": "bea01fdb28e183aeefbe0c7f31d10dfb",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/generations.rs": {
-    "mtime": 1787684003.1251292,
+    "mtime": 1787691836.8445818,
     "ast_hash": "396a21f529c9608ea7294332eea66f3d",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/hardening.rs": {
-    "mtime": 1787680547.3119245,
+    "mtime": 1787691836.8448625,
     "ast_hash": "4d6d2bf5c075ec1427a96bb5cddee5a9",
     "semantic_hash": "4d6d2bf5c075ec1427a96bb5cddee5a9"
   },
   "crates/wiremesh-enforcer/tests/iface_validation.rs": {
-    "mtime": 1787680547.3121538,
+    "mtime": 1787691836.8451374,
     "ast_hash": "a6ffa37ed9a839e2a5ae53f943aad578",
     "semantic_hash": "a6ffa37ed9a839e2a5ae53f943aad578"
   },
   "crates/wiremesh-enforcer/tests/lpm_capacity.rs": {
-    "mtime": 1787684003.1273208,
+    "mtime": 1787691836.8453138,
     "ast_hash": "6784189a712f3f386beb0703fe17f754",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/nft_backend.rs": {
-    "mtime": 1787684003.1299345,
+    "mtime": 1787691836.845643,
     "ast_hash": "db403b98318c2e6d1597b5c75b8e757e",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/nft_codegen.rs": {
-    "mtime": 1787684003.131195,
+    "mtime": 1787691836.8458636,
     "ast_hash": "9f27201b670c45f50a13982b70c582ab",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/reap_deadline.rs": {
-    "mtime": 1787684003.1328726,
+    "mtime": 1787691836.8460524,
     "ast_hash": "00fbab7441e65837da5c54abea5e04a3",
     "semantic_hash": ""
   },
   "crates/wiremesh-enroll/src/lib.rs": {
-    "mtime": 1787684003.1341524,
+    "mtime": 1787691836.8465006,
     "ast_hash": "ae19ef26f1e42322871899f35b275c4c",
     "semantic_hash": ""
   },
   "crates/wiremesh-enroll/tests/enroll_live.rs": {
-    "mtime": 1787684003.1347854,
+    "mtime": 1787691836.846677,
     "ast_hash": "56d003fb87586f5cd483f3dacf9f8624",
     "semantic_hash": ""
   },
   "crates/wiremesh-enroll/tests/validate_host_port.rs": {
-    "mtime": 1787680547.3140388,
+    "mtime": 1787691836.84679,
     "ast_hash": "3807e9f8cfa2e7ef1fa491ab9aa5f6e2",
     "semantic_hash": "3807e9f8cfa2e7ef1fa491ab9aa5f6e2"
   },
   "crates/wiremesh-gateway/src/cli.rs": {
-    "mtime": 1787680547.3147154,
+    "mtime": 1787691836.8472745,
     "ast_hash": "8f4c6aa1be0c7ccb92dcc00931622892",
     "semantic_hash": "8f4c6aa1be0c7ccb92dcc00931622892"
   },
   "crates/wiremesh-gateway/src/config.rs": {
-    "mtime": 1787684003.148298,
+    "mtime": 1787691836.8474658,
     "ast_hash": "688aafe0a3f4dbf96dd24513618a6cba",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/enforce.rs": {
-    "mtime": 1787684003.1486328,
+    "mtime": 1787691836.8476,
     "ast_hash": "c1ff63f6a84ccc3243978d9cf2789764",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/enroll.rs": {
-    "mtime": 1787684003.1493483,
+    "mtime": 1787691836.8477745,
     "ast_hash": "d7308a3aa60532ca44367bf381d8b123",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/epochkeys.rs": {
-    "mtime": 1787684003.1505928,
+    "mtime": 1787691836.8479877,
     "ast_hash": "8b8b031cf62af3c9c853673e4ec6eea5",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/identity.rs": {
-    "mtime": 1787684003.1523044,
+    "mtime": 1787691836.848174,
     "ast_hash": "ff695628360b27c113ca6cdd86a343c2",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/lib.rs": {
-    "mtime": 1787684003.1524336,
+    "mtime": 1787691836.8482995,
     "ast_hash": "709cdb8da008c0182715cd622f87d076",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/main.rs": {
-    "mtime": 1787684003.2094126,
+    "mtime": 1787691836.84994,
     "ast_hash": "ebbb89e0ad623f4fad9ae5d214dc5816",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/metrics.rs": {
-    "mtime": 1787684003.1535504,
+    "mtime": 1787691836.8501627,
     "ast_hash": "75f9bc3ee28f009a0c4566dbe0ec88bb",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/netif.rs": {
-    "mtime": 1787684003.153958,
+    "mtime": 1787691836.8503776,
     "ast_hash": "b78c701faf57f0f090503fff1b2d1c7a",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/observe.rs": {
-    "mtime": 1787684003.1544387,
+    "mtime": 1787691836.8505685,
     "ast_hash": "f993afc66a9214d574df37792082b2aa",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/path.rs": {
-    "mtime": 1787684003.1560552,
+    "mtime": 1787691836.8509316,
     "ast_hash": "549cd52e9cc03c21249f01781b9d478d",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/policy_apply.rs": {
-    "mtime": 1787684003.1571603,
+    "mtime": 1787691836.8512979,
     "ast_hash": "d81be539bfccf8cb84bf0fdfc8451677",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/punch.rs": {
-    "mtime": 1787684003.1577384,
+    "mtime": 1787691836.8516083,
     "ast_hash": "f9f2a6ef98e541d924f6db5dfbe34574",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/punch_backoff.rs": {
-    "mtime": 1787680547.3242793,
+    "mtime": 1787691836.851877,
     "ast_hash": "747e09d45452e73291ac33f3d177f36e",
     "semantic_hash": "747e09d45452e73291ac33f3d177f36e"
   },
   "crates/wiremesh-gateway/src/reconcile.rs": {
-    "mtime": 1787684003.1608202,
+    "mtime": 1787691836.852157,
     "ast_hash": "4562409789a8265f7f1685f37f2d73c9",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/relay.rs": {
-    "mtime": 1787684003.1627722,
+    "mtime": 1787691836.8524528,
     "ast_hash": "556656ae16b0290ddae2eeb7c8452e4d",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/rotation.rs": {
-    "mtime": 1787684003.1637647,
+    "mtime": 1787691836.852716,
     "ast_hash": "c4e5b33d231f21b32e99c2c56d3974c3",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/routes.rs": {
-    "mtime": 1787684003.1642075,
+    "mtime": 1787691836.8529084,
     "ast_hash": "fa225dd0cc2e17444e74457cade698d1",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/state.rs": {
-    "mtime": 1787684003.1689506,
+    "mtime": 1787691836.853521,
     "ast_hash": "2bfb349ced8c31907a14f180493f2ca3",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/sync.rs": {
-    "mtime": 1787684003.1699533,
+    "mtime": 1787691836.8538163,
     "ast_hash": "6646b3c62a5022711aef7ccf4d368d26",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/tunnel.rs": {
-    "mtime": 1787684003.1702008,
+    "mtime": 1787691836.8540611,
     "ast_hash": "67da05b8db91f8e20e225edb9c4072af",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/tunnelset.rs": {
-    "mtime": 1787684003.1726997,
+    "mtime": 1787691836.8543117,
     "ast_hash": "49fe10539cb46a0873752f00101c59e5",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/src/uapi.rs": {
-    "mtime": 1787684003.1763968,
+    "mtime": 1787691836.8548708,
     "ast_hash": "4a86f3692d3727903d0b5c6a125b48e2",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/apply_make_before_break.rs": {
-    "mtime": 1787684003.2128084,
+    "mtime": 1787691836.855265,
     "ast_hash": "2130520149be6e6a3628800580bd48f0",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/cli_help_version.rs": {
-    "mtime": 1787684003.2157514,
+    "mtime": 1787691836.855793,
     "ast_hash": "24b2884a149f636c95775e4805fb1f56",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/convergence_matrix.rs": {
-    "mtime": 1787684003.2255888,
+    "mtime": 1787691836.8566117,
     "ast_hash": "d28c076e28daa909f11d9e3423bfc71e",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/directive_should_punch.rs": {
-    "mtime": 1787680547.3300042,
+    "mtime": 1787691836.8568175,
     "ast_hash": "f5a29ed15f8f0f544127f0f9dfda0117",
     "semantic_hash": "f5a29ed15f8f0f544127f0f9dfda0117"
   },
   "crates/wiremesh-gateway/tests/enforce_netns.rs": {
-    "mtime": 1787684003.2267046,
+    "mtime": 1787691836.857039,
     "ast_hash": "877387a24045634faafcd6bac19294c4",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/enroll_cmd.rs": {
-    "mtime": 1787684003.2280638,
+    "mtime": 1787691836.8572328,
     "ast_hash": "9d372880af1adfb07c2ffd63be8a8505",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/enroll_idempotent.rs": {
-    "mtime": 1787684003.229194,
+    "mtime": 1787691836.8578403,
     "ast_hash": "2f37fdb1c8092129a5932498e5e6fe73",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/epoch_boot_key.rs": {
-    "mtime": 1787684003.229956,
+    "mtime": 1787691836.8580258,
     "ast_hash": "655ff3a3017c040257da8de6e4dda841",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/epoch_persistence.rs": {
-    "mtime": 1787684003.230917,
+    "mtime": 1787691836.8582098,
     "ast_hash": "ae976cc7907cc41b73e3ff490e41531f",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/epoch_watch_keys.rs": {
-    "mtime": 1787684003.2334538,
+    "mtime": 1787691836.8583937,
     "ast_hash": "c4d96fb6c60e1a59af195da345b8acb0",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/fail_static_policy_ir.rs": {
-    "mtime": 1787684003.236359,
+    "mtime": 1787691836.858743,
     "ast_hash": "f97549e1b6156606e0ee80d12c010b59",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/hostname_resolve.rs": {
-    "mtime": 1787684003.2374568,
+    "mtime": 1787691836.8589358,
     "ast_hash": "d36e83137129cda6958694687e041690",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/keepalive_emission.rs": {
-    "mtime": 1787684003.2385547,
+    "mtime": 1787691836.85913,
     "ast_hash": "b040dfdf1ff02e7a6ec635e1c640170a",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/key_rotation.rs": {
-    "mtime": 1787690320.1687195,
+    "mtime": 1787691836.8602946,
     "ast_hash": "713dc27eb5bccc945e71932e80294e57",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/mesh_milestone.rs": {
-    "mtime": 1787684003.2566273,
+    "mtime": 1787691836.8605118,
     "ast_hash": "82aea000abf5e7987d2b7b9bc2532420",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/nat_matrix.rs": {
-    "mtime": 1787684003.2600722,
+    "mtime": 1787691836.8608272,
     "ast_hash": "2b4792057ce872e0049181871262d44f",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/observe_parity.rs": {
-    "mtime": 1787684003.2606447,
+    "mtime": 1787691836.860961,
     "ast_hash": "2d11d888d46fe302bbb7de84d1a3d678",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/overlap_write_back.rs": {
-    "mtime": 1787684003.2614908,
+    "mtime": 1787691836.8611774,
     "ast_hash": "128de9b31edf2d4b308e1c88be954536",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/path_relay_death.rs": {
-    "mtime": 1787684003.262922,
+    "mtime": 1787691836.8614762,
     "ast_hash": "d10cf0d6738ac19e790a26c9f3cffab7",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/path_rx_liveness.rs": {
-    "mtime": 1787680547.3354323,
+    "mtime": 1787691836.8617394,
     "ast_hash": "c102e32d6efb12a0d878406c76fdff4e",
     "semantic_hash": "c102e32d6efb12a0d878406c76fdff4e"
   },
   "crates/wiremesh-gateway/tests/path_settled_boundary.rs": {
-    "mtime": 1787680547.3357122,
+    "mtime": 1787691836.8620472,
     "ast_hash": "0b7e5509a1a4a0e8ca5da9d0ef840201",
     "semantic_hash": "0b7e5509a1a4a0e8ca5da9d0ef840201"
   },
   "crates/wiremesh-gateway/tests/peer_metrics.rs": {
-    "mtime": 1787684003.2680383,
+    "mtime": 1787691836.8625846,
     "ast_hash": "c154cdc70c71167f4677ce179ed90a7e",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/policy_apply_liveness.rs": {
-    "mtime": 1787684003.2703688,
+    "mtime": 1787691836.8628612,
     "ast_hash": "06ab7e505c53510434daec0f441977c5",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/policy_apply_worker.rs": {
-    "mtime": 1787684003.2764344,
+    "mtime": 1787691836.8635218,
     "ast_hash": "909a798c38f6e6f94531e45d539b9535",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/punch_backoff.rs": {
-    "mtime": 1787684003.2793446,
+    "mtime": 1787691836.8639147,
     "ast_hash": "a737847de0f5d4c364a92dbce0cf9d78",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/punch_endpoint_driven.rs": {
-    "mtime": 1787684003.2809017,
+    "mtime": 1787691836.8641515,
     "ast_hash": "e81586e93584b6c0323b1d34980b078a",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/relay_death_reason.rs": {
-    "mtime": 1787684003.2823143,
+    "mtime": 1787691836.8643997,
     "ast_hash": "361c850033faab51c71ca0b1d2527f56",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/relay_matrix.rs": {
-    "mtime": 1787684003.290642,
+    "mtime": 1787691836.865333,
     "ast_hash": "8dbc380fa8583157ab5d71e20b7ebc86",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/relay_transport.rs": {
-    "mtime": 1787684003.2917647,
+    "mtime": 1787691836.8656054,
     "ast_hash": "447d302e6eb8947089a3be8156777619",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/role_b_decisions.rs": {
-    "mtime": 1787684003.293168,
+    "mtime": 1787691836.8658473,
     "ast_hash": "393451f468a3665515f55c1a80a71c10",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/rotation_slot_quarantine.rs": {
-    "mtime": 1787684003.2948,
+    "mtime": 1787691836.8660653,
     "ast_hash": "a61f323ec43a2572d6ba0a230a0d06f6",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/rotation_slot_quarantine_netns.rs": {
-    "mtime": 1787684003.2965105,
+    "mtime": 1787691836.8663168,
     "ast_hash": "eac3cf158372cdfe84f0c24846317bc8",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/routes_netns.rs": {
-    "mtime": 1787684003.2971568,
+    "mtime": 1787691836.867603,
     "ast_hash": "9fdf4c91ada6592732f4ddfe695b46ba",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/scoped_peer_apply.rs": {
-    "mtime": 1787684003.2984872,
+    "mtime": 1787691836.8678615,
     "ast_hash": "43d5363d11ec24b620f4412d785f5837",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/sync_client.rs": {
-    "mtime": 1787684003.3002791,
+    "mtime": 1787691836.8681068,
     "ast_hash": "fcdfe73cad4f8f1d0f5dbb50c25e8f3d",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/throughput_bench.rs": {
-    "mtime": 1787684003.3017428,
+    "mtime": 1787691836.8683743,
     "ast_hash": "98a92dfc70723753aa2bbd6d8535f8e7",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/tunnel_id_decollision.rs": {
-    "mtime": 1787684003.304057,
+    "mtime": 1787691836.8686202,
     "ast_hash": "be0f1fe4c03eab355c50d7b0faf6fcab",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/tunnel_netns.rs": {
-    "mtime": 1787684003.3051305,
+    "mtime": 1787691836.8688443,
     "ast_hash": "54c9988b5e0f3c8867d668cc2b4e63f5",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/tunnelset_netns.rs": {
-    "mtime": 1787684003.3062694,
+    "mtime": 1787691836.8690622,
     "ast_hash": "70a736d94625a8cee78a19441c963c82",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/tunnelset_same_epoch_netns.rs": {
-    "mtime": 1787684003.3074958,
+    "mtime": 1787691836.8692908,
     "ast_hash": "23d56af871d3458d22eaa52f7f9961ef",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/admin.rs": {
-    "mtime": 1787684003.316151,
+    "mtime": 1787691836.8699994,
     "ast_hash": "c73497fcdcae5593367cf2584df54ebc",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/admin_exec.rs": {
-    "mtime": 1787684003.3175192,
+    "mtime": 1787691836.8702147,
     "ast_hash": "cea3fa6599f1d54604b9460711d82eb2",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/bin/crdgen.rs": {
-    "mtime": 1787680547.3459213,
+    "mtime": 1787691836.8705084,
     "ast_hash": "728807d730497fd34fece5d16ed8cb5d",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/cli.rs": {
-    "mtime": 1787680547.346124,
+    "mtime": 1787691836.870786,
     "ast_hash": "78ce4f1375591062b3311262d98187ce",
     "semantic_hash": "78ce4f1375591062b3311262d98187ce"
   },
   "crates/wiremesh-operator/src/controllers/controller.rs": {
-    "mtime": 1787684003.318787,
+    "mtime": 1787691836.8710568,
     "ast_hash": "63b85b5197feadac7f763ceaaff5db1f",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/controllers/fabric.rs": {
-    "mtime": 1787684003.3198793,
+    "mtime": 1787691836.8712752,
     "ast_hash": "b8fe1882fc37323b8322b69629f76bf0",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/controllers/gateway.rs": {
-    "mtime": 1787684003.324161,
+    "mtime": 1787691836.8719857,
     "ast_hash": "8fbd667d56e763c4aaff91f3ae8739a1",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/controllers/mod.rs": {
-    "mtime": 1787684003.3256655,
+    "mtime": 1787691836.872252,
     "ast_hash": "c13f0b5919d3879e187f51fd25d64ae3",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/controllers/relay.rs": {
-    "mtime": 1787684003.3268695,
+    "mtime": 1787691836.8726876,
     "ast_hash": "63bdb4e6a129dfaa12cc4fe261a317a9",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/crd.rs": {
-    "mtime": 1787684003.3280716,
+    "mtime": 1787691836.8729186,
     "ast_hash": "8094853fa2cd7dada3a7862e07d104d5",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/fabric.rs": {
-    "mtime": 1787684003.3293798,
+    "mtime": 1787691836.8731384,
     "ast_hash": "fdcec533e8c8ca417f3f6933620fa8f8",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/lib.rs": {
-    "mtime": 1787680547.3492684,
+    "mtime": 1787691836.8733687,
     "ast_hash": "64a24e4e6a09d49998430b9183807999",
     "semantic_hash": "64a24e4e6a09d49998430b9183807999"
   },
   "crates/wiremesh-operator/src/main.rs": {
-    "mtime": 1787680547.3496444,
+    "mtime": 1787691836.8747828,
     "ast_hash": "7dcf3ee001c4b0a5c60bddbe4571d8f6",
     "semantic_hash": "7dcf3ee001c4b0a5c60bddbe4571d8f6"
   },
   "crates/wiremesh-operator/src/operator_admin.rs": {
-    "mtime": 1787684003.3311393,
+    "mtime": 1787691836.87502,
     "ast_hash": "e2dbd1d1a1eb29566e6ce860e25ab8cd",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/src/workloads.rs": {
-    "mtime": 1787684003.3410037,
+    "mtime": 1787691836.8757756,
     "ast_hash": "eb585c775b7d8730fe97d9d664b64558",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/admin_exec_row_json_contract.rs": {
-    "mtime": 1787680547.3511014,
+    "mtime": 1787691836.8761177,
     "ast_hash": "19210185214c19392c7f8da6bed6fe91",
     "semantic_hash": "19210185214c19392c7f8da6bed6fe91"
   },
   "crates/wiremesh-operator/tests/cli_help_version.rs": {
-    "mtime": 1787684003.3443305,
+    "mtime": 1787691836.8763406,
     "ast_hash": "7bac5e0431d85d10337cd0a6be694ece",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/finalizer_best_effort.rs": {
-    "mtime": 1787680547.3530002,
+    "mtime": 1787691836.8783329,
     "ast_hash": "b12c409ed280c19cd376da57c227c0ec",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/gateway_endpoint_overrides.rs": {
-    "mtime": 1787684003.3496192,
+    "mtime": 1787691836.8785405,
     "ast_hash": "5303813b38eee9cc0866cce16a601d84",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/gateway_rebind.rs": {
-    "mtime": 1787684003.3520148,
+    "mtime": 1787691836.8789618,
     "ast_hash": "01013c1b3a569e4ea2ea17eb7938b0b9",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/mint_action_deferral.rs": {
-    "mtime": 1787684003.3528726,
+    "mtime": 1787691836.8792024,
     "ast_hash": "054b25a3231faf40cc59ff7ca206dbb5",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/rebind_redemption_e2e.rs": {
-    "mtime": 1787684003.3537166,
+    "mtime": 1787691836.8794065,
     "ast_hash": "2c16db2273f6083c0145fa16b50a98a0",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/rebind_token_encoding.rs": {
-    "mtime": 1787684003.3543653,
+    "mtime": 1787691836.8796048,
     "ast_hash": "3ee0342e1d4f2761aafc8ae78718fdf9",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/reconcile_guards.rs": {
-    "mtime": 1787680547.359681,
+    "mtime": 1787691836.8798814,
     "ast_hash": "93e158fb587377f33244d9545b7c3dc2",
     "semantic_hash": "93e158fb587377f33244d9545b7c3dc2"
   },
   "crates/wiremesh-operator/tests/relay_durability_pinned.rs": {
-    "mtime": 1787684003.3564134,
+    "mtime": 1787691836.880295,
     "ast_hash": "57d77803792385d5e2d285ac399f3695",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/relay_durability_runtime.rs": {
-    "mtime": 1787684003.3570979,
+    "mtime": 1787691836.8805027,
     "ast_hash": "c7f418367f19106a9369f7c05a57fd7c",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/relay_roster_corroboration.rs": {
-    "mtime": 1787684003.3576632,
+    "mtime": 1787691836.880715,
     "ast_hash": "7d07b8ac3987a46dca9f04749dbf50ad",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/relay_scheduler_pinning.rs": {
-    "mtime": 1787684003.3583481,
+    "mtime": 1787691836.8810372,
     "ast_hash": "a83e9141d424f0c508dfcfe1ff43b319",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/roster_active_filter.rs": {
-    "mtime": 1787684003.3653429,
+    "mtime": 1787691836.8821568,
     "ast_hash": "82f7e3abd9a4e92111a13920fd7c48b6",
     "semantic_hash": ""
   },
   "crates/wiremesh-policy/src/compile.rs": {
-    "mtime": 1787684003.3691335,
+    "mtime": 1787691836.8829827,
     "ast_hash": "1bba1a0e4791baa5101497de6fa61b05",
     "semantic_hash": ""
   },
   "crates/wiremesh-policy/src/dsl.rs": {
-    "mtime": 1787680547.3632452,
+    "mtime": 1787691836.8831973,
     "ast_hash": "821fe6b5c2cdad58ca25aa26fb4f0b97",
     "semantic_hash": "821fe6b5c2cdad58ca25aa26fb4f0b97"
   },
   "crates/wiremesh-policy/src/ir.rs": {
-    "mtime": 1787684003.369694,
+    "mtime": 1787691836.8833852,
     "ast_hash": "9b53cb62dfc0958ca1b4e9e138a8528d",
     "semantic_hash": ""
   },
   "crates/wiremesh-policy/src/lib.rs": {
-    "mtime": 1787680547.3636055,
+    "mtime": 1787691836.8853283,
     "ast_hash": "7f20a5dbfe6aea465c76a623eb036411",
     "semantic_hash": "7f20a5dbfe6aea465c76a623eb036411"
   },
   "crates/wiremesh-policy/src/validate.rs": {
-    "mtime": 1787684003.3718066,
+    "mtime": 1787691836.8856514,
     "ast_hash": "711b52016a3c15cf731c5c1ffa45c93a",
     "semantic_hash": ""
   },
   "crates/wiremesh-policy/tests/fixtures/design_s5_example.ir.json": {
-    "mtime": 1787680547.3642988,
+    "mtime": 1787691836.8863804,
     "ast_hash": "989487091d0a70f5a0670f29297e5f2f",
     "semantic_hash": "989487091d0a70f5a0670f29297e5f2f"
   },
   "crates/wiremesh-policy/tests/golden.rs": {
-    "mtime": 1787684003.3743153,
+    "mtime": 1787691836.8933096,
     "ast_hash": "4f28ab5aec4e159b4356e917c7f8cc94",
     "semantic_hash": ""
   },
   "crates/wiremesh-policy/tests/hardening.rs": {
-    "mtime": 1787684003.3757486,
+    "mtime": 1787691836.8936145,
     "ast_hash": "3e4ba938b82cc0da4324822a5f488bdd",
     "semantic_hash": ""
   },
   "crates/wiremesh-policy/tests/props.rs": {
-    "mtime": 1787684003.3803892,
+    "mtime": 1787691836.8967795,
     "ast_hash": "ed35b3f0ebc543e845ef5f0cc0f29399",
     "semantic_hash": ""
   },
   "crates/wiremesh-proto/build.rs": {
-    "mtime": 1787684003.3808281,
+    "mtime": 1787691836.901059,
     "ast_hash": "7ce010fc0f2253c668e79653486ea4b8",
     "semantic_hash": ""
   },
   "crates/wiremesh-proto/src/lib.rs": {
-    "mtime": 1787680547.3668334,
+    "mtime": 1787691836.9012206,
     "ast_hash": "39cf2071058246c39c7082d722a7f6ee",
     "semantic_hash": "39cf2071058246c39c7082d722a7f6ee"
   },
   "crates/wiremesh-proto/tests/codegen.rs": {
-    "mtime": 1787684003.383745,
+    "mtime": 1787691836.90218,
     "ast_hash": "2dcc2bee30761abb4747d4df28909157",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/src/bin/enroll.rs": {
-    "mtime": 1787680547.368263,
+    "mtime": 1787691836.9033158,
     "ast_hash": "fa09a431da417e25090a5a7906e6bb7f",
     "semantic_hash": "fa09a431da417e25090a5a7906e6bb7f"
   },
   "crates/wiremesh-relay/src/bin/mkcerts.rs": {
-    "mtime": 1787680547.3683667,
+    "mtime": 1787691836.903746,
     "ast_hash": "3b5d48122adc7e8fc35594d9f421db22",
     "semantic_hash": "3b5d48122adc7e8fc35594d9f421db22"
   },
   "crates/wiremesh-relay/src/bin/relay.rs": {
-    "mtime": 1787684003.3851347,
+    "mtime": 1787691836.9041195,
     "ast_hash": "43a45ffda431dbff7ab68f3c4c0404b7",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/src/enroll.rs": {
-    "mtime": 1787684003.3887882,
+    "mtime": 1787691836.904636,
     "ast_hash": "b7275b8fa014ec284bc087a350cacd93",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/src/lib.rs": {
-    "mtime": 1787684003.394829,
+    "mtime": 1787691836.9057188,
     "ast_hash": "69ec7648e6630869b8b47975a5f797bf",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/bridge.rs": {
-    "mtime": 1787684003.3959246,
+    "mtime": 1787691836.9060483,
     "ast_hash": "e7745b9a6e6743ba1a034f7c8be11be7",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/denylist.rs": {
-    "mtime": 1787684003.39703,
+    "mtime": 1787691836.9064832,
     "ast_hash": "c8fa26e07f326296cca22c184aaec130",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/dest_pinning.rs": {
-    "mtime": 1787684003.399111,
+    "mtime": 1787691836.9067757,
     "ast_hash": "8cee7b95e52b086fe2197224741125bf",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/enroll_cmd.rs": {
-    "mtime": 1787680547.3706212,
+    "mtime": 1787691836.9069924,
     "ast_hash": "d18fd29764356842e74265c949c176d7",
     "semantic_hash": "d18fd29764356842e74265c949c176d7"
   },
   "crates/wiremesh-relay/tests/enroll_idempotent.rs": {
-    "mtime": 1787684003.400994,
+    "mtime": 1787691836.907655,
     "ast_hash": "5681f8872a36d0fb3bc8ff9501e76a87",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/impersonation.rs": {
-    "mtime": 1787684003.4019604,
+    "mtime": 1787691836.908046,
     "ast_hash": "c695d53b0c13c485743e6861e0f729bb",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/pair_id_width.rs": {
-    "mtime": 1787684003.4028144,
+    "mtime": 1787691836.9084451,
     "ast_hash": "c79caa83d23d1d18610c369890541a4f",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/register_decision.rs": {
-    "mtime": 1787684003.4039912,
+    "mtime": 1787691836.90872,
     "ast_hash": "ea1793727e9108050f378147defa945b",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/relay_bin_cli.rs": {
-    "mtime": 1787684003.404405,
+    "mtime": 1787691836.9089081,
     "ast_hash": "eb03e4fc84b62e6a279889ebae86a55d",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/relay_bin_controller_arg.rs": {
-    "mtime": 1787680547.3720884,
+    "mtime": 1787691836.9090614,
     "ast_hash": "8cd066ef5934d175ea1e6f2813660279",
     "semantic_hash": "8cd066ef5934d175ea1e6f2813660279"
   },
   "crates/wiremesh-relay/tests/relay_enroll_cli.rs": {
-    "mtime": 1787684003.4054496,
+    "mtime": 1787691836.9093459,
     "ast_hash": "74b6bb14454442f5dae3c07bde358291",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/relay_pair_collision.rs": {
-    "mtime": 1787684003.4071546,
+    "mtime": 1787691836.9096441,
     "ast_hash": "10614b0caef9c69fef4106954fe0ac5c",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/sync_hostname.rs": {
-    "mtime": 1787684003.4088483,
+    "mtime": 1787691836.9100468,
     "ast_hash": "9c880e39871110978b1b3a86d09dffbb",
     "semantic_hash": ""
   },
   "crates/wiremesh-relay/tests/sync_keepalive.rs": {
-    "mtime": 1787680547.3727837,
+    "mtime": 1787691836.9103808,
     "ast_hash": "c1e5135080dcd2e3688b4338fbaa91fc",
     "semantic_hash": "c1e5135080dcd2e3688b4338fbaa91fc"
   },
   "crates/wiremesh-testkit/src/conformance.rs": {
-    "mtime": 1787684003.4162624,
+    "mtime": 1787691836.911219,
     "ast_hash": "486aa233e3b21581bcf20ed5392d028d",
     "semantic_hash": ""
   },
   "crates/wiremesh-testkit/src/lib.rs": {
-    "mtime": 1787684003.4226627,
+    "mtime": 1787691836.9120095,
     "ast_hash": "60d9620470c462a897d4c2d70e6a9c75",
     "semantic_hash": ""
   },
   "crates/wiremesh-testkit/src/netns.rs": {
-    "mtime": 1787684003.4243972,
+    "mtime": 1787691836.9123416,
     "ast_hash": "c9176c75cc9471f76c0e8153c2136926",
     "semantic_hash": ""
   },
   "crates/wiremesh-testkit/tests/conformance.rs": {
-    "mtime": 1787684003.427876,
+    "mtime": 1787691836.9128103,
     "ast_hash": "148466176c7b7c4f7e2625cdc0ad70cb",
     "semantic_hash": ""
   },
   "crates/wiremesh-testkit/tests/end_to_end_policy.rs": {
-    "mtime": 1787684003.4307947,
+    "mtime": 1787691836.9131935,
     "ast_hash": "b0ba30db09109edc0b1cad337f3c1081",
     "semantic_hash": ""
   },
   "crates/wiremesh-testkit/tests/netem.rs": {
-    "mtime": 1787684003.4314237,
+    "mtime": 1787691836.9135149,
     "ast_hash": "678ad5a5c1d0f91cd870c297eac7bfdf",
     "semantic_hash": ""
   },
   "crates/wiremesh-testkit/tests/stub_enroll.rs": {
-    "mtime": 1787684003.432287,
+    "mtime": 1787691836.913782,
     "ast_hash": "848e8534cb729eda3faea3ef2e994ce3",
     "semantic_hash": ""
   },
   "crates/wiremesh-trust/src/lib.rs": {
-    "mtime": 1787684003.4363394,
+    "mtime": 1787691836.9147131,
     "ast_hash": "de302a23ab3e85966b03c9e92496f4ed",
     "semantic_hash": ""
   },
   "crates/wiremesh-trust/tests/ca_legacy_guard.rs": {
-    "mtime": 1787684003.4405417,
+    "mtime": 1787691836.9151714,
     "ast_hash": "ff53daf2812ed1f238e7a6412c8886e6",
     "semantic_hash": ""
   },
   "crates/wiremesh-trust/tests/conformance.rs": {
-    "mtime": 1787684003.4467375,
+    "mtime": 1787691836.9154294,
     "ast_hash": "2a4a019035a1b330073b2aae31c6d7af",
     "semantic_hash": ""
   },
   "crates/wiremesh-trust/tests/embedded.rs": {
-    "mtime": 1787684003.4489129,
+    "mtime": 1787691836.9157276,
     "ast_hash": "9620abeb3905cda42a5aaae1301e9ac6",
     "semantic_hash": ""
   },
   "deploy/packages/scripts/postinstall-gateway.sh": {
-    "mtime": 1787680547.3808699,
+    "mtime": 1787691836.9238334,
     "ast_hash": "acf598e5cfd37197df5e4d863b55792a",
     "semantic_hash": "acf598e5cfd37197df5e4d863b55792a"
   },
   "deploy/packages/scripts/postinstall-relay.sh": {
-    "mtime": 1787680547.3809474,
+    "mtime": 1787691836.927443,
     "ast_hash": "7ecc15063561858ad8f6f4b1c602a506",
     "semantic_hash": "7ecc15063561858ad8f6f4b1c602a506"
   },
   "deploy/packages/scripts/postinstall-server.sh": {
-    "mtime": 1787680547.3812735,
+    "mtime": 1787691836.9324188,
     "ast_hash": "926edb3448b33b0566bcfd51d8eb7285",
     "semantic_hash": "926edb3448b33b0566bcfd51d8eb7285"
   },
   "deploy/packages/scripts/postremove.sh": {
-    "mtime": 1787680547.3813581,
+    "mtime": 1787691836.936698,
     "ast_hash": "2741ea9f157410215b1b8b9e1e498032",
     "semantic_hash": "2741ea9f157410215b1b8b9e1e498032"
   },
   "deploy/packages/scripts/preremove-controller.sh": {
-    "mtime": 1787680547.3814278,
+    "mtime": 1787691836.936999,
     "ast_hash": "0dc0069fc61655ff60f3b735170b65cf",
     "semantic_hash": "0dc0069fc61655ff60f3b735170b65cf"
   },
   "deploy/packages/scripts/preremove-gateway.sh": {
-    "mtime": 1787680547.3814912,
+    "mtime": 1787691836.9377332,
     "ast_hash": "ea27dc98c88b50e9f834ba333e3cd18b",
     "semantic_hash": "ea27dc98c88b50e9f834ba333e3cd18b"
   },
   "deploy/packages/scripts/preremove-relay.sh": {
-    "mtime": 1787680547.3815513,
+    "mtime": 1787691836.938198,
     "ast_hash": "179dbde31b07713cbf9b485fadc6d8e6",
     "semantic_hash": "179dbde31b07713cbf9b485fadc6d8e6"
   },
   "dev.sh": {
-    "mtime": 1787680547.3822744,
+    "mtime": 1787691836.9434981,
     "ast_hash": "9764fccfc5b629d8a2c13c95053312ef",
     "semantic_hash": "9764fccfc5b629d8a2c13c95053312ef"
   },
   "dev/doctor.sh": {
-    "mtime": 1787680547.3829148,
+    "mtime": 1787691836.9467633,
     "ast_hash": "5f62796b302a394fcf396fce2f7e9f9b",
     "semantic_hash": ""
   },
   "scripts/set-version.sh": {
-    "mtime": 1787680547.4357157,
+    "mtime": 1787691837.0788693,
     "ast_hash": "0f8de7a8dcab56f04d343af999c3536a",
     "semantic_hash": ""
   },
   ".github/workflows/codeql.yml": {
-    "mtime": 1787680547.2807024,
+    "mtime": 1787691836.8090773,
     "ast_hash": "98476f3c44cb1342b3bb907faaef352c",
     "semantic_hash": "98476f3c44cb1342b3bb907faaef352c"
   },
   ".github/workflows/container-images.yml": {
-    "mtime": 1787680547.281023,
+    "mtime": 1787691836.8099716,
     "ast_hash": "662dc9d753bf28ea9c899c5f39e97934",
     "semantic_hash": ""
   },
   ".github/workflows/release.yml": {
-    "mtime": 1787680547.2812505,
+    "mtime": 1787691836.8101313,
     "ast_hash": "27b69d61b884e3dc43979ddaa1db3607",
     "semantic_hash": "27b69d61b884e3dc43979ddaa1db3607"
   },
   ".superpowers/sdd/progress.md": {
-    "mtime": 1787680547.281732,
+    "mtime": 1787691836.8106575,
     "ast_hash": "67fa09f686d8ffef9203ce837ae9d8f4",
     "semantic_hash": "67fa09f686d8ffef9203ce837ae9d8f4"
   },
   ".superpowers/sdd/task-1-report.md": {
-    "mtime": 1787680547.2818856,
+    "mtime": 1787691836.8108697,
     "ast_hash": "14ad61b18bfa4b05825882b8df575e9e",
     "semantic_hash": "14ad61b18bfa4b05825882b8df575e9e"
   },
   "CLAUDE.md": {
-    "mtime": 1787680547.2823706,
-    "ast_hash": "fdff7f9eff6601eb812279b7fb901f11",
+    "mtime": 1787692362.0999556,
+    "ast_hash": "23232e5bd866953737567c26e51544bf",
     "semantic_hash": ""
   },
   "README.md": {
-    "mtime": 1787680547.2840028,
+    "mtime": 1787691836.8129752,
     "ast_hash": "0661fdc474e2da8924fdf36f7d6ca4ca",
     "semantic_hash": ""
   },
   "assets/brand/README.md": {
-    "mtime": 1787680547.284503,
+    "mtime": 1787691836.8133397,
     "ast_hash": "275a2a9a21b61326f9f0577490ee93bf",
     "semantic_hash": "275a2a9a21b61326f9f0577490ee93bf"
   },
   "crates/wiremesh-gateway/bench.md": {
-    "mtime": 1787680547.3145902,
+    "mtime": 1787691836.8471048,
     "ast_hash": "bc832523269047ac578a1f2907dd52f5",
     "semantic_hash": "bc832523269047ac578a1f2907dd52f5"
   },
   "crates/wiremesh-policy/tests/fixtures/bare_string_src_dst.yaml": {
-    "mtime": 1787680547.364228,
+    "mtime": 1787691836.886305,
     "ast_hash": "0f09537833bbbd651224ede53ff56d72",
     "semantic_hash": "0f09537833bbbd651224ede53ff56d72"
   },
   "crates/wiremesh-policy/tests/fixtures/design_s5_example.yaml": {
-    "mtime": 1787680547.364367,
+    "mtime": 1787691836.8864567,
     "ast_hash": "fec1c1b5dd1c199a97e544ffebbbd89d",
     "semantic_hash": "fec1c1b5dd1c199a97e544ffebbbd89d"
   },
   "crates/wiremesh-policy/tests/fixtures/dst_not_subset.yaml": {
-    "mtime": 1787680547.364435,
+    "mtime": 1787691836.886528,
     "ast_hash": "73fda35a60d2db5bf6567d5c0421aa1f",
     "semantic_hash": "73fda35a60d2db5bf6567d5c0421aa1f"
   },
   "crates/wiremesh-policy/tests/fixtures/duplicate_block_pair.yaml": {
-    "mtime": 1787680547.3645096,
+    "mtime": 1787691836.8865936,
     "ast_hash": "b556b1e0f407be239bf96a07a0f20141",
     "semantic_hash": "b556b1e0f407be239bf96a07a0f20141"
   },
   "crates/wiremesh-policy/tests/fixtures/empty_rules_block.yaml": {
-    "mtime": 1787680547.364582,
+    "mtime": 1787691836.886677,
     "ast_hash": "ab34a97388c911a3d858981639a0c944",
     "semantic_hash": "ab34a97388c911a3d858981639a0c944"
   },
   "crates/wiremesh-policy/tests/fixtures/invalid_proto_no_ports.yaml": {
-    "mtime": 1787680547.3646562,
+    "mtime": 1787691836.8867595,
     "ast_hash": "399e04b9b997d75b0cf03fd0590b2e04",
     "semantic_hash": "399e04b9b997d75b0cf03fd0590b2e04"
   },
   "crates/wiremesh-policy/tests/fixtures/malformed_cidr.yaml": {
-    "mtime": 1787680547.3647308,
+    "mtime": 1787691836.8868237,
     "ast_hash": "edb4af1c260daabbeb0e4f5d67d277e9",
     "semantic_hash": "edb4af1c260daabbeb0e4f5d67d277e9"
   },
   "crates/wiremesh-policy/tests/fixtures/multi_error.yaml": {
-    "mtime": 1787680547.3648012,
+    "mtime": 1787691836.8869135,
     "ast_hash": "fd6bda2dcaa1b587ccd251063be96107",
     "semantic_hash": "fd6bda2dcaa1b587ccd251063be96107"
   },
   "crates/wiremesh-policy/tests/fixtures/non_ipv4_cidr.yaml": {
-    "mtime": 1787680547.364867,
+    "mtime": 1787691836.8910058,
     "ast_hash": "d21df0a5d321364c4a300956f94964b4",
     "semantic_hash": "d21df0a5d321364c4a300956f94964b4"
   },
   "crates/wiremesh-policy/tests/fixtures/port_range_inverted.yaml": {
-    "mtime": 1787680547.364938,
+    "mtime": 1787691836.8912437,
     "ast_hash": "fd6250a55290e3d7cfebb834deaa622e",
     "semantic_hash": "fd6250a55290e3d7cfebb834deaa622e"
   },
   "crates/wiremesh-policy/tests/fixtures/port_too_high.yaml": {
-    "mtime": 1787680547.3650148,
+    "mtime": 1787691836.8914077,
     "ast_hash": "89daa971a6b411bcf2135fc40da8902f",
     "semantic_hash": "89daa971a6b411bcf2135fc40da8902f"
   },
   "crates/wiremesh-policy/tests/fixtures/port_zero.yaml": {
-    "mtime": 1787680547.3650894,
+    "mtime": 1787691836.8915646,
     "ast_hash": "c742f7e4ae3937f3bbac00e4495662b7",
     "semantic_hash": "c742f7e4ae3937f3bbac00e4495662b7"
   },
   "crates/wiremesh-policy/tests/fixtures/ports_proto_icmp.yaml": {
-    "mtime": 1787680547.3651836,
+    "mtime": 1787691836.8917282,
     "ast_hash": "3311c5b09c8b99e19aa49bb7ed26c294",
     "semantic_hash": "3311c5b09c8b99e19aa49bb7ed26c294"
   },
   "crates/wiremesh-policy/tests/fixtures/ports_proto_omitted.yaml": {
-    "mtime": 1787680547.3652565,
+    "mtime": 1787691836.8920069,
     "ast_hash": "0cf539ab7a08572bfc57bd6520dd14e1",
     "semantic_hash": "0cf539ab7a08572bfc57bd6520dd14e1"
   },
   "crates/wiremesh-policy/tests/fixtures/positive_subset_containment.yaml": {
-    "mtime": 1787680547.3653324,
+    "mtime": 1787691836.8921237,
     "ast_hash": "f91fcdf0762d4b9fe9650f44fec24aa5",
     "semantic_hash": "f91fcdf0762d4b9fe9650f44fec24aa5"
   },
   "crates/wiremesh-policy/tests/fixtures/rule_both_actions.yaml": {
-    "mtime": 1787680547.3654099,
+    "mtime": 1787691836.8922212,
     "ast_hash": "2b4eec77fdf055032e8ff6a2d3625d07",
     "semantic_hash": "2b4eec77fdf055032e8ff6a2d3625d07"
   },
   "crates/wiremesh-policy/tests/fixtures/rule_id_stable_base.yaml": {
-    "mtime": 1787680547.3654866,
+    "mtime": 1787691836.8923185,
     "ast_hash": "d5fce4daa66564d79354c42755c59cfc",
     "semantic_hash": "d5fce4daa66564d79354c42755c59cfc"
   },
   "crates/wiremesh-policy/tests/fixtures/rule_id_stable_changed.yaml": {
-    "mtime": 1787680547.365563,
+    "mtime": 1787691836.8923874,
     "ast_hash": "646c12a40d7d08fc427ae5a33add9a46",
     "semantic_hash": "646c12a40d7d08fc427ae5a33add9a46"
   },
   "crates/wiremesh-policy/tests/fixtures/rule_missing_action.yaml": {
-    "mtime": 1787680547.365634,
+    "mtime": 1787691836.8924508,
     "ast_hash": "fe158b80669be43a6d7a91b09a556975",
     "semantic_hash": "fe158b80669be43a6d7a91b09a556975"
   },
   "crates/wiremesh-policy/tests/fixtures/src_not_subset.yaml": {
-    "mtime": 1787680547.3657017,
+    "mtime": 1787691836.8925245,
     "ast_hash": "6d09b3aa7e6c7354d60efcf49c9d90fd",
     "semantic_hash": "6d09b3aa7e6c7354d60efcf49c9d90fd"
   },
   "crates/wiremesh-policy/tests/fixtures/unknown_segment.yaml": {
-    "mtime": 1787680547.3657675,
+    "mtime": 1787691836.8925936,
     "ast_hash": "56ab912dd77ff5a367e9cdb9e43dd303",
     "semantic_hash": "56ab912dd77ff5a367e9cdb9e43dd303"
   },
   "crates/wiremesh-policy/tests/fixtures/valid_proto_no_ports.yaml": {
-    "mtime": 1787680547.3658462,
+    "mtime": 1787691836.892858,
     "ast_hash": "5774aa41594d1b7152589804ddd7850a",
     "semantic_hash": "5774aa41594d1b7152589804ddd7850a"
   },
   "deploy/helm/wiremesh-operator/Chart.yaml": {
-    "mtime": 1787680547.3776374,
+    "mtime": 1787691836.916557,
     "ast_hash": "378cbfbcaba5d93f692578226a132f77",
     "semantic_hash": "378cbfbcaba5d93f692578226a132f77"
   },
   "deploy/helm/wiremesh-operator/crds/wiremesh-crds.yaml": {
-    "mtime": 1787680547.378076,
+    "mtime": 1787691836.9169273,
     "ast_hash": "6041c87a1605c9ff47bb5d9d50b57a86",
     "semantic_hash": ""
   },
   "deploy/helm/wiremesh-operator/templates/deployment.yaml": {
-    "mtime": 1787680547.3782687,
+    "mtime": 1787691836.9171612,
     "ast_hash": "84ade45b3bd93cb4ff513e27cd976a2e",
     "semantic_hash": "84ade45b3bd93cb4ff513e27cd976a2e"
   },
   "deploy/helm/wiremesh-operator/templates/gatewayapi-routes.yaml": {
-    "mtime": 1787680547.3783371,
+    "mtime": 1787691836.9172468,
     "ast_hash": "6788ec49cc933afd1ef53fbeb8261bbe",
     "semantic_hash": "6788ec49cc933afd1ef53fbeb8261bbe"
   },
   "deploy/helm/wiremesh-operator/templates/rbac.yaml": {
-    "mtime": 1787680547.378417,
+    "mtime": 1787691836.9173398,
     "ast_hash": "1e11a6d80e6683c8d123bf76750e6e28",
     "semantic_hash": "1e11a6d80e6683c8d123bf76750e6e28"
   },
   "deploy/helm/wiremesh-operator/values.yaml": {
-    "mtime": 1787680547.3785262,
+    "mtime": 1787691836.9175572,
     "ast_hash": "5837455d03b6198a8b423d742c098f40",
     "semantic_hash": "5837455d03b6198a8b423d742c098f40"
   },
   "deploy/operator/crds/wiremesh-crds.yaml": {
-    "mtime": 1787680547.3788478,
+    "mtime": 1787691836.9178162,
     "ast_hash": "6041c87a1605c9ff47bb5d9d50b57a86",
     "semantic_hash": ""
   },
   "deploy/operator/deployment.yaml": {
-    "mtime": 1787680547.3789213,
+    "mtime": 1787691836.9178846,
     "ast_hash": "a2dddefe6ac6c1d1b73054b7417eee68",
     "semantic_hash": "a2dddefe6ac6c1d1b73054b7417eee68"
   },
   "deploy/operator/examples/00-cert-manager-ca.yaml": {
-    "mtime": 1787680547.379026,
+    "mtime": 1787691836.918014,
     "ast_hash": "f98297a48c476c39719b6442712acc0e",
     "semantic_hash": "f98297a48c476c39719b6442712acc0e"
   },
   "deploy/operator/examples/01-controller.yaml": {
-    "mtime": 1787680547.3790944,
+    "mtime": 1787691836.9181318,
     "ast_hash": "7a417710d54b4b55e2ddec55ab1e001b",
     "semantic_hash": "7a417710d54b4b55e2ddec55ab1e001b"
   },
   "deploy/operator/examples/02-fabric.yaml": {
-    "mtime": 1787680547.3791602,
+    "mtime": 1787691836.9182165,
     "ast_hash": "60ddb654ccfd4412d5147853cd043f1c",
     "semantic_hash": "60ddb654ccfd4412d5147853cd043f1c"
   },
   "deploy/operator/examples/03-gateway.yaml": {
-    "mtime": 1787680547.3792317,
+    "mtime": 1787691836.9182901,
     "ast_hash": "62b1fa36e94409e096fd3872b13e0530",
     "semantic_hash": "62b1fa36e94409e096fd3872b13e0530"
   },
   "deploy/operator/gateway-api/README.md": {
-    "mtime": 1787680547.3793616,
+    "mtime": 1787691836.9184525,
     "ast_hash": "0ec0a437a69264aca3f0afb09e96aac8",
     "semantic_hash": "0ec0a437a69264aca3f0afb09e96aac8"
   },
   "deploy/operator/gateway-api/routes.yaml": {
-    "mtime": 1787680547.379441,
+    "mtime": 1787691836.9185474,
     "ast_hash": "3fa5c1525bb0e39d66518f18971223a4",
     "semantic_hash": "3fa5c1525bb0e39d66518f18971223a4"
   },
   "deploy/operator/kustomization.yaml": {
-    "mtime": 1787680547.3795207,
+    "mtime": 1787691836.918626,
     "ast_hash": "8529f49c0876badf386378d00a01773a",
     "semantic_hash": "8529f49c0876badf386378d00a01773a"
   },
   "deploy/operator/namespace.yaml": {
-    "mtime": 1787680547.3795881,
+    "mtime": 1787691836.9189265,
     "ast_hash": "5ec92bb1da98bd7d1579489ccc2c5b27",
     "semantic_hash": "5ec92bb1da98bd7d1579489ccc2c5b27"
   },
   "deploy/operator/rbac.yaml": {
-    "mtime": 1787680547.3796566,
+    "mtime": 1787691836.919023,
     "ast_hash": "c13d976805cd1af774f9d1b37ba3f01d",
     "semantic_hash": "c13d976805cd1af774f9d1b37ba3f01d"
   },
   "deploy/packages/nfpm/controller.yaml": {
-    "mtime": 1787680547.380545,
+    "mtime": 1787691836.9199038,
     "ast_hash": "049724cdfd35292cd4e7b044adf8b6c6",
     "semantic_hash": "049724cdfd35292cd4e7b044adf8b6c6"
   },
   "deploy/packages/nfpm/fabricctl.yaml": {
-    "mtime": 1787680547.3806176,
+    "mtime": 1787691836.921702,
     "ast_hash": "764d8e59198109c1cea7675662c9911b",
     "semantic_hash": "764d8e59198109c1cea7675662c9911b"
   },
   "deploy/packages/nfpm/gateway.yaml": {
-    "mtime": 1787680547.3806956,
+    "mtime": 1787691836.9234173,
     "ast_hash": "9606f535f158729aa602ad664966b955",
     "semantic_hash": "9606f535f158729aa602ad664966b955"
   },
   "deploy/packages/nfpm/relay.yaml": {
-    "mtime": 1787680547.3807669,
+    "mtime": 1787691836.9235168,
     "ast_hash": "657ee5ae42b90733146b40d328301725",
     "semantic_hash": "657ee5ae42b90733146b40d328301725"
   },
   "docs/PRD.md": {
-    "mtime": 1787680547.3844597,
+    "mtime": 1787691836.9551826,
     "ast_hash": "86bc6a99275ea81ad15dd4c53df6f43f",
     "semantic_hash": "86bc6a99275ea81ad15dd4c53df6f43f"
   },
   "docs/install.md": {
-    "mtime": 1787680547.385557,
+    "mtime": 1787691836.958822,
     "ast_hash": "f87dc97dc703d13801e2cf97140b4c34",
     "semantic_hash": ""
   },
   "docs/operator.md": {
-    "mtime": 1787680547.3863313,
+    "mtime": 1787691836.9604816,
     "ast_hash": "b62345e1d5fba019090c7942b9b78a4c",
     "semantic_hash": ""
   },
   "docs/progress.html": {
-    "mtime": 1787680547.3872392,
+    "mtime": 1787691836.962425,
     "ast_hash": "cff6531e73cd54f2b31466953814f211",
     "semantic_hash": ""
   },
   "docs/research/backlog-program-notes.md": {
-    "mtime": 1787680547.3884587,
+    "mtime": 1787691836.9676237,
     "ast_hash": "86d449cb956fa2990bc9716674d8b67b",
     "semantic_hash": "86d449cb956fa2990bc9716674d8b67b"
   },
   "docs/research/boringtun-assessment.md": {
-    "mtime": 1787680547.388732,
+    "mtime": 1787691836.9693754,
     "ast_hash": "e228d20e6fddb0115e6644f28aa53680",
     "semantic_hash": "e228d20e6fddb0115e6644f28aa53680"
   },
   "docs/research/client-component-scoping.md": {
-    "mtime": 1787680547.3891292,
+    "mtime": 1787691836.971337,
     "ast_hash": "9507ac3002288a07d98626c04d634ca1",
     "semantic_hash": "9507ac3002288a07d98626c04d634ca1"
   },
   "docs/research/cycle2-controller-notes.md": {
-    "mtime": 1787680547.3893945,
+    "mtime": 1787691836.971495,
     "ast_hash": "75fd1cf0236d97eeb011a40e30137a26",
     "semantic_hash": "75fd1cf0236d97eeb011a40e30137a26"
   },
   "docs/research/cycle3-policy-notes.md": {
-    "mtime": 1787680547.389754,
+    "mtime": 1787691836.9730132,
     "ast_hash": "17e26d2bc1af3afbbaf20fa351554e9e",
     "semantic_hash": "17e26d2bc1af3afbbaf20fa351554e9e"
   },
   "docs/research/cycle4a-gateway-notes.md": {
-    "mtime": 1787680547.3900077,
+    "mtime": 1787691836.9731634,
     "ast_hash": "07df68906fea5b437fd452ad62a132ef",
     "semantic_hash": "07df68906fea5b437fd452ad62a132ef"
   },
   "docs/research/cycle4b-nat-matrix-notes.md": {
-    "mtime": 1787680547.3901346,
+    "mtime": 1787691836.973313,
     "ast_hash": "8a4ca65978461dbe83c614105bec0209",
     "semantic_hash": "8a4ca65978461dbe83c614105bec0209"
   },
   "docs/research/cycle4b-nat-traversal-notes.md": {
-    "mtime": 1787680547.3902667,
+    "mtime": 1787691836.9734716,
     "ast_hash": "fcb6b84ae7bea8dcde6ad344ef26bac5",
     "semantic_hash": "fcb6b84ae7bea8dcde6ad344ef26bac5"
   },
   "docs/research/cycle4b-path-liveness-note.md": {
-    "mtime": 1787680547.3903487,
+    "mtime": 1787691836.9735723,
     "ast_hash": "1b46c61a6eddfd961723ef64453102e5",
     "semantic_hash": "1b46c61a6eddfd961723ef64453102e5"
   },
   "docs/research/cycle4c-relay-notes.md": {
-    "mtime": 1787680547.3905947,
+    "mtime": 1787691836.9737225,
     "ast_hash": "21b41f12373f72b5674bd2baaab8ff77",
     "semantic_hash": "21b41f12373f72b5674bd2baaab8ff77"
   },
   "docs/research/cycle4c-relay-stability-note.md": {
-    "mtime": 1787680547.3906872,
+    "mtime": 1787691836.9738636,
     "ast_hash": "db49edd76af82be2a930b089232c2404",
     "semantic_hash": "db49edd76af82be2a930b089232c2404"
   },
   "docs/research/decision-defer-openbao-reference-driver.md": {
-    "mtime": 1787680547.3910277,
+    "mtime": 1787691836.974622,
     "ast_hash": "9ac6c52c6af9bcadf53b1ebec730dcfc",
     "semantic_hash": "9ac6c52c6af9bcadf53b1ebec730dcfc"
   },
   "docs/research/flake-direct-rotation-zero-drop.md": {
-    "mtime": 1787680547.3913913,
+    "mtime": 1787691836.9763048,
     "ast_hash": "f5de70e16e996722c3cd4b12270ed495",
     "semantic_hash": ""
   },
   "docs/research/in-step-rotation-cutover-arbitration.md": {
-    "mtime": 1787680547.3920982,
+    "mtime": 1787691836.9796994,
     "ast_hash": "8f27ac422ada5a25798399674746daae",
     "semantic_hash": "8f27ac422ada5a25798399674746daae"
   },
   "docs/research/key-rotation-plan-verification.md": {
-    "mtime": 1787680547.3929937,
+    "mtime": 1787691836.982827,
     "ast_hash": "46fc36a11bb96803e9eca53ea7145332",
     "semantic_hash": "46fc36a11bb96803e9eca53ea7145332"
   },
   "docs/research/key-rotation-teardown-notes.md": {
-    "mtime": 1787680547.393414,
+    "mtime": 1787691836.9841,
     "ast_hash": "97de017108f7483104d4488f03fdcd7b",
     "semantic_hash": "97de017108f7483104d4488f03fdcd7b"
   },
   "docs/research/keyrot-spike-note.md": {
-    "mtime": 1787680547.3935218,
+    "mtime": 1787691836.9842706,
     "ast_hash": "ecf1cb43723f5ead124e7fc714b4f153",
     "semantic_hash": "ecf1cb43723f5ead124e7fc714b4f153"
   },
   "docs/research/keyrot-task6-uapi-pubkey-note.md": {
-    "mtime": 1787680547.3936276,
+    "mtime": 1787691836.9844108,
     "ast_hash": "ccac406fb1e9298c50ef1bb890f500cb",
     "semantic_hash": "ccac406fb1e9298c50ef1bb890f500cb"
   },
   "docs/research/macos-exclusion-premise-and-the-client-gap.md": {
-    "mtime": 1787680547.3941295,
+    "mtime": 1787691836.9862373,
     "ast_hash": "adf2885519c08f30189803568b7a50e4",
     "semantic_hash": ""
   },
   "docs/research/operator-admin-channel-gap.md": {
-    "mtime": 1787680547.3942213,
+    "mtime": 1787691836.9863725,
     "ast_hash": "ae092d31eead5ce357aa89a7c1fd52bd",
     "semantic_hash": "ae092d31eead5ce357aa89a7c1fd52bd"
   },
   "docs/research/operator-enrollment-client-gap.md": {
-    "mtime": 1787680547.3943434,
+    "mtime": 1787691836.9865572,
     "ast_hash": "d6c648a69c74d9e55719f25a2ca9f45f",
     "semantic_hash": "d6c648a69c74d9e55719f25a2ca9f45f"
   },
   "docs/research/operator-remote-deployment-notes.md": {
-    "mtime": 1787680547.3944468,
+    "mtime": 1787691836.9867287,
     "ast_hash": "89c607686b0a1ae48c17ab7f151b0b88",
     "semantic_hash": "89c607686b0a1ae48c17ab7f151b0b88"
   },
   "docs/research/ops-finding-multi-gateway-convergence.md": {
-    "mtime": 1787680547.3946898,
+    "mtime": 1787691836.986885,
     "ast_hash": "559a1fd12b581ca82b38d27603b6f918",
     "semantic_hash": "559a1fd12b581ca82b38d27603b6f918"
   },
   "docs/research/ops-finding-pvc-adoption-migration.md": {
-    "mtime": 1787680547.3947885,
+    "mtime": 1787691836.9870367,
     "ast_hash": "86b01785ba079d0d4e851aabdc33fe10",
     "semantic_hash": "86b01785ba079d0d4e851aabdc33fe10"
   },
   "docs/research/ops-finding-sync-half-open-stream.md": {
-    "mtime": 1787680547.3949132,
+    "mtime": 1787691836.987215,
     "ast_hash": "0c099a02d62acd945107819ce527a21f",
     "semantic_hash": "0c099a02d62acd945107819ce527a21f"
   },
   "docs/research/phase0-report.md": {
-    "mtime": 1787680547.3950624,
+    "mtime": 1787691836.9874454,
     "ast_hash": "bfeca3889a1da0d005e5cff2d08e0972",
     "semantic_hash": "bfeca3889a1da0d005e5cff2d08e0972"
   },
   "docs/research/phase0-results.md": {
-    "mtime": 1787680547.3954024,
+    "mtime": 1787691836.9877932,
     "ast_hash": "42f932e49b4f610e04bd20eb891bd6ac",
     "semantic_hash": "42f932e49b4f610e04bd20eb891bd6ac"
   },
   "docs/research/proto-block-design-verification.md": {
-    "mtime": 1787680547.396428,
+    "mtime": 1787691836.9910216,
     "ast_hash": "3bc0962dcfd11c0a7aafb85499d55371",
     "semantic_hash": "3bc0962dcfd11c0a7aafb85499d55371"
   },
   "docs/research/relay-mux-design-verification.md": {
-    "mtime": 1787680547.3968835,
+    "mtime": 1787691836.9926558,
     "ast_hash": "6e85028bb874dcc35ef17515f61732e4",
     "semantic_hash": "6e85028bb874dcc35ef17515f61732e4"
   },
   "docs/research/rotation-cutover-gate-is-fabric-wide-not-per-peer.md": {
-    "mtime": 1787680547.3972697,
+    "mtime": 1787691836.9942062,
     "ast_hash": "cbae3f92f9cd9781edb033e844af6af5",
     "semantic_hash": "cbae3f92f9cd9781edb033e844af6af5"
   },
   "docs/research/rotation-endpoint-and-port-model-is-broken.md": {
-    "mtime": 1787680547.3978064,
+    "mtime": 1787691836.995981,
     "ast_hash": "4294cf6e8d17a38fcc943145c60f0984",
     "semantic_hash": ""
   },
   "docs/research/rotation-fixes-review-findings.md": {
-    "mtime": 1787680547.3981953,
+    "mtime": 1787691836.9975631,
     "ast_hash": "a458886c9c3d67c892bff9653c6afba9",
     "semantic_hash": "a458886c9c3d67c892bff9653c6afba9"
   },
   "docs/research/rotation-wedge-and-the-residual-write-back-race.md": {
-    "mtime": 1787680547.3985627,
+    "mtime": 1787691836.9992368,
     "ast_hash": "45dad1e303eee1b032dbc706c438201a",
     "semantic_hash": "45dad1e303eee1b032dbc706c438201a"
   },
   "docs/runbooks/controller-migration-to-fi.md": {
-    "mtime": 1787680547.3995392,
+    "mtime": 1787691837.004199,
     "ast_hash": "119a1a4bc1305b6133041a40b4c6fe4f",
     "semantic_hash": "119a1a4bc1305b6133041a40b4c6fe4f"
   },
   "docs/superpowers/plans/2026-07-15-phase0-spike.md": {
-    "mtime": 1787680547.40023,
+    "mtime": 1787691837.0060241,
     "ast_hash": "4435d1d84a23bf8542c559b0c481405f",
     "semantic_hash": "4435d1d84a23bf8542c559b0c481405f"
   },
   "docs/superpowers/plans/2026-07-16-controller-core.md": {
-    "mtime": 1787680547.4005013,
+    "mtime": 1787691837.0062656,
     "ast_hash": "daa9d29083127abc529e49c591cce38c",
     "semantic_hash": "daa9d29083127abc529e49c591cce38c"
   },
   "docs/superpowers/plans/2026-07-17-policy-pipeline.md": {
-    "mtime": 1787680547.4007642,
+    "mtime": 1787691837.0065205,
     "ast_hash": "316702c2da870e015d34886c13ae8ebf",
     "semantic_hash": "316702c2da870e015d34886c13ae8ebf"
   },
   "docs/superpowers/plans/2026-07-20-cycle4a-direct-gateway.md": {
-    "mtime": 1787680547.401139,
+    "mtime": 1787691837.0068676,
     "ast_hash": "ce803f7fc40f1ad54075e4457cd1d070",
     "semantic_hash": "ce803f7fc40f1ad54075e4457cd1d070"
   },
   "docs/superpowers/plans/2026-07-20-cycle4b-nat-traversal.md": {
-    "mtime": 1787680547.401313,
+    "mtime": 1787691837.0070715,
     "ast_hash": "9447dd0551dbd846da515491a6381fdb",
     "semantic_hash": "9447dd0551dbd846da515491a6381fdb"
   },
   "docs/superpowers/plans/2026-07-20-cycle4c-relay-plan.md": {
-    "mtime": 1787680547.401407,
+    "mtime": 1787691837.0072186,
     "ast_hash": "58adfa80c9729a7501491affa250d811",
     "semantic_hash": "58adfa80c9729a7501491affa250d811"
   },
   "docs/superpowers/plans/2026-07-21-key-rotation.md": {
-    "mtime": 1787680547.4015813,
+    "mtime": 1787691837.0073705,
     "ast_hash": "4f98d952a474c51c39fea83c9185697c",
     "semantic_hash": "4f98d952a474c51c39fea83c9185697c"
   },
   "docs/superpowers/plans/2026-07-22-enrollment-client.md": {
-    "mtime": 1787680547.4017122,
+    "mtime": 1787691837.0075276,
     "ast_hash": "2fcfeb322612081e1ee325476c8d2524",
     "semantic_hash": "2fcfeb322612081e1ee325476c8d2524"
   },
   "docs/superpowers/plans/2026-07-22-kubernetes-operator.md": {
-    "mtime": 1787680547.4018583,
+    "mtime": 1787691837.0077047,
     "ast_hash": "b148ef9291168533a610ce23e868af54",
     "semantic_hash": "b148ef9291168533a610ce23e868af54"
   },
   "docs/superpowers/plans/2026-07-28-cli-help-version.md": {
-    "mtime": 1787680547.401956,
+    "mtime": 1787691837.0078332,
     "ast_hash": "af8bc4895cd7f7151bc992c67acd9a68",
     "semantic_hash": "af8bc4895cd7f7151bc992c67acd9a68"
   },
   "docs/superpowers/plans/2026-07-28-mesh-convergence-fixes.md": {
-    "mtime": 1787680547.4020936,
+    "mtime": 1787691837.00798,
     "ast_hash": "854a70cea92b3adae369e615c99531aa",
     "semantic_hash": "854a70cea92b3adae369e615c99531aa"
   },
   "docs/superpowers/plans/2026-07-29-puncher-socket-productionization.md": {
-    "mtime": 1787680547.4021895,
+    "mtime": 1787691837.008074,
     "ast_hash": "b5a6516068c49a01b1caa8be7ea87e54",
     "semantic_hash": "b5a6516068c49a01b1caa8be7ea87e54"
   },
   "docs/superpowers/plans/2026-07-29-pvc-adoption-fixes.md": {
-    "mtime": 1787680547.402291,
+    "mtime": 1787691837.0082188,
     "ast_hash": "79dc785b450f7f0f45d73d426a3f1eb0",
     "semantic_hash": "79dc785b450f7f0f45d73d426a3f1eb0"
   },
   "docs/superpowers/specs/2026-07-15-wiremesh-engineering-design.md": {
-    "mtime": 1787680547.4032526,
+    "mtime": 1787691837.0159698,
     "ast_hash": "a493e40de7e0e3a1054d7ccaceeb4e46",
     "semantic_hash": "a493e40de7e0e3a1054d7ccaceeb4e46"
   },
   "docs/superpowers/specs/2026-07-16-controller-core-design.md": {
-    "mtime": 1787680547.4035566,
+    "mtime": 1787691837.0178413,
     "ast_hash": "a63cea181bebd68a5ca507ecf635cde2",
     "semantic_hash": "a63cea181bebd68a5ca507ecf635cde2"
   },
   "docs/superpowers/specs/2026-07-17-policy-pipeline-design.md": {
-    "mtime": 1787680547.4037929,
+    "mtime": 1787691837.017999,
     "ast_hash": "260233e3204fa4c34186c30d3c91e228",
     "semantic_hash": "260233e3204fa4c34186c30d3c91e228"
   },
   "docs/superpowers/specs/2026-07-20-cycle4a-direct-gateway-design.md": {
-    "mtime": 1787680547.4040291,
+    "mtime": 1787691837.0181468,
     "ast_hash": "1ce4680bf4776e6b1f1a9df0a457cddc",
     "semantic_hash": "1ce4680bf4776e6b1f1a9df0a457cddc"
   },
   "docs/superpowers/specs/2026-07-20-cycle4b-nat-traversal-design.md": {
-    "mtime": 1787680547.4042985,
+    "mtime": 1787691837.018282,
     "ast_hash": "d905cbef6e0ae1862d6ae4e2b203a15d",
     "semantic_hash": "d905cbef6e0ae1862d6ae4e2b203a15d"
   },
   "docs/superpowers/specs/2026-07-20-cycle4c-relay-design.md": {
-    "mtime": 1787680547.404529,
+    "mtime": 1787691837.0184038,
     "ast_hash": "df5e1d2a368abaad56b354982177ac18",
     "semantic_hash": "df5e1d2a368abaad56b354982177ac18"
   },
   "docs/superpowers/specs/2026-07-21-key-rotation-design.md": {
-    "mtime": 1787680547.4047549,
+    "mtime": 1787691837.018537,
     "ast_hash": "878804f54c4c41a777dfd027f790f838",
     "semantic_hash": "878804f54c4c41a777dfd027f790f838"
   },
   "docs/superpowers/specs/2026-07-22-kubernetes-operator-design.md": {
-    "mtime": 1787680547.4048967,
+    "mtime": 1787691837.0191839,
     "ast_hash": "f953d411c2b0979e2ed9c0dc31c9d10f",
     "semantic_hash": "f953d411c2b0979e2ed9c0dc31c9d10f"
   },
   "docs/superpowers/specs/2026-07-22-release-distribution-design.md": {
-    "mtime": 1787680547.4053798,
+    "mtime": 1787691837.021626,
     "ast_hash": "bd44b18a2519f9b4cc8e1bd56fd92f9d",
     "semantic_hash": "bd44b18a2519f9b4cc8e1bd56fd92f9d"
   },
   "docs/superpowers/specs/2026-07-28-gateway-identity-pvc-design.md": {
-    "mtime": 1787680547.4054923,
+    "mtime": 1787691837.0223086,
     "ast_hash": "8187b134da96aa7869b5421caa8eb9e9",
     "semantic_hash": "8187b134da96aa7869b5421caa8eb9e9"
   },
   "docs/superpowers/specs/2026-07-28-puncher-socket-isolation-design.md": {
-    "mtime": 1787680547.4057107,
+    "mtime": 1787691837.0225127,
     "ast_hash": "cd1506f0f0979a3e4d05217a5a4933ab",
     "semantic_hash": "cd1506f0f0979a3e4d05217a5a4933ab"
   },
   "assets/brand/wiremesh-mark.svg": {
-    "mtime": 1787680547.2847047,
+    "mtime": 1787691836.813538,
     "ast_hash": "341e80a98cef6a5745b942d7455896b0",
     "semantic_hash": "341e80a98cef6a5745b942d7455896b0"
   },
   "assets/brand/wiremesh-menubar-offTemplate.svg": {
-    "mtime": 1787680547.284836,
+    "mtime": 1787691836.8136845,
     "ast_hash": "1bd13ace7ac828832f9fe194b6ad8ed8",
     "semantic_hash": "1bd13ace7ac828832f9fe194b6ad8ed8"
   },
   "assets/brand/wiremesh-menubarTemplate.svg": {
-    "mtime": 1787680547.284968,
+    "mtime": 1787691836.8138251,
     "ast_hash": "18bfa9c09fe50a7f27d0d0200f8106c5",
     "semantic_hash": "18bfa9c09fe50a7f27d0d0200f8106c5"
   },
   "docs/graphify.md": {
-    "mtime": 1787680547.3851223,
+    "mtime": 1787691836.956967,
     "ast_hash": "c8cccd39a6e65e1720a352a66a02f661",
     "semantic_hash": ""
   },
   "docs/research/port-authority-verification-the-shape-was-wrong.md": {
-    "mtime": 1787680547.3959196,
+    "mtime": 1787691836.9894145,
     "ast_hash": "d35df527ce6389b31be396074ab35511",
     "semantic_hash": ""
   },
   "docs/research/second-rotation-stranded-tracker.md": {
-    "mtime": 1787680547.3988788,
+    "mtime": 1787691837.000893,
     "ast_hash": "58b66d13b4b324520edbae536a704557",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/rotation_retire_drive.rs": {
-    "mtime": 1787684003.1010294,
+    "mtime": 1787691836.8339705,
     "ast_hash": "d7919c1e0322d0844d9bef5fa440a346",
     "semantic_hash": ""
   },
   "docs/research/socket-leak-on-rebind.md": {
-    "mtime": 1787680547.3991845,
+    "mtime": 1787691837.002509,
     "ast_hash": "49151742b0dec1009038dd3064f1c98b",
     "semantic_hash": ""
   },
   "docs/BACKLOG.md": {
-    "mtime": 1787680547.383743,
-    "ast_hash": "ad7ec0513df53a4d927368034b045d04",
+    "mtime": 1787692348.1828475,
+    "ast_hash": "bb108dace3c1512f65088ed3deafcbcd",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/candidate_cap_gateway_relation.rs": {
-    "mtime": 1787680547.296321,
+    "mtime": 1787691836.8244996,
     "ast_hash": "1251dbf32a7b1a0c5439cfd9ce82f9cc",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/report_local_endpoints_validation.rs": {
-    "mtime": 1787684003.0891325,
+    "mtime": 1787691836.8320062,
     "ast_hash": "6d14969dc390c8d97e7841f077ef79e5",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/candidate_ingest_validation.rs": {
-    "mtime": 1787684003.2148273,
+    "mtime": 1787691836.8555346,
     "ast_hash": "e4a3a5b6bc09f89d39406bedcedd330f",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/predicate_equality.rs": {
-    "mtime": 1787684003.2779758,
+    "mtime": 1787691836.8637178,
     "ast_hash": "fbd9febdda270d2fa3fede0cca2e635f",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/uapi_endpoint_validation.rs": {
-    "mtime": 1787684003.3088143,
+    "mtime": 1787691836.8695257,
     "ast_hash": "dfd76a5dc85f3aa4b89b3d6b7b30506e",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/crd_manifest_freshness.rs": {
-    "mtime": 1787684003.346884,
+    "mtime": 1787691836.8768034,
     "ast_hash": "685ef5f1b4f05df129f1ad2667bd97c1",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/enroll_wg_pubkey_validation.rs": {
-    "mtime": 1787684003.0645998,
+    "mtime": 1787691836.8264942,
     "ast_hash": "1da5398eb667101b1609ed9751d04dda",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/peer_key_and_allowedips_validation.rs": {
-    "mtime": 1787684003.2669418,
+    "mtime": 1787691836.8623645,
     "ast_hash": "1d403de61965d92e6ad08dd10111cbcb",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/controller_rotation_interval.rs": {
-    "mtime": 1787684003.345723,
+    "mtime": 1787691836.876574,
     "ast_hash": "8353bf274760a8739c6d9c500695a32b",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/relay_controller_endpoint_override.rs": {
-    "mtime": 1787684003.3556051,
+    "mtime": 1787691836.8800857,
     "ast_hash": "79e49aaf68bd828285b91a576a26fbef",
     "semantic_hash": ""
   },
   "docs/research/gateway-key-filter-placement.md": {
-    "mtime": 1787680547.3918262,
+    "mtime": 1787691836.97807,
     "ast_hash": "130696bfc73e67012ff1cabac35a8f98",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/enroll_init_container_arg_pinning.rs": {
-    "mtime": 1787684003.3481574,
+    "mtime": 1787691836.8770092,
     "ast_hash": "ccf65363dd9e0cbd9d24e1c4d90eaca0",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/gateway_metrics_bind_override.rs": {
-    "mtime": 1787684003.3512146,
+    "mtime": 1787691836.878738,
     "ast_hash": "b3a2e50a5a89e6969ec8c5350d85cb5a",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/replicas_omitted_scaledown_condition.rs": {
-    "mtime": 1787684003.3647947,
+    "mtime": 1787691836.8818681,
     "ast_hash": "fe426745f56aae5c5abc15b892fec363",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/workload_readiness_truth_table.rs": {
-    "mtime": 1787684003.3663833,
+    "mtime": 1787691836.8823907,
     "ast_hash": "3cd114c51f17540ad9f984488e91cc78",
     "semantic_hash": ""
   },
   "docs/research/in-step-rotation-rebaselined.md": {
-    "mtime": 1787680547.3924363,
+    "mtime": 1787691836.9814446,
     "ast_hash": "468635b1f0fa6ee75b179a177329a01a",
     "semantic_hash": ""
   },
   "docs/superpowers/plans/2026-08-11-in-step-rotation-fix.md": {
-    "mtime": 1787680547.4026067,
+    "mtime": 1787691837.012587,
     "ast_hash": "df6c97b82a6fc77861e935d485c1d7ee",
     "semantic_hash": ""
   },
   "crates/wiremesh-gateway/tests/collapse_dial.rs": {
-    "mtime": 1787684003.2176783,
+    "mtime": 1787691836.8559918,
     "ast_hash": "d240a65a506881aa47cbab5fb6baa472",
     "semantic_hash": ""
   },
   "docs/research/2026-08-11-v1.0-release-scope.md": {
-    "mtime": 1787680547.3879287,
+    "mtime": 1787691836.965808,
     "ast_hash": "8796bbba05a9c5af32de337fbd44b042",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/config_from_env.rs": {
-    "mtime": 1787684003.0586936,
+    "mtime": 1787691836.8254228,
     "ast_hash": "82c56b715c1518ff1cbead67778031c3",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/rotation_disabled_banner.rs": {
-    "mtime": 1787680547.3026595,
+    "mtime": 1787691836.8330615,
     "ast_hash": "6fcce63a8d0e36106f5fc1f990e4614b",
     "semantic_hash": ""
   },
   "crates/wiremesh-operator/tests/release_version_stamping.rs": {
-    "mtime": 1787684003.363339,
+    "mtime": 1787691836.881484,
     "ast_hash": "1886cf74347cb23e1a388fca988a5622",
     "semantic_hash": ""
   }

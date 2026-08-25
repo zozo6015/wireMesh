@@ -35,8 +35,8 @@ use tonic::{Request, Response, Status};
 use wiremesh_proto::v1::sync_message::Body;
 use wiremesh_proto::v1::sync_server::Sync;
 use wiremesh_proto::v1::{
-    ReportRequest, ReportResponse, SubmitEpochKeyRequest, SubmitEpochKeyResponse, SyncMessage,
-    WatchRequest,
+    EpochAck, ReportRequest, ReportResponse, SubmitEpochKeyRequest, SubmitEpochKeyResponse,
+    SyncMessage, WatchRequest,
 };
 
 use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
@@ -276,7 +276,12 @@ pub struct SyncSvc {
 /// DB read for the real-key flag and the broker's live connected-peer set.
 pub(crate) struct RotationTracker {
     pending_epoch: u32,
-    prior_active_epoch: u32,
+    /// The epoch that was `active` in the key snapshot this tracker was seeded
+    /// from, or `None` if that snapshot held no `active` row (the legacy/gap
+    /// row set `Db::rotate_key` deliberately tolerates). Carried as an
+    /// `Option` so the absence survives into [`RotationState`] instead of
+    /// being coerced to epoch 0 — BACKLOG item 5, the `Retire{0}` wedge.
+    prior_active_epoch: Option<u32>,
     started_at: Instant,
     promoted_at: Option<Instant>,
     live_acks: BTreeSet<u64>,
@@ -702,6 +707,139 @@ impl SyncSvc {
     }
 }
 
+/// One entry of [`seed_and_record_epoch_acks`]' unlocked pre-read: a rotating
+/// gateway's id paired with the seed a lazy tracker create needs.
+///
+/// **Both `Option` levels are load-bearing and mean different things.**
+///
+///  * The **outer** `Option` is `None` when that gateway has no `pending` row,
+///    or when the DB read failed — either way, "do not create a tracker for
+///    this one".
+///  * The **inner** `Option<u32>` is the prior active epoch, `None` when the
+///    key snapshot held no `active` row at all. It must STAY `None`: coercing
+///    it to `Some(0)` is BACKLOG item 5, the `Retire{0}` wedge — a promoted
+///    tracker would then ask `Db::retire_epoch` to retire epoch 0 forever, a
+///    CAS that matches nothing on every tick.
+///
+/// Named rather than written inline so the two levels can be told apart at the
+/// use site (and so `clippy::type_complexity` has nothing to complain about).
+type RotationSeed = (i64, Option<(u32, Option<u32>)>);
+
+/// (S3) Free-function core of [`SyncSvc::report`]'s ack-driven rotation
+/// pipeline -- the in-memory seed/record half only. Lifted out of `report`
+/// VERBATIM, the same move `drive_rotation_for` documents one function down,
+/// and for the same reason it gives: a tonic service method cannot be driven
+/// from a test, because `peer_identity` needs a `TlsConnectInfo` that has no
+/// public constructor. Behaviour is unchanged; only its home. The drive loop
+/// stays in `report` -- it needs `&self`.
+///
+/// Returns the distinct rotating gateway ids in FIRST-SEEN order, which is
+/// exactly what the caller's `drive_rotation` loop consumes.
+///
+/// # The ack-direction rule (unchanged, see `.superpowers/sdd/task-3-brief.md`)
+///
+/// An `EpochAck{peer_gateway_id, epoch, live}` sent by the REPORTING gateway
+/// (`reporting_gateway_id`) means "I have a live WireGuard session with the
+/// ROTATING gateway `peer_gateway_id`'s epoch `epoch` key" -- so the ack
+/// advances `peer_gateway_id`'s tracker, recording that `reporting_gateway_id`
+/// has acked, not the other way around.
+///
+/// # Locking discipline (read before editing)
+///
+/// The `rotations` guard is held across the whole ack-recording pass (ONE
+/// critical section: tracker-or-lazily-create-it, then mutate `live_acks`) so
+/// two concurrent `Report` calls acking the same rotating gateway can't
+/// interleave their inserts. It is released BEFORE the caller's
+/// `drive_rotation` loop -- see `drive_rotation`'s doc comment for why a single
+/// reusable helper can't also be called while this block still holds the same
+/// non-reentrant lock.
+///
+/// The DB read the lazy create needs is deliberately hoisted OUT of that
+/// critical section and out of the per-ack loop. It used to sit inside both:
+/// `all_keys_for_gateway` is a `spawn_blocking` hop, so the guard -- shared by
+/// every gateway's rotation, the sweep tick and every concurrent Report -- was
+/// parked across one gateway's DB read, once per ack. Hoisting it also dedupes
+/// the read per distinct rotating gateway rather than repeating it per ack. The
+/// record pass itself is NOT split: both the create and the `live_acks.insert`
+/// still happen under one continuous hold. **Do not collapse these back
+/// together.**
+async fn seed_and_record_epoch_acks(
+    db: &DbHandle,
+    rotations: &Arc<Mutex<HashMap<i64, RotationTracker>>>,
+    reporting_gateway_id: i64,
+    epoch_acks: &[EpochAck],
+) -> Vec<i64> {
+    // Distinct rotating gateway ids, in first-seen order.
+    let mut touched_rotating_gateways: Vec<i64> = Vec::new();
+    for ack in epoch_acks {
+        let rotating_id = ack.peer_gateway_id as i64;
+        if !touched_rotating_gateways.contains(&rotating_id) {
+            touched_rotating_gateways.push(rotating_id);
+        }
+    }
+
+    // Unlocked: one read per distinct rotating gateway, reduced to the
+    // `(pending_epoch, prior_active_epoch)` seed a lazy create needs. The OUTER
+    // `None` — no `pending` row, or the read failed — means "do not create a
+    // tracker for this one", exactly as before. The INNER `Option<u32>` is the
+    // prior active epoch, which is absent when the snapshot holds no `active`
+    // row (S3, BACKLOG item 5) — NO `.unwrap_or(0)`.
+    let mut seeds: Vec<RotationSeed> = Vec::with_capacity(touched_rotating_gateways.len());
+    for &rotating_id in &touched_rotating_gateways {
+        let seed =
+            match db.all_keys_for_gateway(rotating_id).await {
+                Ok(keys) => keys.iter().find(|(_, _, state)| state == "pending").map(
+                    |(pending_epoch, _, _)| {
+                        let prior_active_epoch = keys
+                            .iter()
+                            .find(|(_, _, state)| state == "active")
+                            .map(|(epoch, _, _)| *epoch as u32);
+                        (*pending_epoch as u32, prior_active_epoch)
+                    },
+                ),
+                Err(_) => None,
+            };
+        seeds.push((rotating_id, seed));
+    }
+
+    {
+        // ONE critical section, NO `.await` inside it.
+        let mut rotations = rotations.lock().await;
+
+        for (rotating_id, seed) in &seeds {
+            if rotations.contains_key(rotating_id) {
+                continue;
+            }
+            if let Some((pending_epoch, prior_active_epoch)) = *seed {
+                let now = Instant::now();
+                rotations.insert(
+                    *rotating_id,
+                    RotationTracker {
+                        pending_epoch,
+                        prior_active_epoch,
+                        started_at: now,
+                        promoted_at: None,
+                        live_acks: BTreeSet::new(),
+                        installed_at: now,
+                    },
+                );
+            }
+        }
+
+        for ack in epoch_acks {
+            let rotating_id = ack.peer_gateway_id as i64;
+            if let Some(tracker) = rotations.get_mut(&rotating_id) {
+                if ack.epoch == tracker.pending_epoch && ack.live {
+                    tracker.live_acks.insert(reporting_gateway_id as u64);
+                }
+            }
+        }
+        // `rotations` (the guard) drops here.
+    }
+
+    touched_rotating_gateways
+}
+
 /// (Key-rotation Task 4) Free-function core of [`SyncSvc::drive_rotation`],
 /// extracted so both the tonic service methods (`report`/`submit_epoch_key`,
 /// via the thin `SyncSvc::drive_rotation` wrapper above) AND the
@@ -834,11 +972,12 @@ pub(crate) async fn drive_rotation_for(
 
         if !rotations.contains_key(&rotating_gateway_id) {
             if let Some(pending_epoch) = db_pending_epoch {
+                // (S3, BACKLOG item 5) NO `.unwrap_or(0)`: a snapshot with no
+                // `active` row must seed `None`, not epoch 0.
                 let prior_active_epoch = keys
                     .iter()
                     .find(|(_, _, state)| state == "active")
-                    .map(|(epoch, _, _)| *epoch as u32)
-                    .unwrap_or(0);
+                    .map(|(epoch, _, _)| *epoch as u32);
                 let now = Instant::now();
                 rotations.insert(
                     rotating_gateway_id,
@@ -897,6 +1036,63 @@ pub(crate) async fn drive_rotation_for(
     // --- Execute, guard RELEASED. ---
     match decision {
         RotationDecision::Wait => {}
+        // (S3, BACKLOG item 5) Nothing to retire: this tracker was seeded from a
+        // key snapshot with no `active` row, so there is no prior epoch to hand
+        // to `Db::retire_epoch`. No DB call at all -- `Retire { epoch: 0 }` here
+        // CASes against a row that does not exist, on every tick, forever, and
+        // is indistinguishable from a legitimate first rotation's retire.
+        //
+        // `TrackerEffect::Finished` is THIS MODULE's enum, not the decision: the
+        // shared name is deliberate and the two are different types. It must NOT
+        // be `TrackerEffect::FinishedIfUnpromoted`, whose narrower window exists
+        // for the `Abort` path only.
+        //
+        // WHY CLEARING THE TRACKER IS SAFE HERE, where the `Retire`/`NoMatch`
+        // arm below deliberately refuses to (a removed tracker hands a live
+        // `retiring` row to `sweep_rotations`' grace-free step-3 orphan path --
+        // `RETIRE_GRACE` 30s -> ~0):
+        //
+        //  1. No row can have been freshly demoted into `retiring` by THIS
+        //     rotation. `prior_active_epoch == None` means the seed snapshot
+        //     held no `active` row, and no `active` row can appear for an
+        //     already-enrolled gateway between that seed and the promote:
+        //     `Db::enroll_gateway`'s epoch-0 `active` INSERT keys off
+        //     `tx.last_insert_rowid()` of a `gateway` row inserted in the SAME
+        //     transaction, so it only ever fires for a brand-new gateway;
+        //     `Db::rotate_key` inserts `'pending'`; `Db::set_epoch_pubkey`
+        //     writes only `pubkey`; `Db::retire_epoch`/`Db::drop_pending_epoch`
+        //     only DELETE; and `Db::promote_epoch`'s own `SET state = 'active'`
+        //     runs AFTER its demote in one transaction, so it cannot feed its
+        //     own demote. `promote_epoch`'s `UPDATE ... SET state = 'retiring'
+        //     WHERE state = 'active'` therefore matched ZERO rows and created
+        //     nothing.
+        //
+        //  2. A PRE-EXISTING `retiring` row (the legacy `[pending, retiring]`-
+        //     no-`active` set `Db::rotate_key` deliberately tolerates) may be
+        //     live, and reaping it grace-free is INTENDED: it predates this
+        //     tracker's seed, so its own `RETIRE_GRACE` elapsed before this
+        //     rotation began, and it is exactly the stranded row step 3 exists
+        //     to collect. The bug this replaces did the same thing when the
+        //     epochs lined up -- `Retire { epoch: 0 }` DELETEd such a row
+        //     directly when it happened to be epoch 0, also grace-free, and
+        //     wedged forever when it was not.
+        //
+        // If a future change makes an `active` row reachable mid-rotation, leg 1
+        // dies and this becomes a fifth `RETIRE_GRACE`-collapse route. Re-check
+        // it here.
+        RotationDecision::Finished => {
+            eprintln!(
+                "wiremesh-controller: rotation for gateway {rotating_gateway_id} finished with \
+                 nothing to retire (no prior active epoch) -- dropping the tracker, no DB call"
+            );
+            apply_tracker_effect(
+                rotations,
+                rotating_gateway_id,
+                taken,
+                TrackerEffect::Finished,
+            )
+            .await;
+        }
         RotationDecision::Promote { epoch } => {
             match db.promote_epoch(rotating_gateway_id, epoch).await {
                 Ok(CasOutcome::Applied) => {
@@ -1201,11 +1397,12 @@ pub(crate) async fn sweep_rotations(
                 guard.remove(&gateway_id);
             }
             if !guard.contains_key(&gateway_id) {
+                // (S3, BACKLOG item 5) NO `.unwrap_or(0)`: a snapshot with no
+                // `active` row must seed `None`, not epoch 0.
                 let prior_active_epoch = keys
                     .iter()
                     .find(|(_, _, state)| state == "active")
-                    .map(|(epoch, _, _)| *epoch as u32)
-                    .unwrap_or(0);
+                    .map(|(epoch, _, _)| *epoch as u32);
                 let now = Instant::now();
                 guard.insert(
                     gateway_id,
@@ -1877,101 +2074,15 @@ impl Sync for SyncSvc {
             // block proceed.
         }
 
-        // (Key-rotation Task 3) Ack-driven rotation pipeline. Per the ack
-        // direction rule (see `.superpowers/sdd/task-3-brief.md`): an
-        // `EpochAck{peer_gateway_id, epoch, live}` sent by THIS reporting
-        // gateway (`gw.id`) means "I (`gw.id`) have a live WireGuard session
-        // with the ROTATING gateway `peer_gateway_id`'s epoch `epoch` key" —
-        // so the ack advances `peer_gateway_id`'s tracker, recording that
-        // `gw.id` has acked, not the other way around.
-        //
-        // The `rotations` guard is held across the whole ack-recording pass
-        // (ONE critical section: tracker-or-lazily-create-it, then mutate
-        // `live_acks`) so two concurrent `Report` calls acking the same
-        // rotating gateway can't interleave their inserts. It is then
-        // released BEFORE calling `drive_rotation` per touched rotating
-        // gateway below — see `drive_rotation`'s doc comment for why a single
-        // reusable helper can't also be called while this block still holds
-        // the same non-reentrant lock.
-        //
-        // The DB read the lazy create needs is deliberately hoisted OUT of
-        // that critical section and out of the per-ack loop. It used to sit
-        // inside both: `all_keys_for_gateway` is a `spawn_blocking` hop, so
-        // the guard — shared by every gateway's rotation, the sweep tick and
-        // every concurrent Report — was parked across one gateway's DB read,
-        // once per ack. Hoisting it also dedupes the read per distinct
-        // rotating gateway rather than repeating it per ack. The record pass
-        // itself is NOT split: both the create and the `live_acks.insert`
-        // still happen under one continuous hold.
+        // (Key-rotation Task 3) Ack-driven rotation pipeline. The in-memory
+        // seed/record half lives in [`seed_and_record_epoch_acks`] -- see that
+        // function for the ack-direction rule and the locking discipline. The
+        // drive loop stays here because it needs `&self`.
         if !req.epoch_acks.is_empty() {
-            // Distinct rotating gateway ids, in first-seen order.
-            let mut touched_rotating_gateways: Vec<i64> = Vec::new();
-            for ack in &req.epoch_acks {
-                let rotating_id = ack.peer_gateway_id as i64;
-                if !touched_rotating_gateways.contains(&rotating_id) {
-                    touched_rotating_gateways.push(rotating_id);
-                }
-            }
+            let touched =
+                seed_and_record_epoch_acks(&self.db, &self.rotations, gw.id, &req.epoch_acks).await;
 
-            // Unlocked: one read per distinct rotating gateway, reduced to
-            // the `(pending_epoch, prior_active_epoch)` seed a lazy create
-            // needs. `None` — no `pending` row, or the read failed — means
-            // "do not create a tracker for this one", exactly as before.
-            let mut seeds: Vec<(i64, Option<(u32, u32)>)> =
-                Vec::with_capacity(touched_rotating_gateways.len());
-            for &rotating_id in &touched_rotating_gateways {
-                let seed = match self.db.all_keys_for_gateway(rotating_id).await {
-                    Ok(keys) => keys.iter().find(|(_, _, state)| state == "pending").map(
-                        |(pending_epoch, _, _)| {
-                            let prior_active_epoch = keys
-                                .iter()
-                                .find(|(_, _, state)| state == "active")
-                                .map(|(epoch, _, _)| *epoch as u32)
-                                .unwrap_or(0);
-                            (*pending_epoch as u32, prior_active_epoch)
-                        },
-                    ),
-                    Err(_) => None,
-                };
-                seeds.push((rotating_id, seed));
-            }
-
-            {
-                // ONE critical section, NO `.await` inside it.
-                let mut rotations = self.rotations.lock().await;
-
-                for (rotating_id, seed) in &seeds {
-                    if rotations.contains_key(rotating_id) {
-                        continue;
-                    }
-                    if let Some((pending_epoch, prior_active_epoch)) = *seed {
-                        let now = Instant::now();
-                        rotations.insert(
-                            *rotating_id,
-                            RotationTracker {
-                                pending_epoch,
-                                prior_active_epoch,
-                                started_at: now,
-                                promoted_at: None,
-                                live_acks: BTreeSet::new(),
-                                installed_at: now,
-                            },
-                        );
-                    }
-                }
-
-                for ack in &req.epoch_acks {
-                    let rotating_id = ack.peer_gateway_id as i64;
-                    if let Some(tracker) = rotations.get_mut(&rotating_id) {
-                        if ack.epoch == tracker.pending_epoch && ack.live {
-                            tracker.live_acks.insert(gw.id as u64);
-                        }
-                    }
-                }
-                // `rotations` (the guard) drops here.
-            }
-
-            for rotating_id in touched_rotating_gateways {
+            for rotating_id in touched {
                 self.drive_rotation(rotating_id).await;
             }
         }
@@ -2463,7 +2574,11 @@ mod tests {
     fn tracker(pending_epoch: u32, installed_at: Instant) -> RotationTracker {
         RotationTracker {
             pending_epoch,
-            prior_active_epoch: 0,
+            // (S3) Inert here — these cases are about `apply_tracker_effect`'s
+            // write-back gating, which never reads this field. `Some(0)` keeps
+            // the previous meaning exactly (a real epoch numbered zero) rather
+            // than quietly turning these fixtures into the absence case.
+            prior_active_epoch: Some(0),
             started_at: installed_at,
             promoted_at: None,
             live_acks: BTreeSet::new(),
@@ -2707,11 +2822,19 @@ mod tests {
     /// its own.
     ///
     /// That promise is ASSERTED, not assumed — see the postcondition below.
+    ///
+    /// (S3) `prior_active_epoch` stays a bare `u32` parameter and is wrapped at
+    /// the field init below, rather than widening the signature to
+    /// `Option<u32>` and touching all five call sites. Every caller here is
+    /// about the `Abort` path, where this field is inert — `decide` rule 2
+    /// never reads it — so none of them needs to express absence, and a
+    /// one-line wrap says that more clearly than five `Some(..)`s would. If a
+    /// future case genuinely needs the absence, widen it then.
     fn aborting_tracker(pending_epoch: u32, prior_active_epoch: u32) -> RotationTracker {
         let started_at = saturating_ago(rotation::ABORT_AFTER + ABORT_MARGIN);
         let tracker = RotationTracker {
             pending_epoch,
-            prior_active_epoch,
+            prior_active_epoch: Some(prior_active_epoch),
             started_at,
             promoted_at: None,
             live_acks: BTreeSet::new(),
@@ -3139,6 +3262,479 @@ mod tests {
             "and the tracker must survive the sweep too: decide's rule 1 sees promoted_at \
              stamped moments ago, so it must return Wait, not Retire, until RETIRE_GRACE has \
              actually elapsed"
+        );
+    }
+
+    // =======================================================================
+    // S3 — the three `prior_active_epoch` SEED SITES (BACKLOG item 5,
+    // design §4, architect ruling Rev 1.10).
+    //
+    // THERE ARE THREE TESTS BECAUSE THERE ARE THREE SEED SITES, AND A FIX THAT
+    // MISSES THE THIRD LEAVES THE BUG REACHABLE VIA THE ACK PATH. That is the
+    // axis that must not be collapsed: if someone later consolidates these
+    // into one parametrised case, the parameter has to remain WHICH SITE
+    // SEEDED THE TRACKER, not which decision came out.
+    //
+    //   site 1 — `drive_rotation_for`'s rebuild branch
+    //   site 2 — `sweep_rotations` step 2's rebuild branch
+    //   site 3 — `SyncSvc::report`'s batched seed loop (the ack path)
+    //
+    // A FOURTH `.unwrap_or(0)` lives in `SyncSvc::recorded_session_generation`
+    // and is UNRELATED — it is the Sync session-generation nonce, where 0 is a
+    // deliberate legacy sentinel that makes the gate inert. It must not be
+    // touched; `recorded_session_generation_is_not_a_seed_site` pins that.
+    //
+    // # The bug, and why the DB cannot see it
+    //
+    // A tracker seeded from a key snapshot with no `active` row used to get
+    // `prior_active_epoch = 0` via `.unwrap_or(0)`. Once promoted, `decide`
+    // rule 1 yields `Retire { epoch: 0 }` forever: `Db::retire_epoch` CASes on
+    // `epoch = 0 AND state = 'retiring'`, matches nothing, rolls back WITHOUT
+    // bumping the revision, and returns `NoMatch` — and
+    // `drive_rotation_for`'s `Retire`/`NoMatch` arm DELIBERATELY keeps the
+    // tracker (removing it would hand a live `retiring` row to
+    // `sweep_rotations`' grace-free step-3 orphan path and collapse
+    // `RETIRE_GRACE` — trap #2, and that arm's comment says so).
+    //
+    // So the buggy run and the fixed run leave the database BYTE-IDENTICAL.
+    // Everything these tests can observe therefore has to come from the
+    // in-memory map — which is the whole reason they live in this module.
+    //
+    // # Probe shape (identical for all three, one property varying)
+    //
+    //   1. Construct the state: a real-keyed `pending` row and NO `active`
+    //      row, by DELETING the `active` row through a second DB connection.
+    //      Per design §1.2 C3 this state is NOT reachable from any current
+    //      mutation path (`promote_epoch` verifies a real-keyed `pending` row
+    //      before demoting the active row; `enroll_gateway` always inserts an
+    //      epoch-0 `active` row) — it is reachable only for a legacy/gap key
+    //      row set, which `Db::rotate_key` deliberately tolerates. S3 is
+    //      hardening. Do not go looking for a production route; there is none.
+    //   2. Drive the site ONCE, so the site itself does the seeding.
+    //   3. Read the seeded `prior_active_epoch` back and assert it directly —
+    //      this is the sharpest possible pin on the site, sharper than
+    //      inferring it from the decision.
+    //   4. Mutate ONLY `promoted_at`, backdated past `RETIRE_GRACE`, so rule 1
+    //      fires on the next pass. Nothing else is touched, so
+    //      `prior_active_epoch` remains exactly what the site produced.
+    //   5. Drive again, and assert the tracker is GONE.
+    //
+    // Step 5 doubles as the non-vacuity guard: `TrackerEffect::Finished` is
+    // the only thing that removes the tracker, and only
+    // `RotationDecision::Finished` maps to it, so "the tracker is gone" cannot
+    // be true unless rule 1 actually fired and produced `Finished`. A `Wait`
+    // (rule 1 not reached) leaves the tracker in place and reds the test.
+    // =======================================================================
+
+    /// The `pending` epoch every S3 fixture below rotates toward.
+    ///
+    /// Named rather than spelled `7` at each use because site 3 COUPLES two
+    /// of those uses: `seed_and_record_epoch_acks`' record condition is
+    /// `ack.epoch == tracker.pending_epoch && ack.live`, so an `EpochAck`
+    /// whose epoch drifts from the fixture's `pending` row silently stops
+    /// landing in `live_acks` — and site 3's non-vacuity guard reads exactly
+    /// that. With one constant feeding both, the drift is unrepresentable.
+    ///
+    /// If site 3's `live_acks` assertion ever reds, check this coupling before
+    /// suspecting the hoist (controller-dev's note, 2026-08-25).
+    const PENDING_EPOCH: u32 = 7;
+
+    /// How far past [`rotation::RETIRE_GRACE`] the promote stamp is backdated.
+    /// Mirrors [`ABORT_MARGIN`]'s role for [`aborting_tracker`]: it only has to
+    /// cover the gap between the `Instant` computed here and the one the
+    /// driver later hands to `rotation::decide`.
+    const RETIRE_MARGIN: Duration = Duration::from_secs(1);
+
+    /// Deletes [`GW`]'s `active` key row through a second connection, and
+    /// asserts exactly one row went.
+    ///
+    /// The count is not decoration. If a schema change ever made this delete a
+    /// no-op, every test below would construct a gateway that still HAS an
+    /// active row, every seed would legitimately be `Some(..)`, and the whole
+    /// group would pass while testing nothing at all. This is the one place
+    /// that can catch it.
+    fn delete_active_row(dir: &std::path::Path) {
+        let deleted = raw_conn(dir)
+            .execute(
+                "DELETE FROM gateway_key WHERE gateway_id = ?1 AND state = 'active'",
+                rusqlite::params![GW],
+            )
+            .expect("deleting the active key row");
+        assert_eq!(
+            deleted, 1,
+            "the S3 fixture must actually REMOVE an active key row — it deleted {deleted}. \
+             With an active row still present every seed below is legitimately `Some(..)` \
+             and the entire per-seed-site group passes while exercising nothing"
+        );
+    }
+
+    /// Reads back the `prior_active_epoch` the site under test seeded, then
+    /// stamps `promoted_at` far enough in the past that `decide` rule 1's
+    /// `RETIRE_GRACE` has elapsed.
+    ///
+    /// It touches `promoted_at` AND NOTHING ELSE. That is the isolation the
+    /// whole group rests on: the only value that varies between a green and a
+    /// red run is the one the seed site wrote.
+    async fn read_seed_and_stamp_promoted(
+        rotations: &Arc<Mutex<HashMap<i64, RotationTracker>>>,
+    ) -> Option<u32> {
+        let mut guard = rotations.lock().await;
+        let tracker = guard.get_mut(&GW).expect(
+            "the site under test must have SEEDED a tracker on its first pass. No tracker \
+             here means the fixture never reached the seed branch at all (no `pending` row \
+             found, or an `evict_decision` that removed it), so nothing below would be \
+             testing the seed site",
+        );
+        let seeded = tracker.prior_active_epoch;
+        tracker.promoted_at = Some(saturating_ago(rotation::RETIRE_GRACE + RETIRE_MARGIN));
+        seeded
+    }
+
+    /// The failure text for the direct seed assertion, shared by all three
+    /// tests so a reviewer can see at a glance that they differ ONLY in which
+    /// site produced the value.
+    fn seed_must_be_none(site: &str, seeded: Option<u32>) {
+        assert_eq!(
+            seeded, None,
+            "{site} seeded `prior_active_epoch = {seeded:?}` from a key snapshot with NO \
+             `active` row. It must be `None`. `Some(0)` is the bug: `Retire{{0}}` is \
+             indistinguishable from a legitimate first rotation's retire, `Db::retire_epoch` \
+             then CASes on `epoch = 0 AND state = 'retiring'` and matches nothing, and \
+             `drive_rotation_for`'s `NoMatch` arm deliberately KEEPS the tracker (removing \
+             it would hand a live `retiring` row to `sweep_rotations`' grace-free step-3 \
+             orphan path and collapse `RETIRE_GRACE` — trap #2). Nothing else ever clears \
+             it: `evict_decision`'s `db_pending == None` leg is an unconditional keep, and \
+             with no `pending`/`retiring` row the gateway is invisible to \
+             `db::gateways_with_rotation_state`. The stale tracker then eats the next \
+             rotation's one and only ack"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SITE 1 — `drive_rotation_for`'s rebuild branch.
+    // -----------------------------------------------------------------------
+
+    /// Site 1, plus the only place in this group where "no failing CAS" is
+    /// made DIRECTLY observable.
+    ///
+    /// # Why this fixture carries an epoch-0 `retiring` row
+    ///
+    /// A failing CAS writes nothing, so "a CAS was attempted and matched
+    /// nothing" and "no CAS was attempted" are indistinguishable on a normal
+    /// fixture — both leave the database byte-identical, and `retire_epoch`
+    /// rolls back without even bumping the revision. The only way to make the
+    /// attempt observable is to give it something to hit: an epoch-0 row in
+    /// state `retiring`, which is exactly what `Retire{0}`'s CAS targets.
+    ///
+    /// So the buggy path DELETES a real key row here, and the fixed path
+    /// leaves it. That is not an artificial amplification of the bug — it IS
+    /// the bug's worst case, and it is the `RETIRE_GRACE`-collapse family
+    /// (§10 R5) showing up one more time: a row whose grace has not run out is
+    /// destroyed by a decision that was only ever an artefact of coercing
+    /// absence to zero.
+    ///
+    /// This probe is available ONLY here. See site 2's comment for why the
+    /// same fixture would be a FALSE probe under `sweep_rotations`.
+    ///
+    /// # WHICH ASSERTION CATCHES WHAT — read before weakening any of them
+    ///
+    /// The three assertions below guard three DIFFERENT defect classes, and
+    /// exactly one of them falsifies this site's sabotage. Spelling that out
+    /// because "a half-check reads as a check" is a recorded trap here, and
+    /// because the epoch-0 `retiring` row that makes the CAS observable ALSO
+    /// changes what the tracker assertion can see:
+    ///
+    ///  1. `seed_must_be_none` — **the falsifier for sabotage 1**, and the
+    ///     proximate one: it fires FIRST and the test aborts there, so under
+    ///     `.or(Some(0))` at this site neither assertion below is even
+    ///     reached. It catches the coercion at the site itself.
+    ///  2. "the tracker is gone" — catches a fix that carries `None` through
+    ///     the seed but then produces `Wait` (a `Wait` never ends, which is
+    ///     why the fix is a new variant). It **does NOT falsify sabotage 1**,
+    ///     and cannot: with the epoch-0 row present the sabotaged `Retire{0}`
+    ///     CAS *matches*, returns `CasOutcome::Applied`, and reaches the SAME
+    ///     `TrackerEffect::Finished` the fix does — so the tracker is removed
+    ///     on both paths. Keep it for the `Wait` class; do not read it as
+    ///     evidence about this site's coercion.
+    ///  3. "the epoch-0 `retiring` row survives" — catches a fix that seeds
+    ///     `None` correctly and still emits a retire further downstream. This
+    ///     is the only assertion here that would red on a buggy `decide`
+    ///     rather than a buggy seed.
+    ///
+    /// If (3) is ever weakened, this test keeps two assertions and stops
+    /// proving anything about the CAS at all — (1) is about the seed and (2)
+    /// is satisfied by the bug. That is the failure mode this comment exists
+    /// to prevent.
+    #[tokio::test]
+    async fn drive_rotation_for_seeds_no_prior_active_epoch_when_the_active_row_is_absent() {
+        let (dir, db) = seeded_db(&[
+            (0, "EPOCH0==", "active"),
+            (PENDING_EPOCH as i64, "EPOCH7==", "pending"),
+        ]);
+        delete_active_row(dir.path());
+        // The row `Retire{0}`'s CAS would destroy. Inserted AFTER the delete so
+        // epoch 0 is free again.
+        raw_conn(dir.path())
+            .execute(
+                "INSERT INTO gateway_key (gateway_id, epoch, pubkey, state) \
+                 VALUES (?1, 0, 'RETIRING0==', 'retiring')",
+                rusqlite::params![GW],
+            )
+            .expect("seeding the epoch-0 retiring row the buggy CAS would hit");
+
+        let (change_tx, _change_rx) = broadcast::channel(16);
+        let broker = Broker::new(db.clone(), crate::broker::new_registry());
+        let rotations: Arc<Mutex<HashMap<i64, RotationTracker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Pass 1: the site seeds. `decide` answers `Wait` (real key present,
+        // no connected peers so rule 3 cannot fire, and GRACE_PROMOTE has not
+        // elapsed), so this pass mutates nothing but the map.
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+        let seeded = read_seed_and_stamp_promoted(&rotations).await;
+        seed_must_be_none("drive_rotation_for's rebuild branch", seeded);
+
+        // Pass 2: rule 1 fires on the now-promoted tracker.
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+
+        // GUARD (2) — the `Wait` class. NOT a falsifier for this site's
+        // sabotage: see the "WHICH ASSERTION CATCHES WHAT" block above. With
+        // the epoch-0 row present a sabotaged `Retire{0}` CAS MATCHES, returns
+        // `Applied`, and removes the tracker through the very same
+        // `TrackerEffect::Finished` the fix uses, so this passes either way.
+        assert!(
+            !rotations.lock().await.contains_key(&GW),
+            "a promoted rotation with nothing to retire must drive to \
+             `RotationDecision::Finished`, which `drive_rotation_for` maps to \
+             `TrackerEffect::Finished` and which REMOVES the tracker. Still here means rule \
+             1 produced `Wait` — and a `Wait` never ends, which is exactly why the fix is a \
+             new decision variant rather than a `Wait`. (This assertion does NOT distinguish \
+             `Finished` from a `Retire{{0}}` that matched the epoch-0 row in this fixture; \
+             the row-survival assertion below is what does that.)"
+        );
+
+        // GUARD (3) — the only assertion here that would red on a `decide`
+        // that seeds `None` correctly and still emits a retire. Weakening it
+        // leaves a two-assertion test that proves nothing about the CAS.
+        assert!(
+            key_states(&db).await.contains(&(0, "retiring".to_string())),
+            "the epoch-0 `retiring` row is GONE, which means a `Retire{{0}}` CAS ran and \
+             MATCHED it. That is the failing-CAS half of BACKLOG item 5 in its worst form: \
+             the coerced-to-zero epoch did not merely spam a no-op compare-and-swap, it \
+             destroyed a real key row whose `RETIRE_GRACE` had not run out — the same 30s \
+             to ~0 collapse `evict_decision`'s `None`-means-keep leg and \
+             `drive_rotation_for`'s two `NoMatch` arms exist to prevent (§10 R5). A \
+             rotation with `prior_active_epoch == None` must issue NO retire CAS at all"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SITE 2 — `sweep_rotations` step 2's rebuild branch.
+    // -----------------------------------------------------------------------
+
+    /// Site 2.
+    ///
+    /// # Why this fixture has no epoch-0 `retiring` row, unlike site 1's
+    ///
+    /// It would be a FALSE PROBE — it reds and greens for reasons that have
+    /// nothing to do with the seed site. `sweep_rotations` step 2b calls
+    /// `drive_rotation_for`, and step 3 then RE-READS the keys and deletes
+    /// every `retiring` row grace-free IF no tracker is held. So:
+    ///
+    ///   * fixed run  — step 2b's `Finished` removes the tracker, step 3 finds
+    ///     no tracker, and deletes the epoch-0 row;
+    ///   * buggy run  — `Retire{0}`'s CAS deletes the epoch-0 row itself.
+    ///
+    /// The row is gone either way, and an assertion on it would pass under
+    /// sabotage. Worse, invert it and it "passes" for the opposite wrong
+    /// reason. Site 2 therefore asserts the seed directly and the tracker's
+    /// disposition, and leaves the CAS-observability job to site 1, where it
+    /// is genuinely decisive.
+    ///
+    /// This is the "a test firing under sabotage may be firing for the wrong
+    /// reason" trap, caught in the fixture rather than in the assertion.
+    #[tokio::test]
+    async fn sweep_rotations_step2_seeds_no_prior_active_epoch_when_the_active_row_is_absent() {
+        let (dir, db) = seeded_db(&[
+            (0, "EPOCH0==", "active"),
+            (PENDING_EPOCH as i64, "EPOCH7==", "pending"),
+        ]);
+        delete_active_row(dir.path());
+
+        let (change_tx, _change_rx) = broadcast::channel(16);
+        let broker = Broker::new(db.clone(), crate::broker::new_registry());
+        let rotations: Arc<Mutex<HashMap<i64, RotationTracker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Pass 1. Step 1 returns GW (it holds a `pending` row, so
+        // `gateways_with_rotation_state` sees it); step 2 seeds; step 2b's
+        // `drive_rotation_for` finds the tracker already present — the seed
+        // came from SITE 2, not site 1, because `evict_decision` keeps a
+        // tracker whose pending epoch matches the DB and whose `installed_at`
+        // predates that call's `read_at`. That is what makes this test
+        // sensitive to site 2's `.unwrap_or(0)` and NOT to site 1's.
+        sweep_rotations(&db, &change_tx, &broker, &rotations).await;
+        let seeded = read_seed_and_stamp_promoted(&rotations).await;
+        seed_must_be_none("sweep_rotations step 2's rebuild branch", seeded);
+
+        // Pass 2: step 2 keeps the tracker, step 2b drives rule 1.
+        sweep_rotations(&db, &change_tx, &broker, &rotations).await;
+
+        assert!(
+            !rotations.lock().await.contains_key(&GW),
+            "sweep_rotations' step 2b must drive the promoted, nothing-to-retire tracker to \
+             `RotationDecision::Finished` and remove it. It is still here, so rule 1 \
+             produced `Retire{{0}}` (kept on `NoMatch`) or `Wait` (never ends) — either way \
+             the wedge BACKLOG item 5 describes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // SITE 3 — `SyncSvc::report`'s batched seed loop (the ack path).
+    // -----------------------------------------------------------------------
+
+    // Why the hoist exists at all: `SyncSvc::report` opens with
+    // `peer_identity(&request)` -> `tonic::Request::peer_certs()`, which reads
+    // a `TlsConnectInfo` extension that has NO public constructor. An
+    // in-module test cannot fabricate an authenticated `Request`, so the seed
+    // loop is unreachable from here in its inlined form.
+    //
+    // The alternative — a real `Sync.Report` through `StubGateway`, asserting
+    // the documented downstream cost (the stale tracker eats the next
+    // rotation's one and only ack, so that rotation falls back to the 90s
+    // grace promote) — was REJECTED by the architect and is recorded as
+    // rejected so nobody re-proposes it as extra safety. Two reasons: it
+    // asserts a PROXY that can pass or fail for reasons unrelated to the bug,
+    // and it is a wall-clock timing assertion on a project where
+    // `direct_rotation_is_zero_drop` already reds ~42% under host load. A ~45s
+    // test that flakes for reasons other than the defect trains people to
+    // ignore reds.
+    //
+    /// Site 3 — the ack path, and the reason there are three tests.
+    ///
+    /// A fix that lands at sites 1 and 2 and misses this one leaves the bug
+    /// FULLY REACHABLE: `report` seeds trackers of its own, and its
+    /// ack-recording pass does not run `evict_decision`. Sites 1 and 2 would
+    /// be green and the fabric would still wedge.
+    ///
+    /// # The reporting gateway is not the rotating one
+    ///
+    /// `EpochAck::peer_gateway_id` names the gateway BEING rotated (whose
+    /// tracker gets seeded); `reporting_gateway_id` is the PEER doing the
+    /// acking, and it is what lands in `live_acks`. They are deliberately
+    /// different values here — passing the same id for both would still seed
+    /// a tracker and would still red under sabotage, but it would quietly
+    /// stop exercising the distinction, and a later reader could not tell
+    /// which argument the seed actually keys on.
+    #[tokio::test]
+    async fn report_ack_seed_loop_seeds_no_prior_active_epoch_when_the_active_row_is_absent() {
+        let (dir, db) = seeded_db(&[
+            (0, "EPOCH0==", "active"),
+            (PENDING_EPOCH as i64, "EPOCH7==", "pending"),
+        ]);
+        delete_active_row(dir.path());
+
+        let rotations: Arc<Mutex<HashMap<i64, RotationTracker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // A peer acking GW's pending epoch 7. `live: true` is required — the
+        // recording pass ignores a non-live ack, and this test's non-vacuity
+        // guard below reads `live_acks`.
+        const ACKING_PEER: i64 = GW + 1;
+        let acks = [EpochAck {
+            peer_gateway_id: GW as u64,
+            // Same constant as the fixture's `pending` row, deliberately —
+            // see `PENDING_EPOCH`. `live: true` is required: the record
+            // condition is `ack.epoch == tracker.pending_epoch && ack.live`,
+            // so a non-live ack would leave `live_acks` empty and the
+            // non-vacuity guard below would red for the wrong reason.
+            epoch: PENDING_EPOCH,
+            live: true,
+        }];
+
+        let touched = seed_and_record_epoch_acks(&db, &rotations, ACKING_PEER, &acks).await;
+        assert_eq!(
+            touched,
+            vec![GW],
+            "the seed loop must return the distinct rotating gateway ids in first-seen \
+             order — that is what `report`'s trailing drive loop consumes. Getting \
+             something else here means the ack was not attributed to GW at all, and every \
+             assertion below would be about a tracker that exists for the wrong reason"
+        );
+
+        let seeded = read_seed_and_stamp_promoted(&rotations).await;
+        seed_must_be_none("report's batched ack seed loop", seeded);
+
+        // NON-VACUITY GUARD, and the one thing sites 1 and 2 cannot check:
+        // that the tracker this test is reading was actually seeded by THIS
+        // function's seed pass and then found by its recording pass. An
+        // implementation that seeded under a different key, or that recorded
+        // acks before seeding, would leave `live_acks` empty while still
+        // producing a tracker — and the seed assertion above would pass.
+        assert!(
+            rotations
+                .lock()
+                .await
+                .get(&GW)
+                .expect("tracker was just read")
+                .live_acks
+                .contains(&(ACKING_PEER as u64)),
+            "the acking peer must be recorded in the seeded tracker's `live_acks`. Empty \
+             means the seed and the record passes disagree about the key or the order — \
+             the tracker exists, but not because this ack found it, so the seed assertion \
+             above proved nothing about the ack path"
+        );
+
+        // Rule 1 is driven by `drive_rotation_for`, exactly as `report`'s
+        // trailing loop does it — the hoist deliberately did NOT lift that
+        // loop, so this mirrors production rather than inventing a path.
+        let (change_tx, _change_rx) = broadcast::channel(16);
+        let broker = Broker::new(db.clone(), crate::broker::new_registry());
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+
+        assert!(
+            !rotations.lock().await.contains_key(&GW),
+            "a tracker seeded by the ACK PATH with nothing to retire must drive to \
+             `RotationDecision::Finished` and be removed, exactly as one seeded by \
+             `drive_rotation_for` or `sweep_rotations` does. Still present means this site \
+             still coerces absence to epoch 0 — and this is the site whose miss is \
+             invisible to the other two tests, because `report` seeds trackers of its own \
+             and its ack-recording pass never runs `evict_decision`"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The fourth `.unwrap_or(0)`, which is NOT a seed site.
+    // -----------------------------------------------------------------------
+
+    /// `SyncSvc::recorded_session_generation`'s `.unwrap_or(0)` is the Sync
+    /// session-generation nonce, not a rotation epoch, and its `0` is a
+    /// DELIBERATE legacy sentinel meaning "no opinion — accept". S3 must not
+    /// touch it.
+    ///
+    /// This is the obvious mis-fix: someone greps `unwrap_or(0)` in this file,
+    /// finds four, and changes four. Doing so would turn the gate's fail-open
+    /// legs into something else and start rejecting legacy gateways' `Report`
+    /// calls wholesale with `FAILED_PRECONDITION`.
+    #[tokio::test]
+    async fn recorded_session_generation_is_not_a_seed_site() {
+        let (_dir, db) = seeded_db(&[(0, "EPOCH0==", "active")]);
+        let (change_tx, _change_rx) = broadcast::channel(16);
+        let broker = Broker::new(db.clone(), crate::broker::new_registry());
+        // `Broker::new` already hands back an `Arc<Broker>`, which is exactly
+        // what `SyncSvc::new` wants — wrapping it again builds an
+        // `Arc<Arc<Broker>>`.
+        let svc = SyncSvc::new(db, change_tx, broker);
+
+        assert_eq!(
+            svc.recorded_session_generation(GW),
+            0,
+            "a gateway with no recorded Sync session must read as generation 0 — the \
+             legacy/unknown sentinel that makes the session-generation gate INERT and \
+             fail-open for that gateway. This `.unwrap_or(0)` is a fourth, unrelated site: \
+             it is a per-boot nonce, not a rotation epoch, and S3 must leave it exactly as \
+             it is. Changing it to an `Option` alongside the three seed sites would start \
+             rejecting legacy gateways' `Sync.Report` calls with FAILED_PRECONDITION"
         );
     }
 }

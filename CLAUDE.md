@@ -168,6 +168,14 @@ was never driven, stranding a `retiring` row — and `initiate_due_rotations` sk
 `state IN ('pending','retiring')`, so **automatic rotation was self-disabling
 after one round per gateway, silently**.
 
+**S3 — the `Retire{0}` wedge (backlog item 5) — is closed too:**
+`prior_active_epoch` is `Option<u32>` at all three tracker-seed sites, and
+`decide` rule 1 yields `Finished` rather than an unsatisfiable `Retire{0}` when
+a promoted tracker has no prior active epoch. **This was hardening, not a timer
+gate** — the state is unreachable from any current mutation path and arises only
+for a key-row set with no `active` row, which `Db::rotate_key` deliberately
+tolerates. See `docs/BACKLOG.md` item 5.
+
 Rotation research notes live in `docs/research/`
 (`second-rotation-stranded-tracker.md`,
 `port-authority-verification-the-shape-was-wrong.md`,
