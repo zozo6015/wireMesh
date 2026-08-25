@@ -451,18 +451,33 @@ that file is `#[ignore]`d today. This item no longer holds the timer &mdash; ite
 The in-step case is a multi-gateway problem and **there is no harness for it**. That is
 why it went unnoticed until a done-bar forced it. Likely a prerequisite for item 3.
 
-### 5. `Retire{0}` permanent wedge
+### 5. RESOLVED &mdash; `Retire{0}` permanent wedge
 
-`prior_active_epoch` is `.unwrap_or(0)` when the snapshot has no `active` row, at
-**three** sites &mdash; `drive_rotation_for`, `sweep_rotations` step 2, and **`report`'s
-batched seed loop** (a fix that misses the third leaves it reachable via the ack path).
-The tracker promotes, rule 1 then yields `Retire{0}` forever, the CAS matches nothing
-forever, and `evict_decision`'s `None`-means-keep makes it an unconditional keep with no
-`pending`/`retiring` row for the sweep to find. Permanent.
+**Fixed in PR2 (S3).** `prior_active_epoch` is now `Option<u32>` end to end &mdash;
+`rotation::RotationState::prior_active_epoch` and
+`services::sync::RotationTracker::prior_active_epoch` &mdash; and the `.unwrap_or(0)`
+coercion is gone from **all three** tracker-seed sites: the rebuild-if-absent block in
+`services::sync::drive_rotation_for`, step 2 of `services::sync::sweep_rotations`, and the
+batched seed loop now living in `services::sync::seed_and_record_epoch_acks` (hoisted out
+of `SyncSvc::report` so the third site is reachable from a test at all &mdash;
+`peer_identity` needs a `TlsConnectInfo` with no public constructor). `rotation::decide`
+rule 1 yields the new `rotation::RotationDecision::Finished` when a promoted tracker has
+no prior active epoch, which `drive_rotation_for` maps to `TrackerEffect::Finished` with
+**no DB call**, so the tracker clears instead of failing a CAS on every tick forever.
 
-Fix: type `prior_active_epoch` as `Option<u32>` and teach rule 1 to skip a retire with
-nothing to retire. **Do not** paper over it by removing the tracker on row-absent &mdash;
-that is trap #2 below, in a new place.
+`Finished` is returned **regardless of elapsed time**: `RETIRE_GRACE` buys
+make-before-break time for peers still finishing a handshake on the prior key, and with no
+prior key there is nothing for a grace to protect.
+
+**Not fixed by removing the tracker on row-absent** &mdash; that was the explicitly
+forbidden shape (trap #2 in a new place). The `Retire`/`CasOutcome::NoMatch` arm still
+keeps its tracker, `evict_decision`'s `None`-means-keep is untouched, and the unrelated
+`.unwrap_or(0)` in `SyncSvc::recorded_session_generation` (a session-generation nonce) was
+deliberately left alone.
+
+This was **hardening, not a timer gate**: the entry state is unreachable from any current
+mutation path and arises only for a key-row set with no `active` row, which
+`Db::rotate_key` deliberately tolerates. Item 9 is the only code gate on the timer.
 
 ### 6. Rotation observability (F2/F5) &mdash; deferred review findings
 
