@@ -3041,7 +3041,23 @@ async fn run_path_ticks(ctx: PathCtx) {
         // element. A relay dropped from the advertised set keeps its entry
         // until the PEER goes away; that is deliberate (the relay may be
         // re-advertised, and the back-off it earned is still the truth about
-        // it), and the map is bounded by peers x advertised relays.
+        // it).
+        //
+        // The bound, stated exactly, because the loose version invites
+        // skipping a cleanup that matters: this is bounded by LIVE peers ×
+        // the relays ever advertised to them WHILE THEY LIVE — not by the
+        // currently-advertised set. Relay ids are controller-assigned
+        // enrollment ids, so that second factor is a small, bounded set
+        // rather than anything attacker- or churn-driven, and an entry costs
+        // one `RelayConnectBackoff`. It is therefore bounded, but by a
+        // HIGH-WATER MARK, not by the live advertisement.
+        //
+        // The principled cleanup is filed, not done here (`docs/BACKLOG.md`,
+        // beside item 19): "a `RelaysChanged` delta that alters relay R's
+        // endpoint should clear the `(gid, R)` back-off entry — the
+        // accumulated failure history is about a string that no longer
+        // exists". That is the right trigger; peer departure is merely the
+        // one this loop already has in hand.
         ctx.relay_connect_backoff
             .lock()
             .unwrap()
