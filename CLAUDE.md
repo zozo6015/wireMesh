@@ -133,19 +133,32 @@ DEFAULT EVERYWHERE, not just on the live fabric: an absent
 the schedule is opt-in and the live fabric's `off` is one instance of the
 default rather than a local override. Rotation on demand works, but only as the
 Admin `RotateKey` RPC — `fabricctl` has **no `rotate` subcommand**, so it takes a
-hand-rolled gRPC call against the loopback-only Admin service (backlog item 33). Both original blockers are now cleared; what gates arming
-the timer anywhere is a third finding — **backlog item 9, the rotation wedge**,
-which surfaced while clearing the first:
+hand-rolled gRPC call against the loopback-only Admin service (backlog item 33). Both original blockers are now cleared; what gated arming
+the timer was a third finding — **backlog item 9, the rotation wedge**, which
+surfaced while clearing the first and whose silent-permanent half (route R1) is
+now fixed:
 
 1. ~~**The in-step case is red.**~~ **FIXED in v0.9.1.** The controller rotates
    every active gateway off one timer, so the fabric rotates in step — a
    scenario nothing had tested. Its done-bar at
    `crates/wiremesh-gateway/tests/key_rotation.rs` is green with no `#[ignore]`s
-   left. What still gates the timer is **backlog item 9, the rotation wedge**: a
-   rotation that fails part-way parks the phase off-`Idle`, and
-   `Rotation::on_directive` is honoured only from `Idle`, so that gateway
-   silently ignores every later directive until the process restarts (and never
-   scrubs the old key). `docs/BACKLOG.md` item 9.
+   left. ~~What still gates the timer is backlog item 9, the rotation wedge.~~
+   **Item 9's route R1 is FIXED in Phase B (PR1/B2):** `handle_rotate` now
+   unwinds its own failure synchronously — `handle_rotate_inner` threads a
+   `RotationResidue`, and on `Err` `unwind_failed_rotation` drops `role_a`,
+   tears the new epoch's tun down, evicts its enforcer, scrubs the orphan mint
+   (`EpochKeys::discard_pending`), and drives `Rotation::on_failed`
+   (`Overlapping → Idle`) last, so the next directive is honoured and the
+   minted private key does not survive on disk. `EpochKeys::generate_next` was
+   replaced by `generate_next_at` in the same change: the gateway's local
+   `max + 1` numbering was a second counter that diverged from the controller's
+   the moment the scrub removed a local entry, and diverged it left the OLD key
+   unscrubbed.
+   **B2 closes the wedge; the timer remains off pending R2/R15 (Phase C)** —
+   R2 is item 9's route where the new epoch never goes live
+   (aborting it gateway-side would be a hard blackhole, so it gets
+   `OVERLAP_STALL_WARN` and the phase gauge only), and R15 is the
+   `submit_epoch_key` hang route. `docs/BACKLOG.md` item 9.
 2. ~~The reserved-port handoff rests on kernel UDP hash ordering.~~ **Checked
    2026-08-07 and DOWNGRADED — no longer a blocker.** The boringtun socket leak
    is real and larger than predicted (four sockets on the reserved port at the

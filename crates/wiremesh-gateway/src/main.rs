@@ -362,6 +362,34 @@ const ROTATION_TICK_PERIOD: Duration = Duration::from_millis(200);
 /// the old key — before the old private key is dropped (make-before-break).
 const RETIRE_GRACE: Duration = Duration::from_secs(2 * ROTATION_KEEPALIVE as u64);
 
+/// How long this gateway's rotation may sit in `Overlapping` — new epoch built
+/// and its key submitted, but no peer ever rx-corroborated live on the new tun
+/// — before the tick says so, loudly and once (B2, design §3.2 Piece 1b's
+/// route R2).
+///
+/// **A gateway-LOCAL constant that deliberately MIRRORS the controller's
+/// `GRACE_PROMOTE`, and must be revisited if that changes.** It is not an
+/// import and cannot be one: `crates/wiremesh-gateway`'s dependencies are
+/// `wiremesh-{proto,policy,enforcer,trust,relay,enroll}` and nothing else, so
+/// `wiremesh_controller::rotation::GRACE_PROMOTE` is not nameable here, and
+/// adding a dependency on the control plane to reach a log line would invert
+/// the layering. The duplication is the cheaper of the two failure modes.
+///
+/// What it warns about: at this point the controller has probably ALREADY
+/// grace-promoted this gateway's new epoch with ZERO acks (`decide` rule 4, the
+/// recorded KNOWN HAZARD §E), so the roster is advertising a key the data plane
+/// here has not cut over to. This is observability ONLY — R2 is explicitly not
+/// abortable gateway-side, because aborting after the key was submitted turns a
+/// degraded-but-reachable gateway into a hard, non-self-healing blackhole
+/// (there is no gateway-to-controller cancel RPC). See `Rotation::on_failed`.
+///
+/// **Mirrored by `tests/rotation_wedge.rs::STALL_WARN_AFTER`.** Changing this
+/// value means changing that one in the same commit: the done-bar's healthy
+/// follow-up rotation only trusts its "no new stall warning" assertion once
+/// more than this much time has elapsed, so a drift makes the test decline to
+/// assert rather than fail — silently weaker, not red.
+const OVERLAP_STALL_WARN: Duration = Duration::from_secs(90);
+
 /// How often the run task wakes to service a pending old-epoch retire even when
 /// the controller is quiet (no Sync traffic). The teardown happens in the run
 /// task because it owns the non-`Send` `TunnelSet`; the rotation tick only
@@ -711,6 +739,18 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
     // scrape body carries live path-state gauges + transition counters
     // (review finding: these were rendered/tested in `metrics.rs` but never
     // actually reached the HTTP scrape).
+    // Rotation observability (B2, design §3.2 Piece 4) is constructed HERE,
+    // above the metrics block, rather than with the rest of `RotationShared`
+    // below: the `fetch` closure is built before `rot` exists, and a renderer
+    // the scrape cannot reach proves nothing (the exact wiring failure the
+    // path-state gauges once had — see `tests/peer_metrics.rs`'s header). Both
+    // handles are cloned into the closure AND into `RotationShared`, the same
+    // pattern `epoch_keys`/`applied_version` already use.
+    let rotation: Arc<std::sync::Mutex<Rotation>> =
+        Arc::new(std::sync::Mutex::new(Rotation::new()));
+    // Counts rotations that failed setup and were unwound. Written by
+    // `unwind_failed_rotation`, read only by the scrape.
+    let rotation_aborts: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
     {
         let metrics_listener = TcpListener::bind(cfg.metrics_addr)
             .await
@@ -723,12 +763,16 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         let applied_version = applied_version.clone();
         let ctx = ctx.clone();
         let policy_apply_metrics = policy_apply.clone();
+        let rotation_metrics = rotation.clone();
+        let rotation_aborts_metrics = rotation_aborts.clone();
         tokio::spawn(async move {
             let fetch = move || {
                 let enforcers = enforcers.clone();
                 let applied_version = applied_version.clone();
                 let ctx = ctx.clone();
                 let policy_apply = policy_apply_metrics.clone();
+                let rotation = rotation_metrics.clone();
+                let rotation_aborts = rotation_aborts_metrics.clone();
                 async move {
                     // Aggregate deny counters across ALL live enforcers (boot
                     // tun + any rotation tun) so a post-rotation deny on the new
@@ -824,6 +868,13 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
                         // reason — a gauge that never reaches the scrape body
                         // proves nothing. See `render_live_enforcers`.
                         live_enforcers,
+                        // B2: this gateway's own rotation phase + the count of
+                        // rotations that failed setup and were unwound. The
+                        // guard is taken and dropped in this expression (no
+                        // `.await` in scope), same discipline as every other
+                        // `std::sync::Mutex` read on this path.
+                        rotation.lock().unwrap().phase.clone(),
+                        rotation_aborts.load(Ordering::Relaxed),
                     ))
                 }
             };
@@ -837,8 +888,18 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
 
     // --- Key-rotation wiring (make-before-break) ---------------------------
     // Migrate the pre-rotation single identity key into a one-epoch store
-    // (epoch 0, "active") the first time a rotation-aware gateway boots, so
-    // `generate_next` has a base to mint from. Steady-state (no rotation)
+    // (epoch 0, "active") the first time a rotation-aware gateway boots.
+    //
+    // This baseline is STILL REQUIRED after B2 made the controller the sole
+    // epoch-numbering authority (`EpochKeys::generate_next_at`), even though
+    // the old justification — "so `generate_next` has a base to mint from" —
+    // no longer applies: nothing derives an epoch NUMBER from the store any
+    // more, but `EpochKeys::active` and `select_boot_key` resolve by STATE, and
+    // `handle_rotate_inner`'s `active_epoch` reads `ek.active()` with an
+    // `unwrap_or(0)` fallback. Without an epoch-0 "active" row that fallback
+    // would silently stand in for the real active epoch, and it anchors the
+    // port authority and decides which epoch a retire tears down. Steady-state
+    // (no rotation)
     // behavior is completely unchanged: the boot epoch already runs on `wg0`
     // at the base port from the boot above; the epoch store is only consulted
     // when a rotation actually starts. Uses the store loaded at boot-key
@@ -885,7 +946,8 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         state_dir: cfg.state_dir.clone(),
         identity: Arc::new(id.clone()),
         controller_sync_addr: cfg.controller_sync_addr.clone(),
-        rotation: Arc::new(std::sync::Mutex::new(Rotation::new())),
+        rotation: rotation.clone(),
+        rotation_aborts: rotation_aborts.clone(),
         role_a: Arc::new(std::sync::Mutex::new(None)),
         role_b: Arc::new(std::sync::Mutex::new(HashMap::new())),
         active: active.clone(),
@@ -4325,7 +4387,21 @@ struct RotationShared {
     controller_sync_addr: String,
     /// This gateway's own rotation state machine (Role A). `on_directive`
     /// (sync loop) and `on_new_epoch_session` (tick) both drive it.
+    ///
+    /// Constructed ABOVE the metrics block rather than here, because the
+    /// scrape's `fetch` closure needs the same handle and is built first —
+    /// see `wiremesh_gateway_rotation_phase` (B2).
     rotation: Arc<std::sync::Mutex<Rotation>>,
+    /// How many rotations have failed setup and been unwound
+    /// ([`unwind_failed_rotation`], B2). Exposed as
+    /// `wiremesh_gateway_rotation_aborts_total{reason="failed"}`.
+    ///
+    /// Incremented on ENTRY to the unwind — "an unwind ran" — deliberately NOT
+    /// when `Rotation::on_failed` returns `Some(Abort)`. Tying it to the state
+    /// machine's edge would make one sabotage (deleting the unwind's
+    /// `on_failed` step) turn TWO assertions red at once, and a probe that
+    /// fires for more than one reason cannot tell you which property broke.
+    rotation_aborts: Arc<AtomicU64>,
     /// Present while THIS gateway is rotating its own key (Role A): what the
     /// tick must watch on the new tun to trigger the route flip.
     role_a: Arc<std::sync::Mutex<Option<RoleA>>>,
@@ -4516,11 +4592,151 @@ impl RoleB {
     }
 }
 
-/// Role A: handle a `RotateDirective`. Mint+persist the new epoch key, bring
-/// its Device up alongside `wg0` (the "make"), reconcile it against the
-/// current peers at the offset port, submit the real pubkey to the controller,
-/// and arm the observation tick to watch for the peer's live session. Idempotent
-/// against a re-entrant directive (the SM only honors one from `Idle`).
+/// What a `handle_rotate_inner` that failed part-way left behind, so
+/// [`unwind_failed_rotation`] can take exactly it back down and nothing else
+/// (B2, design §3.2 Piece 2b).
+///
+/// A LOCAL `&mut` out-param of `handle_rotate_inner`, not shared state:
+/// only the synchronous `Err` path in the wrapper ever reads it, and it is
+/// written progressively as the rotation makes progress, so unwinding an
+/// epoch that was never built is a no-op rather than a guess.
+///
+/// **Deliberately NOT `Default`-constructible.** A defaulted `tun_epoch` of 0
+/// names `TunnelId::Own { epoch: 0 }` — the LIVE boot tun on a gateway that
+/// has never rotated — so a default residue reaching the unwind would tear the
+/// data plane down. [`RotationResidue::for_directive`] is the only constructor
+/// and it requires the epoch up front.
+struct RotationResidue {
+    /// The epoch whose tun/enforcer this rotation keyed on: the DIRECTIVE
+    /// epoch, which is what `plan_tunnel`/`bring_up` were called with.
+    tun_epoch: u32,
+    /// `Some` once a key has actually been minted into the store, so unwind
+    /// step 4 knows whether there is an orphan `"pending"` entry to scrub.
+    /// Stays an `Option` even though B2 mints at the directive epoch (making
+    /// the two numbers equal): what step 4 gates on is "did a mint happen at
+    /// all", and collapsing it to a bare `u32` would reintroduce exactly the
+    /// scrub-something-that-was-never-minted hazard this type exists to stop.
+    minted_epoch: Option<u32>,
+}
+
+impl RotationResidue {
+    /// The only constructor: a rotation that has just been accepted by the SM
+    /// and has built nothing yet.
+    ///
+    /// Seeding `tun_epoch` from the directive epoch is exact, not a guess:
+    /// `Rotation::on_directive(directive_epoch)` can only return
+    /// `MintBringUpSubmit { epoch: directive_epoch }`, and a REFUSED directive
+    /// returns `Ok(())` from the inner without ever reaching the unwind.
+    fn for_directive(directive_epoch: u32) -> Self {
+        Self {
+            tun_epoch: directive_epoch,
+            minted_epoch: None,
+        }
+    }
+}
+
+/// Take back down everything a failed rotation built, then return the state
+/// machine to `Idle` so the NEXT `RotateDirective` is honored (B2, BACKLOG
+/// item 9).
+///
+/// # Why this exists
+///
+/// `handle_rotate` advances the phase to `Overlapping` in its FIRST statement
+/// and then does eight fallible things. Any `Err` before `rot.role_a` is set
+/// used to park the machine off-`Idle` with `role_a == None` — and the entire
+/// Role-A arm of [`run_rotation_ticks`] is inside `if let Some(a) = role_a`,
+/// so that state was structurally invisible to the tick: nothing drove it,
+/// nothing timed it out, and `Rotation::on_directive` refuses from any
+/// non-`Idle` phase. The gateway silently ignored every later directive until
+/// the process restarted, and never scrubbed its old key. Nothing retried the
+/// directive either — the controller emits it exactly once per `KeyRotated`.
+///
+/// # Best-effort throughout, and the order is load-bearing
+///
+/// No `?` anywhere: every step logs and continues, because a failure to clean
+/// up one resource must not strand the others OR block the SM reset that is
+/// the whole point. `on_failed` runs LAST so the phase only returns to `Idle`
+/// after the resources it named are gone — otherwise a directive accepted in
+/// the gap would collide with them.
+async fn unwind_failed_rotation(
+    tunnels: &mut TunnelSet,
+    enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
+    rot: &RotationShared,
+    residue: &RotationResidue,
+) {
+    // Counted HERE, on entry — "an unwind ran" — not on `on_failed`'s edge
+    // below. See `RotationShared::rotation_aborts` for why the distinction is
+    // deliberate and must not be "tidied".
+    rot.rotation_aborts.fetch_add(1, Ordering::Relaxed);
+
+    // 1. Stop the tick watching a rotation that is being abandoned. First,
+    //    because every later step removes something the tick could otherwise
+    //    observe mid-teardown.
+    *rot.role_a.lock().unwrap() = None;
+
+    // 2. The new epoch's Device. Idempotent: `TunnelSet::tear_down` returns
+    //    `Ok(())` for an id it does not hold, which is the common case here
+    //    (most of the fallible steps precede `bring_up`).
+    let id = TunnelId::Own {
+        epoch: residue.tun_epoch,
+    };
+    if let Err(e) = tunnels.tear_down(id) {
+        eprintln!(
+            "wiremesh-gateway: unwinding failed rotation: tearing down epoch {} Device failed: \
+             {e}",
+            residue.tun_epoch
+        );
+    }
+
+    // 3. Its enforcer entry. Dropping the value detaches the tc-BPF/nft
+    //    program; the Device is already gone, so this closes the map entry
+    //    rather than disarming anything live.
+    enforcers.lock().await.remove(&id);
+
+    // 4. The orphan mint — the SECURITY half. Every aborted rotation used to
+    //    leave its freshly-generated PRIVATE KEY in `epoch_keys.json` with no
+    //    removal path at all (`retire` only accepts `"retiring"`), so they
+    //    accumulated without bound. Only reached when a mint is known to have
+    //    happened, so `discard_pending`'s absent-is-an-error guard is never
+    //    tripped from here.
+    if let Some(minted) = residue.minted_epoch {
+        let mut ek = rot.epoch_keys.lock().unwrap();
+        match ek.discard_pending(minted) {
+            Ok(()) => {
+                if let Err(e) = ek.persist(&rot.state_dir) {
+                    eprintln!(
+                        "wiremesh-gateway: CRITICAL: persisting the discard of aborted epoch \
+                         {minted} failed: {e:#} — its PRIVATE KEY is still on disk in \
+                         epoch_keys.json"
+                    );
+                }
+            }
+            Err(e) => eprintln!(
+                "wiremesh-gateway: CRITICAL: discarding aborted epoch {minted} from the key \
+                 store failed: {e:#} — its private key remains in epoch_keys.json"
+            ),
+        }
+    }
+
+    // 5. LAST: return the SM to `Idle`. A no-op from `Idle`, and — critically —
+    //    from `CutOver`, which this path cannot be in but which `on_failed`
+    //    refuses anyway (tearing the old epoch down after routes have flipped
+    //    is how make-before-break collapses; see `Rotation::on_failed`).
+    let action = rot.rotation.lock().unwrap().on_failed();
+    if let Some(RotationAction::Abort { epoch }) = action {
+        eprintln!(
+            "wiremesh-gateway: rotation abort unwound epoch {epoch}; state machine returned to \
+             Idle — the next RotateDirective will be honoured"
+        );
+    }
+}
+
+/// Role A: handle a `RotateDirective` and, if any step of it fails, unwind
+/// that failure synchronously before returning the error (B2).
+///
+/// The body lives in [`handle_rotate_inner`]; this wrapper exists only to own
+/// the failure path. Its caller (the sync loop) only logs the error, which is
+/// exactly why the unwind cannot be left to the caller.
 async fn handle_rotate(
     tunnels: &mut TunnelSet,
     enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
@@ -4529,14 +4745,69 @@ async fn handle_rotate(
     applied: Option<&DesiredState>,
     client: &mut SyncClient<Channel>,
 ) -> anyhow::Result<()> {
+    let mut residue = RotationResidue::for_directive(directive_epoch);
+    let result = handle_rotate_inner(
+        tunnels,
+        enforcers,
+        rot,
+        directive_epoch,
+        applied,
+        client,
+        &mut residue,
+    )
+    .await;
+    if let Err(e) = &result {
+        // Emitted BEFORE the unwind, so this line is independent of every one
+        // of the unwind's five steps and survives regardless of which of them
+        // is reached. `ROTATION ABORTED` is the stable operator/test anchor:
+        // `tests/rotation_wedge.rs` greps stderr for that exact token. Do not
+        // reword it without updating the test.
+        //
+        // `{e:#}` (alternate) prints anyhow's FULL context chain, deliberately:
+        // a second directive arriving inside `tunnelset::QUARANTINE` fails at
+        // `plan_tunnel` because the reserved own-tun port is still held, and
+        // that error text is the only thing distinguishing "the rotation was
+        // refused for 5 seconds" from "the gateway is wedged". Do not collapse
+        // this to `{e}`.
+        eprintln!(
+            "wiremesh-gateway: ROTATION ABORTED — rotation to epoch {} failed, unwinding: {e:#}",
+            residue.tun_epoch
+        );
+        unwind_failed_rotation(tunnels, enforcers, rot, &residue).await;
+    }
+    result
+}
+
+/// Role A: handle a `RotateDirective`. Mint+persist the new epoch key, bring
+/// its Device up alongside `wg0` (the "make"), reconcile it against the
+/// current peers at the offset port, submit the real pubkey to the controller,
+/// and arm the observation tick to watch for the peer's live session. Idempotent
+/// against a re-entrant directive (the SM only honors one from `Idle`).
+async fn handle_rotate_inner(
+    tunnels: &mut TunnelSet,
+    enforcers: &Arc<Mutex<HashMap<TunnelId, GatewayEnforcer>>>,
+    rot: &RotationShared,
+    directive_epoch: u32,
+    applied: Option<&DesiredState>,
+    client: &mut SyncClient<Channel>,
+    residue: &mut RotationResidue,
+) -> anyhow::Result<()> {
     let action = rot.rotation.lock().unwrap().on_directive(directive_epoch);
     let Some(RotationAction::MintBringUpSubmit { epoch: n }) = action else {
+        // REFUSED, not failed: nothing was built, so this returns `Ok` and the
+        // wrapper's unwind is never reached. That is what makes the residue
+        // safe to seed with the directive epoch before this point.
         eprintln!(
             "wiremesh-gateway: ignoring RotateDirective(epoch={directive_epoch}) — a rotation is \
              already in flight"
         );
         return Ok(());
     };
+    // Accepted. `n == directive_epoch` by construction (`on_directive` echoes
+    // its argument), so this restates rather than changes the seed — but it is
+    // written here so the residue's provenance is the SM's answer, not the
+    // caller's guess.
+    residue.tun_epoch = n;
     let ds = applied.ok_or_else(|| {
         anyhow::anyhow!(
             "RotateDirective arrived before any desired state; no peer set to mint against"
@@ -4548,19 +4819,43 @@ async fn handle_rotate(
     // from the same snapshot — post-reboot-on-a-promoted-epoch this is the
     // promoted epoch (not 0), which anchors the port offset and, later, which
     // epoch the retire tears down.
+    //
+    // The mint is AT THE DIRECTIVE EPOCH `n` (B2). The gateway used to number
+    // its own epochs `local max + 1`, a second counter that agreed with the
+    // controller's `MAX(epoch) + 1` only for as long as nothing removed a
+    // local entry — which B2's orphan scrub now does. See
+    // `EpochKeys::generate_next_at` for the full derivation of what diverging
+    // costs (a submit under one number and a store under another, a cutover
+    // promote that misses, and an old private key that is never scrubbed).
     let (new_key, active_epoch) = {
         let mut ek = rot.epoch_keys.lock().unwrap();
-        let new_key = ek.generate_next()?.clone();
+        let new_key = ek.generate_next_at(n)?.clone();
+        // Recorded BEFORE the persist: the mint is already in the in-memory
+        // store at this point, and that store is shared with two other
+        // writers, so a failed persist still leaves an orphan the unwind must
+        // scrub.
+        residue.minted_epoch = Some(new_key.epoch);
         ek.persist(&rot.state_dir)?;
         let active_epoch = ek.active().map(|k| k.epoch).unwrap_or(0);
         (new_key, active_epoch)
     };
+    // Unreachable by construction now that the mint takes the directive epoch,
+    // and kept as a hard error rather than deleted: it is the only tripwire on
+    // the invariant everything below (the port formula, the tun name, the
+    // submit, the cutover's promote) silently assumes.
     if new_key.epoch != n {
-        eprintln!(
-            "wiremesh-gateway: WARNING minted epoch {} != directive epoch {n}; proceeding on the \
-             directive epoch for the port/tun convention",
+        anyhow::bail!(
+            "minted epoch {} != directive epoch {n} — generate_next_at must mint at the epoch it \
+             is given; every port/tun/submit/promote below assumes they are the same",
             new_key.epoch
         );
+    }
+
+    #[cfg(feature = "netns-tests")]
+    if wiremesh_gateway::config::fault::rotation_faults()
+        .take(wiremesh_gateway::config::fault::RotationFailPoint::AfterMint)
+    {
+        anyhow::bail!("injected rotation failure at after-mint (netns-tests fault hook)");
     }
 
     // Plan the new tun's ifname + listen port against everything already live
@@ -4599,6 +4894,13 @@ async fn handle_rotate(
         TUN_MTU,
     )?;
 
+    #[cfg(feature = "netns-tests")]
+    if wiremesh_gateway::config::fault::rotation_faults()
+        .take(wiremesh_gateway::config::fault::RotationFailPoint::AfterBringUp)
+    {
+        anyhow::bail!("injected rotation failure at after-bring-up (netns-tests fault hook)");
+    }
+
     // SECURITY (fail-closed): attach the L4 enforcer to the new epoch tun with
     // the current policy BEFORE the device is made session-capable (peer
     // apply, below). `bring_up` only brought the Device up with an EMPTY peer
@@ -4629,6 +4931,18 @@ async fn handle_rotate(
     // at the same epoch number would DROP the displaced enforcer and detach
     // its tc-BPF/nft program from a tun that is still carrying traffic.
     enforcers.lock().await.insert(plan.id, ke);
+
+    // The maximal-residue point: mint persisted, tun up, enforcer inserted,
+    // `role_a` still `None` — i.e. design §2.2's step 8, the one that leaks
+    // BOTH the tun and the enforcer entry, and an R1 park rather than an R2.
+    #[cfg(feature = "netns-tests")]
+    if wiremesh_gateway::config::fault::rotation_faults()
+        .take(wiremesh_gateway::config::fault::RotationFailPoint::AfterEnforcerInsert)
+    {
+        anyhow::bail!(
+            "injected rotation failure at after-enforcer-insert (netns-tests fault hook)"
+        );
+    }
 
     let dev = reconcile::device_config_at_port(
         ds,
@@ -5350,8 +5664,34 @@ async fn run_rotation_ticks(rot: RotationShared) {
     // The tick runs five times a second, so the warning is emitted on the
     // transition into that state rather than every 200ms.
     let mut warned_empty_watch = false;
+    // Loop-local, same idiom as the two above: when the CURRENT `Overlapping`
+    // spell began, and whether its stall has already been reported. Kept here
+    // rather than on `Rotation` so the state machine stays clock-free — a
+    // deliberate constraint, see `Rotation::on_failed`.
+    let mut overlapping_since: Option<Instant> = None;
+    let mut warned_overlap_stall = false;
     loop {
         tokio::time::sleep(ROTATION_TICK_PERIOD).await;
+
+        // R2 stall clock (B2), tracked OUTSIDE the `role_a` guard on purpose.
+        // An `Overlapping` spell begins the moment `handle_rotate` accepts the
+        // directive, which is BEFORE `role_a` is set — and `role_a` is cleared
+        // again at the retire while the phase is still moving — so a clock kept
+        // inside the guard would both start late and, worse, survive across
+        // rotations: the reset would be skipped on every tick where `role_a`
+        // was `None`, and the NEXT rotation would inherit a stale start instant
+        // and warn immediately. The warning itself still lives in the
+        // `Overlapping` arm below, since its message needs the tun/epoch that
+        // only `role_a` carries.
+        if matches!(
+            rot.rotation.lock().unwrap().phase,
+            RotationPhase::Overlapping { .. }
+        ) {
+            overlapping_since.get_or_insert_with(Instant::now);
+        } else {
+            overlapping_since = None;
+            warned_overlap_stall = false;
+        }
 
         // Role A: our own new epoch's Device.
         let role_a = rot.role_a.lock().unwrap().clone();
@@ -5426,8 +5766,38 @@ async fn run_rotation_ticks(rot: RotationShared) {
                 && live
                     .as_ref()
                     .map_or(false, |l| watch.iter().all(|(_, hex)| l.contains(hex)));
+            // R2 stall detection (B2). Tracked off the phase itself so it
+            // covers the whole `Overlapping` spell, and reset on any other
+            // phase so a completed or aborted rotation starts the next one
+            // clean.
             match phase {
                 RotationPhase::Overlapping { .. } => {
+                    let elapsed = overlapping_since.map_or(Duration::ZERO, |t| t.elapsed());
+                    if elapsed >= OVERLAP_STALL_WARN && !warned_overlap_stall {
+                        warned_overlap_stall = true;
+                        // TEST ANCHOR: `tests/rotation_wedge.rs::STALL_WARN_MARKER`
+                        // greps stderr for the token `ROTATION STALLED`, and it
+                        // does so as an ABSENCE check — the healthy follow-up
+                        // rotation asserts this count does NOT increase. So a
+                        // reworded line makes that assertion pass SILENTLY and
+                        // look like a healthy gateway rather than a broken test.
+                        // Rewording this string means updating that test in the
+                        // same change.
+                        eprintln!(
+                            "wiremesh-gateway: ROTATION STALLED — this gateway's rotation to {} \
+                             has been Overlapping for {}s with no peer ever rx-corroborated live \
+                             on the new tun. The controller grace-promotes with ZERO acks at \
+                             ~90s (recorded KNOWN HAZARD §E), so the roster is probably already \
+                             advertising epoch {} while this data plane is still serving the old \
+                             one. This is NOT self-healing and the gateway will NOT abort it: \
+                             once the key was submitted, unwinding here would tear down the tun \
+                             peers are dialling and blackhole them instead. Check the \
+                             controller's view of this gateway's epochs",
+                            a.new_tun,
+                            elapsed.as_secs(),
+                            a.old_epoch + 1
+                        );
+                    }
                     if any_live {
                         let action = rot.rotation.lock().unwrap().on_new_epoch_session(true);
                         if let Some(RotationAction::FlipRoutes { epoch }) = action {

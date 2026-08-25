@@ -40,9 +40,21 @@ pub struct EpochKey {
     pub state: String,
 }
 
-/// The gateway's full set of epoch keys, ordered by insertion (not
-/// necessarily by epoch number, though `generate_next` always appends the
-/// newest at the end).
+/// The gateway's full set of epoch keys.
+///
+/// **At most one entry per epoch**, and that is the invariant every mutation
+/// upholds: [`EpochKeys::generate_next_at`] replaces a `"pending"` occupant by
+/// REMOVING it before pushing, and [`EpochKeys::retire`] /
+/// [`EpochKeys::discard_pending`] remove by epoch.
+///
+/// **Insertion order carries no meaning and must not be relied on.** The
+/// vector may hold holes — a retired epoch is removed outright, never
+/// tombstoned — and it need not be ascending, because a mint lands at the
+/// epoch the controller's directive named, which is not necessarily the
+/// highest one present (B2: the gateway no longer numbers epochs itself; see
+/// `generate_next_at`). Every lookup is therefore by **state**
+/// ([`EpochKeys::active`]) or by **exact epoch** ([`EpochKeys::by_epoch`],
+/// `promote`, `retire`, `discard_pending`); nothing reads position.
 #[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct EpochKeys {
     pub epochs: Vec<EpochKey>,
@@ -65,30 +77,87 @@ impl EpochKeys {
         })
     }
 
-    /// Generate a fresh keypair at the next epoch number (`max epoch + 1`,
-    /// or `0` if the store is empty), append it in state `"pending"`, and
-    /// return a reference to it. The private key is 32 raw random bytes —
-    /// WireGuard/x25519 clamps on use, so no hand-clamping is needed here
-    /// (matches what `wg genkey` effectively produces).
-    pub fn generate_next(&mut self) -> anyhow::Result<&EpochKey> {
+    /// Generate a fresh keypair AT THE EPOCH THE CONTROLLER NAMED, store it in
+    /// state `"pending"`, and return a reference to it. The private key is 32
+    /// raw random bytes — WireGuard/x25519 clamps on use, so no hand-clamping
+    /// is needed here (matches what `wg genkey` effectively produces).
+    ///
+    /// # Why the caller supplies the number (B2, design §3.2 Piece 2c)
+    ///
+    /// This replaced a `generate_next` that numbered epochs itself as local
+    /// `max(epoch) + 1`. That was a SECOND, independent counter: the controller
+    /// numbers a rotation `MAX(epoch) + 1` over ITS `gateway_key` rows
+    /// (`controller/src/db.rs::Db::rotate_key`), and the two agreed only
+    /// because nothing ever removed a local entry. Once a failed rotation
+    /// scrubs its orphan mint (`discard_pending`, B2's whole point) they
+    /// diverge: the controller re-issues epoch *n+1* while this store's max is
+    /// back at *n-1*, so the gateway would submit its pubkey under the
+    /// directive epoch and store it under a different one. The cutover's
+    /// `promote(directive_epoch)` would then miss, nothing would be demoted to
+    /// `"retiring"`, and `service_retire`'s `retire` would miss too — leaving
+    /// the OLD PRIVATE KEY on disk forever, which is precisely the security
+    /// half B2 exists to deliver. The controller is the single authority on
+    /// epoch numbering; this function takes its answer.
+    ///
+    /// # Occupant handling — split by state, deliberately
+    ///
+    /// * `"pending"` at `epoch` → **replaced**. A crash between the mint's
+    ///   persist and the unwind can strand a local `"pending"` row at `n`
+    ///   while the controller's abort (`drop_pending_epoch`) DELETEs its own,
+    ///   freeing `n` to be re-issued. Refusing here would fail that mint
+    ///   forever — a second permanent wedge wearing a safety guard's clothes.
+    ///   The stale entry is removed (not flipped, not overwritten in place),
+    ///   because only removal takes its private key out of the bytes
+    ///   `persist` writes.
+    /// * `"active"` / `"retiring"` at `epoch` → **`Err`**, no mutation. Those
+    ///   are keys the data plane is using or still owes a grace to.
+    ///
+    /// # Ordering invariant
+    ///
+    /// **Nothing mutates `self.epochs` until every fallible step has already
+    /// succeeded** — guard, then derive, then replace, then push. Pubkey
+    /// derivation can fail, and mutating first would leave the occupant
+    /// scrubbed with nothing minted while the caller's `RotationResidue`
+    /// still says no mint happened, so the unwind would skip it. This store is
+    /// a shared `Arc<Mutex<EpochKeys>>` with three writers (`handle_rotate`,
+    /// the tick's cutover promote, `service_retire`), so a partial in-memory
+    /// mutation left by one is liable to be persisted by whichever runs next.
+    pub fn generate_next_at(&mut self, epoch: u32) -> anyhow::Result<&EpochKey> {
+        // 1. GUARD — refuse a live occupant. No mutation on this path.
+        if let Some(occupant) = self.epochs.iter().find(|k| k.epoch == epoch) {
+            if occupant.state != "pending" {
+                return Err(anyhow!(
+                    "cannot mint epoch {epoch}: already occupied by a \"{}\" key",
+                    occupant.state
+                ));
+            }
+        }
+        // 2. DERIVE — the last fallible step, still before any mutation.
         let mut raw = [0u8; 32];
         OsRng.fill_bytes(&mut raw);
         let private_key_b64 = crate::uapi::base64_encode(&raw);
         let pubkey_b64 = crate::uapi::base64_pub_from_priv(&private_key_b64)
             .context("deriving pubkey for newly generated epoch key")?;
-        let epoch = self
-            .epochs
-            .iter()
-            .map(|k| k.epoch)
-            .max()
-            .map_or(0, |m| m + 1);
+        // 3. REPLACE — remove any (necessarily "pending") occupant, so the
+        //    stale private key leaves the serialized bytes at the next
+        //    `persist`, and so the one-entry-per-epoch invariant holds.
+        self.epochs.retain(|k| k.epoch != epoch);
+        // 4. PUSH.
         self.epochs.push(EpochKey {
             epoch,
             private_key_b64,
             pubkey_b64,
             state: "pending".to_string(),
         });
-        Ok(self.epochs.last().expect("just pushed"))
+        // Looked up by epoch rather than `.last()`: the struct's documented
+        // invariant is that position means nothing, and leaving zero
+        // order-dependent expressions in this file is what makes that
+        // greppable rather than aspirational.
+        Ok(self
+            .epochs
+            .iter()
+            .find(|k| k.epoch == epoch)
+            .expect("just pushed"))
     }
 
     /// Persist to `state_dir/epoch_keys.json`, 0600, atomic tmp+rename +
@@ -158,7 +227,7 @@ impl EpochKeys {
     ///  2. No store, or a store with NO `"active"` entry → synthesized
     ///     epoch-0 active entry from the legacy key. NB the no-active-entry
     ///     branch has no natural producer in today's lifecycle: a crash
-    ///     between `generate_next`+persist and the cutover's promote leaves
+    ///     between `generate_next_at`+persist and the cutover's promote leaves
     ///     epoch 0 STILL `"active"` alongside the `"pending"` mint (branch 1
     ///     correctly selects epoch 0 — no cutover happened). It is
     ///     defensive hardening for a hand-edited/foreign store, pinned by
@@ -240,6 +309,41 @@ impl EpochKeys {
         if !is_retiring {
             return Err(anyhow!(
                 "cannot retire epoch {epoch}: not found or not in \"retiring\" state"
+            ));
+        }
+        self.epochs.retain(|k| k.epoch != epoch);
+        Ok(())
+    }
+
+    /// Remove `epoch` iff it is currently "pending". Errors otherwise (not
+    /// found, or found but not "pending"). The mirror of [`EpochKeys::retire`]
+    /// — same guard shape, same removal-is-the-scrub mechanism — for the OTHER
+    /// end of an epoch's life: a key that was minted but whose rotation never
+    /// reached cutover (B2, BACKLOG item 9).
+    ///
+    /// Every aborted rotation used to leave its mint behind: `generate_next_at`
+    /// appends in state `"pending"`, `promote` is the only thing that moves it
+    /// on, and `retire` refuses anything that is not `"retiring"` — so an
+    /// orphan `"pending"` PRIVATE KEY had no removal path at all and they
+    /// accumulated in `epoch_keys.json` without bound. This is that path.
+    ///
+    /// The `"pending"`-only guard is not decorative: an over-broad version
+    /// would delete the live `"active"` key, or a `"retiring"` one still inside
+    /// its grace. Removal (not a state flip) is what takes the key out of the
+    /// bytes the caller's `persist` writes — see `retire`.
+    ///
+    /// Atomic by construction: the guard is followed by a `retain` with no
+    /// fallible step between them, so this either removes the entry or leaves
+    /// the store untouched (the ordering invariant `generate_next_at`
+    /// documents, satisfied trivially here).
+    pub fn discard_pending(&mut self, epoch: u32) -> anyhow::Result<()> {
+        let is_pending = self
+            .epochs
+            .iter()
+            .any(|k| k.epoch == epoch && k.state == "pending");
+        if !is_pending {
+            return Err(anyhow!(
+                "cannot discard epoch {epoch}: not found or not in \"pending\" state"
             ));
         }
         self.epochs.retain(|k| k.epoch != epoch);

@@ -11,6 +11,7 @@
 //! boot — is proven end-to-end by Task 12's mesh milestone, which spawns the
 //! real binary and scrapes this port for real.
 use crate::path::PathState;
+use crate::rotation::RotationPhase;
 use std::future::Future;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -180,6 +181,43 @@ pub fn render_live_enforcers(count: u64) -> String {
     s
 }
 
+/// Render the gateway's own key-rotation state (B2, design §3.2 Piece 4):
+/// the current phase as an info-gauge plus the count of rotations that failed
+/// setup and were unwound.
+///
+/// `wiremesh_gateway_rotation_phase{phase="idle|overlapping|cutover"} 1`
+/// follows the `wiremesh_gateway_backend_info` / `wiremesh_gateway_path_state`
+/// info-gauge pattern — ONE line, for the current phase only, rather than
+/// explicit 0s for the other two. The phase label is
+/// [`RotationPhase::as_str`] and deliberately carries no epoch number, which
+/// would be unbounded-cardinality.
+///
+/// `wiremesh_gateway_rotation_aborts_total{reason="failed"}` counts unwinds.
+/// One label value only: `reason="failed"` is the sole way a rotation is
+/// abandoned gateway-side. A rotation whose key was already SUBMITTED is
+/// explicitly not abortable (design §3.2 Piece 1b — aborting there converts a
+/// degraded-but-reachable gateway into a hard blackhole), so there is no
+/// `reason="deadline"` and adding one would be a behaviour change, not a
+/// label.
+///
+/// Both are always emitted, including at 0 — an absent series is
+/// indistinguishable from a dead exporter, and "this gateway is aborting
+/// rotations" is exactly the alert an operator needs to be able to write
+/// (same rule as [`render_policy_apply_failures`]).
+pub fn render_rotation(phase: &RotationPhase, aborts: u64) -> String {
+    let mut s = String::new();
+    s.push_str("# TYPE wiremesh_gateway_rotation_phase gauge\n");
+    s.push_str(&format!(
+        "wiremesh_gateway_rotation_phase{{phase=\"{}\"}} 1\n",
+        phase.as_str()
+    ));
+    s.push_str("# TYPE wiremesh_gateway_rotation_aborts_total counter\n");
+    s.push_str(&format!(
+        "wiremesh_gateway_rotation_aborts_total{{reason=\"failed\"}} {aborts}\n"
+    ));
+    s
+}
+
 /// Wrap a Prometheus text body in a minimal HTTP/1.1 response.
 fn http_response(body: &str) -> String {
     format!(
@@ -195,8 +233,8 @@ fn http_response(body: &str) -> String {
 /// transition_counts, peer_stats, policy_apply_failures, live_enforcers)`,
 /// which is rendered via [`render`] + [`render_path_state`] +
 /// [`render_path_transitions`] + [`render_peer_stats`] +
-/// [`render_policy_apply_failures`] + [`render_live_enforcers`] and written
-/// back verbatim (any HTTP request line the client sent is drained and
+/// [`render_policy_apply_failures`] + [`render_live_enforcers`] +
+/// [`render_rotation`] and written back verbatim (any HTTP request line the client sent is drained and
 /// ignored — this is a scrape-only stub server, not a general HTTP server).
 ///
 /// `peer_stats` (sixth, mesh-convergence fix T5),
@@ -217,6 +255,8 @@ where
                 Vec<((PathState, PathState), u64)>,
                 Vec<(String, PeerStats)>,
                 u64,
+                u64,
+                RotationPhase,
                 u64,
             )>,
         > + Send
@@ -240,6 +280,8 @@ where
                     peer_stats,
                     policy_apply_failures,
                     live_enforcers,
+                    rotation_phase,
+                    rotation_aborts,
                 )) => {
                     let mut body = render(&kind, version, &counters);
                     body.push_str(&render_path_state(&peer_states));
@@ -247,6 +289,7 @@ where
                     body.push_str(&render_peer_stats(&peer_stats));
                     body.push_str(&render_policy_apply_failures(policy_apply_failures));
                     body.push_str(&render_live_enforcers(live_enforcers));
+                    body.push_str(&render_rotation(&rotation_phase, rotation_aborts));
                     body
                 }
                 Err(e) => format!("# error collecting counters: {e:#}\n"),
