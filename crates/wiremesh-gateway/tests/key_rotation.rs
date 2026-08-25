@@ -2589,11 +2589,12 @@ async fn in_step_rotation_of_both_gateways_stands_up_own_and_overlap_tuns() {
     // base port, and the retire is gated on this very session having been live
     // for a full `RETIRE_GRACE` (6s), so the window is comfortably wide — but
     // it is a window, and "was it ever right" is the honest question.
-    const BASE_WG_PORT: u16 = 51820; // must match `spawn_gw`'s `--wg-port`
-                                     // The peer's active key lives at `base + OWN_TUN_PORT_OFFSET` between its
-                                     // cutover and its retire — a RESERVED port, derived from the constant that
-                                     // reserves it rather than written as `51821`, so a change to the
-                                     // reservation moves the test with the code instead of silently past it.
+    // must match `spawn_gw`'s `--wg-port`
+    const BASE_WG_PORT: u16 = 51820;
+    // The peer's active key lives at `base + OWN_TUN_PORT_OFFSET` between its
+    // cutover and its retire — a RESERVED port, derived from the constant that
+    // reserves it rather than written as `51821`, so a change to the
+    // reservation moves the test with the code instead of silently past it.
     let own_tun_port = BASE_WG_PORT + OWN_TUN_PORT_OFFSET;
 
     let a_e1_b64 = poll_epoch_pubkey(&h, ga.id(), 1, Duration::from_secs(10)).await;

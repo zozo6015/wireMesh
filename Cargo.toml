@@ -18,9 +18,16 @@ exclude = ["crates/wiremesh-enforcer-ebpf"]
 # `cargo-platform` 0.3.3 (reached via `cargo_metadata`, which
 # `crates/wiremesh-enforcer/build.rs` uses to locate that sibling workspace),
 # which declares rustc 1.91. `cargo +1.91 check --workspace --all-targets -j 1`
-# then passes a real compile, clean. Verified once at PR0 by that run, and
-# re-verified nightly by the scheduled `cold-build` workflow, which installs
-# this exact version and fails closed.
+# then passes a real compile, clean. That run at PR0 is the whole of the
+# evidence today: the scheduled `cold-build` workflow does not exist yet. B4
+# (PR3) WILL add it, with an MSRV step that installs this exact version and
+# re-runs the check, failing closed. Until that lands this is a once-measured
+# floor, not a continuously enforced one.
+#
+# Nothing reads it for dependency resolution either: this workspace is
+# `resolver = "2"`, and MSRV-aware resolution arrived with resolver 3. So
+# `rust-version` here is a DECLARATION for humans and packagers -- cargo will
+# still happily resolve a dependency that raises the real floor above it.
 #
 # CI never builds AT this floor. Every job runs inside `dev/Dockerfile`,
 # whose default toolchain is 1.97.1 -- that image pin, not a root

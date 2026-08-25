@@ -2,9 +2,11 @@
 # The compiler is PINNED to an exact patch, not the floating `rust:1-bookworm`
 # tag, and this is the same discipline the bpf-linker pin below already
 # follows: capture the known-good version from a green run instead of letting a
-# rebuild silently adopt one the suite has never run on. It became load-bearing
-# when CI started running `cargo fmt --check` and `cargo clippy -D warnings` --
-# both produce toolchain-dependent output, so a floating base makes an
+# rebuild silently adopt one the suite has never run on. It becomes
+# load-bearing with B4 (PR3), which will add the repo's first `cargo fmt
+# --check` and `cargo clippy -D warnings` jobs -- no workflow runs either today
+# (`grep -rn "cargo fmt\|clippy\|rustfmt" .github/` returns nothing). Both
+# produce toolchain-dependent output, so a floating base would make an
 # unchanged tree red on the day a new stable ships.
 #
 # WHY THE PIN LIVES HERE AND NOT IN A ROOT `rust-toolchain.toml`. That was
@@ -18,9 +20,9 @@
 # darwin-x86_64 std, failing with `E0463 can't find crate for std` and taking
 # the x86_64 tarball and the universal .pkg with it. A toolchain file also
 # cannot carry per-platform targets, so there is no version of it that works.
-# Pinning the IMAGE instead reaches every job that needs pinning -- all CI runs
-# in this image -- and leaves the mac/windows release jobs on `@stable`,
-# exactly as they were before.
+# Pinning the IMAGE instead reaches every job that needs pinning -- B4's jobs
+# will all run in this image -- and leaves the mac/windows release jobs on
+# `@stable`, exactly as they were before.
 #
 # TWO LINES MUST MOVE TOGETHER, and they are named here because a version-tag
 # pin and a digest pin cannot drift together on their own -- this comment is
@@ -41,6 +43,18 @@
 # rather than fixed -- the design's "the compiler the suite is proven on" only
 # ever described Linux, which is precisely why the pin belongs to the images
 # and not to a root toolchain file.
+#
+# TWO ACCEPTED COSTS of naming an exact patch, stated rather than discovered.
+# (1) This tag no longer picks up base-OS security patches that
+# `rust:1-bookworm` would have rolled in; the release image is equally frozen
+# (its base is digest-pinned), so this does not make the shipped artifacts
+# staler than they already were, but it does mean base updates are now a
+# deliberate act. (2) A version tag is still a MUTABLE reference -- the
+# official images rebuild `rust:1.97.1-bookworm` in place -- so this pins the
+# compiler, not the layer. A digest would pin both; that is a bigger change
+# than PR0 and is filed as a follow-up, together with adding
+# `.github/dependabot.yml` (`package-ecosystem: docker`) so base bumps arrive
+# as reviewable PRs instead of never.
 #
 # The equivalence does not cover the eBPF half either: both Dockerfiles ALSO
 # `rustup toolchain install nightly` UNDATED, the object that nightly produces
@@ -75,20 +89,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #
 # `rustfmt` and `clippy` are added explicitly on BOTH toolchains. Neither was
 # present before: `cargo fmt` in this image failed with "'cargo-fmt' is not
-# installed for the toolchain '1.97.1-…'". CI's `fmt` and `clippy` jobs run in
-# this image, and relying on `rust-toolchain.toml`'s `components` to
-# auto-install them at runtime is not an option — containers run `--rm`, so
+# installed for the toolchain '1.97.1-…'". B4's `fmt` and `clippy` jobs will
+# run in this image, and relying on a `rust-toolchain.toml` `components` list
+# to auto-install them at runtime is not an option — containers run `--rm`, so
 # every invocation would re-download them.
 #
 # NIGHTLY needs `rustfmt` for a non-obvious reason, found by running it:
 # `crates/wiremesh-enforcer-ebpf` carries its own `rust-toolchain.toml` naming
-# nightly (so the root stable pin cannot capture that standalone build), which
-# means `cargo fmt` in THAT directory resolves to nightly's rustfmt, not
-# stable's. Without this, CI's `fmt` job dies on its second invocation with
-# "'cargo-fmt' is not installed for the toolchain 'nightly-...'". Nightly also
-# gets `clippy` so a later `bpfel-unknown-none` lint of the eBPF classifier
-# needs no new image.
-RUN rustup toolchain install nightly --component rust-src --component clippy --component rustfmt \
+# nightly, so `cargo fmt` in THAT directory resolves to nightly's rustfmt, not
+# stable's. Without this, B4's `fmt` job would die on its second invocation
+# with "'cargo-fmt' is not installed for the toolchain 'nightly-...'" against a
+# perfectly formatted tree. Nightly also gets `clippy` so a later
+# `bpfel-unknown-none` lint of the eBPF classifier needs no new image.
+#
+# `--allow-downgrade` is REQUIRED, not defensive. `clippy` and `rustfmt` are
+# toolstate-gated on nightly: on any nightly where one of them failed to build,
+# `rustup toolchain install nightly --component clippy --component rustfmt`
+# hard-fails rather than skipping the missing piece -- and because this is one
+# `RUN`, that failure would take the `cargo install bpf-linker` below with it
+# and break a cold `./dev.sh build` for reasons unrelated to this repo.
+# `--allow-downgrade` makes rustup step back to the most recent nightly that
+# has every requested component. `dtolnay/rust-toolchain` does exactly this for
+# nightly-plus-components, for exactly this reason.
+RUN rustup toolchain install nightly --component rust-src --component clippy --component rustfmt --allow-downgrade \
     && rustup component add rustfmt clippy \
     && cargo install bpf-linker --version 0.10.4 --locked \
     && cargo install cargo-generate
