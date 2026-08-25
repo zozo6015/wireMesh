@@ -468,9 +468,11 @@ except Exception:
     ns.exec(&["python3", "-c", &script]).is_ok()
 }
 
-// The spawned child is a long-lived netns helper (traffic generator /
-// listener) that this harness kills at teardown; `wait()`ing on it here
-// would block the test forever, which is what clippy's fix would do.
+// A long-lived netns helper (traffic generator / listener). `wait()`ing on
+// it here would block the suite forever, which is exactly what clippy's fix
+// does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
+// `ip netns del`, which takes every process in the namespace with it -- so
+// there is no orphan to reap and nothing for a `wait()` to accomplish.
 #[allow(clippy::zombie_processes)]
 fn check_tcp(from_ns: &Ns, to_ns: &Ns, to_addr: &str, dst_port: u16) -> bool {
     let mut listener = spawn_accept_only_listener(to_ns, dst_port);
@@ -720,9 +722,11 @@ fn check_raw_ip_proto(from_ns: &Ns, to_ns: &Ns, to_addr: &str, proto_num: u8) ->
 /// against BOTH backends from the same call site rather than being
 /// duplicated per-backend. Callers (this crate's `tests/conformance.rs`)
 /// call this once per `BackendKind`, alongside the `SCENARIOS` table.
-// The spawned child is a long-lived netns helper (traffic generator /
-// listener) that this harness kills at teardown; `wait()`ing on it here
-// would block the test forever, which is what clippy's fix would do.
+// A long-lived netns helper (traffic generator / listener). `wait()`ing on
+// it here would block the suite forever, which is exactly what clippy's fix
+// does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
+// `ip netns del`, which takes every process in the namespace with it -- so
+// there is no orphan to reap and nothing for a `wait()` to accomplish.
 #[allow(clippy::zombie_processes)]
 pub fn flip_under_traffic_zero_loss(kind: BackendKind) -> anyhow::Result<()> {
     let (lab, a, b) = wg_lab("aeth13");

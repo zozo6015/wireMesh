@@ -92,10 +92,15 @@ fn env(name: &str, value: impl Into<String>) -> EnvVar {
 /// hostNetwork), so a default RollingUpdate would surge a second pod that cannot
 /// mount the RWO PVC (or bind the host net), wedging the rollout.
 fn recreate_strategy() -> DeploymentStrategy {
+    // No `..Default::default()`: `DeploymentStrategy` is exhaustively specified
+    // here and is not `#[non_exhaustive]`, so a field added by a future
+    // k8s-openapi bump becomes a BUILD FAILURE at this line -- deliberately.
+    // Spreading the default instead would silently accept the new field's
+    // default for a Deployment strategy, which is the opposite of what a
+    // rollout-critical struct wants.
     DeploymentStrategy {
         type_: Some("Recreate".into()),
         rolling_update: None,
-        ..Default::default()
     }
 }
 
