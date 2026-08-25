@@ -375,6 +375,10 @@ mod tests {
             // And likewise the trailing `1u64` (key-rotation T3): the
             // steady-state live-enforcer count is the lone boot tun's, and
             // the scrape assertion for it lives in the rotation netns suite.
+            // B2: the tuple grows by two (phase, aborts). `tests/peer_metrics.rs`'s
+            // header records the rule this obeys — adding a metric means the
+            // `serve_metrics` fetch tuple grows by one element — because a
+            // renderer alone is INVISIBLE to a scrape.
             Ok::<_, anyhow::Error>((
                 "ebpf".to_string(),
                 9u64,
@@ -384,6 +388,8 @@ mod tests {
                 peer_stats,
                 0u64,
                 1u64,
+                RotationPhase::Overlapping { new_epoch: 3 },
+                2u64,
             ))
         }));
 
@@ -422,6 +428,68 @@ mod tests {
                 "wiremesh_gateway_path_transitions_total{from=\"connecting\",to=\"direct\"} 3"
             ),
             "path transitions must reach the scrape body: {text}"
+        );
+        // Without these two the netns done-bar's step (iii) cannot pass: it
+        // scrapes both series off a REAL gateway process, so a renderer that
+        // never reached the fetch tuple would make that assertion vacuous.
+        assert!(
+            text.contains("wiremesh_gateway_rotation_phase{phase=\"overlapping\"} 1"),
+            "the rotation phase gauge must reach the scrape body, not merely exist as a \
+             separately-tested pure renderer: {text}"
+        );
+        assert!(
+            text.contains("wiremesh_gateway_rotation_aborts_total{reason=\"failed\"} 2"),
+            "likewise the abort counter — it is `rotation_wedge.rs` step (iii)'s primary \
+             machine-readable evidence that the unwind ran at all: {text}"
+        );
+    }
+
+    #[test]
+    fn render_rotation_emits_phase_gauge_and_abort_counter() {
+        let out = render_rotation(&RotationPhase::Overlapping { new_epoch: 3 }, 2);
+        assert!(out.contains("# TYPE wiremesh_gateway_rotation_phase gauge"));
+        assert!(
+            out.contains("wiremesh_gateway_rotation_phase{phase=\"overlapping\"} 1"),
+            "body: {out}"
+        );
+        assert!(out.contains("# TYPE wiremesh_gateway_rotation_aborts_total counter"));
+        assert!(
+            out.contains("wiremesh_gateway_rotation_aborts_total{reason=\"failed\"} 2"),
+            "the abort counter is the only ALERTABLE signal that a gateway is failing rotations. \
+             R2 and R3 are both left OPEN by Phase B (design §3.2 Piece 1b, §3.5) and their \
+             entire operator story is this counter plus the phase gauge. body: {out}"
+        );
+    }
+
+    #[test]
+    fn render_rotation_names_only_the_current_phase() {
+        let idle = render_rotation(&RotationPhase::Idle, 0);
+        assert!(
+            idle.contains("wiremesh_gateway_rotation_phase{phase=\"idle\"} 1"),
+            "body: {idle}"
+        );
+        assert_eq!(
+            idle.lines()
+                .filter(|l| l.starts_with("wiremesh_gateway_rotation_phase{"))
+                .count(),
+            1,
+            "info-gauge pattern, as `render_backend_info` and `render_path_state` already use: \
+             emit ONLY the current phase, never 0-valued lines for the others. A scrape that \
+             also carried `phase=\"overlapping\" 0` would make \
+             `max_over_time(...phase{{phase=\"overlapping\"}})` — the alert an operator writes \
+             for a stuck rotation — silently useless. body: {idle}"
+        );
+
+        let cutover = render_rotation(&RotationPhase::CutOver { new_epoch: 4 }, 0);
+        assert!(
+            cutover.contains("wiremesh_gateway_rotation_phase{phase=\"cutover\"} 1"),
+            "body: {cutover}"
+        );
+        assert!(
+            !cutover.contains("phase=\"overlapping\""),
+            "a gateway in CutOver must not also report Overlapping: the two mean different things \
+             to an operator (setup in flight vs. retire debt outstanding — design §2), and \
+             CutOver is the one phase Phase B deliberately leaves unabortable. body: {cutover}"
         );
     }
 }

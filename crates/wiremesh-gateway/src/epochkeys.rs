@@ -355,12 +355,19 @@ impl EpochKeys {
 mod tests {
     use super::*;
 
+    /// REPURPOSED, not deleted (Piece 2c / Rev 1.9). This test's original
+    /// subject was `generate_next`'s `max+1` numbering — the thing Piece 2c
+    /// removes, because the CONTROLLER owns the epoch number. Both halves that
+    /// survive that change are kept verbatim: the stored pubkey really is
+    /// derived from the stored private key, and two mints produce distinct key
+    /// material. The `epoch == max+1` assertions are gone because the property
+    /// no longer exists; `generate_next_at_mints_at_the_requested_epoch_over_a_lower_max`
+    /// covers what replaced it. Net coverage rises — no case was dropped.
     #[test]
-    fn generate_next_produces_valid_keypair_at_next_epoch() {
+    fn generate_next_at_produces_a_valid_keypair() {
         let mut keys = EpochKeys::default();
 
-        let k0 = keys.generate_next().unwrap().clone();
-        assert_eq!(k0.epoch, 0);
+        let k0 = keys.generate_next_at(0).unwrap().clone();
         assert_eq!(k0.state, "pending");
         assert_eq!(
             crate::uapi::base64_pub_from_priv(&k0.private_key_b64).unwrap(),
@@ -368,8 +375,7 @@ mod tests {
             "stored pubkey must be the real derived pubkey"
         );
 
-        let k1 = keys.generate_next().unwrap().clone();
-        assert_eq!(k1.epoch, 1);
+        let k1 = keys.generate_next_at(1).unwrap().clone();
         assert_eq!(k1.state, "pending");
         assert_ne!(
             k1.private_key_b64, k0.private_key_b64,
@@ -382,7 +388,7 @@ mod tests {
         // Generate a known-valid 32-byte private key via generate_next, then
         // feed it into from_legacy as if it were the pre-rotation single key.
         let mut seed = EpochKeys::default();
-        let known_valid_priv = seed.generate_next().unwrap().private_key_b64.clone();
+        let known_valid_priv = seed.generate_next_at(0).unwrap().private_key_b64.clone();
 
         let keys = EpochKeys::from_legacy(&known_valid_priv).unwrap();
         assert_eq!(keys.epochs.len(), 1);
@@ -399,8 +405,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         let mut keys = EpochKeys::default();
-        keys.generate_next().unwrap();
-        keys.generate_next().unwrap();
+        keys.generate_next_at(0).unwrap();
+        keys.generate_next_at(1).unwrap();
         assert_eq!(keys.epochs.len(), 2);
 
         let dir = tempfile::tempdir().unwrap();
@@ -422,10 +428,10 @@ mod tests {
     #[test]
     fn promote_moves_pending_to_active_and_prior_active_to_retiring() {
         let mut seed = EpochKeys::default();
-        let priv0 = seed.generate_next().unwrap().private_key_b64.clone();
+        let priv0 = seed.generate_next_at(0).unwrap().private_key_b64.clone();
         let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
 
-        keys.generate_next().unwrap(); // epoch 1, pending
+        keys.generate_next_at(1).unwrap(); // epoch 1, pending
         keys.promote(1).unwrap();
 
         assert_eq!(keys.by_epoch(1).unwrap().state, "active");
@@ -435,9 +441,9 @@ mod tests {
     #[test]
     fn retire_removes_the_retiring_epoch() {
         let mut seed = EpochKeys::default();
-        let priv0 = seed.generate_next().unwrap().private_key_b64.clone();
+        let priv0 = seed.generate_next_at(0).unwrap().private_key_b64.clone();
         let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
-        keys.generate_next().unwrap(); // epoch 1, pending
+        keys.generate_next_at(1).unwrap(); // epoch 1, pending
         keys.promote(1).unwrap(); // epoch1 active, epoch0 retiring
 
         keys.retire(0).unwrap();
@@ -469,7 +475,7 @@ mod tests {
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o666)).unwrap();
 
         let mut keys = EpochKeys::default();
-        keys.generate_next().unwrap();
+        keys.generate_next_at(0).unwrap();
         keys.persist(dir.path()).unwrap();
 
         let mode = std::fs::metadata(dir.path().join("epoch_keys.json"))
@@ -481,5 +487,399 @@ mod tests {
             mode, 0o600,
             "epoch_keys.json (holds PRIVATE keys) must be 0600 even when the tmp file pre-existed world-readable"
         );
+    }
+
+    // `#[cfg(test)] mod tests`, next to `retire_removes_the_retiring_epoch`.
+
+    // --- B2: scrubbing the orphan mint an aborted rotation leaves behind ----
+    // (design §2.2: `generate_next` mints at `max(epoch)+1` on EVERY directive,
+    // and before B2 nothing could ever remove a `"pending"` entry — `retire`
+    // requires `"retiring"` — so every aborted rotation stranded a live
+    // PRIVATE KEY in `epoch_keys.json`, without bound.)
+
+    /// A store with one active epoch and one pending mint, the exact residue
+    /// an aborted rotation leaves: `[0 active, 1 pending]`.
+    fn store_with_orphan_mint() -> (EpochKeys, String, String) {
+        let mut seed = EpochKeys::default();
+        let priv0 = seed.generate_next_at(0).unwrap().private_key_b64.clone();
+        let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
+        let priv1 = keys.generate_next_at(1).unwrap().private_key_b64.clone();
+        assert_eq!(keys.by_epoch(1).unwrap().state, "pending");
+        (keys, priv0, priv1)
+    }
+
+    #[test]
+    fn discard_pending_removes_only_the_pending_epoch() {
+        let (mut keys, _priv0, _priv1) = store_with_orphan_mint();
+
+        keys.discard_pending(1).unwrap();
+
+        assert!(
+            keys.by_epoch(1).is_none(),
+            "the orphan mint must be REMOVED, not flagged: removal is the scrub mechanism in \
+             this file (see `retire`), because a state flag leaves the private key sitting in \
+             `epoch_keys.json`'s bytes"
+        );
+        assert_eq!(keys.epochs.len(), 1);
+        assert_eq!(
+            keys.by_epoch(0).unwrap().state,
+            "active",
+            "discarding the aborted rotation's mint must leave the epoch the data plane is \
+             actually running completely untouched"
+        );
+    }
+
+    #[test]
+    fn discard_pending_refuses_an_active_epoch() {
+        let (mut keys, _priv0, _priv1) = store_with_orphan_mint();
+
+        let err = keys.discard_pending(0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot discard epoch 0: not found or not in \"pending\" state",
+            "the error text mirrors `retire`'s shape deliberately (design §3.2 Piece 2): the two \
+             guards are the only things standing between a caller's mistaken epoch and a live \
+             private key, and an operator reading a CRITICAL log line should not have to know \
+             which of the two fired to understand what was refused"
+        );
+        assert!(
+            keys.by_epoch(0).is_some(),
+            "SECURITY: epoch 0 is the key the data plane is running on. An over-broad \
+             `discard_pending` deletes a LIVE private key — the gateway would lose the only key \
+             its peers dial it with and could not boot back onto it \
+             (`EpochKeys::select_boot_key`). The guard is the whole point of the method: it is \
+             called from the failure path of a rotation, where the caller's idea of which epoch \
+             is 'the mint' is exactly what just went wrong."
+        );
+    }
+
+    #[test]
+    fn discard_pending_refuses_a_retiring_epoch() {
+        let (mut keys, _priv0, _priv1) = store_with_orphan_mint();
+        keys.promote(1).unwrap(); // 1 active, 0 retiring
+
+        let err = keys.discard_pending(0).unwrap_err();
+        assert!(
+            err.to_string().contains("pending"),
+            "error must name the required state: {err}"
+        );
+        assert!(
+            keys.by_epoch(0).is_some(),
+            "a `\"retiring\"` epoch is still decrypting in-flight traffic from peers that have \
+             not caught up to the new epoch — destroying it early is the RETIRE_GRACE collapse \
+             this project has four recorded routes to. `retire` is the only thing allowed to \
+             remove it, and only once the retire grace has elapsed."
+        );
+    }
+
+    #[test]
+    fn discard_pending_errors_on_an_absent_epoch() {
+        let (mut keys, _priv0, _priv1) = store_with_orphan_mint();
+
+        assert!(
+            keys.discard_pending(9).is_err(),
+            "an absent epoch must be an error, not a silent no-op: the unwind calls this ONLY \
+             when a mint is known to have happened (design §9), so 'nothing to discard' means \
+             the caller's residue bookkeeping is wrong and must be loud, not swallowed"
+        );
+        assert_eq!(
+            keys.epochs.len(),
+            2,
+            "a refused discard must not mutate the store"
+        );
+    }
+
+    #[test]
+    fn discard_pending_then_persist_scrubs_the_orphan_private_key() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (mut keys, priv0, priv1) = store_with_orphan_mint();
+        let dir = tempfile::tempdir().unwrap();
+        keys.persist(dir.path()).unwrap();
+
+        // Precondition: the orphan's PRIVATE key really is on disk before the
+        // scrub, so the post-scrub assertion cannot pass vacuously.
+        let before = std::fs::read_to_string(dir.path().join("epoch_keys.json")).unwrap();
+        assert!(
+            before.contains(&priv1),
+            "harness precondition: the aborted rotation's minted private key must be on disk \
+             before the scrub, or this test proves nothing"
+        );
+
+        keys.discard_pending(1).unwrap();
+        keys.persist(dir.path()).unwrap();
+
+        let after = std::fs::read_to_string(dir.path().join("epoch_keys.json")).unwrap();
+        assert!(
+            !after.contains(&priv1),
+            "SECURITY: the aborted rotation's private key must be gone from the serialized \
+             bytes, not just from the in-memory Vec. Before B2 nothing could remove a \
+             `\"pending\"` entry at all, so these accumulated in `epoch_keys.json` without \
+             bound — one live private key per failed rotation, forever (design §2.2). File \
+             contents:\n{after}"
+        );
+        assert!(
+            after.contains(&priv0),
+            "the ACTIVE epoch's key must survive the scrub — a store that lost it could not \
+             boot the data plane back up"
+        );
+        assert_eq!(
+            EpochKeys::load(dir.path()).unwrap(),
+            Some(keys.clone()),
+            "the scrubbed store must round-trip"
+        );
+        assert_eq!(
+            std::fs::metadata(dir.path().join("epoch_keys.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the rewrite must not relax the mode of a file holding raw WireGuard private keys"
+        );
+    }
+
+    // --- B2 Piece 2c (Rev 1.7): mint at the DIRECTIVE epoch ----------------
+    //
+    // The controller is authoritative for the epoch number — it is already the
+    // number used for the tun name, the port formula, `submit_epoch_key`, and
+    // the cutover's `promote`/`retire`. Before Piece 2c the store minted at its
+    // OWN `max+1`, which agreed with the controller only by accident: an
+    // aborted rotation's `pending` row survives controller-side (there is no
+    // cancel RPC) while `discard_pending` removes the local one, so the two
+    // counters drift by one per abort — and the cutover's
+    // `promote(directive_epoch)` then fails against a store that filed the key
+    // under a different number.
+
+    #[test]
+    fn generate_next_at_mints_at_the_requested_epoch_over_a_lower_max() {
+        let mut seed = EpochKeys::default();
+        let priv0 = seed.generate_next_at(0).unwrap().private_key_b64.clone();
+        let mut keys = EpochKeys::from_legacy(&priv0).unwrap(); // max = 0
+
+        let minted = keys.generate_next_at(2).unwrap().clone();
+
+        assert_eq!(
+            minted.epoch, 2,
+            "the CONTROLLER decides the epoch number: it is already what the tun name, the port \
+             formula, `submit_epoch_key` and the cutover's `promote` all key on. A store that \
+             mints its own number files the key under a name none of those four will look it up \
+             by."
+        );
+        assert_eq!(minted.state, "pending");
+        assert_eq!(
+            crate::uapi::base64_pub_from_priv(&minted.private_key_b64).unwrap(),
+            minted.pubkey_b64,
+            "the stored pubkey must be the real derived pubkey, as `generate_next` guarantees"
+        );
+    }
+
+    #[test]
+    fn a_hole_in_the_epoch_sequence_still_resolves_every_lookup() {
+        let mut seed = EpochKeys::default();
+        let priv0 = seed.generate_next_at(0).unwrap().private_key_b64.clone();
+        let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
+        keys.generate_next_at(2).unwrap(); // epochs [0, 2] — 1 was aborted away
+
+        // Holes are expected after an aborted rotation and are harmless BY
+        // CONSTRUCTION: every consumer looks up by STATE or by EXACT epoch,
+        // never by `max` or by position. This test is the pin on that claim —
+        // if a future consumer starts deriving an epoch from `max` or from the
+        // Vec's length, it must fail here rather than in a netns run.
+        assert_eq!(keys.active().map(|k| k.epoch), Some(0));
+        assert!(
+            keys.by_epoch(2).is_some(),
+            "the minted epoch must be reachable across the hole"
+        );
+        assert!(
+            keys.by_epoch(1).is_none(),
+            "the aborted epoch must genuinely be absent"
+        );
+        assert_eq!(
+            EpochKeys::select_boot_key(Some(&keys), &priv0)
+                .unwrap()
+                .epoch,
+            0,
+            "boot selection is by STATE (`active`), so a hole below the pending mint cannot \
+             change which key the data plane comes back on"
+        );
+    }
+
+    #[test]
+    fn generate_next_at_replaces_a_stale_pending_occupant() {
+        let mut seed = EpochKeys::default();
+        let priv0 = seed.generate_next_at(0).unwrap().private_key_b64.clone();
+        let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
+        let stale = keys.generate_next_at(1).unwrap().private_key_b64.clone();
+
+        let fresh = keys.generate_next_at(1).unwrap().private_key_b64.clone();
+
+        assert_ne!(
+            fresh, stale,
+            "a `\"pending\"` row at the directive epoch means a PREVIOUS attempt at this epoch \
+             never completed, and the controller has just told us to do this epoch. A fresh \
+             mint is the only correct state — reusing the stale key would hand the fabric a \
+             key whose matching attempt already failed."
+        );
+        assert_eq!(
+            keys.epochs.iter().filter(|k| k.epoch == 1).count(),
+            1,
+            "replace, do not append: two rows at one epoch would make `by_epoch`/`promote`/ \
+             `retire` resolve by Vec order, which is not a contract this file has"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        keys.persist(dir.path()).unwrap();
+        let raw = std::fs::read_to_string(dir.path().join("epoch_keys.json")).unwrap();
+        assert!(
+            !raw.contains(&stale),
+            "SECURITY: replacing a stale `\"pending\"` occupant must SCRUB its private key, not \
+             leave it behind — the replacement is the only thing that will ever remove it \
+             (`retire` accepts only `\"retiring\"`). File:\n{raw}"
+        );
+        assert!(raw.contains(&fresh), "the fresh mint must be persisted");
+        assert!(
+            raw.contains(&priv0),
+            "the ACTIVE epoch's key must be untouched"
+        );
+    }
+
+    #[test]
+    fn generate_next_at_refuses_an_active_or_retiring_occupant() {
+        let mut seed = EpochKeys::default();
+        let priv0 = seed.generate_next_at(0).unwrap().private_key_b64.clone();
+        let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
+
+        let err = keys.generate_next_at(0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot mint epoch 0: already occupied by a \"active\" key",
+            "an `\"active\"` occupant is a real invariant violation, not a leftover: epoch 0 \
+             here is the key the data plane is RUNNING on, and minting over it would replace a \
+             live private key with one no peer has ever been told about. Only a `\"pending\"` \
+             row may be replaced (Rev 1.8) — the split is by STATE, and collapsing it back into \
+             a flat rule is wrong in one direction or the other whichever way it is collapsed. \
+             The message must also name WHICH state occupies the epoch, which is not cosmetic: \
+             without it a mis-split is indistinguishable from correct behaviour in a log. \
+             Got: {err}"
+        );
+        assert_eq!(
+            keys.active().unwrap().private_key_b64,
+            priv0,
+            "a refused mint must not have mutated the store"
+        );
+
+        keys.generate_next_at(1).unwrap();
+        keys.promote(1).unwrap(); // 1 active, 0 retiring
+        let retiring_priv = keys.by_epoch(0).unwrap().private_key_b64.clone();
+
+        let err = keys.generate_next_at(0).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "cannot mint epoch 0: already occupied by a \"retiring\" key",
+            "a `\"retiring\"` occupant is still decrypting in-flight traffic from peers that \
+             have not caught up. Minting over it destroys that key early — the RETIRE_GRACE \
+             collapse this project has four recorded routes to. Got: {err}"
+        );
+        assert_eq!(
+            keys.by_epoch(0).unwrap().private_key_b64,
+            retiring_priv,
+            "a refused mint must not have mutated the store"
+        );
+        assert_eq!(keys.epochs.len(), 2, "a refused mint must not append");
+    }
+
+    #[test]
+    fn a_crash_stranded_pending_row_does_not_wedge_the_next_directive() {
+        // THE REGRESSION PIN (Rev 1.8). Read the whole comment before
+        // "simplifying" `generate_next_at`'s state split into a flat error.
+        //
+        // A gateway that crashes between the mint's `persist` and the unwind
+        // reboots with a stranded `"pending"` row at epoch n that nothing will
+        // ever remove on its own: `retire` accepts only `"retiring"`, and
+        // `discard_pending` is only ever called from the synchronous unwind,
+        // which that process no longer exists to run.
+        //
+        // The controller then aborts its own rotation at ABORT_AFTER and
+        // `drop_pending_epoch` DELETEs its row — so `MAX(epoch)` DROPS BACK,
+        // and the next `db.rs::rotate_key` (which is `MAX(epoch)+1`) re-issues
+        // THE VERY SAME EPOCH n.
+        //
+        // With a flat duplicate guard that is a permanent, silent wedge in
+        // exactly the shape B2 exists to remove: `generate_next_at(n)` errors,
+        // `handle_rotate` returns Err, the unwind runs but skips its scrub
+        // (step 4 is guarded on `residue.minted_epoch`, which is None because
+        // the mint never succeeded), the stranded row survives, and the next
+        // directive is the same epoch again. Every rotation on that gateway
+        // fails identically, forever.
+        //
+        // Note this is NOT a pre-existing defect: before Piece 2c,
+        // `generate_next` minted at `max+1` and the rotation completed,
+        // carrying the numbering drift instead. The guard is what would have
+        // made a survivable crash fatal.
+        let mut seed = EpochKeys::default();
+        let priv0 = seed.generate_next_at(0).unwrap().private_key_b64.clone();
+        let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
+        let stranded = keys.generate_next_at(1).unwrap().private_key_b64.clone();
+        // ... the process dies here. On reboot the store is [0 active, 1 pending].
+
+        let retried = keys
+            .generate_next_at(1)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "WEDGE: a re-issued directive for epoch 1 was REFUSED because a \
+                     crash-stranded `\"pending\"` row already occupies it: {e:#}. The \
+                     controller genuinely re-issues an epoch after its own abort deletes the \
+                     pending row and `MAX(epoch)` drops back, so this is a reachable state, not \
+                     a hypothetical — and a refusal here fails EVERY subsequent rotation on \
+                     this gateway identically, forever, because the unwind's scrub is skipped \
+                     when the mint itself failed. `generate_next_at` must REPLACE a \
+                     `\"pending\"` occupant and refuse only `\"active\"`/`\"retiring\"` ones \
+                     (design §3.2 Piece 2c, Rev 1.8)."
+                )
+            })
+            .clone();
+        assert_ne!(
+            retried.private_key_b64, stranded,
+            "the retry must mint fresh key material"
+        );
+
+        // ... and the retried rotation completes end to end.
+        keys.promote(1).unwrap();
+        keys.retire(0).unwrap();
+        assert_eq!(keys.active().map(|k| k.epoch), Some(1));
+        assert_eq!(
+            keys.epochs.len(),
+            1,
+            "the retried rotation must leave exactly the new active epoch — no stranded orphan, \
+             no retired key: {:?}",
+            keys.epochs
+        );
+    }
+
+    #[test]
+    fn promote_and_retire_round_trip_at_an_epoch_above_max_plus_one() {
+        let mut seed = EpochKeys::default();
+        let priv0 = seed.generate_next_at(0).unwrap().private_key_b64.clone();
+        let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
+        keys.generate_next_at(2).unwrap(); // the post-abort shape: [0 active, 2 pending]
+
+        // This is the exact sequence the cutover and `service_retire` drive,
+        // and it is what the pre-Piece-2c store could NOT do: `promote` took
+        // the directive epoch (2) while the mint had been filed as 1, so it
+        // failed, epoch 0 was never demoted, and `retire(0)` then failed too —
+        // leaving the retired PRIVATE KEY on disk forever.
+        keys.promote(2).unwrap();
+        assert_eq!(keys.by_epoch(2).unwrap().state, "active");
+        assert_eq!(keys.by_epoch(0).unwrap().state, "retiring");
+
+        keys.retire(0).unwrap();
+        assert!(
+            keys.by_epoch(0).is_none(),
+            "SECURITY: retirement is key DESTRUCTION in this file, not a state flag next to a \
+             still-readable key. A non-contiguous epoch sequence must not be able to block it."
+        );
+        assert_eq!(keys.epochs.len(), 1);
+        assert_eq!(keys.active().map(|k| k.epoch), Some(2));
     }
 }

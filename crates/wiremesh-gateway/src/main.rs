@@ -6419,4 +6419,51 @@ mod tests {
             "slot released once the guard drops"
         );
     }
+
+    // (the `tests/*` integration binaries link the LIB and cannot reach bin symbols
+    // like `RotationShared`, `RotationResidue` or `OVERLAP_STALL_WARN` — §13.2).
+    // SIGNATURES UNCONFIRMED — pending gateway-dev on the residue's constructor.
+
+    #[test]
+    fn overlap_stall_warn_is_90s_and_is_a_gateway_local_constant() {
+        assert_eq!(
+            OVERLAP_STALL_WARN,
+            std::time::Duration::from_secs(90),
+            "this MIRRORS `wiremesh-controller`'s `rotation::GRACE_PROMOTE` and must stay a \
+             gateway-LOCAL constant (design Rev 1.4, RS2): `crates/wiremesh-gateway` has no \
+             `wiremesh-controller` dependency, and adding one to reach that value would invert \
+             the control-plane layering for a log line. The duplication is deliberate. What the \
+             90s buys: past it, `decide` rule 4 has grace-promoted the new epoch with ZERO acks \
+             (recorded hazard §E), so the roster is advertising a key this gateway has not cut \
+             over to — R2, which Phase B leaves OPEN by ruling because aborting it gateway-side \
+             is strictly worse (a hard blackhole, §3.2 Piece 1b). If GRACE_PROMOTE moves, this \
+             must move with it."
+        );
+    }
+
+    #[test]
+    fn a_residue_with_no_progress_names_nothing_to_unwind() {
+        // The residue the wrapper hands `unwind_failed_rotation` when
+        // `handle_rotate_inner` fails on its FIRST fallible step (no desired
+        // state yet — design §2.2 step 1): the directive epoch is known, but
+        // nothing has been minted.
+        let residue = RotationResidue::for_directive(5);
+
+        assert_eq!(
+            residue.minted_epoch, None,
+            "`discard_pending` errors on an absent epoch by design, and the unwind calls it ONLY \
+             when a mint is known to have happened (§9). A residue that claims a mint before \
+             `generate_next` ran would make every early-failure unwind log a spurious CRITICAL \
+             about a private key that was never created."
+        );
+        assert_eq!(
+            residue.tun_epoch, 5,
+            "the residue must be built FROM THE DIRECTIVE EPOCH, never defaulted. `tun_epoch` is \
+             fed straight to `TunnelId::Own {{ epoch }}`, and `main.rs`'s boot tun is registered \
+             as `TunnelId::Own {{ epoch: boot_key.epoch }}` — epoch 0 on a gateway that has \
+             never rotated. So a `Default`-derived `tun_epoch: 0` would make an early unwind \
+             tear down the LIVE data-plane tun. Design §3.2 Piece 2b names this exactly: \
+             'unwinding the wrong one would tear down a live tun'."
+        );
+    }
 }
