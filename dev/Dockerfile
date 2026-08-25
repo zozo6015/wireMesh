@@ -7,11 +7,20 @@
 # both produce toolchain-dependent output, so a floating base makes an
 # unchanged tree red on the day a new stable ships.
 #
-# The exact patch (not `stable`) was chosen from a measurement, not a
-# preference: with `channel = "stable"` in `rust-toolchain.toml`, rustup syncs
-# to 1.98.0 and prints `downloading N components` on EVERY `docker run --rm`,
-# because this image's rustup home is ephemeral. `1.97.1` is already installed
-# here, so it resolves instantly and nothing is fetched.
+# WHY THE PIN LIVES HERE AND NOT IN A ROOT `rust-toolchain.toml`. That was
+# tried and had to be reverted. Rustup consults a toolchain file by walking up
+# from wherever cargo was invoked, and it outranks the `rustup default` that
+# `dtolnay/rust-toolchain@stable` sets -- so a root file would have governed
+# EVERY cargo invocation in the checkout, including `release.yml`'s macOS and
+# Windows jobs. The macOS job builds `--target x86_64-apple-darwin`, and that
+# action installs requested targets into the toolchain IT installs; under a
+# root pin the build would have run on a different toolchain with no
+# darwin-x86_64 std, failing with `E0463 can't find crate for std` and taking
+# the x86_64 tarball and the universal .pkg with it. A toolchain file also
+# cannot carry per-platform targets, so there is no version of it that works.
+# Pinning the IMAGE instead reaches every job that needs pinning -- all CI runs
+# in this image -- and leaves the mac/windows release jobs on `@stable`,
+# exactly as they were before.
 #
 # TWO LINES MUST MOVE TOGETHER, and they are named here because a version-tag
 # pin and a digest pin cannot drift together on their own -- this comment is
@@ -22,15 +31,22 @@
 #
 # The digest was measured to carry rustc 1.97.1 (8bab26f4f 2026-07-14) -- the
 # same stable this tag installs -- so today the compiler that TESTS the code
-# and the compiler that SHIPS it are identical. Change one and you must change
-# the other, or that stops being true silently.
+# and the compiler that SHIPS the Linux artifacts are identical. Change one and
+# you must change the other, or that stops being true silently.
 #
-# SCOPE OF THAT EQUIVALENCE: stable/userspace only. Both Dockerfiles ALSO
-# `rustup toolchain install nightly` UNDATED, and the eBPF object that nightly
-# produces is baked into the shipped gateway via `include_bytes_aligned!`.
-# The two nightlies float independently and resolve at each image's last COLD
-# build, by deliberate design -- they are NOT covered by the equivalence above,
-# and PR0 leaves both undated on purpose.
+# SCOPE OF THAT EQUIVALENCE: stable/userspace ON LINUX, and nothing wider.
+# The macOS and Windows release artifacts are built on their own runners by a
+# floating `dtolnay/rust-toolchain@stable`, so which compiler produced them is
+# recorded nowhere. That is pre-existing, not introduced here, and is filed
+# rather than fixed -- the design's "the compiler the suite is proven on" only
+# ever described Linux, which is precisely why the pin belongs to the images
+# and not to a root toolchain file.
+#
+# The equivalence does not cover the eBPF half either: both Dockerfiles ALSO
+# `rustup toolchain install nightly` UNDATED, the object that nightly produces
+# is baked into the shipped gateway via `include_bytes_aligned!`, and those two
+# nightlies float independently, resolving at each image's last COLD build.
+# That is deliberate, and left undated on purpose.
 FROM rust:1.97.1-bookworm
 
 # `conntrack` (conntrack-tools): NftEnforcer::flush_flows (Task 12 addendum)

@@ -22,6 +22,11 @@ exclude = ["crates/wiremesh-enforcer-ebpf"]
 # re-verified nightly by the scheduled `cold-build` workflow, which installs
 # this exact version and fails closed.
 #
+# CI never builds AT this floor. Every job runs inside `dev/Dockerfile`,
+# whose default toolchain is 1.97.1 -- that image pin, not a root
+# `rust-toolchain.toml`, is where this repo states its compiler. See that
+# Dockerfile's comment for why a root toolchain file could not be used.
+#
 # WHAT THE NUMBER CLAIMS, precisely. `cargo +1.91 check` still runs
 # `wiremesh-enforcer/build.rs`, which builds the eBPF program on the UNDATED
 # nightly. So this means "the userspace crates build on 1.91, given a nightly

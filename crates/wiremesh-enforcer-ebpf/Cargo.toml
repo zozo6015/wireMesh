@@ -25,16 +25,24 @@ default-members = ["common"]
 [workspace.package]
 license = "Apache-2.0"
 edition = "2024"
-# NO `rust-version` here, deliberately. This workspace is edition 2024 and is
-# only ever compiled by the undated nightly named in its `rust-toolchain.toml`
-# (via `aya_build`, or via a standalone build from this directory), so any MSRV
-# stated here would be a claim nothing in the project can ever verify -- a
-# doc-comment asserting behaviour, in metadata form. For the record, it was
-# measured: `cargo +1.85 check --all-targets` here PASSES on default features,
-# and fails only with the `user` feature ("aya@0.14.0 requires rustc 1.87.0").
-# That number is real but describes a configuration nobody builds, which is
-# exactly why it is not declared. The root workspace's `rust-version` is the
-# one that means something, because CI and packagers actually exercise it.
+# NO `rust-version` anywhere in this workspace, deliberately, and for two
+# DIFFERENT reasons -- an earlier version of this comment gave one reason for
+# both crates and the reason it gave was false.
+#
+# `program` is `#![no_std] #![no_main]` and is only ever compiled by the
+# undated nightly named in `rust-toolchain.toml`, so any floor stated for it
+# would be a claim nothing in the project can verify.
+#
+# `common` IS host-compiled, and constantly: `crates/wiremesh-enforcer/Cargo.toml`
+# depends on it with `features = ["user"]`, so the aya-enabled configuration is
+# built on EVERY root-workspace build. (The superseded comment called that "a
+# configuration nobody builds", which was exactly backwards.) A floor here is
+# therefore measurable -- `cargo +1.85 check -p wiremesh-enforcer-common
+# --features user` fails with "aya@0.14.0 requires rustc 1.87.0", while default
+# features pass -- but it would be REDUNDANT: every build that compiles that
+# configuration is a root-workspace build, and the root's declared
+# `rust-version = "1.91"` already dominates 1.87. Declaring it would add a
+# second number to keep in step without constraining anything.
 
 [workspace.dependencies]
 aya = { version = "0.14.0", default-features = false }
