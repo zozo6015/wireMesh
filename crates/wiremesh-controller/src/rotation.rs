@@ -144,11 +144,17 @@ mod tests {
     /// yet, and no promotion/retirement in flight. Override individual
     /// fields per case with struct-update syntax to keep each test focused
     /// on the one thing it's checking.
+    ///
+    /// (S3) `prior_active_epoch` is `Some(3)` — the ORDINARY case, a rotation
+    /// that has a real prior epoch to retire. The `None` case is not a
+    /// variation on a normal rotation, it is the absence the whole of item 5
+    /// is about, so every test that wants it says so explicitly rather than
+    /// inheriting it here.
     fn base_state(t0: Instant) -> RotationState {
         RotationState {
             pending_epoch: 7,
             pending_has_real_key: true,
-            prior_active_epoch: 3,
+            prior_active_epoch: Some(3),
             started_at: t0,
             promoted_at: None,
             expected_peers: BTreeSet::new(),
@@ -267,15 +273,17 @@ mod tests {
         let t0 = Instant::now();
         let s = RotationState {
             promoted_at: Some(t0),
+            prior_active_epoch: Some(3),
             ..base_state(t0)
         };
         assert_eq!(
             decide(&s, t0 + Duration::from_secs(31)),
-            RotationDecision::Retire {
-                epoch: s.prior_active_epoch
-            },
-            "RETIRE_GRACE (30s) has elapsed since promotion — the prior active epoch \
-             must now be retired"
+            RotationDecision::Retire { epoch: 3 },
+            "RETIRE_GRACE (30s) has elapsed since promotion and there IS a prior active \
+             epoch (Some(3)) — it must now be retired. (S3: the expected epoch is written \
+             literally rather than read back off `s.prior_active_epoch`, because that field \
+             is now an `Option<u32>` and unwrapping it in the assertion would let a \
+             `None`-coerced-to-`Some(0)` regression pick its own expected value and pass.)"
         );
     }
 
@@ -291,6 +299,237 @@ mod tests {
             RotationDecision::Wait,
             "only 5s since promotion — well inside the 30s retire grace — must not \
              retire the prior active epoch yet"
+        );
+    }
+
+    // =======================================================================
+    // S3 — `prior_active_epoch: Option<u32>` (BACKLOG item 5, design §4).
+    //
+    // The bug: a tracker seeded from a key snapshot with NO `active` row used
+    // to get `prior_active_epoch = 0` via `.unwrap_or(0)` at three seed sites
+    // in `services::sync`. Once promoted, rule 1 below yields
+    // `Retire { epoch: 0 }` on every tick; `Db::retire_epoch` CASes on
+    // `state = 'retiring'`, matches nothing, and `drive_rotation_for`'s
+    // `Retire`/`CasOutcome::NoMatch` arm DELIBERATELY keeps the tracker (see
+    // that arm's comment — removing it hands a live `retiring` row to
+    // `sweep_rotations`' grace-free step-3 orphan path, collapsing
+    // `RETIRE_GRACE`). So the tracker is wedged forever and eats the next
+    // rotation's one and only ack.
+    //
+    // The fix is a TYPE change, not a guard: absence is carried as `None`
+    // instead of being coerced to a number that means something else. These
+    // tests pin the two halves of that — what `None` must do, and what it must
+    // NOT do — plus the over-correction, plus the rules that must not move.
+    //
+    // Reachability (design §1.2 C3): this state is NOT reachable from any
+    // current mutation path — `promote_epoch` verifies a real-keyed `pending`
+    // row before demoting the active row, and `enroll_gateway` always inserts
+    // an epoch-0 `active` row. It is reachable only for a legacy/gap key-row
+    // set, which `Db::rotate_key` deliberately tolerates. S3 is hardening. It
+    // is still worth pinning precisely BECAUSE `Retire{0}` is
+    // indistinguishable from a legitimate first rotation's retire, so any
+    // future change that makes the state reachable would wedge silently.
+    // =======================================================================
+
+    /// Rule 1's absent-prior-epoch leg: a promoted rotation with nothing to
+    /// retire is COMPLETE, and says so with its own decision.
+    ///
+    /// `Finished` rather than `Wait` is the whole point (design §4.2 step 2):
+    /// `Wait` would leave the tracker in the map forever, which is the bug
+    /// wearing a different mask.
+    #[test]
+    fn promoted_with_no_prior_active_epoch_is_finished() {
+        let t0 = Instant::now();
+        let s = RotationState {
+            promoted_at: Some(t0),
+            prior_active_epoch: None,
+            ..base_state(t0)
+        };
+        assert_eq!(
+            decide(&s, t0 + Duration::from_secs(31)),
+            RotationDecision::Finished,
+            "this rotation promoted and there was NO prior active epoch to retire \
+             (`prior_active_epoch == None`), so the rotation is over and `decide` must \
+             say `Finished` — the decision `drive_rotation_for` maps to \
+             `TrackerEffect::Finished` with no DB call, which is what finally clears the \
+             tracker. Returning `Wait` here instead would leave the tracker in the map \
+             forever, which is BACKLOG item 5's bug in a different shape"
+        );
+    }
+
+    /// `None` short-circuits rule 1 BEFORE the `RETIRE_GRACE` comparison, so
+    /// elapsed time cannot change the answer.
+    ///
+    /// Separate from the test above on purpose: that one pins the decision at
+    /// one instant; this one pins that the decision does not depend on the
+    /// clock at all. A fix that wrote `if elapsed >= RETIRE_GRACE { match
+    /// prior { Some(e) => Retire{e}, None => Finished } } else { Wait }` would
+    /// pass the test above and fail this one — and it would be a real defect,
+    /// because it parks a finished rotation's tracker in `Wait` for 30s for no
+    /// reason.
+    #[test]
+    fn finished_regardless_of_elapsed_time_when_there_is_no_prior_active_epoch() {
+        let t0 = Instant::now();
+        let s = RotationState {
+            promoted_at: Some(t0),
+            prior_active_epoch: None,
+            ..base_state(t0)
+        };
+        for secs in [0u64, 1, 29, 30, 31, 3600] {
+            assert_eq!(
+                decide(&s, t0 + Duration::from_secs(secs)),
+                RotationDecision::Finished,
+                "at {secs}s after promotion with `prior_active_epoch == None`: there is \
+                 nothing to retire, so `RETIRE_GRACE` has nothing to protect and must not \
+                 be consulted at all. `Finished` is the answer at EVERY instant — a \
+                 `Wait` before 30s would park a finished rotation's tracker for half a \
+                 minute for no reason"
+            );
+        }
+    }
+
+    /// THE TRAP (design §4.3, §10 R5). `None` must never be coerced to `0`.
+    ///
+    /// This is deliberately a NEGATIVE assertion rather than a restatement of
+    /// the two positive tests above, because the thing that must never happen
+    /// is what the failure message has to explain, and because the failure
+    /// mode it guards is silent by construction: `Retire { epoch: 0 }` is a
+    /// perfectly legitimate decision for a gateway rotating off its epoch-0
+    /// enrollment key, so nothing downstream can tell the two apart. The type
+    /// is the only place the distinction survives.
+    #[test]
+    fn none_prior_active_epoch_is_never_coerced_to_retire_zero() {
+        let t0 = Instant::now();
+        let s = RotationState {
+            promoted_at: Some(t0),
+            prior_active_epoch: None,
+            ..base_state(t0)
+        };
+        for secs in [0u64, 29, 30, 31, 3600] {
+            let d = decide(&s, t0 + Duration::from_secs(secs));
+            assert!(
+                !matches!(d, RotationDecision::Retire { .. }),
+                "at {secs}s after promotion, `decide` produced {d:?} for a rotation with \
+                 `prior_active_epoch == None`. `Retire{{0}}` is indistinguishable from a \
+                 legitimate first rotation's retire; `None` must never be coerced to 0. \
+                 Downstream, `Db::retire_epoch` CASes on `state = 'retiring'` and matches \
+                 nothing, `drive_rotation_for`'s `NoMatch` arm deliberately KEEPS the \
+                 tracker (removing it would hand a live `retiring` row to \
+                 `sweep_rotations`' grace-free orphan path and collapse `RETIRE_GRACE`), \
+                 and `evict_decision`'s `None`-means-keep leg never clears it — so the \
+                 tracker wedges forever and eats the next rotation's one and only ack"
+            );
+        }
+    }
+
+    /// The OVER-CORRECTION guard, and the reason `Option` is the fix rather
+    /// than "treat 0 as absent".
+    ///
+    /// Epoch 0 is a REAL epoch: `enroll_gateway` inserts every gateway's
+    /// baseline key at epoch 0, so a gateway's very first rotation genuinely
+    /// has `prior_active_epoch == Some(0)` and genuinely must retire it. A
+    /// fix that spelled this `if prior == 0 { Finished }` would strand that
+    /// row on disk — and a stranded `retiring` row excludes its gateway from
+    /// `Db::gateways_with_rotation_state`, i.e. from the rotation timer, for
+    /// the life of the deployment (the failure `tests/rotation_retire_drive.rs`
+    /// exists for). Same class of defect as the bug S3 fixes, opposite sign.
+    #[test]
+    fn a_genuine_prior_active_epoch_zero_still_retires_zero() {
+        let t0 = Instant::now();
+        let s = RotationState {
+            promoted_at: Some(t0),
+            prior_active_epoch: Some(0),
+            ..base_state(t0)
+        };
+        assert_eq!(
+            decide(&s, t0 + Duration::from_secs(31)),
+            RotationDecision::Retire { epoch: 0 },
+            "`Some(0)` is a gateway retiring its epoch-0 ENROLLMENT key — the ordinary \
+             first rotation, and a row that really is on disk in state 'retiring'. It \
+             must still be retired. The distinction S3 introduces is `Some(0)` (a real \
+             epoch numbered zero) versus `None` (no prior epoch at all); a fix that \
+             collapses them by testing `prior == 0` strands the row, and a stranded \
+             'retiring' row removes its gateway from the rotation timer permanently \
+             (`Db::gateways_with_rotation_state`)"
+        );
+    }
+
+    /// The edges that must not move (design §9): rules 2, 3 and 4 do not read
+    /// `prior_active_epoch` at all, and making it an `Option` must not give
+    /// them an opinion about it.
+    ///
+    /// One test, four probes, because the property IS the conjunction: "the
+    /// absent prior epoch is invisible to every rule except rule 1". Splitting
+    /// it into four would name the same property four times.
+    #[test]
+    fn rules_2_to_4_are_unaffected_by_an_absent_prior_active_epoch() {
+        let t0 = Instant::now();
+
+        // Rule 2, inside the abort window: sentinel key, must Wait.
+        let s = RotationState {
+            pending_has_real_key: false,
+            prior_active_epoch: None,
+            ..base_state(t0)
+        };
+        assert_eq!(
+            decide(&s, t0 + Duration::from_secs(10)),
+            RotationDecision::Wait,
+            "rule 2 (no real key, inside ABORT_AFTER) must be reached and answer `Wait` \
+             regardless of `prior_active_epoch`. Rule 1 short-circuits on `promoted_at`, \
+             which is `None` here, so an absent prior epoch must not divert this case"
+        );
+
+        // Rule 2, past the abort deadline: sentinel key, must Abort the PENDING
+        // epoch — never the (absent) prior one.
+        let s = RotationState {
+            pending_has_real_key: false,
+            prior_active_epoch: None,
+            ..base_state(t0)
+        };
+        match decide(&s, t0 + Duration::from_secs(301)) {
+            RotationDecision::Abort { epoch, .. } => assert_eq!(
+                epoch, 7,
+                "rule 2's `Abort` must target the PENDING epoch (7), which is present and \
+                 real. An absent `prior_active_epoch` is a different field and must not \
+                 leak into this decision"
+            ),
+            other => panic!(
+                "expected `RotationDecision::Abort {{ epoch: 7, .. }}` once ABORT_AFTER \
+                 (300s) has elapsed with no real key submitted — `prior_active_epoch == \
+                 None` must not change which rule fires — got: {other:?}"
+            ),
+        }
+
+        // Rule 3: real key + full acks promotes immediately.
+        let s = RotationState {
+            prior_active_epoch: None,
+            expected_peers: BTreeSet::from([2, 3]),
+            live_acks: BTreeSet::from([2, 3]),
+            ..base_state(t0)
+        };
+        assert_eq!(
+            decide(&s, t0 + Duration::from_secs(10)),
+            RotationDecision::Promote { epoch: 7 },
+            "rule 3 (real key, every expected peer acked) must promote on acks whether or \
+             not there is a prior active epoch to retire afterwards. Having nothing to \
+             retire is a fact about the END of the rotation, not about whether it may \
+             promote"
+        );
+
+        // Rule 4: real key, no acks, past GRACE_PROMOTE.
+        let s = RotationState {
+            prior_active_epoch: None,
+            expected_peers: BTreeSet::from([2]),
+            live_acks: BTreeSet::new(),
+            ..base_state(t0)
+        };
+        assert_eq!(
+            decide(&s, t0 + Duration::from_secs(91)),
+            RotationDecision::Promote { epoch: 7 },
+            "rule 4 (real key, GRACE_PROMOTE elapsed, zero acks) must still grace-promote \
+             with `prior_active_epoch == None`. This is the recorded KNOWN HAZARD §E path \
+             and S3 must not change its threshold or its reachability — design §3.3 and \
+             §9 list rule 4 as an edge that must not move"
         );
     }
 }
