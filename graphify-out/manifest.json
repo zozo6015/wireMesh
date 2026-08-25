@@ -95,8 +95,8 @@
     "semantic_hash": "a0094c8abed95c8e00123f64042aa624"
   },
   "crates/wiremesh-controller/src/services/sync.rs": {
-    "mtime": 1787693173.3941844,
-    "ast_hash": "4ff6997f13e3b386e7b18eef3bf8e5be",
+    "mtime": 1787695629.5390089,
+    "ast_hash": "91cf9750f676b76c2a2e89c2aa930919",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/tests/admin.rs": {
