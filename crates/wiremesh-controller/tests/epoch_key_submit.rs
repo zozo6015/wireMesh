@@ -19,6 +19,7 @@
 //!     `SyncClient` using the gateway's own identity, calling the
 //!     newly-real `Sync.SubmitEpochKey`, which as of Task 1 is stubbed to
 //!     `Err(Status::unimplemented(..))`).
+//!
 //! That compile failure is the expected RED for this task.
 
 use std::time::Duration;

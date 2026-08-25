@@ -1370,6 +1370,7 @@ pub(crate) async fn drive_rotation_for(
 ///      rebuild its `RotationTracker` (fresh `started_at`) if none is
 ///      currently held — the same check-and-evict plus crash-recovery
 ///      rebuild `drive_rotation_for` itself does.
+///
 ///   2b. Then call `drive_rotation_for` for EVERY gateway in the step-1 set,
 ///      `pending` row or not, which fires grace-promote/abort/retire via
 ///      `rotation::decide` exactly as an ack-triggered call would.

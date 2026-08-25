@@ -133,8 +133,8 @@ pub fn directive_should_punch(state: Option<PathState>, relay_pointed: bool) -> 
 /// relay-death edge; `direct -> degraded`) is the unsettle edge the broker
 /// must see quickly to un-skip the pair, re-arm its punch budget, and emit a
 /// SYNCHRONIZED punch pair — the authoritative case-4 run showed both sides
-/// otherwise punching on unsynchronized self-timers (idle-timeout detection
-/// + backoff drift), which a port-restricted pair can never land. Movement
+/// otherwise punching on unsynchronized self-timers (idle-timeout detection +
+/// backoff drift), which a port-restricted pair can never land. Movement
 /// entirely within one side of the boundary (`connecting -> disconnected`,
 /// `direct -> relayed`) changes nothing the broker acts on and returns
 /// `false` — reporting those eagerly would just re-create report chatter.

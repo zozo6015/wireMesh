@@ -20,6 +20,7 @@
 //!    boot instead of logging resolution failures forever;
 //!  - every rejection names the offending input (operators diagnose from
 //!    the one log/usage line).
+//!
 //! ./dev.sh run "cargo test -p wiremesh-enroll --test validate_host_port -- --test-threads=1 --nocapture"
 
 use wiremesh_enroll::validate_host_port;

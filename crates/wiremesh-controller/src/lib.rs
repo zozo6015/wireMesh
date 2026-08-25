@@ -760,8 +760,8 @@ pub struct RunningController {
     sync_join: Option<JoinHandle<()>>,
     observe_shutdown_tx: Option<oneshot::Sender<()>>,
     observe_join: Option<JoinHandle<()>>,
-    /// (Cycle-4b Task 5) The broker's background trigger loop (candidate-change
-    /// + periodic-retry punch triggers — see [`broker::Broker::spawn`]), torn
+    /// (Cycle-4b Task 5) The broker's background trigger loop (candidate-change +
+    /// periodic-retry punch triggers — see [`broker::Broker::spawn`]), torn
     /// down the same bounded-join-then-abort way as every other server task.
     broker_shutdown_tx: Option<oneshot::Sender<()>>,
     broker_join: Option<JoinHandle<()>>,

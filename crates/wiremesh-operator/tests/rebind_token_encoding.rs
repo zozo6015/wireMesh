@@ -18,6 +18,7 @@
 //!   * exec — `admin_exec.rs` → argv `["mint-token", "--kind", "gateway",
 //!     "--rebind-segment-id", "<id>"]`, and `operator_admin.rs` passes `--kind`
 //!     through to `MintTokenRequest.kind` verbatim.
+//!
 //! So EVERY operator-issued rebind is a plain gateway token: the CIDR-change
 //! rebind path (gateway.rs:415-455) can never replace the segment's active
 //! gateway — the redemption is refused and the gateway stays wedged.

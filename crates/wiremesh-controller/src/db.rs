@@ -2179,8 +2179,8 @@ impl Db {
         Ok(DropPendingOutcome::Dropped)
     }
 
-    /// (Key-rotation Task 3) Atomic combination of [`Db::all_keys_for_gateway`]
-    /// + [`Db::current_revision`]: acquires the connection `Mutex` guard
+    /// (Key-rotation Task 3) Atomic combination of [`Db::all_keys_for_gateway`] +
+    /// [`Db::current_revision`]: acquires the connection `Mutex` guard
     /// exactly ONCE and reads both the gateway's full key set AND the
     /// persisted revision while holding it, so the pair is a single
     /// consistent snapshot — mirrors [`Db::relays_snapshot`]'s doc comment
@@ -2612,8 +2612,8 @@ impl Db {
         Ok(rows)
     }
 
-    /// (CodeRabbit round 3, Major) Atomic combination of [`Db::active_relays`]
-    /// + [`Db::current_revision`]: acquires the connection `Mutex` guard
+    /// (CodeRabbit round 3, Major) Atomic combination of [`Db::active_relays`] +
+    /// [`Db::current_revision`]: acquires the connection `Mutex` guard
     /// exactly ONCE and reads both the active-relay set AND the persisted
     /// revision while holding it, so the pair is a single consistent
     /// snapshot. Every `RelaysChanged`-emitting call site

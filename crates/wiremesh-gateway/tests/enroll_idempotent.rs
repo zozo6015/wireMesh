@@ -20,6 +20,7 @@
 //!   * loads OK                → skip (log the "already enrolled" line, return Ok(()))
 //!   * NotFound OR JSON parse  → proceed to the real enrollment (unchanged)
 //!   * any other io::ErrorKind → PROPAGATE the error (return Err; do NOT enroll)
+//!
 //! Suggested seam: `Identity::probe(state_dir) -> anyhow::Result<bool>` returning
 //! Ok(true)=present, Ok(false)=absent/malformed, Err=other IO failure — the enroll
 //! guard matches on that. The "no identity present" path (see `enroll_cmd.rs`)

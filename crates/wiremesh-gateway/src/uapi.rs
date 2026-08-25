@@ -139,8 +139,8 @@ pub fn is_valid_ipv4_cidr(cidr: &str) -> bool {
     validate_ipv4_cidr(cidr).is_ok()
 }
 
-/// Render one peer's `set` block (public_key + endpoint? + replace_allowed_ips
-/// + allowed_ip* + persistent_keepalive_interval). Shared by [`encode_set`]
+/// Render one peer's `set` block (public_key + endpoint? + replace_allowed_ips +
+/// allowed_ip* + persistent_keepalive_interval). Shared by [`encode_set`]
 /// (full config) and [`encode_add_peers`] (incremental add-only). Fallible:
 /// the endpoint and every allowed-ips CIDR are validated as IPv4 before ANY
 /// field is written (v1 is IPv4-only — see [`validate_ipv4_endpoint`] /

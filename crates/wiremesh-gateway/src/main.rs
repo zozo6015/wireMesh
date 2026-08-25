@@ -4451,8 +4451,8 @@ struct RotationShared {
     /// drives `promote(new)` + `persist` and `service_retire` drives
     /// `retire(old)` + `persist`, so the on-disk `epoch_keys.json` tracks the
     /// data plane's lifecycle transitions and a reboot at any point selects
-    /// the right key (`EpochKeys::select_boot_key`). `persist` (sync file I/O
-    /// + fsync) runs under the guard — brief, and serializing writers through
+    /// the right key (`EpochKeys::select_boot_key`). `persist` (sync file I/O +
+    /// fsync) runs under the guard — brief, and serializing writers through
     /// the lock is exactly what keeps two transitions from interleaving their
     /// tmp+rename writes.
     epoch_keys: Arc<std::sync::Mutex<EpochKeys>>,
@@ -4478,8 +4478,8 @@ struct RotationShared {
     /// Signal from the rotation tick to the run task: Role-B overlap Devices
     /// whose COLLAPSE completed its reverse make-before-break (base-tun
     /// session live toward the peer's new key, routes flipped back to `wg0`)
-    /// and now need their `(peer gateway_id, overlap epoch)` Device torn down
-    /// + enforcer evicted. Same owns-the-non-`Send`-`tunnels` split as
+    /// and now need their `(peer gateway_id, overlap epoch)` Device torn down +
+    /// enforcer evicted. Same owns-the-non-`Send`-`tunnels` split as
     /// `retire_ready`, but a separate channel: consuming it must NOT drive
     /// the Role-A `Rotation` SM (this gateway isn't the one rotating).
     collapse_ready: Arc<std::sync::Mutex<Vec<(u64, u32)>>>,
