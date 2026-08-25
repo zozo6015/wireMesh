@@ -27,7 +27,8 @@ use wiremesh_gateway::epochkeys::EpochKeys;
 /// generator (matches what `wg genkey` effectively produces).
 fn fresh_priv() -> String {
     let mut seed = EpochKeys::default();
-    seed.generate_next().unwrap().private_key_b64.clone()
+    // Epoch 0 on an empty store: key-bytes harvest only, number arbitrary.
+    seed.generate_next_at(0).unwrap().private_key_b64.clone()
 }
 
 /// Cutover persistence: promote epoch 1, persist, reload — the reloaded
@@ -38,7 +39,7 @@ fn fresh_priv() -> String {
 fn promote_then_reload_reports_new_epoch_active() {
     let priv0 = fresh_priv();
     let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
-    keys.generate_next().unwrap(); // epoch 1, "pending"
+    keys.generate_next_at(1).unwrap(); // epoch 1, "pending"
     keys.promote(1).unwrap();
 
     let dir = tempfile::tempdir().unwrap();
@@ -80,7 +81,7 @@ fn promote_then_reload_reports_new_epoch_active() {
 fn retire_then_reload_scrubs_retired_private_key_from_disk() {
     let priv0 = fresh_priv();
     let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
-    keys.generate_next().unwrap(); // epoch 1, "pending"
+    keys.generate_next_at(1).unwrap(); // epoch 1, "pending"
     let priv1 = keys.by_epoch(1).unwrap().private_key_b64.clone();
     keys.promote(1).unwrap(); // epoch 1 active, epoch 0 retiring
     keys.retire(0).unwrap(); // epoch 0 removed
@@ -137,7 +138,7 @@ fn promote_persist_reload_retire_persist_reload_converges() {
     // "Process 1": mint + promote + persist (the cutover).
     {
         let mut keys = EpochKeys::from_legacy(&priv0).unwrap();
-        keys.generate_next().unwrap();
+        keys.generate_next_at(1).unwrap();
         keys.promote(1).unwrap();
         keys.persist(dir.path()).unwrap();
     }
