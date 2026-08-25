@@ -37,7 +37,9 @@ async fn single_gateway_receives_a_full_snapshot() {
 
     let snap = match msg.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
 
     assert_eq!(

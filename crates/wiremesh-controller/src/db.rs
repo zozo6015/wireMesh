@@ -361,7 +361,12 @@ impl std::error::Error for OverlapError {}
 /// declaration can't nest two overlapping CIDRs of its own undetected). Does
 /// NOT roll back on error — see [`insert_segment_tx`]'s doc comment for why
 /// that's the caller's job.
-fn insert_cidrs_tx(tx: &Transaction<'_>, segment_id: i64, name: &str, cidrs: &[Ipv4Net]) -> Result<()> {
+fn insert_cidrs_tx(
+    tx: &Transaction<'_>,
+    segment_id: i64,
+    name: &str,
+    cidrs: &[Ipv4Net],
+) -> Result<()> {
     let mut accepted: Vec<Ipv4Net> = Vec::with_capacity(cidrs.len());
 
     for cidr in cidrs {
@@ -396,7 +401,9 @@ fn insert_cidrs_tx(tx: &Transaction<'_>, segment_id: i64, name: &str, cidrs: &[I
         };
 
         if let Some((_, conflicting_segment)) = conflict {
-            return Err(anyhow::Error::new(OverlapError { conflicting_segment }));
+            return Err(anyhow::Error::new(OverlapError {
+                conflicting_segment,
+            }));
         }
 
         tx.execute(
@@ -442,7 +449,8 @@ fn read_all_segment_defs_tx(tx: &Transaction<'_>) -> Result<Vec<wiremesh_policy:
     let mut out = Vec::with_capacity(segments.len());
     for (id, name) in segments {
         let cidr_strs: Vec<String> = {
-            let mut stmt = tx.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
+            let mut stmt =
+                tx.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
             let rows = stmt.query_map(params![id], |row| row.get::<_, String>(0))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
@@ -450,7 +458,9 @@ fn read_all_segment_defs_tx(tx: &Transaction<'_>) -> Result<Vec<wiremesh_policy:
             .iter()
             .map(|c| c.parse())
             .collect::<Result<_, _>>()
-            .map_err(|e| anyhow::anyhow!("stored cidr for segment {name:?} is not valid IPv4: {e}"))?;
+            .map_err(|e| {
+                anyhow::anyhow!("stored cidr for segment {name:?} is not valid IPv4: {e}")
+            })?;
         out.push(wiremesh_policy::SegmentDef { name, cidrs });
     }
     Ok(out)
@@ -558,7 +568,10 @@ impl std::fmt::Display for EnrollError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             EnrollError::InvalidToken => {
-                write!(f, "invalid, expired, wrong-kind, or already-used enrollment token")
+                write!(
+                    f,
+                    "invalid, expired, wrong-kind, or already-used enrollment token"
+                )
             }
             EnrollError::NoMatchingSegment => {
                 write!(f, "no segment is registered for the declared cidrs")
@@ -945,13 +958,16 @@ impl Db {
                 // host-bits restatement of an unchanged network (e.g.
                 // `172.16.5.9/12` vs. the stored `172.16.0.0/12`) would
                 // wrongly compare as different.
-                let segment_id: i64 =
-                    tx.query_row("SELECT id FROM segment WHERE name = ?1", params![name], |row| {
-                        row.get(0)
-                    })?;
+                let segment_id: i64 = tx.query_row(
+                    "SELECT id FROM segment WHERE name = ?1",
+                    params![name],
+                    |row| row.get(0),
+                )?;
                 let existing_cidr_strs: Vec<String> = {
-                    let mut stmt = tx.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
-                    let rows = stmt.query_map(params![segment_id], |row| row.get::<_, String>(0))?;
+                    let mut stmt =
+                        tx.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
+                    let rows =
+                        stmt.query_map(params![segment_id], |row| row.get::<_, String>(0))?;
                     rows.collect::<rusqlite::Result<_>>()?
                 };
                 let existing_set: std::collections::BTreeSet<Ipv4Net> = existing_cidr_strs
@@ -975,7 +991,10 @@ impl Db {
                 // (`c.segment_id != ?1`), and since they're deleted first
                 // here, a segment growing its own CIDR range never
                 // self-conflicts.
-                tx.execute("DELETE FROM cidr WHERE segment_id = ?1", params![segment_id])?;
+                tx.execute(
+                    "DELETE FROM cidr WHERE segment_id = ?1",
+                    params![segment_id],
+                )?;
                 match insert_cidrs_tx(&tx, segment_id, name, cidrs) {
                     Ok(()) => {}
                     Err(e) => {
@@ -1493,8 +1512,8 @@ impl Db {
                 _ => {}
             }
         }
-        let segment_id =
-            segment_id.expect("cidrs is non-empty: loop above always sets segment_id or returns early");
+        let segment_id = segment_id
+            .expect("cidrs is non-empty: loop above always sets segment_id or returns early");
 
         // Per-kind scope/occupancy check, now that the target segment is
         // known:
@@ -1530,10 +1549,11 @@ impl Db {
                         "SELECT serial, issuer_handle FROM certificate \
                          WHERE subject_kind = 'gateway' AND subject_id = ?1 AND revoked_at IS NULL",
                     )?;
-                    let rows = stmt.query_map(params![old_gateway_id], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                    let rows = stmt
+                        .query_map(params![old_gateway_id], |row| {
+                            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
                     rows
                 };
                 for (serial, handle) in certs_to_revoke {
@@ -1816,7 +1836,11 @@ impl Db {
         )?;
         let rows = stmt
             .query_map(params![gateway_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -1840,7 +1864,11 @@ impl Db {
         )?;
         let rows = stmt
             .query_map(params![gateway_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
@@ -1876,7 +1904,8 @@ impl Db {
     /// [`Db::gateways_with_rotation_state`].
     pub fn active_gateway_ids(&self) -> Result<Vec<i64>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT id FROM gateway WHERE status = 'active' ORDER BY id")?;
+        let mut stmt =
+            conn.prepare("SELECT id FROM gateway WHERE status = 'active' ORDER BY id")?;
         let rows = stmt
             .query_map([], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1960,7 +1989,10 @@ impl Db {
         bump_revision_tx(&tx)?;
 
         tx.commit()?;
-        Ok(RotateKeyOutcome { epoch: new_epoch, pubkey })
+        Ok(RotateKeyOutcome {
+            epoch: new_epoch,
+            pubkey,
+        })
     }
 
     /// (Key-rotation Task 2) Overwrites the `"awaiting-submission"` sentinel
@@ -2164,7 +2196,11 @@ impl Db {
         )?;
         let keys = stmt
             .query_map(params![gateway_id], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         drop(stmt);
@@ -2355,8 +2391,9 @@ impl Db {
     /// `revoked_serials`.
     pub fn revoked_serials(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT serial FROM certificate WHERE revoked_at IS NOT NULL ORDER BY serial")?;
+        let mut stmt = conn.prepare(
+            "SELECT serial FROM certificate WHERE revoked_at IS NOT NULL ORDER BY serial",
+        )?;
         let rows = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2388,8 +2425,9 @@ impl Db {
             [],
             |row| row.get(0),
         )?;
-        let mut stmt = conn
-            .prepare("SELECT serial FROM certificate WHERE revoked_at IS NOT NULL ORDER BY serial")?;
+        let mut stmt = conn.prepare(
+            "SELECT serial FROM certificate WHERE revoked_at IS NOT NULL ORDER BY serial",
+        )?;
         let revoked_serials = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2409,8 +2447,9 @@ impl Db {
         // value above `i64::MAX` would silently wrap to a negative number
         // rather than erroring, corrupting the persisted applied-version
         // bookkeeping. Reject it instead.
-        let applied_version = i64::try_from(applied_version)
-            .map_err(|_| anyhow::anyhow!("applied_version {applied_version} exceeds SQLite INTEGER range"))?;
+        let applied_version = i64::try_from(applied_version).map_err(|_| {
+            anyhow::anyhow!("applied_version {applied_version} exceeds SQLite INTEGER range")
+        })?;
         let conn = self.conn.lock().unwrap();
         let updated = conn.execute(
             "UPDATE gateway SET applied_version = ?1 WHERE id = ?2",
@@ -2436,7 +2475,8 @@ impl Db {
 
         let mut out = Vec::with_capacity(segments.len());
         for (id, name) in segments {
-            let mut cstmt = conn.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
+            let mut cstmt =
+                conn.prepare("SELECT cidr FROM cidr WHERE segment_id = ?1 ORDER BY cidr")?;
             let cidrs = cstmt
                 .query_map(params![id], |row| row.get::<_, String>(0))?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2480,7 +2520,10 @@ impl Db {
             );
         }
 
-        tx.execute("DELETE FROM cidr WHERE segment_id = ?1", params![segment_id])?;
+        tx.execute(
+            "DELETE FROM cidr WHERE segment_id = ?1",
+            params![segment_id],
+        )?;
         tx.execute("DELETE FROM segment WHERE id = ?1", params![segment_id])?;
 
         // Audited atomically with the mutation itself (rather than a
@@ -2543,8 +2586,7 @@ impl Db {
     /// (Task 13) Every registered relay, ordered by id.
     pub fn list_relays(&self) -> Result<Vec<(i64, String, String, String)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt =
-            conn.prepare("SELECT id, name, endpoint, status FROM relay ORDER BY id")?;
+        let mut stmt = conn.prepare("SELECT id, name, endpoint, status FROM relay ORDER BY id")?;
         let rows = stmt
             .query_map([], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
@@ -2562,8 +2604,8 @@ impl Db {
     /// fields it doesn't need.
     pub fn active_relays(&self) -> Result<Vec<(i64, String)>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, endpoint FROM relay WHERE status = 'active' ORDER BY id")?;
+        let mut stmt =
+            conn.prepare("SELECT id, endpoint FROM relay WHERE status = 'active' ORDER BY id")?;
         let rows = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2595,8 +2637,8 @@ impl Db {
     /// closes that window.
     pub fn relays_snapshot(&self) -> Result<(Vec<(i64, String)>, u64)> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn
-            .prepare("SELECT id, endpoint FROM relay WHERE status = 'active' ORDER BY id")?;
+        let mut stmt =
+            conn.prepare("SELECT id, endpoint FROM relay WHERE status = 'active' ORDER BY id")?;
         let relays = stmt
             .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -2731,7 +2773,11 @@ impl Db {
     /// covers "no such token", "revoked", and "expired" uniformly (same
     /// non-disclosure posture as `EnrollError::InvalidToken`: a caller can't
     /// distinguish which).
-    pub fn find_active_api_token_role(&self, secret_hash: &str, now: &str) -> Result<Option<String>> {
+    pub fn find_active_api_token_role(
+        &self,
+        secret_hash: &str,
+        now: &str,
+    ) -> Result<Option<String>> {
         self.find_active_api_token(secret_hash, now)
             .map(|opt| opt.map(|(_name, role)| role))
     }
@@ -3017,9 +3063,7 @@ impl Db {
 
         let Some(existing_endpoint) = existing else {
             tx.rollback()?;
-            anyhow::bail!(
-                "set_candidate_endpoint: no active gateway row with id {gateway_id}"
-            );
+            anyhow::bail!("set_candidate_endpoint: no active gateway row with id {gateway_id}");
         };
 
         if existing_endpoint.as_deref() == Some(addr) {
@@ -3145,7 +3189,11 @@ impl Db {
     /// mirroring `set_candidate_endpoint`'s change-detection discipline so a
     /// gateway re-reporting an unchanged local-address set doesn't churn the
     /// revision or trigger a delta broadcast every time.
-    pub fn set_local_candidates(&self, gateway_id: i64, endpoints: &[String]) -> Result<Option<u64>> {
+    pub fn set_local_candidates(
+        &self,
+        gateway_id: i64,
+        endpoints: &[String],
+    ) -> Result<Option<u64>> {
         let mut conn = self.conn.lock().unwrap();
         let tx = conn.transaction()?;
 
@@ -3412,9 +3460,9 @@ mod cas_tests {
         seed_key(&db, 0, "EPOCH0==", "retiring");
         seed_key(&db, 1, REAL_KEY, "active");
 
-        let outcome = db.drop_pending_epoch(GW, 0).unwrap_or_else(|e| {
-            panic!("a zero-row CAS must not be an error, got: {e:#}")
-        });
+        let outcome = db
+            .drop_pending_epoch(GW, 0)
+            .unwrap_or_else(|e| panic!("a zero-row CAS must not be an error, got: {e:#}"));
         let _ = outcome;
 
         assert_eq!(
@@ -3614,9 +3662,9 @@ mod cas_tests {
         seed_key(&db, 0, "EPOCH0==", "active");
         seed_key(&db, 1, AWAITING_SUBMISSION_SENTINEL, "pending");
 
-        let _ = db.promote_epoch(GW, 1).unwrap_or_else(|e| {
-            panic!("a zero-row CAS must not be an error, got: {e:#}")
-        });
+        let _ = db
+            .promote_epoch(GW, 1)
+            .unwrap_or_else(|e| panic!("a zero-row CAS must not be an error, got: {e:#}"));
 
         assert_eq!(
             states(&db),
@@ -3648,15 +3696,17 @@ mod cas_tests {
         let applied = db
             .set_epoch_pubkey(GW, 1, REAL_KEY)
             .expect("filling in a genuinely pending epoch's sentinel must succeed");
-        let no_match = db.set_epoch_pubkey(GW, 1, "SECOND-KEY==").unwrap_or_else(|e| {
-            panic!(
-                "the sentinel is already gone, so this CAS matched zero rows. It must be a \
+        let no_match = db
+            .set_epoch_pubkey(GW, 1, "SECOND-KEY==")
+            .unwrap_or_else(|e| {
+                panic!(
+                    "the sentinel is already gone, so this CAS matched zero rows. It must be a \
                  VALUE, not a message the caller has to grep: SyncSvc::submit_epoch_key \
                  currently decides between FailedPrecondition and Internal with \
                  `msg.contains(\"no pending epoch\")`, which silently reclassifies the RPC \
                  the moment anyone rewords the bail. Got: {e:#}"
-            )
-        });
+                )
+            });
 
         assert_ne!(
             applied, no_match,

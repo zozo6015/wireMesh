@@ -18,7 +18,9 @@ use wiremesh_testkit::{enroll_one, StubGateway, TestController};
 /// a resolver.
 #[tokio::test]
 async fn resolve_ip_literal_passes_through_unchanged() {
-    let addr = sync::resolve_host_port("127.0.0.1:6000").await.expect("IP literal resolves");
+    let addr = sync::resolve_host_port("127.0.0.1:6000")
+        .await
+        .expect("IP literal resolves");
     assert_eq!(addr, "127.0.0.1:6000".parse::<SocketAddr>().unwrap());
 }
 
@@ -67,8 +69,14 @@ async fn resolve_v6_only_target_errors_with_no_ipv4_message() {
         .await
         .expect_err("a target with only IPv6 candidates must error, not fall back");
     let chain = format!("{err:#}");
-    assert!(chain.contains("[::1]:9500"), "error must name the input, got: {chain}");
-    assert!(chain.contains("no IPv4 addresses"), "error must say no IPv4 addresses, got: {chain}");
+    assert!(
+        chain.contains("[::1]:9500"),
+        "error must name the input, got: {chain}"
+    );
+    assert!(
+        chain.contains("no IPv4 addresses"),
+        "error must say no IPv4 addresses, got: {chain}"
+    );
 }
 
 #[test]
@@ -83,7 +91,9 @@ fn prefer_ipv4_empty_list_yields_none() {
 /// resolver result order varies by host, so this only smokes the wiring.)
 #[tokio::test]
 async fn resolve_localhost_prefers_ipv4() {
-    let addr = sync::resolve_host_port("localhost:9500").await.expect("localhost resolves");
+    let addr = sync::resolve_host_port("localhost:9500")
+        .await
+        .expect("localhost resolves");
     assert_eq!(addr, "127.0.0.1:9500".parse::<SocketAddr>().unwrap());
 }
 
@@ -134,7 +144,9 @@ async fn connect_via_hostname_yields_working_mtls_sync() {
         .await
         .expect("hostname dial resolves and completes the mTLS connect");
 
-    let mut stream = sync::watch(&mut client).await.expect("watch over hostname-dialed channel");
+    let mut stream = sync::watch(&mut client)
+        .await
+        .expect("watch over hostname-dialed channel");
     let mut cur = None;
     let ds = match sync::next_event(&mut stream, &mut cur)
         .await
@@ -145,7 +157,9 @@ async fn connect_via_hostname_yields_working_mtls_sync() {
         other => panic!("first Sync message must be a snapshot, got {other:?}"),
     };
     assert!(
-        ds.peers.iter().any(|p| p.allowed_ips.contains(&"10.10.2.0/24".to_string())),
+        ds.peers
+            .iter()
+            .any(|p| p.allowed_ips.contains(&"10.10.2.0/24".to_string())),
         "snapshot over the hostname-dialed channel lists peer B's segment: {:?}",
         ds.peers
     );

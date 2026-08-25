@@ -52,7 +52,10 @@ async fn enroll_redeems_token_and_returns_signed_leaf() {
         out.ca_bundle_pem
     );
     assert!(out.gateway_id > 0, "controller must assign a gateway_id");
-    assert!(!out.observe_key.is_empty(), "controller must return an observe_key");
+    assert!(
+        !out.observe_key.is_empty(),
+        "controller must return an observe_key"
+    );
     assert!(
         out.key_pem.contains("PRIVATE KEY"),
         "key_pem must be the locally-generated private key"

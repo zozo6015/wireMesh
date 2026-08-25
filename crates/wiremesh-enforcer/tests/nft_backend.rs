@@ -58,8 +58,14 @@ use wiremesh_testkit::netns::{join_netns, wg_lab, Ns};
 /// established per-file self-sufficiency convention.
 fn segments_exact() -> Vec<SegmentDef> {
     vec![
-        SegmentDef { name: "seg-a".into(), cidrs: vec!["10.10.0.1/32".parse().unwrap()] },
-        SegmentDef { name: "seg-b".into(), cidrs: vec!["10.10.0.2/32".parse().unwrap()] },
+        SegmentDef {
+            name: "seg-a".into(),
+            cidrs: vec!["10.10.0.1/32".parse().unwrap()],
+        },
+        SegmentDef {
+            name: "seg-b".into(),
+            cidrs: vec!["10.10.0.2/32".parse().unwrap()],
+        },
     ]
 }
 
@@ -71,7 +77,11 @@ fn compile_with(yaml: &str, segs: &[SegmentDef], version: u64) -> PolicyIR {
 }
 
 fn empty_ir(version: u64) -> PolicyIR {
-    PolicyIR { schema: 1, version, blocks: vec![] }
+    PolicyIR {
+        schema: 1,
+        version,
+        blocks: vec![],
+    }
 }
 
 // --- packet-level helpers (no `nc`/`ncat`/`socat` in this image -- see
@@ -93,7 +103,8 @@ while True:
     c.close()
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn accept-only listener")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn accept-only listener")
 }
 
 /// `connect()`s to `dst_addr:port`, `timeout_s`-second timeout. Returns
@@ -129,7 +140,8 @@ s.bind(("{bind_ip}", {bind_port}))
 s.sendto(b"x", ("{dst_ip}", {dst_port}))
 "#
     );
-    ns.exec(&["python3", "-c", &script]).expect("one-shot udp send");
+    ns.exec(&["python3", "-c", &script])
+        .expect("one-shot udp send");
 }
 
 /// Spawns a background listener on `port` that prints `RECEIVED` and exits
@@ -150,11 +162,14 @@ except socket.timeout:
     print("TIMEOUT")
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn udp recv probe")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn udp recv probe")
 }
 
 fn probe_received(child: Child) -> bool {
-    let out = child.wait_with_output().expect("udp recv probe should exit");
+    let out = child
+        .wait_with_output()
+        .expect("udp recv probe should exit");
     String::from_utf8_lossy(&out.stdout).trim() == "RECEIVED"
 }
 
@@ -178,7 +193,8 @@ except socket.timeout:
 print(count)
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn udp counting receiver")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn udp counting receiver")
 }
 
 /// Sends `count` UDP datagrams to `dst_addr:port`, `interval_s` seconds
@@ -195,7 +211,8 @@ for i in range(n):
 print(n)
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn udp sender")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn udp sender")
 }
 
 /// Spawns a background raw-ICMP listener on `ns` that prints `GOT <type>`
@@ -230,7 +247,8 @@ except socket.timeout:
     print("TIMEOUT")
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn icmp type probe")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn icmp type probe")
 }
 
 fn icmp_probe_got(child: Child, want_type: u8) -> bool {
@@ -320,8 +338,9 @@ fn allow_deny_carve_out_behavior_through_the_nftables_backend() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
-        .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
+            .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
     assert_eq!(enforcer.kind(), BackendKind::Nftables);
 
     let segs = segments_exact();
@@ -366,7 +385,12 @@ policy:
         counters.by_rule
     );
     assert!(
-        counters.by_rule.get(&allow_all_rule_id).copied().unwrap_or(0) > 0,
+        counters
+            .by_rule
+            .get(&allow_all_rule_id)
+            .copied()
+            .unwrap_or(0)
+            > 0,
         "allow-all-tcp rule's own named nft counter should have incremented for the allowed \
          connection: {:?}",
         counters.by_rule
@@ -403,8 +427,9 @@ fn established_conntrack_lets_a_reply_pass_with_no_rule_for_that_direction() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
-        .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
+            .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
     enforcer
         .apply(&empty_ir(1))
         .expect("empty (default-deny) policy should apply");
@@ -465,8 +490,9 @@ fn icmp_echo_via_explicit_rule_and_pmtud_style_embedded_error_via_related() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
-        .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
+            .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
 
     let segs = segments_exact();
 
@@ -480,7 +506,9 @@ policy:
           proto: icmp
 ";
     let icmp_ir = compile_with(icmp_yaml, &segs, 1);
-    enforcer.apply(&icmp_ir).expect("explicit icmp-allow policy should apply");
+    enforcer
+        .apply(&icmp_ir)
+        .expect("explicit icmp-allow policy should apply");
 
     assert!(
         a.exec(&["ping", "-c", "1", "-W", "3", "10.10.0.2"]).is_ok(),
@@ -506,7 +534,8 @@ policy:
     // removed the icmp-allow rule (not just a no-op), so Part 2's
     // eventual PASS below is attributable only to `related`.
     assert!(
-        a.exec(&["ping", "-c", "1", "-W", "2", "10.10.0.2"]).is_err(),
+        a.exec(&["ping", "-c", "1", "-W", "2", "10.10.0.2"])
+            .is_err(),
         "ping should now be denied -- the re-applied policy has no icmp rule at all"
     );
 
@@ -552,8 +581,9 @@ fn atomic_replace_under_continuous_traffic_has_zero_drops_across_20_applies() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
-        .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
+            .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
 
     let segs = segments_exact();
     let yaml = "
@@ -575,20 +605,28 @@ policy:
     // 20 flips of the SAME allow policy, back-to-back (no reap grace to
     // pace against), concurrent with the live traffic.
     for i in 0..20 {
-        enforcer
-            .apply(&ir)
-            .unwrap_or_else(|e| panic!("flip #{i} (re-applying the same allow policy) failed: {e:#}"));
+        enforcer.apply(&ir).unwrap_or_else(|e| {
+            panic!("flip #{i} (re-applying the same allow policy) failed: {e:#}")
+        });
     }
 
     let sender_out = sender.wait_with_output().expect("udp sender should exit");
-    assert!(sender_out.status.success(), "udp sender exited non-zero: {sender_out:?}");
+    assert!(
+        sender_out.status.success(),
+        "udp sender exited non-zero: {sender_out:?}"
+    );
     let sent: u64 = String::from_utf8_lossy(&sender_out.stdout)
         .trim()
         .parse()
         .expect("sender should print its packet count");
 
-    let receiver_out = receiver.wait_with_output().expect("udp receiver should exit after its idle timeout");
-    assert!(receiver_out.status.success(), "udp receiver exited non-zero: {receiver_out:?}");
+    let receiver_out = receiver
+        .wait_with_output()
+        .expect("udp receiver should exit after its idle timeout");
+    assert!(
+        receiver_out.status.success(),
+        "udp receiver exited non-zero: {receiver_out:?}"
+    );
     let received: u64 = String::from_utf8_lossy(&receiver_out.stdout)
         .trim()
         .parse()
@@ -627,8 +665,9 @@ fn counters_survive_a_policy_reapply_via_the_offset_accumulator() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
-        .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
+    let mut enforcer =
+        wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
+            .expect("probe_with(Nftables, ..) should load the nftables backend on wg0");
 
     let segs = segments_exact();
     let yaml = "
@@ -650,7 +689,10 @@ policy:
 
     let k1 = 3;
     for _ in 0..k1 {
-        assert!(tcp_connect(&a, "10.10.0.2", 9600, 2), "connect should succeed under the allow rule");
+        assert!(
+            tcp_connect(&a, "10.10.0.2", 9600, 2),
+            "connect should succeed under the allow rule"
+        );
     }
     let counters1 = enforcer.counters().expect("counters() should succeed");
     assert_eq!(
@@ -662,7 +704,9 @@ policy:
 
     // Re-apply the IDENTICAL policy: nft's atomic flush+recreate resets the
     // underlying named counter object's raw value to 0.
-    enforcer.apply(&ir).expect("re-applying the identical allow-tcp policy should succeed");
+    enforcer
+        .apply(&ir)
+        .expect("re-applying the identical allow-tcp policy should succeed");
 
     let k2 = 2;
     for _ in 0..k2 {
@@ -714,8 +758,9 @@ fn probe_with_nftables_returns_a_functional_nftables_backend() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let mut enforcer = wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
-        .expect("probe_with(Nftables, ..) should return a working nftables backend");
+    let mut enforcer =
+        wiremesh_enforcer::probe_with(BackendKind::Nftables, "wg0", EnforcerConfig::default())
+            .expect("probe_with(Nftables, ..) should return a working nftables backend");
     assert_eq!(
         enforcer.kind(),
         BackendKind::Nftables,

@@ -87,8 +87,7 @@ fn list_relay_rows(db_path: &std::path::Path) -> Vec<(i64, String, String, Strin
 /// per test means at most one relay certificate is ever recorded across
 /// these tests, so "the" row (rather than "a" row) is unambiguous.
 fn find_relay_certificate_row(db_path: &std::path::Path) -> Option<(String, String)> {
-    let conn =
-        Connection::open(db_path).expect("opening controller.db for certificate inspection");
+    let conn = Connection::open(db_path).expect("opening controller.db for certificate inspection");
     conn.query_row(
         "SELECT serial, subject_kind FROM certificate WHERE subject_kind = 'relay'",
         [],
@@ -177,9 +176,8 @@ async fn relay_enrollment_issues_ca_signed_cert_and_creates_active_relay_row() {
     let cert_row = tokio::task::spawn_blocking(move || find_relay_certificate_row(&db_path))
         .await
         .expect("blocking certificate-row inspection task panicked");
-    let (db_serial, subject_kind) = cert_row.expect(
-        "a certificate row with subject_kind = 'relay' must exist after relay enrollment",
-    );
+    let (db_serial, subject_kind) = cert_row
+        .expect("a certificate row with subject_kind = 'relay' must exist after relay enrollment");
     assert_eq!(subject_kind, "relay");
     assert_eq!(
         db_serial.to_lowercase(),

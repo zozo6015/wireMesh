@@ -1,0 +1,47 @@
+# This standalone workspace builds on NIGHTLY, and says so here so that builds
+# run FROM THIS DIRECTORY -- the way CLAUDE.md's execution rules say to build
+# it -- do not fall back to the image's default stable.
+#
+# Note precisely WHICH builds need it: `default-members = ["common"]`, so a
+# bare `cargo build` here compiles only `common` and never reaches `program`
+# at all. It is `cargo build --workspace`, or anything that names `program`,
+# that needs nightly -- on stable those fail with
+# `error: unwinding panics are not supported without std` at `program`'s
+# `#![no_std] #![no_main]` classifier.
+#
+# This file is SAFE where a repo-root one is not. Rustup consults a toolchain
+# file found by walking up from the directory cargo was invoked in, so this one
+# is read only for builds started inside this workspace. It is never seen by
+# the root-workspace builds, and never by `release.yml`'s macOS and Windows
+# jobs -- which is exactly the mechanism that made a ROOT toolchain file
+# unshippable: it would have outranked the `rustup default` that
+# `dtolnay/rust-toolchain@stable` sets and cross-built
+# `--target x86_64-apple-darwin` under a toolchain that never had that target
+# installed. `crates/wiremesh-enforcer`'s build script is unaffected either
+# way, and that was proven rather than reasoned: it `set_current_dir`s into
+# THIS workspace before calling `aya_build::build_ebpf(.., Toolchain::default())`,
+# which shells out as `rustup run nightly cargo build` -- and `rustup run` sets
+# `RUSTUP_TOOLCHAIN`, which outranks every toolchain file. The reviewer
+# confirmed that precedence with a control: a toolchain file naming a
+# NONEXISTENT version, which the build ignored.
+#
+# The channel is UNDATED on purpose. Pinning a dated nightly needs its own
+# verification pass against `aya_build` and `bpf-linker` 0.10.4, and that is a
+# separate piece of work; `dev/Dockerfile` installs one nightly and this
+# resolves to it with no download.
+#
+# NO `components` KEY, deliberately, and this was proven by running it. The
+# release builder base ships the MINIMAL rustup profile, and
+# `deploy/docker/Dockerfile` does `COPY . .` before `cargo build --release`,
+# so any component listed in a toolchain file inside the build context gets
+# FETCHED there, uncached, on every release build -- for components that build
+# never invokes. `dev/Dockerfile` installs `rust-src` on this toolchain with an
+# explicit `--component rust-src`, and that explicit install -- not any
+# property of the channel -- is what guarantees it is present. (`rust-src` is
+# not a nightly-only component; it is available on stable too. It is required
+# here because the BPF target has no prebuilt std, so `aya_build`
+# cross-compiles `core` via `-Z build-std`.) The same line installs rustfmt and
+# clippy, and B4's jobs will run in that image, so all three are present
+# without being requested here.
+[toolchain]
+channel = "nightly"

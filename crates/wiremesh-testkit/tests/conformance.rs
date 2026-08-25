@@ -45,7 +45,7 @@
 
 use wiremesh_enforcer::BackendKind;
 use wiremesh_testkit::conformance::{
-    ep, flip_under_traffic_zero_loss, run_scenario, Expect, L4, Node, Scenario, Step,
+    ep, flip_under_traffic_zero_loss, run_scenario, Expect, Node, Scenario, Step, L4,
 };
 
 const SEG_AB: &[(&str, &[&str])] = &[("seg-a", &["10.10.0.1/32"]), ("seg-b", &["10.10.0.2/32"])];
@@ -168,9 +168,21 @@ const STATEFUL_REPLY_SCENARIO: Scenario = Scenario {
 // --- 4. ICMP echo allowed by an explicit rule -------------------------------
 
 const ICMP_ECHO_STEPS: &[Step] = &[
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 0), proto: L4::Icmp, expect: Expect::Delivered },
-    Step::ApplyPolicy { yaml: "policy: []\n" },
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 0), proto: L4::Icmp, expect: Expect::Dropped },
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 0),
+        proto: L4::Icmp,
+        expect: Expect::Delivered,
+    },
+    Step::ApplyPolicy {
+        yaml: "policy: []\n",
+    },
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 0),
+        proto: L4::Icmp,
+        expect: Expect::Dropped,
+    },
 ];
 
 const ICMP_ECHO_SCENARIO: Scenario = Scenario {
@@ -205,7 +217,10 @@ const ICMP_EMBEDDED_ERROR_STEPS: &[Step] = &[
     Step::Send {
         from: ep(Node::A, 0),
         to: ep(Node::B, 0),
-        proto: L4::IcmpFragNeeded { embedded_src_port: 6100, embedded_dst_port: 7100 },
+        proto: L4::IcmpFragNeeded {
+            embedded_src_port: 6100,
+            embedded_dst_port: 7100,
+        },
         expect: Expect::Delivered,
     },
     // Same shape, but embedding a tuple that was NEVER a real flow -- must
@@ -213,7 +228,10 @@ const ICMP_EMBEDDED_ERROR_STEPS: &[Step] = &[
     Step::Send {
         from: ep(Node::A, 0),
         to: ep(Node::B, 0),
-        proto: L4::IcmpFragNeeded { embedded_src_port: 6101, embedded_dst_port: 7101 },
+        proto: L4::IcmpFragNeeded {
+            embedded_src_port: 6101,
+            embedded_dst_port: 7101,
+        },
         expect: Expect::Dropped,
     },
 ];
@@ -374,7 +392,9 @@ const FLUSH_FLOWS_STEPS: &[Step] = &[
         expect: Expect::Delivered,
     },
     // 3. v2 removes udp/8200's allow rule entirely (no block at all).
-    Step::ApplyPolicy { yaml: "policy: []\n" },
+    Step::ApplyPolicy {
+        yaml: "policy: []\n",
+    },
     // 4. SAME tuple as step 1, no flush yet: must still be Delivered on
     //    BOTH backends -- eBPF's FLOWS entry is untouched by apply(); on
     //    nftables this flow is now genuinely `ct state established`
@@ -435,12 +455,33 @@ policy:
 
 const COUNTER_STABILITY_STEPS: &[Step] = &[
     // Two hits on ruleA (tcp/9200, kept verbatim across the update).
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 9200), proto: L4::Tcp, expect: Expect::Delivered },
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 9200), proto: L4::Tcp, expect: Expect::Delivered },
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 9200),
+        proto: L4::Tcp,
+        expect: Expect::Delivered,
+    },
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 9200),
+        proto: L4::Tcp,
+        expect: Expect::Delivered,
+    },
     // One hit on ruleB (udp/9300, about to change in v2).
-    Step::Send { from: ep(Node::A, 9310), to: ep(Node::B, 9300), proto: L4::Udp, expect: Expect::Delivered },
-    Step::ExpectCounter { rule_id_of: ("seg-a->seg-b", 0, 0), min: 2 },
-    Step::ExpectCounter { rule_id_of: ("seg-a->seg-b", 0, 1), min: 1 },
+    Step::Send {
+        from: ep(Node::A, 9310),
+        to: ep(Node::B, 9300),
+        proto: L4::Udp,
+        expect: Expect::Delivered,
+    },
+    Step::ExpectCounter {
+        rule_id_of: ("seg-a->seg-b", 0, 0),
+        min: 2,
+    },
+    Step::ExpectCounter {
+        rule_id_of: ("seg-a->seg-b", 0, 1),
+        min: 1,
+    },
     // v2: ruleA's text is byte-identical (same rule_id); ruleB's port
     // changes 9300 -> 9301 (a genuinely different rule_id).
     Step::ApplyPolicy {
@@ -459,11 +500,27 @@ policy:
     },
     // ruleA hit once more post-update -- its counter must be CUMULATIVE
     // (old + new), proving it survived the update keyed by rule_id.
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 9200), proto: L4::Tcp, expect: Expect::Delivered },
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 9200),
+        proto: L4::Tcp,
+        expect: Expect::Delivered,
+    },
     // ruleB' (new rule_id) still functions normally on its new port.
-    Step::Send { from: ep(Node::A, 9311), to: ep(Node::B, 9301), proto: L4::Udp, expect: Expect::Delivered },
-    Step::ExpectCounter { rule_id_of: ("seg-a->seg-b", 0, 0), min: 3 },
-    Step::ExpectCounter { rule_id_of: ("seg-a->seg-b", 0, 1), min: 1 },
+    Step::Send {
+        from: ep(Node::A, 9311),
+        to: ep(Node::B, 9301),
+        proto: L4::Udp,
+        expect: Expect::Delivered,
+    },
+    Step::ExpectCounter {
+        rule_id_of: ("seg-a->seg-b", 0, 0),
+        min: 3,
+    },
+    Step::ExpectCounter {
+        rule_id_of: ("seg-a->seg-b", 0, 1),
+        min: 1,
+    },
 ];
 
 const COUNTER_STABILITY_SCENARIO: Scenario = Scenario {
@@ -487,13 +544,48 @@ policy:
 // --- 9. ports-range edge: lo, hi, single port -------------------------------
 
 const PORTS_RANGE_EDGE_STEPS: &[Step] = &[
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 8000), proto: L4::Tcp, expect: Expect::Delivered }, // lo
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 8010), proto: L4::Tcp, expect: Expect::Delivered }, // hi
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 8005), proto: L4::Tcp, expect: Expect::Delivered }, // mid
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 7999), proto: L4::Tcp, expect: Expect::Dropped }, // just below lo
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 8011), proto: L4::Tcp, expect: Expect::Dropped }, // just above hi
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 9000), proto: L4::Tcp, expect: Expect::Delivered }, // single port
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 9001), proto: L4::Tcp, expect: Expect::Dropped }, // adjacent to single port
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 8000),
+        proto: L4::Tcp,
+        expect: Expect::Delivered,
+    }, // lo
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 8010),
+        proto: L4::Tcp,
+        expect: Expect::Delivered,
+    }, // hi
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 8005),
+        proto: L4::Tcp,
+        expect: Expect::Delivered,
+    }, // mid
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 7999),
+        proto: L4::Tcp,
+        expect: Expect::Dropped,
+    }, // just below lo
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 8011),
+        proto: L4::Tcp,
+        expect: Expect::Dropped,
+    }, // just above hi
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 9000),
+        proto: L4::Tcp,
+        expect: Expect::Delivered,
+    }, // single port
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 9001),
+        proto: L4::Tcp,
+        expect: Expect::Dropped,
+    }, // adjacent to single port
 ];
 
 const PORTS_RANGE_EDGE_SCENARIO: Scenario = Scenario {
@@ -531,12 +623,32 @@ policy:
 //         section for the root-cause writeup. ------------------------------
 
 const PROTO_ANY_STEPS: &[Step] = &[
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 5000), proto: L4::Tcp, expect: Expect::Delivered },
-    Step::Send { from: ep(Node::A, 5001), to: ep(Node::B, 5002), proto: L4::Udp, expect: Expect::Delivered },
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 0), proto: L4::Icmp, expect: Expect::Delivered },
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 5000),
+        proto: L4::Tcp,
+        expect: Expect::Delivered,
+    },
+    Step::Send {
+        from: ep(Node::A, 5001),
+        to: ep(Node::B, 5002),
+        proto: L4::Udp,
+        expect: Expect::Delivered,
+    },
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 0),
+        proto: L4::Icmp,
+        expect: Expect::Delivered,
+    },
     // GRE (IP protocol 47): proto-any means tcp+udp+icmp ONLY -- this must
     // be denied on BOTH backends, falling through to default-deny.
-    Step::Send { from: ep(Node::A, 0), to: ep(Node::B, 0), proto: L4::RawIpProto(47), expect: Expect::Dropped },
+    Step::Send {
+        from: ep(Node::A, 0),
+        to: ep(Node::B, 0),
+        proto: L4::RawIpProto(47),
+        expect: Expect::Dropped,
+    },
 ];
 
 const PROTO_ANY_SCENARIO: Scenario = Scenario {

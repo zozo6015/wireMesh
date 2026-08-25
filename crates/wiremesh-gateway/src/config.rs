@@ -56,7 +56,10 @@ impl GatewayConfig {
         let mut metrics_addr = None;
         let mut it = args.skip(1); // argv[0]
         while let Some(flag) = it.next() {
-            let mut val = || it.next().ok_or_else(|| anyhow!("flag {flag} needs a value"));
+            let mut val = || {
+                it.next()
+                    .ok_or_else(|| anyhow!("flag {flag} needs a value"))
+            };
             match flag.as_str() {
                 "--controller-sync" => {
                     let v = val()?;
@@ -76,15 +79,15 @@ impl GatewayConfig {
             }
         }
         Ok(GatewayConfig {
-            controller_sync_addr: controller.ok_or_else(|| anyhow!("--controller-sync required"))?,
+            controller_sync_addr: controller
+                .ok_or_else(|| anyhow!("--controller-sync required"))?,
             observe_addr: observe.ok_or_else(|| anyhow!("--observe required"))?,
             tun_ifname: tun.ok_or_else(|| anyhow!("--tun required"))?,
             wg_listen_port: wg_port.ok_or_else(|| anyhow!("--wg-port required"))?,
             state_dir: state_dir.ok_or_else(|| anyhow!("--state-dir required"))?,
             // Optional: default to loopback + OS-assigned port (historical
             // behavior) when `--metrics` is absent.
-            metrics_addr: metrics_addr
-                .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
+            metrics_addr: metrics_addr.unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 0))),
         })
     }
 }
@@ -97,11 +100,16 @@ mod tests {
     fn parse_reads_all_fields_from_args() {
         let args = [
             "wiremesh-gateway",
-            "--controller-sync", "127.0.0.1:6000",
-            "--observe", "127.0.0.1:6001",
-            "--tun", "wg0",
-            "--wg-port", "51820",
-            "--state-dir", "/var/lib/wiremesh",
+            "--controller-sync",
+            "127.0.0.1:6000",
+            "--observe",
+            "127.0.0.1:6001",
+            "--tun",
+            "wg0",
+            "--wg-port",
+            "51820",
+            "--state-dir",
+            "/var/lib/wiremesh",
         ]
         .into_iter()
         .map(String::from);
@@ -115,7 +123,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_missing_required_flag() {
-        let args = ["wiremesh-gateway", "--tun", "wg0"].into_iter().map(String::from);
+        let args = ["wiremesh-gateway", "--tun", "wg0"]
+            .into_iter()
+            .map(String::from);
         assert!(GatewayConfig::parse(args).is_err());
     }
 
@@ -127,11 +137,16 @@ mod tests {
     fn parse_accepts_hostname_dial_targets_verbatim() {
         let args = [
             "wiremesh-gateway",
-            "--controller-sync", "controller.example.com:9500",
-            "--observe", "ddns.example.net:9600",
-            "--tun", "wg0",
-            "--wg-port", "51820",
-            "--state-dir", "/var/lib/wiremesh",
+            "--controller-sync",
+            "controller.example.com:9500",
+            "--observe",
+            "ddns.example.net:9600",
+            "--tun",
+            "wg0",
+            "--wg-port",
+            "51820",
+            "--state-dir",
+            "/var/lib/wiremesh",
         ]
         .into_iter()
         .map(String::from);
@@ -145,11 +160,16 @@ mod tests {
     fn parse_with_sync_value(v: &str) -> anyhow::Result<GatewayConfig> {
         let args = [
             "wiremesh-gateway",
-            "--controller-sync", v,
-            "--observe", "127.0.0.1:6001",
-            "--tun", "wg0",
-            "--wg-port", "51820",
-            "--state-dir", "/var/lib/wiremesh",
+            "--controller-sync",
+            v,
+            "--observe",
+            "127.0.0.1:6001",
+            "--tun",
+            "wg0",
+            "--wg-port",
+            "51820",
+            "--state-dir",
+            "/var/lib/wiremesh",
         ]
         .into_iter()
         .map(String::from);
@@ -177,15 +197,23 @@ mod tests {
     fn parse_rejects_malformed_observe_value() {
         let args = [
             "wiremesh-gateway",
-            "--controller-sync", "127.0.0.1:6000",
-            "--observe", "observer.example.com",
-            "--tun", "wg0",
-            "--wg-port", "51820",
-            "--state-dir", "/var/lib/wiremesh",
+            "--controller-sync",
+            "127.0.0.1:6000",
+            "--observe",
+            "observer.example.com",
+            "--tun",
+            "wg0",
+            "--wg-port",
+            "51820",
+            "--state-dir",
+            "/var/lib/wiremesh",
         ]
         .into_iter()
         .map(String::from);
-        assert!(GatewayConfig::parse(args).is_err(), "--observe without a port must be rejected");
+        assert!(
+            GatewayConfig::parse(args).is_err(),
+            "--observe without a port must be rejected"
+        );
     }
 
     /// `--metrics` is a BIND address, not a dial target: it still requires a
@@ -195,19 +223,28 @@ mod tests {
         let mk = |metrics: &str| {
             [
                 "wiremesh-gateway",
-                "--controller-sync", "127.0.0.1:6000",
-                "--observe", "127.0.0.1:6001",
-                "--tun", "wg0",
-                "--wg-port", "51820",
-                "--state-dir", "/var/lib/wiremesh",
-                "--metrics", metrics,
+                "--controller-sync",
+                "127.0.0.1:6000",
+                "--observe",
+                "127.0.0.1:6001",
+                "--tun",
+                "wg0",
+                "--wg-port",
+                "51820",
+                "--state-dir",
+                "/var/lib/wiremesh",
+                "--metrics",
+                metrics,
             ]
             .into_iter()
             .map(String::from)
             .collect::<Vec<_>>()
             .into_iter()
         };
-        assert!(GatewayConfig::parse(mk("localhost:9100")).is_err(), "hostname must be rejected");
+        assert!(
+            GatewayConfig::parse(mk("localhost:9100")).is_err(),
+            "hostname must be rejected"
+        );
         let cfg = GatewayConfig::parse(mk("0.0.0.0:9100")).expect("ip:port metrics parses");
         assert_eq!(cfg.metrics_addr, SocketAddr::from(([0, 0, 0, 0], 9100)));
     }
@@ -224,7 +261,12 @@ mod tests {
     /// (boot), with an error that says so, instead of failing at every dial.
     #[test]
     fn validate_host_port_rejects_ipv6_dial_targets() {
-        for target in ["[::1]:9500", "[2001:db8::1]:9500", "::1:9500", "2001:db8::1:9500"] {
+        for target in [
+            "[::1]:9500",
+            "[2001:db8::1]:9500",
+            "::1:9500",
+            "2001:db8::1:9500",
+        ] {
             let err = validate_host_port(target)
                 .expect_err(&format!("IPv6 dial target {target:?} must be rejected"));
             let chain = format!("{err:#}");
@@ -246,8 +288,14 @@ mod tests {
     /// looping on resolution failures forever.
     #[test]
     fn validate_host_port_rejects_malformed_ip_literal_attempts() {
-        assert!(validate_host_port("10.0.0.300:9500").is_err(), "IPv4-shaped host, invalid octet");
-        assert!(validate_host_port("999.1.2.3:1").is_err(), "IPv4-shaped host, out-of-range octets");
+        assert!(
+            validate_host_port("10.0.0.300:9500").is_err(),
+            "IPv4-shaped host, invalid octet"
+        );
+        assert!(
+            validate_host_port("999.1.2.3:1").is_err(),
+            "IPv4-shaped host, out-of-range octets"
+        );
     }
 
     /// The fast-fail must not eat genuine hostnames: names mixing digits and
@@ -269,11 +317,17 @@ mod tests {
 
     #[test]
     fn validate_host_port_rejects_syntax_errors() {
-        assert!(validate_host_port("no-port-at-all").is_err(), "missing port");
+        assert!(
+            validate_host_port("no-port-at-all").is_err(),
+            "missing port"
+        );
         assert!(validate_host_port(":9500").is_err(), "empty host");
         assert!(validate_host_port("host:").is_err(), "empty port");
         assert!(validate_host_port("host:0x1f").is_err(), "non-numeric port");
-        assert!(validate_host_port("host:65536").is_err(), "port out of u16 range");
+        assert!(
+            validate_host_port("host:65536").is_err(),
+            "port out of u16 range"
+        );
         assert!(validate_host_port("host:-1").is_err(), "negative port");
     }
 }

@@ -94,14 +94,19 @@ fn own_and_overlap_devices_at_the_same_epoch_coexist() {
     // directly rather than planned (main.rs:476-482, OD-1).
     let boot_id = TunnelId::Own { epoch: 1 };
     let boot_priv = gen_priv();
-    set.bring_up(boot_id, BASE_TUN, &boot_priv, BASE_PORT, 1280).unwrap();
-    let boot_plan =
-        TunnelPlan { id: boot_id, ifname: BASE_TUN.to_string(), listen_port: BASE_PORT };
+    set.bring_up(boot_id, BASE_TUN, &boot_priv, BASE_PORT, 1280)
+        .unwrap();
+    let boot_plan = TunnelPlan {
+        id: boot_id,
+        ifname: BASE_TUN.to_string(),
+        listen_port: BASE_PORT,
+    };
     let mut live = vec![boot_plan];
 
     // (2) Role A: our own new epoch 2.
     let own_id = TunnelId::Own { epoch: 2 };
-    let own = plan_tunnel(own_id, BASE_TUN, BASE_PORT, &live).expect("planning our own epoch-2 tun");
+    let own =
+        plan_tunnel(own_id, BASE_TUN, BASE_PORT, &live).expect("planning our own epoch-2 tun");
     let own_priv = gen_priv();
     set.bring_up(own_id, &own.ifname, &own_priv, own.listen_port, 1280)
         .expect("Role A's own epoch-2 Device must come up");
@@ -111,18 +116,32 @@ fn own_and_overlap_devices_at_the_same_epoch_coexist() {
     // ACTIVE key (main.rs:3786-3793), not a fresh one, so the private key here
     // is deliberately `boot_priv`: two Devices holding the same keypair on
     // different ports is legal WireGuard and is exactly what production does.
-    let ovl_id = TunnelId::Overlap { gateway_id: 7, epoch: 2 };
+    let ovl_id = TunnelId::Overlap {
+        gateway_id: 7,
+        epoch: 2,
+    };
     let ovl = plan_tunnel(ovl_id, BASE_TUN, BASE_PORT, &live)
         .expect("planning a Role-B overlap toward peer 7's pending epoch 2");
     set.bring_up(ovl_id, &ovl.ifname, &boot_priv, ovl.listen_port, 1280)
-        .expect("the Role-B overlap Device must come up ALONGSIDE our own epoch-2 Device — this \
-                 is the shipped fabric-wide-outage bug (F3)");
+        .expect(
+            "the Role-B overlap Device must come up ALONGSIDE our own epoch-2 Device — this \
+                 is the shipped fabric-wide-outage bug (F3)",
+        );
     live.push(ovl.clone());
 
     // All three are distinct map entries.
-    assert!(set.get(boot_id).is_some(), "boot tun must still be in the set");
-    assert!(set.get(own_id).is_some(), "our own epoch-2 tun must be in the set");
-    assert!(set.get(ovl_id).is_some(), "the overlap toward peer 7 at epoch 2 must be in the set");
+    assert!(
+        set.get(boot_id).is_some(),
+        "boot tun must still be in the set"
+    );
+    assert!(
+        set.get(own_id).is_some(),
+        "our own epoch-2 tun must be in the set"
+    );
+    assert!(
+        set.get(ovl_id).is_some(),
+        "the overlap toward peer 7 at epoch 2 must be in the set"
+    );
 
     // All three are distinct, live kernel links on distinct ports. `wg show`
     // is the arbiter rather than the set's own bookkeeping: a scheme that
@@ -134,17 +153,36 @@ fn own_and_overlap_devices_at_the_same_epoch_coexist() {
 
     // And the axes really are three, not one: the planner's own output has to
     // agree with what the kernel accepted.
-    assert_ne!(own.ifname, ovl.ifname, "own-epoch and overlap tuns must not share an ifname");
-    assert_ne!(own.listen_port, ovl.listen_port, "own-epoch and overlap tuns must not share a port");
-    assert_ne!(own.ifname, BASE_TUN, "a rotation tun must never reuse the base tun's name");
-    assert_ne!(ovl.ifname, BASE_TUN, "an overlap tun must never reuse the base tun's name");
+    assert_ne!(
+        own.ifname, ovl.ifname,
+        "own-epoch and overlap tuns must not share an ifname"
+    );
+    assert_ne!(
+        own.listen_port, ovl.listen_port,
+        "own-epoch and overlap tuns must not share a port"
+    );
+    assert_ne!(
+        own.ifname, BASE_TUN,
+        "a rotation tun must never reuse the base tun's name"
+    );
+    assert_ne!(
+        ovl.ifname, BASE_TUN,
+        "an overlap tun must never reuse the base tun's name"
+    );
 
     // Tearing the overlap down must not disturb our own epoch-2 Device: the
     // two rotations are independent and complete on independent schedules.
     set.tear_down(ovl_id).unwrap();
-    assert!(set.get(ovl_id).is_none(), "the overlap must be gone from the set");
     assert!(
-        !Command::new("ip").args(["link", "show", &ovl.ifname]).status().unwrap().success(),
+        set.get(ovl_id).is_none(),
+        "the overlap must be gone from the set"
+    );
+    assert!(
+        !Command::new("ip")
+            .args(["link", "show", &ovl.ifname])
+            .status()
+            .unwrap()
+            .success(),
         "{} should no longer exist after tear_down",
         ovl.ifname
     );
@@ -166,23 +204,35 @@ fn two_peers_overlapping_at_the_same_epoch_get_their_own_devices() {
     let mut set = TunnelSet::new();
     let boot_id = TunnelId::Own { epoch: 3 };
     let boot_priv = gen_priv();
-    set.bring_up(boot_id, BASE_TUN, &boot_priv, BASE_PORT, 1280).unwrap();
-    let mut live =
-        vec![TunnelPlan { id: boot_id, ifname: BASE_TUN.to_string(), listen_port: BASE_PORT }];
+    set.bring_up(boot_id, BASE_TUN, &boot_priv, BASE_PORT, 1280)
+        .unwrap();
+    let mut live = vec![TunnelPlan {
+        id: boot_id,
+        ifname: BASE_TUN.to_string(),
+        listen_port: BASE_PORT,
+    }];
 
     let mut brought_up = Vec::new();
     for gid in [11u64, 12, 13] {
-        let id = TunnelId::Overlap { gateway_id: gid, epoch: 4 };
+        let id = TunnelId::Overlap {
+            gateway_id: gid,
+            epoch: 4,
+        };
         let plan = plan_tunnel(id, BASE_TUN, BASE_PORT, &live)
             .unwrap_or_else(|e| panic!("planning overlap toward peer {gid} at epoch 4: {e:#}"));
         set.bring_up(id, &plan.ifname, &boot_priv, plan.listen_port, 1280)
-            .unwrap_or_else(|e| panic!("overlap Device for peer {gid} at epoch 4 must come up: {e:#}"));
+            .unwrap_or_else(|e| {
+                panic!("overlap Device for peer {gid} at epoch 4 must come up: {e:#}")
+            });
         live.push(plan.clone());
         brought_up.push((gid, id, plan));
     }
 
     for (gid, id, plan) in &brought_up {
-        assert!(set.get(*id).is_some(), "peer {gid}'s overlap must be in the set");
+        assert!(
+            set.get(*id).is_some(),
+            "peer {gid}'s overlap must be in the set"
+        );
         assert_device_listening(&plan.ifname, plan.listen_port);
     }
     assert_device_listening(BASE_TUN, BASE_PORT);

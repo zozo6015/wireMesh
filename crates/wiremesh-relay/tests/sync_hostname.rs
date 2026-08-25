@@ -117,8 +117,14 @@ async fn resolve_v6_only_target_errors_with_no_ipv4_message() {
         .await
         .expect_err("a target with only IPv6 candidates must error, not fall back");
     let chain = format!("{err:#}");
-    assert!(chain.contains("[::1]:9500"), "error must name the input, got: {chain}");
-    assert!(chain.contains("no IPv4 addresses"), "error must say no IPv4 addresses, got: {chain}");
+    assert!(
+        chain.contains("[::1]:9500"),
+        "error must name the input, got: {chain}"
+    );
+    assert!(
+        chain.contains("no IPv4 addresses"),
+        "error must say no IPv4 addresses, got: {chain}"
+    );
 }
 
 /// An unresolvable name errors, and the error carries the input so a relay
@@ -294,7 +300,9 @@ async fn run_sync_via_hostname_folds_and_persists_revocations() {
     let pre_serial = victim_pre.cert_serial().expect("pre victim serial");
     h.admin_client()
         .await
-        .revoke_cert(RevokeCertRequest { serial: pre_serial.clone() })
+        .revoke_cert(RevokeCertRequest {
+            serial: pre_serial.clone(),
+        })
         .await
         .expect("Admin.RevokeCert (pre-dial victim)");
 
@@ -317,25 +325,27 @@ async fn run_sync_via_hostname_folds_and_persists_revocations() {
         let certdir = dir.path().to_path_buf();
         let persist_path = persist_path.clone();
         tokio::spawn(async move {
-            let result = wiremesh_relay::run_sync(
-                &hostname_addr,
-                &certdir,
-                "relay",
-                denylist,
-                persist_path,
-            )
-            .await;
+            let result =
+                wiremesh_relay::run_sync(&hostname_addr, &certdir, "relay", denylist, persist_path)
+                    .await;
             eprintln!("run_sync ended: {result:?}");
         })
     };
 
     // Snapshot path (replace_all) over the hostname-dialed channel.
-    await_fold(&denylist, &pre_serial, "the opening snapshot's revoked serial").await;
+    await_fold(
+        &denylist,
+        &pre_serial,
+        "the opening snapshot's revoked serial",
+    )
+    .await;
 
     // Delta path (union) — the stream must stay live past the snapshot.
     h.admin_client()
         .await
-        .revoke_cert(RevokeCertRequest { serial: live_serial.clone() })
+        .revoke_cert(RevokeCertRequest {
+            serial: live_serial.clone(),
+        })
         .await
         .expect("Admin.RevokeCert (live victim)");
     await_fold(&denylist, &live_serial, "the live revocation delta").await;

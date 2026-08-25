@@ -147,7 +147,9 @@ fn verify_chains(leaf_pem: &str, bundle_pem: &str) -> bool {
 fn gateway_csr(cn: &str) -> String {
     let kp = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
-    params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
     params.serialize_request(&kp).unwrap().pem().unwrap()
 }
 
@@ -299,7 +301,10 @@ async fn ca_reload_across_restart_keeps_trust_anchor() {
 
     let leaf1 = {
         let trust = open_hermetic(dir.path());
-        let issued = trust.sign(&gateway_csr("gw-aws"), profile("gw-aws")).await.unwrap();
+        let issued = trust
+            .sign(&gateway_csr("gw-aws"), profile("gw-aws"))
+            .await
+            .unwrap();
         issued.cert_pem
         // trust dropped here — simulates process exit.
     };

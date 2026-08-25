@@ -141,12 +141,19 @@ async fn wait_dead(t: &RelayTransport, budget: Duration, label: &str) {
 /// NOT pinned"), but it must exist as the conservative catch-all.
 #[test]
 fn death_reason_enum_shape() {
-    let all = [RelayDeathReason::Closed, RelayDeathReason::TimedOut, RelayDeathReason::Other];
+    let all = [
+        RelayDeathReason::Closed,
+        RelayDeathReason::TimedOut,
+        RelayDeathReason::Other,
+    ];
     for (i, a) in all.iter().enumerate() {
         let copied = *a; // Copy
         assert_eq!(copied, *a, "{copied:?} must equal itself"); // PartialEq + Debug
         for b in &all[i + 1..] {
-            assert_ne!(copied, *b, "variants must be distinct ({copied:?} vs {b:?})");
+            assert_ne!(
+                copied, *b,
+                "variants must be distinct ({copied:?} vs {b:?})"
+            );
         }
     }
 }
@@ -163,9 +170,11 @@ async fn graceful_relay_close_classifies_as_closed() {
     let pems = provision(&dir);
     let (relay_addr, endpoint) = spawn_killable_relay(&dir).await;
 
-    let t = RelayTransport::start(relay_addr, &pems.cert, &pems.key, &pems.ca, "gw-A", "gw-B", None)
-        .await
-        .expect("RelayTransport::start against the in-process relay");
+    let t = RelayTransport::start(
+        relay_addr, &pems.cert, &pems.key, &pems.ca, "gw-A", "gw-B", None,
+    )
+    .await
+    .expect("RelayTransport::start against the in-process relay");
 
     // Alive: healthy, and NO death reason yet — a live transport reporting a
     // reason would let the driver act on a death that hasn't happened.
@@ -220,9 +229,15 @@ async fn idle_silence_classifies_as_timed_out() {
     // (connected to the real relay). Learns the client's address from its
     // first datagram. 64KiB buffers so DPLPMTUD probes on loopback are
     // forwarded rather than truncated.
-    let front = UdpSocket::bind("127.0.0.1:0").await.expect("bind proxy front");
-    let back = UdpSocket::bind("127.0.0.1:0").await.expect("bind proxy back");
-    back.connect(relay_addr).await.expect("connect proxy back to relay");
+    let front = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy front");
+    let back = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind proxy back");
+    back.connect(relay_addr)
+        .await
+        .expect("connect proxy back to relay");
     let proxy_addr = front.local_addr().expect("proxy front addr");
     let proxy = tokio::spawn(async move {
         let mut client: Option<SocketAddr> = None;
@@ -245,10 +260,15 @@ async fn idle_silence_classifies_as_timed_out() {
         }
     });
 
-    let t = RelayTransport::start(proxy_addr, &pems.cert, &pems.key, &pems.ca, "gw-A", "gw-B", None)
-        .await
-        .expect("RelayTransport::start through the proxy (connect+register must succeed)");
-    assert!(t.is_healthy(), "transport must be healthy while the proxy forwards");
+    let t = RelayTransport::start(
+        proxy_addr, &pems.cert, &pems.key, &pems.ca, "gw-A", "gw-B", None,
+    )
+    .await
+    .expect("RelayTransport::start through the proxy (connect+register must succeed)");
+    assert!(
+        t.is_healthy(),
+        "transport must be healthy while the proxy forwards"
+    );
     assert_eq!(t.death_reason(), None, "no death reason while alive");
 
     // Kill the lane: from here on, total silence in both directions — the
@@ -293,9 +313,11 @@ async fn dead_transport_always_has_a_reason() {
     let pems = provision(&dir);
     let (relay_addr, endpoint) = spawn_killable_relay(&dir).await;
 
-    let t = RelayTransport::start(relay_addr, &pems.cert, &pems.key, &pems.ca, "gw-A", "gw-B", None)
-        .await
-        .expect("RelayTransport::start against the in-process relay");
+    let t = RelayTransport::start(
+        relay_addr, &pems.cert, &pems.key, &pems.ca, "gw-A", "gw-B", None,
+    )
+    .await
+    .expect("RelayTransport::start against the in-process relay");
     endpoint.close(0u32.into(), b"test: severing");
     wait_dead(&t, Duration::from_secs(10), "severance").await;
 

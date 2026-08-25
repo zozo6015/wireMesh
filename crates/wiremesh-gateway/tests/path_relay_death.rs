@@ -180,8 +180,14 @@ fn relay_death_then_failed_punch_re_relays_via_existing_ladder() {
 
     // And the re-entered Relayed spell gets its own full probe grace period
     // (the death must have reset the probe gate, not inherited a stale one).
-    let action = p.tick(re_relayed_at + PROBE_DIRECT_INTERVAL - Duration::from_secs(1), true);
-    assert_eq!(action, None, "fresh Relayed spell must get a full undisturbed grace period");
+    let action = p.tick(
+        re_relayed_at + PROBE_DIRECT_INTERVAL - Duration::from_secs(1),
+        true,
+    );
+    assert_eq!(
+        action, None,
+        "fresh Relayed spell must get a full undisturbed grace period"
+    );
     assert_eq!(p.state, PathState::Relayed);
 }
 
@@ -218,7 +224,10 @@ fn degraded_arms_still_retry_then_mark_relay_needed_both_branches() {
     assert_eq!(p.state, PathState::Degraded);
     assert_eq!(action, Some(PathAction::Retry));
     // Still inside the dead grace: Retry, unchanged.
-    let action = p.tick(t0 + DEGRADED_AFTER + DEGRADED_DEAD_AFTER - Duration::from_secs(1), false);
+    let action = p.tick(
+        t0 + DEGRADED_AFTER + DEGRADED_DEAD_AFTER - Duration::from_secs(1),
+        false,
+    );
     assert_eq!(p.state, PathState::Degraded);
     assert_eq!(action, Some(PathAction::Retry));
     let action = p.tick(t0 + DEGRADED_AFTER + DEGRADED_DEAD_AFTER, false);
@@ -256,7 +265,10 @@ fn relayed_with_live_relay_unchanged_grace_then_rate_limited_probe() {
     let action = p.tick(entered + PROBE_DIRECT_INTERVAL, true);
     assert_eq!(action, Some(PathAction::ProbeDirect));
     assert_eq!(p.state, PathState::Relayed);
-    let action = p.tick(entered + PROBE_DIRECT_INTERVAL + Duration::from_secs(1), true);
+    let action = p.tick(
+        entered + PROBE_DIRECT_INTERVAL + Duration::from_secs(1),
+        true,
+    );
     assert_eq!(action, None);
     assert_eq!(p.state, PathState::Relayed);
 }

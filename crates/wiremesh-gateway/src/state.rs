@@ -274,7 +274,10 @@ fn deserialize_dialable_candidates<'de, D>(d: D) -> Result<Vec<String>, D::Error
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(retain_dialable(Vec::<String>::deserialize(d)?, "state.json"))
+    Ok(retain_dialable(
+        Vec::<String>::deserialize(d)?,
+        "state.json",
+    ))
 }
 
 /// `#[serde(deserialize_with)]` shim for [`PeerState::active_pubkey_b64`] —
@@ -313,7 +316,11 @@ pub(crate) struct CidrFilter {
 /// [`partition_dialable`]). Dropping is per-ENTRY and never drops the peer —
 /// see [`PeerState::allowed_ips`]'s invariant.
 pub(crate) fn partition_valid_cidrs(cidrs: Vec<String>) -> CidrFilter {
-    let mut f = CidrFilter { kept: Vec::new(), dropped: 0, samples: Vec::new() };
+    let mut f = CidrFilter {
+        kept: Vec::new(),
+        dropped: 0,
+        samples: Vec::new(),
+    };
 
     for c in cidrs {
         if !crate::uapi::is_valid_ipv4_cidr(&c) {
@@ -372,7 +379,10 @@ fn deserialize_valid_cidrs<'de, D>(d: D) -> Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Ok(retain_valid_cidrs(Vec::<String>::deserialize(d)?, "state.json"))
+    Ok(retain_valid_cidrs(
+        Vec::<String>::deserialize(d)?,
+        "state.json",
+    ))
 }
 
 impl PeerState {
@@ -394,7 +404,11 @@ impl PeerState {
         let keys = p
             .keys
             .iter()
-            .map(|k| PeerKeyInfo { epoch: k.epoch, pubkey_b64: k.pubkey.clone(), state: k.state.clone() })
+            .map(|k| PeerKeyInfo {
+                epoch: k.epoch,
+                pubkey_b64: k.pubkey.clone(),
+                state: k.state.clone(),
+            })
             .collect();
         PeerState {
             gateway_id: p.gateway_id,
@@ -481,12 +495,17 @@ impl DesiredState {
         self.revision = d.revision;
         for p in &d.upserted_peers {
             let ps = PeerState::from_proto(p);
-            match self.peers.iter_mut().find(|x| x.gateway_id == ps.gateway_id) {
+            match self
+                .peers
+                .iter_mut()
+                .find(|x| x.gateway_id == ps.gateway_id)
+            {
                 Some(existing) => *existing = ps,
                 None => self.peers.push(ps),
             }
         }
-        self.peers.retain(|p| !d.removed_peer_ids.contains(&p.gateway_id));
+        self.peers
+            .retain(|p| !d.removed_peer_ids.contains(&p.gateway_id));
         // Replace whenever the delta signals a relay update — including
         // clearing to empty (last-relay eviction). A sparse (non-relay)
         // delta has `relays_updated: false` and must leave `self.relays`
@@ -519,8 +538,12 @@ impl DesiredState {
         {
             use std::io::Write;
             let mut f = fs::OpenOptions::new()
-                .write(true).create(true).truncate(true).mode(0o600)
-                .open(&tmp).context("opening state.json.tmp")?;
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)
+                .context("opening state.json.tmp")?;
             f.write_all(&serde_json::to_vec_pretty(self)?)?;
             f.sync_all()?;
         }
@@ -539,7 +562,9 @@ impl DesiredState {
     pub fn load(state_dir: &Path) -> anyhow::Result<Option<DesiredState>> {
         let path = state_dir.join("state.json");
         match fs::read(&path) {
-            Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes).context("parsing state.json")?)),
+            Ok(bytes) => Ok(Some(
+                serde_json::from_slice(&bytes).context("parsing state.json")?,
+            )),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e).context("reading state.json"),
         }
@@ -632,7 +657,10 @@ impl FailStaticWriter {
         let last_good = persisted
             .filter(|ds| policy_ir_is_decodable(&ds.policy_ir))
             .map(|ds| (ds.policy_version, ds.policy_ir.clone()));
-        FailStaticWriter { last_good, warned: None }
+        FailStaticWriter {
+            last_good,
+            warned: None,
+        }
     }
 
     /// `policy_version` of the last undecodable IR this writer warned about,
@@ -651,7 +679,11 @@ impl FailStaticWriter {
         // canonical JSON form changes). This is the steady-state case: peer
         // churn, endpoint observations and every reconnect snapshot re-send
         // the same policy.
-        if self.last_good.as_ref().is_some_and(|(_, ir)| ir == &ds.policy_ir) {
+        if self
+            .last_good
+            .as_ref()
+            .is_some_and(|(_, ir)| ir == &ds.policy_ir)
+        {
             self.warned = None;
             return ds.save(state_dir);
         }
@@ -724,8 +756,16 @@ mod tests {
             gateway_id: id,
             segment_name: format!("seg{id}"),
             keys: vec![
-                PeerKey { epoch: 1, pubkey: "OLD".into(), state: "retiring".into() },
-                PeerKey { epoch: 2, pubkey: pubkey.into(), state: "active".into() },
+                PeerKey {
+                    epoch: 1,
+                    pubkey: "OLD".into(),
+                    state: "retiring".into(),
+                },
+                PeerKey {
+                    epoch: 2,
+                    pubkey: pubkey.into(),
+                    state: "active".into(),
+                },
             ],
             candidate_endpoints: vec![ep.into()],
             allowed_ips: vec![format!("10.10.{id}.0/24")],
@@ -749,8 +789,14 @@ mod tests {
         assert_eq!(ds.policy_version, 3);
         assert_eq!(ds.peers.len(), 1);
         assert_eq!(ds.peers[0].active_pubkey_b64.as_deref(), Some(VALID_KEY_AA));
-        assert_eq!(ds.peers[0].candidates, vec!["203.0.113.2:51820".to_string()]);
-        assert_eq!(ds.peers[0].primary_endpoint().map(String::as_str), Some("203.0.113.2:51820"));
+        assert_eq!(
+            ds.peers[0].candidates,
+            vec!["203.0.113.2:51820".to_string()]
+        );
+        assert_eq!(
+            ds.peers[0].primary_endpoint().map(String::as_str),
+            Some("203.0.113.2:51820")
+        );
     }
 
     #[test]
@@ -758,7 +804,11 @@ mod tests {
         let p = Peer {
             gateway_id: 9,
             segment_name: "seg9".into(),
-            keys: vec![PeerKey { epoch: 1, pubkey: "PUB9".into(), state: "active".into() }],
+            keys: vec![PeerKey {
+                epoch: 1,
+                pubkey: "PUB9".into(),
+                state: "active".into(),
+            }],
             candidate_endpoints: vec![
                 "198.51.100.9:51820".into(),
                 "10.0.0.9:51820".into(),
@@ -776,7 +826,10 @@ mod tests {
             ],
             "from_proto must keep the FULL candidate list, not just .first()"
         );
-        assert_eq!(ps.primary_endpoint().map(String::as_str), Some("198.51.100.9:51820"));
+        assert_eq!(
+            ps.primary_endpoint().map(String::as_str),
+            Some("198.51.100.9:51820")
+        );
     }
 
     #[test]
@@ -785,8 +838,16 @@ mod tests {
             gateway_id: 11,
             segment_name: "seg11".into(),
             keys: vec![
-                PeerKey { epoch: 0, pubkey: "KA".into(), state: "active".into() },
-                PeerKey { epoch: 1, pubkey: "KP".into(), state: "pending".into() },
+                PeerKey {
+                    epoch: 0,
+                    pubkey: "KA".into(),
+                    state: "active".into(),
+                },
+                PeerKey {
+                    epoch: 1,
+                    pubkey: "KP".into(),
+                    state: "pending".into(),
+                },
             ],
             candidate_endpoints: vec!["203.0.113.11:51820".into()],
             allowed_ips: vec!["10.10.11.0/24".into()],
@@ -807,14 +868,25 @@ mod tests {
             gateway_id: 12,
             segment_name: "seg12".into(),
             keys: vec![
-                PeerKey { epoch: 0, pubkey: "KA".into(), state: "active".into() },
-                PeerKey { epoch: 1, pubkey: "awaiting-submission".into(), state: "pending".into() },
+                PeerKey {
+                    epoch: 0,
+                    pubkey: "KA".into(),
+                    state: "active".into(),
+                },
+                PeerKey {
+                    epoch: 1,
+                    pubkey: "awaiting-submission".into(),
+                    state: "pending".into(),
+                },
             ],
             candidate_endpoints: vec!["203.0.113.12:51820".into()],
             allowed_ips: vec!["10.10.12.0/24".into()],
         };
         let ps = PeerState::from_proto(&p);
-        assert!(ps.pending_key().is_none(), "sentinel pending key must not be reported as a real pending key");
+        assert!(
+            ps.pending_key().is_none(),
+            "sentinel pending key must not be reported as a real pending key"
+        );
         let active = ps.active_key().expect("active key still present");
         assert_eq!(active.pubkey_b64, "KA");
     }
@@ -825,29 +897,50 @@ mod tests {
             gateway_id: 13,
             segment_name: "seg13".into(),
             keys: vec![
-                PeerKey { epoch: 0, pubkey: VALID_KEY_BB.into(), state: "active".into() },
-                PeerKey { epoch: 1, pubkey: "KP".into(), state: "pending".into() },
+                PeerKey {
+                    epoch: 0,
+                    pubkey: VALID_KEY_BB.into(),
+                    state: "active".into(),
+                },
+                PeerKey {
+                    epoch: 1,
+                    pubkey: "KP".into(),
+                    state: "pending".into(),
+                },
             ],
             candidate_endpoints: vec!["203.0.113.13:51820".into()],
             allowed_ips: vec!["10.10.13.0/24".into()],
         };
         let ps = PeerState::from_proto(&p);
         assert_eq!(ps.active_pubkey_b64.as_deref(), Some(VALID_KEY_BB));
-        assert_eq!(ps.active_key().map(|k| k.pubkey_b64.as_str()), Some(VALID_KEY_BB));
+        assert_eq!(
+            ps.active_key().map(|k| k.pubkey_b64.as_str()),
+            Some(VALID_KEY_BB)
+        );
     }
 
     #[test]
     fn apply_delta_upserts_and_removes() {
         let mut ds = DesiredState::from_snapshot(&StateSnapshot {
-            revision: 1, self_cert_pem: "C".into(),
+            revision: 1,
+            self_cert_pem: "C".into(),
             peers: vec![peer(2, "PUBA", "a:1"), peer(3, "PUBB", "b:2")],
-            deprecated_relays: vec![], relay_infos: vec![], policy_ir: vec![], policy_version: 0, revoked_serials: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            policy_ir: vec![],
+            policy_version: 0,
+            revoked_serials: vec![],
         });
         let delta = Delta {
             revision: 2,
             upserted_peers: vec![peer(2, VALID_KEY_CC, "a:9")],
             removed_peer_ids: vec![3],
-            deprecated_relays: vec![], relay_infos: vec![], relays_updated: false, policy_ir: b"NEW".to_vec(), policy_version: 4, revoked_serials: vec![],
+            deprecated_relays: vec![],
+            relay_infos: vec![],
+            relays_updated: false,
+            policy_ir: b"NEW".to_vec(),
+            policy_version: 4,
+            revoked_serials: vec![],
         };
         ds.apply_delta(&delta);
         assert_eq!(ds.revision, 2);
@@ -862,7 +955,10 @@ mod tests {
     fn save_load_round_trip_atomic_0600() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        let ds = DesiredState { revision: 9, ..Default::default() };
+        let ds = DesiredState {
+            revision: 9,
+            ..Default::default()
+        };
         ds.save(dir.path()).unwrap();
         let meta = std::fs::metadata(dir.path().join("state.json")).unwrap();
         assert_eq!(meta.permissions().mode() & 0o777, 0o600);
@@ -926,7 +1022,10 @@ mod tests {
     #[test]
     fn apply_delta_relays_updated_true_replaces_relays() {
         let mut ds = DesiredState {
-            relays: vec![RelayInfo { relay_id: 1, endpoint: "9.9.9.9:1".into() }],
+            relays: vec![RelayInfo {
+                relay_id: 1,
+                endpoint: "9.9.9.9:1".into(),
+            }],
             ..Default::default()
         };
         let delta = Delta {
@@ -934,7 +1033,10 @@ mod tests {
             upserted_peers: vec![],
             removed_peer_ids: vec![],
             deprecated_relays: vec![],
-            relay_infos: vec![RelayInfo { relay_id: 7, endpoint: "1.2.3.4:4443".into() }],
+            relay_infos: vec![RelayInfo {
+                relay_id: 7,
+                endpoint: "1.2.3.4:4443".into(),
+            }],
             relays_updated: true,
             policy_ir: vec![],
             policy_version: 0,
@@ -943,7 +1045,10 @@ mod tests {
         ds.apply_delta(&delta);
         assert_eq!(
             ds.relays,
-            vec![RelayInfo { relay_id: 7, endpoint: "1.2.3.4:4443".into() }]
+            vec![RelayInfo {
+                relay_id: 7,
+                endpoint: "1.2.3.4:4443".into()
+            }]
         );
     }
 
@@ -953,7 +1058,10 @@ mod tests {
         // fix enables. The old `if !d.relay_infos.is_empty()` guard could
         // never clear `self.relays` to empty — this test would fail under it.
         let mut ds = DesiredState {
-            relays: vec![RelayInfo { relay_id: 3, endpoint: "5.6.7.8:4443".into() }],
+            relays: vec![RelayInfo {
+                relay_id: 3,
+                endpoint: "5.6.7.8:4443".into(),
+            }],
             ..Default::default()
         };
         let delta = Delta {
@@ -977,7 +1085,10 @@ mod tests {
         // must not wipe an existing relay set — the reason the old guard
         // existed in the first place.
         let mut ds = DesiredState {
-            relays: vec![RelayInfo { relay_id: 4, endpoint: "2.2.2.2:4443".into() }],
+            relays: vec![RelayInfo {
+                relay_id: 4,
+                endpoint: "2.2.2.2:4443".into(),
+            }],
             ..Default::default()
         };
         let delta = Delta {
@@ -994,7 +1105,10 @@ mod tests {
         ds.apply_delta(&delta);
         assert_eq!(
             ds.relays,
-            vec![RelayInfo { relay_id: 4, endpoint: "2.2.2.2:4443".into() }]
+            vec![RelayInfo {
+                relay_id: 4,
+                endpoint: "2.2.2.2:4443".into()
+            }]
         );
     }
 
@@ -1033,7 +1147,6 @@ mod tests {
         assert_eq!(ds.revoked_serials, vec!["A".to_string(), "B".to_string()]);
     }
 
-
     // -----------------------------------------------------------------
     // (Backlog G3) The bounded drop log
     // -----------------------------------------------------------------
@@ -1056,7 +1169,9 @@ mod tests {
 
     /// Distinct valid endpoints, cheap to generate in bulk for the cap tests.
     fn valid_eps(n: usize) -> Vec<String> {
-        (0..n).map(|i| format!("10.0.{}.{}:51820", i / 256, i % 256)).collect()
+        (0..n)
+            .map(|i| format!("10.0.{}.{}:51820", i / 256, i % 256))
+            .collect()
     }
 
     /// Distinct INVALID endpoints, indexed ALPHABETICALLY rather than
@@ -1094,7 +1209,10 @@ mod tests {
     #[test]
     fn one_filtering_pass_produces_exactly_one_warning_line_not_one_per_dropped_entry() {
         let f = partition_dialable(invalid_eps(200));
-        assert_eq!(f.dropped, 200, "all 200 unusable candidates must be counted as dropped");
+        assert_eq!(
+            f.dropped, 200,
+            "all 200 unusable candidates must be counted as dropped"
+        );
 
         let msg = format_drop_warning(&f, "state.json")
             .expect("200 dropped candidates must produce a warning");
@@ -1125,7 +1243,10 @@ mod tests {
         let msg = warn(markers.clone(), "state.json")
             .expect("10 dropped candidates must produce a warning");
 
-        let quoted: Vec<&String> = markers.iter().filter(|m| msg.contains(m.as_str())).collect();
+        let quoted: Vec<&String> = markers
+            .iter()
+            .filter(|m| msg.contains(m.as_str()))
+            .collect();
         assert!(
             quoted.len() <= DROPPED_SAMPLE_COUNT,
             "at most {DROPPED_SAMPLE_COUNT} of the offending strings may be quoted; {} \
@@ -1164,8 +1285,14 @@ mod tests {
         let ten_k = partition_dialable(vec!["A".repeat(10_000)]);
         let hundred_k = partition_dialable(vec!["A".repeat(100_000)]);
 
-        let a = ten_k.samples.first().expect("the dropped candidate must be sampled");
-        let b = hundred_k.samples.first().expect("the dropped candidate must be sampled");
+        let a = ten_k
+            .samples
+            .first()
+            .expect("the dropped candidate must be sampled");
+        let b = hundred_k
+            .samples
+            .first()
+            .expect("the dropped candidate must be sampled");
         assert_eq!(
             a, b,
             "two candidates sharing their first {DROPPED_SAMPLE_BYTES} bytes must produce \
@@ -1399,7 +1526,10 @@ mod tests {
              unbounded work the controller's MAX_LOCAL_CANDIDATES closes on its side, left \
              open on this one."
         );
-        assert_eq!(capped.over_cap, OVER_BY, "the excess is counted, not silently discarded");
+        assert_eq!(
+            capped.over_cap, OVER_BY,
+            "the excess is counted, not silently discarded"
+        );
         assert_eq!(
             capped.dropped, 0,
             "candidates dropped for the CAP must not be counted as unusable: every one of \
@@ -1413,8 +1543,8 @@ mod tests {
 
         let cap_msg = format_drop_warning(&capped, "state.json")
             .expect("dropping over-cap entries must warn");
-        let bad_msg =
-            format_drop_warning(&invalid, "state.json").expect("dropping unusable entries must warn");
+        let bad_msg = format_drop_warning(&invalid, "state.json")
+            .expect("dropping unusable entries must warn");
         assert_ne!(
             cap_msg, bad_msg,
             "with the same number of entries dropped for two DIFFERENT reasons, the two \
@@ -1442,8 +1572,14 @@ mod tests {
         input.extend(valid_eps(MAX_PEER_CANDIDATES + OVER_BY));
 
         let f = partition_dialable(input);
-        assert_eq!(f.dropped, BAD, "the unusable entries are counted as dropped");
-        assert_eq!(f.over_cap, OVER_BY, "the valid excess is counted as over-cap");
+        assert_eq!(
+            f.dropped, BAD,
+            "the unusable entries are counted as dropped"
+        );
+        assert_eq!(
+            f.over_cap, OVER_BY,
+            "the valid excess is counted as over-cap"
+        );
 
         let msg = format_drop_warning(&f, "state.json").expect("both conditions must warn");
         assert_eq!(
@@ -1513,8 +1649,14 @@ mod tests {
              reordering silently re-points which address this gateway dials, and the \
              controller already decided that order (observed candidate first)."
         );
-        assert_eq!(f.dropped, 3, "the three unusable entries are dropped and counted");
-        assert_eq!(f.over_cap, 0, "six candidates is nowhere near MAX_PEER_CANDIDATES");
+        assert_eq!(
+            f.dropped, 3,
+            "the three unusable entries are dropped and counted"
+        );
+        assert_eq!(
+            f.over_cap, 0,
+            "six candidates is nowhere near MAX_PEER_CANDIDATES"
+        );
     }
 
     /// (CodeRabbit 🟡 Minor, PR #59) A manually-kept-in-sync COPY of

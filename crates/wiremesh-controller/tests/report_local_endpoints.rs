@@ -38,15 +38,17 @@ use wiremesh_proto::v1::{sync_message, StateSnapshot};
 /// purpose (each `tests/*.rs` file is its own binary, so duplicating this
 /// small unwrap is the established convention rather than a shared crate
 /// dependency).
-fn expect_snapshot(msg: Option<Result<wiremesh_proto::v1::SyncMessage, tonic::Status>>) -> StateSnapshot {
+fn expect_snapshot(
+    msg: Option<Result<wiremesh_proto::v1::SyncMessage, tonic::Status>>,
+) -> StateSnapshot {
     let msg = msg
         .expect("Sync.Watch stream ended before delivering a message")
         .expect("Sync.Watch stream yielded an error instead of a message");
     match msg.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!(
-            "expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"
-        ),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 }
 
@@ -101,7 +103,10 @@ async fn reported_local_endpoint_becomes_a_db_and_peer_candidate() {
             )
         });
     assert!(
-        a_peer.candidate_endpoints.iter().any(|c| c == "10.0.0.5:51820"),
+        a_peer
+            .candidate_endpoints
+            .iter()
+            .any(|c| c == "10.0.0.5:51820"),
         "A's peer entry in B's snapshot must list the reported local endpoint, got: {:?}",
         a_peer.candidate_endpoints
     );
@@ -210,7 +215,11 @@ async fn empty_local_endpoints_report_clears_previously_reported_locals() {
         delta.revision,
         snap_rev
     );
-    assert_eq!(delta.upserted_peers.len(), 1, "expected exactly one upserted peer (A)");
+    assert_eq!(
+        delta.upserted_peers.len(),
+        1,
+        "expected exactly one upserted peer (A)"
+    );
     assert_eq!(delta.upserted_peers[0].gateway_id, a.id());
     assert!(
         delta.upserted_peers[0].candidate_endpoints.is_empty(),

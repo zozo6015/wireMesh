@@ -110,7 +110,11 @@ async fn enroll_skips_when_complete_identity_present_and_issues_no_rpc() {
     // read, the read succeeds and the only operation left that could fail is the
     // controller dial — which a correct idempotent enroll must never perform.
     let ca_path = dir.path().join("controller-ca.pem");
-    std::fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nCC\n-----END CERTIFICATE-----\n").unwrap();
+    std::fs::write(
+        &ca_path,
+        "-----BEGIN CERTIFICATE-----\nCC\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
 
     let res = run_enroll(EnrollArgs {
         token: "wiremesh://unused-token".into(),
@@ -136,7 +140,11 @@ async fn enroll_skips_when_complete_identity_present_and_issues_no_rpc() {
     );
     for f in IDENTITY_FILES {
         assert_eq!(
-            std::fs::metadata(certdir.join(f)).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(certdir.join(f))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
             0o600,
             "{f} must still be mode 0600 after the skip"
         );
@@ -184,8 +192,11 @@ async fn enroll_does_not_skip_on_a_partial_identity() {
         std::fs::remove_file(certdir.join(missing)).unwrap();
 
         let ca_path = dir.path().join("controller-ca.pem");
-        std::fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nCC\n-----END CERTIFICATE-----\n")
-            .unwrap();
+        std::fs::write(
+            &ca_path,
+            "-----BEGIN CERTIFICATE-----\nCC\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
 
         let res = run_enroll(EnrollArgs {
             token: "wiremesh://unused-token".into(),
@@ -233,7 +244,11 @@ async fn partial_identity_reenrolls_against_a_live_controller() {
 
     for f in IDENTITY_FILES {
         let meta = std::fs::metadata(certdir.join(f)).unwrap_or_else(|_| panic!("{f} must exist"));
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600, "{f} must be mode 0600");
+        assert_eq!(
+            meta.permissions().mode() & 0o777,
+            0o600,
+            "{f} must be mode 0600"
+        );
     }
     let relay_pem = std::fs::read_to_string(certdir.join("relay.pem")).unwrap();
     assert!(
@@ -270,5 +285,8 @@ async fn truncated_identity_file_is_not_a_complete_identity() {
     .expect("a zero-length identity file must NOT count as enrolled; enroll must proceed");
 
     let key = std::fs::read(certdir.join("relay.key")).unwrap();
-    assert!(!key.is_empty(), "the re-enroll must have written a real private key");
+    assert!(
+        !key.is_empty(),
+        "the re-enroll must have written a real private key"
+    );
 }

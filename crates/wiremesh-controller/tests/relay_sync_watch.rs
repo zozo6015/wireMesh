@@ -169,7 +169,9 @@ async fn open_relay_watch(
         // row ids collide with gateway row ids, so recording one under a
         // relay id would clobber a real gateway's entry). Matches what the
         // real `wiremesh_relay::run_sync` sends.
-        .watch(WatchRequest { session_generation: 0 })
+        .watch(WatchRequest {
+            session_generation: 0,
+        })
         .await
         .map(|resp| resp.into_inner())
 }
@@ -315,7 +317,9 @@ async fn relay_watch_receives_revocations_in_snapshot_and_delta() {
 
     let snap = match next_msg(&mut stream).await.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the relay's first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => panic!(
+            "expected the relay's first Sync.Watch message to be a StateSnapshot, got: {other:?}"
+        ),
     };
     assert!(
         snap.revoked_serials.contains(&pre_serial),
@@ -387,7 +391,9 @@ async fn relay_watch_carries_no_gateway_desired_state() {
 
     let snap = match next_msg(&mut stream).await.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the relay's first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => panic!(
+            "expected the relay's first Sync.Watch message to be a StateSnapshot, got: {other:?}"
+        ),
     };
     assert!(
         snap.peers.is_empty(),
@@ -486,7 +492,9 @@ async fn gateway_watch_still_receives_full_desired_state() {
     let mut stream = gw1.open_sync().await;
     let snap = match next_msg(&mut stream).await.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected gw1's first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected gw1's first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
     assert_eq!(
         snap.policy_version, 1,
@@ -578,7 +586,9 @@ async fn relay_watch_receives_rebind_revocation_without_peer_state() {
     // not a pre-existing revocation, carries it).
     let snap = match next_msg(&mut stream).await.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the relay's first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => panic!(
+            "expected the relay's first Sync.Watch message to be a StateSnapshot, got: {other:?}"
+        ),
     };
     assert!(
         !snap.revoked_serials.contains(&old_serial),

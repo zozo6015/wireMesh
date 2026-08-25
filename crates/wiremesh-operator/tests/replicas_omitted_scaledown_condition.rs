@@ -324,11 +324,16 @@ fn deployment_apply_body_omits_replicas_key_for_all_three_workloads() {
     )
     .expect("relay_deployment must succeed for a well-formed spec");
 
-    for (label, dep) in [("controller", &ctrl), ("gateway", &gw_dep), ("relay", &relay_dep)] {
+    for (label, dep) in [
+        ("controller", &ctrl),
+        ("gateway", &gw_dep),
+        ("relay", &relay_dep),
+    ] {
         let body = deployment_apply_body(dep);
-        let spec_obj = body.get("spec").and_then(|s| s.as_object()).unwrap_or_else(|| {
-            panic!("{label}: apply body has no spec object: {body}")
-        });
+        let spec_obj = body
+            .get("spec")
+            .and_then(|s| s.as_object())
+            .unwrap_or_else(|| panic!("{label}: apply body has no spec object: {body}"));
         assert!(
             !spec_obj.contains_key("replicas"),
             "{label}: deployment_apply_body's JSON must OMIT the \"replicas\" \
@@ -449,7 +454,14 @@ fn no_replicas_shaped_field_on_relay_spec() {
     assert_spec_key_set(
         &serde_json::to_value(full_relay_spec()).unwrap(),
         "WiremeshRelaySpec",
-        &["endpoint", "nodeName", "image", "storageClass", "storageSize", "controllerEndpoint"],
+        &[
+            "endpoint",
+            "nodeName",
+            "image",
+            "storageClass",
+            "storageSize",
+            "controllerEndpoint",
+        ],
     );
 }
 
@@ -463,8 +475,7 @@ fn no_replicas_shaped_field_on_relay_spec() {
 /// tells you a field appeared, not why THIS particular field is the one
 /// Backlog 2b rules out.
 fn assert_spec_key_set(v: &serde_json::Value, type_name: &str, expected: &[&str]) {
-    let keys: std::collections::BTreeSet<String> =
-        v.as_object().unwrap().keys().cloned().collect();
+    let keys: std::collections::BTreeSet<String> = v.as_object().unwrap().keys().cloned().collect();
 
     for k in &keys {
         let lower = k.to_lowercase();

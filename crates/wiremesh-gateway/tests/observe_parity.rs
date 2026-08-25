@@ -13,14 +13,16 @@ async fn controller_accepts_gateway_probe_and_records_candidate() {
     let key = g.observe_key();
 
     // Send the gateway's authenticated probe from a blocking task.
-    let observed = tokio::task::spawn_blocking(move || {
-        observe::report_once(0, observe_addr, &key, gid)
-    })
-    .await
-    .unwrap()
-    .expect("probe accepted + echoed");
+    let observed =
+        tokio::task::spawn_blocking(move || observe::report_once(0, observe_addr, &key, gid))
+            .await
+            .unwrap()
+            .expect("probe accepted + echoed");
 
-    assert!(observed.port() != 0, "controller echoed a concrete observed addr: {observed}");
+    assert!(
+        observed.port() != 0,
+        "controller echoed a concrete observed addr: {observed}"
+    );
     // The controller should now expose this as the gateway's candidate to peers.
     // (Verified indirectly: a second enrolled gateway sees it in its snapshot —
     //  covered end-to-end in the mesh milestone; here we assert the echo alone.)

@@ -121,8 +121,9 @@ pub struct FlatRule {
 fn parse_cidrs(raw: &[String]) -> anyhow::Result<Vec<Ipv4Net>> {
     raw.iter()
         .map(|s| {
-            s.parse::<Ipv4Net>()
-                .map_err(|e| anyhow::anyhow!("wiremesh-policy handed flatten an invalid CIDR '{s}': {e}"))
+            s.parse::<Ipv4Net>().map_err(|e| {
+                anyhow::anyhow!("wiremesh-policy handed flatten an invalid CIDR '{s}': {e}")
+            })
         })
         .collect()
 }

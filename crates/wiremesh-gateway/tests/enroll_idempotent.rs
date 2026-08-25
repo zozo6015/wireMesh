@@ -58,7 +58,11 @@ async fn enroll_skips_when_valid_identity_present_and_issues_no_rpc() {
     // read the read still succeeds and the ONLY operation left that could fail is
     // the controller dial — which a correct idempotent enroll must never perform.
     let ca_path = dir.path().join("ca.pem");
-    std::fs::write(&ca_path, "-----BEGIN CERTIFICATE-----\nCC\n-----END CERTIFICATE-----").unwrap();
+    std::fs::write(
+        &ca_path,
+        "-----BEGIN CERTIFICATE-----\nCC\n-----END CERTIFICATE-----",
+    )
+    .unwrap();
 
     // Point the controller at an address with no listener. If enroll dialed the
     // controller this returns Err (connection refused); a correct idempotent
@@ -81,7 +85,10 @@ async fn enroll_skips_when_valid_identity_present_and_issues_no_rpc() {
     // The existing identity must be left byte-for-byte untouched — not
     // re-enrolled, not re-keyed.
     let after = std::fs::read(state_dir.join("identity.json")).unwrap();
-    assert_eq!(before, after, "existing identity must be left untouched on skip");
+    assert_eq!(
+        before, after,
+        "existing identity must be left untouched on skip"
+    );
     let reloaded = Identity::load(&state_dir).expect("identity still loadable after skip");
     assert_eq!(reloaded.gateway_id, 7, "gateway_id must be unchanged");
     assert_eq!(
@@ -94,7 +101,10 @@ async fn enroll_skips_when_valid_identity_present_and_issues_no_rpc() {
 async fn mint_gateway_token(h: &wiremesh_testkit::TestController) -> String {
     let mut admin = h.admin_client().await;
     admin
-        .create_segment(CreateSegmentRequest { name: "aws".into(), cidrs: vec!["10.0.0.0/16".into()] })
+        .create_segment(CreateSegmentRequest {
+            name: "aws".into(),
+            cidrs: vec!["10.0.0.0/16".into()],
+        })
         .await
         .unwrap();
     admin
@@ -161,7 +171,10 @@ async fn enroll_propagates_non_notfound_io_error_and_leaves_token_unspent() {
         res2.is_ok(),
         "the single-use token must stay unspent when the first run hit an IO error; got {res2:?}"
     );
-    assert!(Identity::load(&good_dir).is_ok(), "the clean enroll wrote a loadable identity");
+    assert!(
+        Identity::load(&good_dir).is_ok(),
+        "the clean enroll wrote a loadable identity"
+    );
 }
 
 #[tokio::test]
@@ -188,7 +201,11 @@ async fn enroll_proceeds_when_identity_is_malformed_json() {
         cidrs: vec!["10.0.0.0/16".into()],
     })
     .await;
-    assert!(res.is_ok(), "a malformed identity.json must fall through to enrollment; got {res:?}");
-    let id = Identity::load(&state_dir).expect("enroll overwrote the malformed identity with a valid one");
+    assert!(
+        res.is_ok(),
+        "a malformed identity.json must fall through to enrollment; got {res:?}"
+    );
+    let id = Identity::load(&state_dir)
+        .expect("enroll overwrote the malformed identity with a valid one");
     assert!(id.gateway_id > 0, "controller assigned a gateway_id");
 }

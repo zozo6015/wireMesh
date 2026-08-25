@@ -46,8 +46,14 @@ async fn enroll_writes_loadable_identity() {
     // The gateway's real boot path must be able to load what enroll wrote.
     let id = Identity::load(&state_dir).expect("Identity::load must read the enrolled identity");
     assert!(id.gateway_id > 0, "controller assigns a gateway_id");
-    assert!(id.cert_pem.contains("BEGIN CERTIFICATE"), "leaf cert stored");
-    assert!(id.ca_bundle_pem.contains("BEGIN CERTIFICATE"), "CA bundle stored");
+    assert!(
+        id.cert_pem.contains("BEGIN CERTIFICATE"),
+        "leaf cert stored"
+    );
+    assert!(
+        id.ca_bundle_pem.contains("BEGIN CERTIFICATE"),
+        "CA bundle stored"
+    );
     // The stored WG private key must derive to a real public key.
     let pubkey = base64_pub_from_priv(&id.wg_private_key_b64).expect("derive WG pubkey");
     assert!(!pubkey.is_empty(), "WG private key must be valid");

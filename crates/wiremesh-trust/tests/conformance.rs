@@ -24,14 +24,20 @@ async fn run_conformance<C: CertificateIssuer + SecretStore>(p: &C) {
     // 1. Issuance: sign a CSR -> leaf chains to trust_bundle().
     // -----------------------------------------------------------------
     let issued = p
-        .sign(&gateway_csr("conformance-issuance"), profile_with_ttl(90 * 24 * 3600))
+        .sign(
+            &gateway_csr("conformance-issuance"),
+            profile_with_ttl(90 * 24 * 3600),
+        )
         .await
         .expect("issuance: sign must succeed for a valid CSR + profile");
     assert!(
         issued.cert_pem.contains("BEGIN CERTIFICATE"),
         "issuance: cert_pem must be a PEM certificate"
     );
-    assert!(!issued.serial.is_empty(), "issuance: serial must be non-empty");
+    assert!(
+        !issued.serial.is_empty(),
+        "issuance: serial must be non-empty"
+    );
 
     let bundle = p
         .trust_bundle()
@@ -48,12 +54,15 @@ async fn run_conformance<C: CertificateIssuer + SecretStore>(p: &C) {
     let ttl_90d = Duration::from_secs(90 * 24 * 3600);
     let before = OffsetDateTime::now_utc();
     let issued_90d = p
-        .sign(&gateway_csr("conformance-ttl-90d"), CertProfile {
-            subject_cn: "conformance-ttl-90d".into(),
-            ttl: ttl_90d,
-            subject_alt_names: vec![],
-            serial: None,
-        })
+        .sign(
+            &gateway_csr("conformance-ttl-90d"),
+            CertProfile {
+                subject_cn: "conformance-ttl-90d".into(),
+                ttl: ttl_90d,
+                subject_alt_names: vec![],
+                serial: None,
+            },
+        )
         .await
         .expect("renewal-follows-ttl: a 90-day TTL must be accepted");
     let expected_not_after = before + time::Duration::seconds(90 * 24 * 3600);
@@ -74,12 +83,15 @@ async fn run_conformance<C: CertificateIssuer + SecretStore>(p: &C) {
     // -----------------------------------------------------------------
     let sub_floor_ttl = Duration::from_secs(60 * 60); // 1 hour, below the 24h floor.
     let result = p
-        .sign(&gateway_csr("conformance-ttl-too-short"), CertProfile {
-            subject_cn: "conformance-ttl-too-short".into(),
-            ttl: sub_floor_ttl,
-            subject_alt_names: vec![],
-            serial: None,
-        })
+        .sign(
+            &gateway_csr("conformance-ttl-too-short"),
+            CertProfile {
+                subject_cn: "conformance-ttl-too-short".into(),
+                ttl: sub_floor_ttl,
+                subject_alt_names: vec![],
+                serial: None,
+            },
+        )
         .await;
     assert!(
         result.is_err(),
@@ -90,7 +102,10 @@ async fn run_conformance<C: CertificateIssuer + SecretStore>(p: &C) {
     // 3. Revoke: revoke(handle) succeeds and is idempotent.
     // -----------------------------------------------------------------
     let issued_for_revoke = p
-        .sign(&gateway_csr("conformance-revoke"), profile_with_ttl(90 * 24 * 3600))
+        .sign(
+            &gateway_csr("conformance-revoke"),
+            profile_with_ttl(90 * 24 * 3600),
+        )
         .await
         .expect("revoke: sign must succeed before revoking");
     p.revoke(&issued_for_revoke.handle)
@@ -113,8 +128,15 @@ async fn run_conformance<C: CertificateIssuer + SecretStore>(p: &C) {
         .await
         .expect("secretstore: get must succeed")
         .expect("secretstore: key just written must be present");
-    assert_eq!(got1.value, b"first-value".to_vec(), "secretstore: get must return exactly what was put");
-    assert_eq!(got1.version, v1, "secretstore: get must report the version put() returned");
+    assert_eq!(
+        got1.value,
+        b"first-value".to_vec(),
+        "secretstore: get must return exactly what was put"
+    );
+    assert_eq!(
+        got1.version, v1,
+        "secretstore: get must report the version put() returned"
+    );
 
     let v2 = p
         .put(key, b"second-value".to_vec())
@@ -134,8 +156,15 @@ async fn run_conformance<C: CertificateIssuer + SecretStore>(p: &C) {
         .await
         .expect("secretstore: get must succeed")
         .expect("secretstore: key must still be present");
-    assert_eq!(got3.value, b"third-value".to_vec(), "secretstore: get must return the latest value");
-    assert_eq!(got3.version, v3, "secretstore: get must report the latest version");
+    assert_eq!(
+        got3.value,
+        b"third-value".to_vec(),
+        "secretstore: get must return the latest value"
+    );
+    assert_eq!(
+        got3.version, v3,
+        "secretstore: get must report the latest version"
+    );
 }
 
 #[tokio::test]
@@ -179,7 +208,9 @@ fn profile_with_ttl(ttl_secs: i64) -> CertProfile {
 fn gateway_csr(cn: &str) -> String {
     let kp = rcgen::KeyPair::generate().unwrap();
     let mut params = rcgen::CertificateParams::new(vec![]).unwrap();
-    params.distinguished_name.push(rcgen::DnType::CommonName, cn);
+    params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, cn);
     params.serialize_request(&kp).unwrap().pem().unwrap()
 }
 

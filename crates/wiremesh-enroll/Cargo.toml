@@ -2,6 +2,7 @@
 name = "wiremesh-enroll"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 # Shipped client half of enrollment: turns an enrollment token into a signed
 # leaf identity by driving the controller's `Enrollment.Enroll` RPC. Consumed

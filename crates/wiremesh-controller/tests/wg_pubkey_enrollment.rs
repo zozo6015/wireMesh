@@ -40,8 +40,8 @@ async fn enrollment_wg_pubkey_reaches_peers_and_empty_falls_back_to_placeholder(
     let h = wiremesh_testkit::TestController::start().await;
 
     // A enrolls WITH a real WG pubkey.
-    let a = wiremesh_testkit::enroll_one_with_wg_pubkey(&h, "aws", "10.0.0.0/16", REAL_WG_PUBKEY)
-        .await;
+    let a =
+        wiremesh_testkit::enroll_one_with_wg_pubkey(&h, "aws", "10.0.0.0/16", REAL_WG_PUBKEY).await;
     // B enrolls WITHOUT one — the existing, untouched back-compat path.
     let b = wiremesh_testkit::enroll_one(&h, "gcp", "10.1.0.0/16").await;
     // C observes both A and B as peers over its own Sync.Watch stream.
@@ -56,35 +56,60 @@ async fn enrollment_wg_pubkey_reaches_peers_and_empty_falls_back_to_placeholder(
 
     let peers = match snap_msg.body {
         Some(sync_message::Body::Snapshot(s)) => s.peers,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
 
     let a_peer = peers
         .iter()
         .find(|p| p.gateway_id == a.id())
-        .unwrap_or_else(|| panic!("expected C's snapshot to include A (id = {}) as a peer, got: {peers:?}", a.id()));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected C's snapshot to include A (id = {}) as a peer, got: {peers:?}",
+                a.id()
+            )
+        });
     let a_key = a_peer
         .keys
         .iter()
         .find(|k| k.epoch == 0)
-        .unwrap_or_else(|| panic!("expected A's peer entry to carry an epoch-0 key, got: {:?}", a_peer.keys));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected A's peer entry to carry an epoch-0 key, got: {:?}",
+                a_peer.keys
+            )
+        });
     assert_eq!(
         a_key.pubkey, REAL_WG_PUBKEY,
         "expected A's epoch-0 PeerKey.pubkey to be the real WG pubkey A enrolled with, \
          got: {:?}",
         a_key
     );
-    assert_eq!(a_key.state, "active", "expected A's epoch-0 key to be active, got: {a_key:?}");
+    assert_eq!(
+        a_key.state, "active",
+        "expected A's epoch-0 key to be active, got: {a_key:?}"
+    );
 
     let b_peer = peers
         .iter()
         .find(|p| p.gateway_id == b.id())
-        .unwrap_or_else(|| panic!("expected C's snapshot to include B (id = {}) as a peer, got: {peers:?}", b.id()));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected C's snapshot to include B (id = {}) as a peer, got: {peers:?}",
+                b.id()
+            )
+        });
     let b_key = b_peer
         .keys
         .iter()
         .find(|k| k.epoch == 0)
-        .unwrap_or_else(|| panic!("expected B's peer entry to carry an epoch-0 key, got: {:?}", b_peer.keys));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected B's peer entry to carry an epoch-0 key, got: {:?}",
+                b_peer.keys
+            )
+        });
     let expected_placeholder = format!("placeholder-pubkey-gw{}-epoch0", b.id());
     assert_eq!(
         b_key.pubkey, expected_placeholder,
@@ -92,5 +117,8 @@ async fn enrollment_wg_pubkey_reaches_peers_and_empty_falls_back_to_placeholder(
          path) must still get the cycle-2 placeholder pubkey, got: {:?}",
         b_key
     );
-    assert_eq!(b_key.state, "active", "expected B's epoch-0 key to be active, got: {b_key:?}");
+    assert_eq!(
+        b_key.state, "active",
+        "expected B's epoch-0 key to be active, got: {b_key:?}"
+    );
 }

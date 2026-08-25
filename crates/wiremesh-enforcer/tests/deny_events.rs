@@ -65,8 +65,14 @@ use wiremesh_testkit::netns::{join_netns, wg_lab, Ns};
 /// self-sufficiency convention.
 fn segments_exact() -> Vec<SegmentDef> {
     vec![
-        SegmentDef { name: "seg-a".into(), cidrs: vec!["10.10.0.1/32".parse().unwrap()] },
-        SegmentDef { name: "seg-b".into(), cidrs: vec!["10.10.0.2/32".parse().unwrap()] },
+        SegmentDef {
+            name: "seg-a".into(),
+            cidrs: vec!["10.10.0.1/32".parse().unwrap()],
+        },
+        SegmentDef {
+            name: "seg-b".into(),
+            cidrs: vec!["10.10.0.2/32".parse().unwrap()],
+        },
     ]
 }
 
@@ -148,20 +154,32 @@ policy:
     let ir = compile_with(yaml, &segs, 1);
     let deny_rule_id = ir.blocks[0].rules[0].rule_id.clone();
 
-    enforcer.apply(&ir).expect("policy with a single explicit deny rule should apply");
+    enforcer
+        .apply(&ir)
+        .expect("policy with a single explicit deny rule should apply");
 
     deny_one_syn(&a, "10.10.0.2", 5222);
     std::thread::sleep(Duration::from_millis(200));
 
-    let events = enforcer.deny_events().expect("deny_events() should succeed");
+    let events = enforcer
+        .deny_events()
+        .expect("deny_events() should succeed");
     assert_eq!(
         events.len(),
         1,
         "expected exactly one DenyEvent for the single denied SYN, got: {events:?}"
     );
     let ev = &events[0];
-    assert_eq!(ev.src, "10.10.0.1".parse::<Ipv4Addr>().unwrap(), "unexpected src: {ev:?}");
-    assert_eq!(ev.dst, "10.10.0.2".parse::<Ipv4Addr>().unwrap(), "unexpected dst: {ev:?}");
+    assert_eq!(
+        ev.src,
+        "10.10.0.1".parse::<Ipv4Addr>().unwrap(),
+        "unexpected src: {ev:?}"
+    );
+    assert_eq!(
+        ev.dst,
+        "10.10.0.2".parse::<Ipv4Addr>().unwrap(),
+        "unexpected dst: {ev:?}"
+    );
     assert_eq!(ev.proto, 6, "unexpected proto (want tcp/6): {ev:?}");
     assert_eq!(ev.dport, 5222, "unexpected dport: {ev:?}");
     assert_eq!(
@@ -189,21 +207,37 @@ fn default_deny_yields_deny_event_with_rule_id_none() {
     let mut enforcer = wiremesh_enforcer::probe("wg0", EnforcerConfig::default())
         .expect("probe should load + attach eBPF on wg0");
 
-    let empty_ir = PolicyIR { schema: 1, version: 0, blocks: vec![] };
-    enforcer.apply(&empty_ir).expect("empty (default-deny) policy should apply");
+    let empty_ir = PolicyIR {
+        schema: 1,
+        version: 0,
+        blocks: vec![],
+    };
+    enforcer
+        .apply(&empty_ir)
+        .expect("empty (default-deny) policy should apply");
 
     deny_one_syn(&a, "10.10.0.2", 5333);
     std::thread::sleep(Duration::from_millis(200));
 
-    let events = enforcer.deny_events().expect("deny_events() should succeed");
+    let events = enforcer
+        .deny_events()
+        .expect("deny_events() should succeed");
     assert_eq!(
         events.len(),
         1,
         "expected exactly one DenyEvent for the single default-denied SYN, got: {events:?}"
     );
     let ev = &events[0];
-    assert_eq!(ev.src, "10.10.0.1".parse::<Ipv4Addr>().unwrap(), "unexpected src: {ev:?}");
-    assert_eq!(ev.dst, "10.10.0.2".parse::<Ipv4Addr>().unwrap(), "unexpected dst: {ev:?}");
+    assert_eq!(
+        ev.src,
+        "10.10.0.1".parse::<Ipv4Addr>().unwrap(),
+        "unexpected src: {ev:?}"
+    );
+    assert_eq!(
+        ev.dst,
+        "10.10.0.2".parse::<Ipv4Addr>().unwrap(),
+        "unexpected dst: {ev:?}"
+    );
     assert_eq!(ev.proto, 6, "unexpected proto (want tcp/6): {ev:?}");
     assert_eq!(ev.dport, 5333, "unexpected dport: {ev:?}");
     assert_eq!(
@@ -243,7 +277,10 @@ fn sampling_bounds_events_while_counter_still_counts_all_100() {
     let (lab, a, b) = wg_lab("aeth10");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
 
-    let cfg = EnforcerConfig { log_per_rule: 5, ..EnforcerConfig::default() };
+    let cfg = EnforcerConfig {
+        log_per_rule: 5,
+        ..EnforcerConfig::default()
+    };
     let mut enforcer =
         wiremesh_enforcer::probe("wg0", cfg).expect("probe should load + attach eBPF on wg0");
 
@@ -278,7 +315,9 @@ policy:
     );
 
     // This test's actual RED driver: sampled, bounded event emission.
-    let events = enforcer.deny_events().expect("deny_events() should succeed");
+    let events = enforcer
+        .deny_events()
+        .expect("deny_events() should succeed");
     assert!(
         events.len() >= 5 && events.len() <= 20,
         "expected a bounded, budget-shaped number of deny events (>=5 for log_per_rule=5, <=20 \

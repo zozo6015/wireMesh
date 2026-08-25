@@ -109,7 +109,9 @@ impl FabricAdmin {
     pub async fn apply(&mut self, fabric_yaml: &str) -> anyhow::Result<ApplyDiff> {
         Ok(self
             .client
-            .apply(ApplyRequest { fabric_yaml: fabric_yaml.to_string() })
+            .apply(ApplyRequest {
+                fabric_yaml: fabric_yaml.to_string(),
+            })
             .await
             .context("Admin.Apply")?
             .into_inner())
@@ -169,7 +171,10 @@ impl FabricAdmin {
     pub async fn register_relay(&mut self, name: &str, endpoint: &str) -> anyhow::Result<u64> {
         Ok(self
             .client
-            .register_relay(RegisterRelayRequest { name: name.to_string(), endpoint: endpoint.to_string() })
+            .register_relay(RegisterRelayRequest {
+                name: name.to_string(),
+                endpoint: endpoint.to_string(),
+            })
             .await
             .context("Admin.RegisterRelay")?
             .into_inner()

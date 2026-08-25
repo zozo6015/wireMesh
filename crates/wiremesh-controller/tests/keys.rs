@@ -56,22 +56,20 @@ async fn key_rotation_advances_epoch_states_and_survives_restart() {
             .find(|p| p.gateway_id == a.id())
             .map(|p| p.keys.iter().map(|k| (k.epoch, k.state.clone())).collect())
             .unwrap_or_default(),
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
     let pre_rotation_max_epoch = pre_rotation_a_keys.iter().map(|(e, _)| *e).max();
     assert!(
-        pre_rotation_a_keys
-            .iter()
-            .any(|(_, st)| st == "active"),
+        pre_rotation_a_keys.iter().any(|(_, st)| st == "active"),
         "expected gateway A to already have an active epoch-0 key before any rotation, \
          got: {pre_rotation_a_keys:?}"
     );
 
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest {
-            gateway_id: a.id(),
-        })
+        .rotate_key(RotateKeyRequest { gateway_id: a.id() })
         .await
         .expect("Admin.RotateKey(gateway_id = a.id()) must succeed");
 

@@ -63,23 +63,43 @@ fn t5_render_peer_stats_emits_per_peer_gauges() {
             // The incident's diagnostic shape: FI's peer showed handshake
             // "28s ago" with rx frozen — exactly what these gauges exist
             // to make visible without a debug container.
-            PeerStats { rx_bytes: 12345, tx_bytes: 6789, last_handshake_age_secs: Some(28) },
+            PeerStats {
+                rx_bytes: 12345,
+                tx_bytes: 6789,
+                last_handshake_age_secs: Some(28),
+            },
         ),
         (
             "6".to_string(),
-            PeerStats { rx_bytes: 0, tx_bytes: 0, last_handshake_age_secs: None },
+            PeerStats {
+                rx_bytes: 0,
+                tx_bytes: 0,
+                last_handshake_age_secs: None,
+            },
         ),
     ]);
 
-    assert!(out.contains("# TYPE wiremesh_gateway_peer_rx_bytes gauge"), "body: {out}");
-    assert!(out.contains("# TYPE wiremesh_gateway_peer_tx_bytes gauge"), "body: {out}");
+    assert!(
+        out.contains("# TYPE wiremesh_gateway_peer_rx_bytes gauge"),
+        "body: {out}"
+    );
+    assert!(
+        out.contains("# TYPE wiremesh_gateway_peer_tx_bytes gauge"),
+        "body: {out}"
+    );
     assert!(
         out.contains("# TYPE wiremesh_gateway_peer_last_handshake_age_seconds gauge"),
         "body: {out}"
     );
 
-    assert!(out.contains("wiremesh_gateway_peer_rx_bytes{peer=\"5\"} 12345"), "body: {out}");
-    assert!(out.contains("wiremesh_gateway_peer_tx_bytes{peer=\"5\"} 6789"), "body: {out}");
+    assert!(
+        out.contains("wiremesh_gateway_peer_rx_bytes{peer=\"5\"} 12345"),
+        "body: {out}"
+    );
+    assert!(
+        out.contains("wiremesh_gateway_peer_tx_bytes{peer=\"5\"} 6789"),
+        "body: {out}"
+    );
     assert!(
         out.contains("wiremesh_gateway_peer_last_handshake_age_seconds{peer=\"5\"} 28"),
         "body: {out}"
@@ -87,8 +107,14 @@ fn t5_render_peer_stats_emits_per_peer_gauges() {
 
     // A zero-traffic peer still gets explicit rx/tx lines (0 is the
     // interesting diagnostic value — finding §4's "rx stayed 0").
-    assert!(out.contains("wiremesh_gateway_peer_rx_bytes{peer=\"6\"} 0"), "body: {out}");
-    assert!(out.contains("wiremesh_gateway_peer_tx_bytes{peer=\"6\"} 0"), "body: {out}");
+    assert!(
+        out.contains("wiremesh_gateway_peer_rx_bytes{peer=\"6\"} 0"),
+        "body: {out}"
+    );
+    assert!(
+        out.contains("wiremesh_gateway_peer_tx_bytes{peer=\"6\"} 0"),
+        "body: {out}"
+    );
 }
 
 /// T5: a never-handshaked peer's age line is OMITTED rather than rendered
@@ -99,7 +125,11 @@ fn t5_render_peer_stats_emits_per_peer_gauges() {
 fn t5_render_peer_stats_omits_age_for_never_handshaked_peer() {
     let out = render_peer_stats(&[(
         "6".to_string(),
-        PeerStats { rx_bytes: 0, tx_bytes: 0, last_handshake_age_secs: None },
+        PeerStats {
+            rx_bytes: 0,
+            tx_bytes: 0,
+            last_handshake_age_secs: None,
+        },
     )]);
     assert!(
         !out.contains("wiremesh_gateway_peer_last_handshake_age_seconds{peer=\"6\"}"),
@@ -117,18 +147,28 @@ async fn t5_serve_metrics_scrape_includes_per_peer_gauges() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(serve_metrics(listener, || async {
-        let counters =
-            Counters { by_rule: BTreeMap::from([("r9".to_string(), 2u64)]), default_deny: 1 };
+        let counters = Counters {
+            by_rule: BTreeMap::from([("r9".to_string(), 2u64)]),
+            default_deny: 1,
+        };
         let peer_states = vec![("5".to_string(), PathState::Direct)];
         let transitions = vec![((PathState::Connecting, PathState::Direct), 3u64)];
         let peer_stats = vec![
             (
                 "5".to_string(),
-                PeerStats { rx_bytes: 12345, tx_bytes: 6789, last_handshake_age_secs: Some(28) },
+                PeerStats {
+                    rx_bytes: 12345,
+                    tx_bytes: 6789,
+                    last_handshake_age_secs: Some(28),
+                },
             ),
             (
                 "6".to_string(),
-                PeerStats { rx_bytes: 0, tx_bytes: 0, last_handshake_age_secs: None },
+                PeerStats {
+                    rx_bytes: 0,
+                    tx_bytes: 0,
+                    last_handshake_age_secs: None,
+                },
             ),
         ];
         // Trailing `0u64`: mechanical +1 tuple element (Backlog item 1's
@@ -152,15 +192,22 @@ async fn t5_serve_metrics_scrape_includes_per_peer_gauges() {
         ))
     }));
 
-    let mut stream =
-        tokio::net::TcpStream::connect(addr).await.expect("connect to metrics listener");
-    stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+    let mut stream = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("connect to metrics listener");
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+        .await
+        .unwrap();
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.unwrap();
     let text = String::from_utf8_lossy(&buf);
 
     // Pre-existing families still present (non-regression).
-    assert!(text.contains("wiremesh_gateway_applied_policy_version 9"), "body: {text}");
+    assert!(
+        text.contains("wiremesh_gateway_applied_policy_version 9"),
+        "body: {text}"
+    );
     assert!(
         text.contains("wiremesh_gateway_path_state{peer=\"5\",state=\"direct\"} 1"),
         "body: {text}"

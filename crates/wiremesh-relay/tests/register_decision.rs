@@ -226,10 +226,30 @@ fn peer_comparison_is_exact_string_equality() {
 fn the_full_truth_table_holds() {
     // (owner matches?, peer matches?) -> decision, over an occupied slot.
     let cases: [(&str, &str, RegisterDecision, &str); 4] = [
-        ("gw-A", "gw-B", RegisterDecision::ReplaceOwnSlot, "same owner, same peer"),
-        ("gw-A", "gw-D", RegisterDecision::RejectKeyCollision, "same owner, different peer"),
-        ("gw-C", "gw-B", RegisterDecision::RejectOwnedByOther, "different owner, SAME peer"),
-        ("gw-C", "gw-D", RegisterDecision::RejectOwnedByOther, "different owner, different peer"),
+        (
+            "gw-A",
+            "gw-B",
+            RegisterDecision::ReplaceOwnSlot,
+            "same owner, same peer",
+        ),
+        (
+            "gw-A",
+            "gw-D",
+            RegisterDecision::RejectKeyCollision,
+            "same owner, different peer",
+        ),
+        (
+            "gw-C",
+            "gw-B",
+            RegisterDecision::RejectOwnedByOther,
+            "different owner, SAME peer",
+        ),
+        (
+            "gw-C",
+            "gw-D",
+            RegisterDecision::RejectOwnedByOther,
+            "different owner, different peer",
+        ),
     ];
     for (cert_identity, peer_identity, expected, label) in cases {
         assert_eq!(
@@ -298,7 +318,10 @@ fn register_decision_is_pure() {
     // The relay calls this under the registry lock and acts on the result; it
     // must be a total function of its three inputs with no hidden state.
     for _ in 0..4 {
-        assert_eq!(register_decision(None, "gw-A", "gw-B"), RegisterDecision::Accept);
+        assert_eq!(
+            register_decision(None, "gw-A", "gw-B"),
+            RegisterDecision::Accept
+        );
         assert_eq!(
             register_decision(INCUMBENT, "gw-A", "gw-B"),
             RegisterDecision::ReplaceOwnSlot

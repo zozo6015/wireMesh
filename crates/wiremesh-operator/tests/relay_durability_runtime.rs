@@ -36,8 +36,14 @@ fn relay(name: &str) -> WiremeshRelay {
 }
 
 fn build(name: &str) -> k8s_openapi::api::apps::v1::Deployment {
-    relay_deployment(&relay(name), "wm:9500", "wm:9400", "wm-ca", "relay-eu-token")
-        .expect("valid endpoint must build")
+    relay_deployment(
+        &relay(name),
+        "wm:9500",
+        "wm:9400",
+        "wm-ca",
+        "relay-eu-token",
+    )
+    .expect("valid endpoint must build")
 }
 
 #[test]

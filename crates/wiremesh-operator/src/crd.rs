@@ -291,7 +291,10 @@ mod tests {
     fn crd_yaml_roundtrips() {
         let seg = WiremeshSegment::new(
             "aws",
-            WiremeshSegmentSpec { segment_name: "aws".into(), cidrs: vec!["10.10.1.0/24".into()] },
+            WiremeshSegmentSpec {
+                segment_name: "aws".into(),
+                cidrs: vec!["10.10.1.0/24".into()],
+            },
         );
         let y = serde_yaml::to_string(&seg).unwrap();
         let back: WiremeshSegment = serde_yaml::from_str(&y).unwrap();
@@ -303,10 +306,48 @@ mod tests {
     fn crd_derive_compiles_all_five() {
         // Construct one of each kind — a compile-proof that every derive works.
         let _ = WiremeshController::new("wm", WiremeshControllerSpec::default_for_test());
-        let _ = WiremeshSegment::new("s", WiremeshSegmentSpec { segment_name: "s".into(), cidrs: vec![] });
-        let _ = WiremeshPolicy::new("p", WiremeshPolicySpec { from: "a".into(), to: "b".into(), rules: vec![] });
-        let _ = WiremeshGateway::new("g", WiremeshGatewaySpec { segment_ref: "s".into(), node_name: None, node_selector: None, wg_port: None, tun: None, image: None, storage_class: None, storage_size: None, observe_endpoint: None, sync_endpoint: None, metrics_bind: None });
-        let _ = WiremeshRelay::new("r", WiremeshRelaySpec { endpoint: "203.0.113.9:4443".into(), node_name: None, image: None, storage_class: None, storage_size: None, controller_endpoint: None });
+        let _ = WiremeshSegment::new(
+            "s",
+            WiremeshSegmentSpec {
+                segment_name: "s".into(),
+                cidrs: vec![],
+            },
+        );
+        let _ = WiremeshPolicy::new(
+            "p",
+            WiremeshPolicySpec {
+                from: "a".into(),
+                to: "b".into(),
+                rules: vec![],
+            },
+        );
+        let _ = WiremeshGateway::new(
+            "g",
+            WiremeshGatewaySpec {
+                segment_ref: "s".into(),
+                node_name: None,
+                node_selector: None,
+                wg_port: None,
+                tun: None,
+                image: None,
+                storage_class: None,
+                storage_size: None,
+                observe_endpoint: None,
+                sync_endpoint: None,
+                metrics_bind: None,
+            },
+        );
+        let _ = WiremeshRelay::new(
+            "r",
+            WiremeshRelaySpec {
+                endpoint: "203.0.113.9:4443".into(),
+                node_name: None,
+                image: None,
+                storage_class: None,
+                storage_size: None,
+                controller_endpoint: None,
+            },
+        );
         // Kind names are what the apiserver registers.
         assert_eq!(WiremeshSegment::kind(&()), "WiremeshSegment");
     }
@@ -357,8 +398,14 @@ mod tests {
             metrics_bind: None,
         };
         let vb = serde_json::to_value(&bare).unwrap();
-        assert!(vb.get("storageClass").is_none(), "storageClass omitted when unset");
-        assert!(vb.get("storageSize").is_none(), "storageSize omitted when unset");
+        assert!(
+            vb.get("storageClass").is_none(),
+            "storageClass omitted when unset"
+        );
+        assert!(
+            vb.get("storageSize").is_none(),
+            "storageSize omitted when unset"
+        );
     }
 
     #[test]
@@ -393,7 +440,11 @@ mod tests {
             "all_crds() order is the document order of the generated CRD bundles"
         );
         for c in &crds {
-            assert_eq!(c.spec.scope, "Cluster", "{} must be cluster-scoped", c.spec.names.kind);
+            assert_eq!(
+                c.spec.scope, "Cluster",
+                "{} must be cluster-scoped",
+                c.spec.names.kind
+            );
             assert_eq!(c.spec.group, "wiremesh.io");
         }
     }

@@ -72,7 +72,10 @@ fn pod_of(s: WiremeshGatewaySpec) -> k8s_openapi::api::core::v1::PodSpec {
 
 /// The value following `flag` in an argv list (flag/value pairs).
 fn arg_after(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 #[test]
@@ -83,7 +86,11 @@ fn overrides_flow_into_gateway_args() {
         Some("10.0.125.45:9600".into()),
         Some("wg.zozotk.go.ro:9500".into()),
     ));
-    let main = pod.containers.iter().find(|c| c.name == "gateway").expect("gateway container");
+    let main = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "gateway")
+        .expect("gateway container");
     let args = main.args.as_ref().expect("gateway args");
     assert_eq!(
         arg_after(args, "--observe").as_deref(),
@@ -102,10 +109,20 @@ fn overrides_flow_into_gateway_args() {
 fn absent_overrides_keep_cluster_ip_defaults() {
     // Regression guard: no override → exactly today's ClusterIP wiring.
     let pod = pod_of(spec(None, None));
-    let main = pod.containers.iter().find(|c| c.name == "gateway").expect("gateway container");
+    let main = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "gateway")
+        .expect("gateway container");
     let args = main.args.as_ref().expect("gateway args");
-    assert_eq!(arg_after(args, "--observe").as_deref(), Some(CLUSTER_OBSERVE));
-    assert_eq!(arg_after(args, "--controller-sync").as_deref(), Some(CLUSTER_SYNC));
+    assert_eq!(
+        arg_after(args, "--observe").as_deref(),
+        Some(CLUSTER_OBSERVE)
+    );
+    assert_eq!(
+        arg_after(args, "--controller-sync").as_deref(),
+        Some(CLUSTER_SYNC)
+    );
 }
 
 #[test]
@@ -114,7 +131,10 @@ fn overrides_are_independent() {
     let pod = pod_of(spec(Some("10.0.125.45:9600".into()), None));
     let main = pod.containers.iter().find(|c| c.name == "gateway").unwrap();
     let args = main.args.as_ref().unwrap();
-    assert_eq!(arg_after(args, "--observe").as_deref(), Some("10.0.125.45:9600"));
+    assert_eq!(
+        arg_after(args, "--observe").as_deref(),
+        Some("10.0.125.45:9600")
+    );
     assert_eq!(
         arg_after(args, "--controller-sync").as_deref(),
         Some(CLUSTER_SYNC),
@@ -124,8 +144,14 @@ fn overrides_are_independent() {
     let pod = pod_of(spec(None, Some("wg.zozotk.go.ro:9500".into())));
     let main = pod.containers.iter().find(|c| c.name == "gateway").unwrap();
     let args = main.args.as_ref().unwrap();
-    assert_eq!(arg_after(args, "--observe").as_deref(), Some(CLUSTER_OBSERVE));
-    assert_eq!(arg_after(args, "--controller-sync").as_deref(), Some("wg.zozotk.go.ro:9500"));
+    assert_eq!(
+        arg_after(args, "--observe").as_deref(),
+        Some(CLUSTER_OBSERVE)
+    );
+    assert_eq!(
+        arg_after(args, "--controller-sync").as_deref(),
+        Some("wg.zozotk.go.ro:9500")
+    );
 }
 
 #[test]

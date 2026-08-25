@@ -290,7 +290,9 @@ impl Drop for RootNetGuard {
 /// attachment `pub0`.
 fn attach_bridge(ns: &Ns, host_end: &str, ns_end_tag: &str, ifname: &str, cidr: &str) {
     let tmp = format!("wmc{ns_end_tag}n");
-    run_root(&["ip", "link", "add", host_end, "type", "veth", "peer", "name", &tmp]);
+    run_root(&[
+        "ip", "link", "add", host_end, "type", "veth", "peer", "name", &tmp,
+    ]);
     run_root(&["ip", "link", "set", host_end, "master", BRIDGE]);
     run_root(&["ip", "link", "set", host_end, "up"]);
     run_root(&["ip", "link", "set", &tmp, "netns", &ns.name]);
@@ -392,7 +394,10 @@ async fn enroll_relay_certs(h: &TestController, addr: &str, csr_tag: &str) -> te
     std::fs::write(certdir.path().join("relay.key"), key_pair.serialize_pem())
         .expect("write relay.key");
     std::fs::write(certdir.path().join("ca.pem"), &resp.ca_bundle_pem).expect("write ca.pem");
-    eprintln!("enroll_relay_certs: relay_id={} addr={addr}", resp.gateway_id);
+    eprintln!(
+        "enroll_relay_certs: relay_id={} addr={addr}",
+        resp.gateway_id
+    );
     certdir
 }
 
@@ -406,7 +411,10 @@ async fn enroll_and_spawn_relay(
     let (bound_addr, handle) = wiremesh_relay::spawn_server(bind, certdir.path())
         .await
         .unwrap_or_else(|e| panic!("spawn_server on {addr}: {e}"));
-    assert_eq!(bound_addr, bind, "relay must bind exactly the enrolled/advertised endpoint");
+    assert_eq!(
+        bound_addr, bind,
+        "relay must bind exactly the enrolled/advertised endpoint"
+    );
     eprintln!("enroll_and_spawn_relay: listening on {bound_addr}");
     (certdir, handle)
 }
@@ -450,18 +458,31 @@ impl Drop for GwProc {
     }
 }
 
-fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, tag: &str) -> GwProc {
+fn spawn_gw(
+    ns: &Ns,
+    statedir: &Path,
+    sync: &str,
+    observe: &str,
+    logdir: &Path,
+    tag: &str,
+) -> GwProc {
     let metrics = format!("0.0.0.0:{METRICS_PORT}");
     let wg_port = WG_PORT.to_string();
     let statedir_s = statedir.to_str().unwrap();
     let args = [
         GW_BIN,
-        "--controller-sync", sync,
-        "--observe", observe,
-        "--tun", "wg0",
-        "--wg-port", &wg_port,
-        "--state-dir", statedir_s,
-        "--metrics", &metrics,
+        "--controller-sync",
+        sync,
+        "--observe",
+        observe,
+        "--tun",
+        "wg0",
+        "--wg-port",
+        &wg_port,
+        "--state-dir",
+        statedir_s,
+        "--metrics",
+        &metrics,
     ];
     let mut child = ns.spawn(&args).expect("spawn wiremesh-gateway");
     let mut drains = vec![];
@@ -482,7 +503,11 @@ fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path, 
             }
         }));
     }
-    GwProc { child, err_log, drains }
+    GwProc {
+        child,
+        err_log,
+        drains,
+    }
 }
 
 // --- traffic probes ----------------------------------------------------------
@@ -512,7 +537,10 @@ while True:
     c.close()
 "#
     );
-    Listener(ns.spawn(&["python3", "-c", &script]).expect("spawn listener"))
+    Listener(
+        ns.spawn(&["python3", "-c", &script])
+            .expect("spawn listener"),
+    )
 }
 
 fn tcp_connect(ns: &Ns, dst: &str, port: u16) -> bool {
@@ -619,7 +647,9 @@ fn conntrack_wg(ns: &Ns) -> String {
         .map(|o| {
             String::from_utf8_lossy(&o.stdout)
                 .lines()
-                .filter(|l| l.contains("dport=51820") || l.contains("sport=51820") || l.contains("5555"))
+                .filter(|l| {
+                    l.contains("dport=51820") || l.contains("sport=51820") || l.contains("5555")
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -635,8 +665,9 @@ fn count_peer_lines(log: &str, prefixes: &[&str], gid: u64) -> usize {
             prefixes.iter().any(|pat| {
                 line.find(pat).is_some_and(|idx| {
                     let rest = &line[idx + pat.len()..];
-                    let digits: &str =
-                        &rest[..rest.find(|c: char| !c.is_ascii_digit()).unwrap_or(rest.len())];
+                    let digits: &str = &rest[..rest
+                        .find(|c: char| !c.is_ascii_digit())
+                        .unwrap_or(rest.len())];
                     digits.parse::<u64>() == Ok(gid)
                 })
             })
@@ -733,9 +764,19 @@ impl Scenario {
         write_identity(&gc, &c_priv, self.sdc.path());
         let sync = self.h.sync_tcp_addr().to_string();
         let observe = self.h.observe_addr().to_string();
-        let pc = spawn_gw(&self.gwc, self.sdc.path(), &sync, &observe, self.logdir.path(), "c");
+        let pc = spawn_gw(
+            &self.gwc,
+            self.sdc.path(),
+            &sync,
+            &observe,
+            self.logdir.path(),
+            "c",
+        );
         self.pc = Some(pc);
-        eprintln!("enroll_and_spawn_c: gateway C enrolled (id={}) and spawned", gc.id());
+        eprintln!(
+            "enroll_and_spawn_c: gateway C enrolled (id={}) and spawned",
+            gc.id()
+        );
         gc.id()
     }
 
@@ -759,13 +800,18 @@ fn dump_diag(label: &str, sc: &Scenario) {
             scrape_metrics(ns)
                 .unwrap_or_default()
                 .lines()
-                .filter(|l| l.contains("path_state") || l.contains("peer_rx") || l.contains("peer_last_handshake"))
+                .filter(|l| l.contains("path_state")
+                    || l.contains("peer_rx")
+                    || l.contains("peer_last_handshake"))
                 .collect::<Vec<_>>()
                 .join("\n")
         );
     }
     for (name, r) in [("rb", &sc.rb), ("rc", &sc.rc)] {
-        eprintln!("--- conntrack@{name} (wg/relay udp) ---\n{}", conntrack_wg(r));
+        eprintln!(
+            "--- conntrack@{name} (wg/relay udp) ---\n{}",
+            conntrack_wg(r)
+        );
     }
     for (name, _, p) in &gws {
         eprintln!("--- {name} stderr tail ---\n{}", p.stderr_tail());
@@ -784,7 +830,10 @@ async fn build_scenario(prefix: &str) -> Scenario {
     // Fabric BEFORE enrollment, so each gateway's first snapshot already
     // carries the compiled policy (all three segments exist from the start).
     let diff = h.apply(FABRIC).await;
-    assert!(diff.policy_updated, "fabric apply must compile a real policy, got: {diff:?}");
+    assert!(
+        diff.policy_updated,
+        "fabric apply must compile a real policy, got: {diff:?}"
+    );
 
     // Relay enrolled + running BEFORE any gateway connects, so every
     // gateway's very first Sync snapshot already advertises it (same
@@ -809,10 +858,16 @@ async fn build_scenario(prefix: &str) -> Scenario {
     let rc = lab.nat_router("rc", NatKind::PortRestricted).expect("rc");
 
     // Inside (gateway <-> router) links for B and C.
-    lab.veth((&gwb, "nat0", &format!("{GWB_INSIDE}/24")), (&rb, "in0", "192.168.91.1/24"))
-        .expect("gwB<->rb");
-    lab.veth((&gwc, "nat0", &format!("{GWC_INSIDE}/24")), (&rc, "in0", "192.168.92.1/24"))
-        .expect("gwC<->rc");
+    lab.veth(
+        (&gwb, "nat0", &format!("{GWB_INSIDE}/24")),
+        (&rb, "in0", "192.168.91.1/24"),
+    )
+    .expect("gwB<->rb");
+    lab.veth(
+        (&gwc, "nat0", &format!("{GWC_INSIDE}/24")),
+        (&rc, "in0", "192.168.92.1/24"),
+    )
+    .expect("gwC<->rc");
 
     // Public attachments: routers' out0, and gwA DIRECTLY on the bridge (the
     // incident's fully-dialable FI host — no NAT in front of it).
@@ -871,26 +926,44 @@ async fn build_scenario(prefix: &str) -> Scenario {
     for r in [&rb, &rc] {
         r.exec(&["sysctl", "-w", "net.netfilter.nf_conntrack_udp_timeout=30"])
             .expect("shorten conntrack udp timeout (per-netns nf_conntrack sysctl)");
-        r.exec(&["sysctl", "-w", "net.netfilter.nf_conntrack_udp_timeout_stream=60"])
-            .expect("shorten conntrack udp stream timeout (per-netns nf_conntrack sysctl)");
+        r.exec(&[
+            "sysctl",
+            "-w",
+            "net.netfilter.nf_conntrack_udp_timeout_stream=60",
+        ])
+        .expect("shorten conntrack udp stream timeout (per-netns nf_conntrack sysctl)");
     }
 
     // Segment (workload) links + routes.
-    lab.veth((&gwa, "seg0", "10.10.21.1/24"), (&wla, "eth0", "10.10.21.2/24"))
-        .expect("seg-a veth");
-    lab.veth((&gwb, "seg0", "10.10.22.1/24"), (&wlb, "eth0", "10.10.22.2/24"))
-        .expect("seg-b veth");
-    lab.veth((&gwc, "seg0", "10.10.23.1/24"), (&wlc, "eth0", "10.10.23.2/24"))
-        .expect("seg-c veth");
-    wla.exec(&["ip", "route", "add", "default", "via", "10.10.21.1"]).expect("wlA route");
-    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.22.1"]).expect("wlB route");
-    wlc.exec(&["ip", "route", "add", "default", "via", "10.10.23.1"]).expect("wlC route");
+    lab.veth(
+        (&gwa, "seg0", "10.10.21.1/24"),
+        (&wla, "eth0", "10.10.21.2/24"),
+    )
+    .expect("seg-a veth");
+    lab.veth(
+        (&gwb, "seg0", "10.10.22.1/24"),
+        (&wlb, "eth0", "10.10.22.2/24"),
+    )
+    .expect("seg-b veth");
+    lab.veth(
+        (&gwc, "seg0", "10.10.23.1/24"),
+        (&wlc, "eth0", "10.10.23.2/24"),
+    )
+    .expect("seg-c veth");
+    wla.exec(&["ip", "route", "add", "default", "via", "10.10.21.1"])
+        .expect("wlA route");
+    wlb.exec(&["ip", "route", "add", "default", "via", "10.10.22.1"])
+        .expect("wlB route");
+    wlc.exec(&["ip", "route", "add", "default", "via", "10.10.23.1"])
+        .expect("wlC route");
 
     // Gateway default routes: B and C via their NAT router; A is directly on
     // the public /24 (everything it needs — controller, relay, both routers'
     // out0 — is on-link).
-    gwb.exec(&["ip", "route", "add", "default", "via", "192.168.91.1"]).expect("gwB route");
-    gwc.exec(&["ip", "route", "add", "default", "via", "192.168.92.1"]).expect("gwC route");
+    gwb.exec(&["ip", "route", "add", "default", "via", "192.168.91.1"])
+        .expect("gwB route");
+    gwc.exec(&["ip", "route", "add", "default", "via", "192.168.92.1"])
+        .expect("gwC route");
 
     // Right-reason guards: B must be dialable from the public side (the DNAT
     // forward actually forwards — asserted indirectly by ASSERTION 1's
@@ -929,8 +1002,22 @@ async fn build_scenario(prefix: &str) -> Scenario {
         gb.id()
     );
 
-    let pa = spawn_gw(&gwa, sda.path(), &sync_addr, &observe_addr, logdir.path(), "a");
-    let pb = spawn_gw(&gwb, sdb.path(), &sync_addr, &observe_addr, logdir.path(), "b");
+    let pa = spawn_gw(
+        &gwa,
+        sda.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "a",
+    );
+    let pb = spawn_gw(
+        &gwb,
+        sdb.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+        "b",
+    );
 
     Scenario {
         pa,
@@ -981,7 +1068,9 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
     // (plan T8.1) Both dialable — the pre-incident working pair. The tcp
     // probes double as the tunnel-demand driver, exactly as
     // `nat_matrix.rs::establish_direct` documents.
-    let crossed = wait_until(AB_CROSS_BUDGET, || tcp_connect(&sc.wla, "10.10.22.2", WORKLOAD_PORT));
+    let crossed = wait_until(AB_CROSS_BUDGET, || {
+        tcp_connect(&sc.wla, "10.10.22.2", WORKLOAD_PORT)
+    });
     if !crossed {
         dump_diag("assertion1 workload-cross", &sc);
         panic!(
@@ -1055,7 +1144,10 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
                 );
             }
         }
-        for (side, ns, peer) in [("gwA[peer B]", &sc.gwa, id_b), ("gwB[peer A]", &sc.gwb, id_a)] {
+        for (side, ns, peer) in [
+            ("gwA[peer B]", &sc.gwa, id_b),
+            ("gwB[peer A]", &sc.gwb, id_a),
+        ] {
             let st = path_state_for(ns, peer);
             if matches!(st.as_deref(), Some("connecting") | Some("disconnected")) {
                 dump_diag("assertion3 state-reversion", &sc);
@@ -1095,7 +1187,8 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
     // a `direct` sighting is then separately treated as a false-liveness
     // alarm below (T2: rc provably never delivers peer UDP to C, so a
     // `direct` C pair cannot be genuine).
-    let settled_ok = |st: &Option<String>| matches!(st.as_deref(), Some("direct") | Some("relayed"));
+    let settled_ok =
+        |st: &Option<String>| matches!(st.as_deref(), Some("direct") | Some("relayed"));
     let pair_sides: [(&str, &Ns, u64); 4] = [
         ("gwC[peer A]", &sc.gwc, id_a),
         ("gwC[peer B]", &sc.gwc, id_b),
@@ -1115,7 +1208,9 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
             );
             last_log = Instant::now();
         }
-        pair_sides.iter().all(|(_, ns, gid)| settled_ok(&path_state_for(ns, *gid)))
+        pair_sides
+            .iter()
+            .all(|(_, ns, gid)| settled_ok(&path_state_for(ns, *gid)))
     });
     if !settled {
         dump_diag("assertion2 settle", &sc);
@@ -1224,13 +1319,21 @@ async fn t8_convergence_incident_lifecycle() {
         ("gwA->C", &sc.pa, id_c),
         ("gwB->C", &sc.pb, id_c),
     ];
-    let baseline: Vec<usize> =
-        storm_sides.iter().map(|(_, gw, gid)| punch_attempts(gw, *gid)).collect();
-    let dir_baseline: Vec<usize> =
-        storm_sides.iter().map(|(_, gw, gid)| punch_directives(gw, *gid)).collect();
+    let baseline: Vec<usize> = storm_sides
+        .iter()
+        .map(|(_, gw, gid)| punch_attempts(gw, *gid))
+        .collect();
+    let dir_baseline: Vec<usize> = storm_sides
+        .iter()
+        .map(|(_, gw, gid)| punch_directives(gw, *gid))
+        .collect();
     eprintln!(
         "assertion2: anti-storm window open ({STORM_WINDOW:?}); attempt baselines: {:?}",
-        storm_sides.iter().zip(&baseline).map(|((n, _, _), b)| (*n, *b)).collect::<Vec<_>>()
+        storm_sides
+            .iter()
+            .zip(&baseline)
+            .map(|((n, _, _), b)| (*n, *b))
+            .collect::<Vec<_>>()
     );
     std::thread::sleep(STORM_WINDOW);
     for (i, (name, gw, gid)) in storm_sides.iter().enumerate() {
@@ -1317,7 +1420,9 @@ async fn t8_keepalive_holds_path_state_under_punch_contention() {
         let ka = wg_keepalives(ns);
         let bad: Vec<&str> = ka
             .lines()
-            .filter(|l| !l.trim().is_empty() && !l.split_whitespace().last().is_some_and(|v| v == "25"))
+            .filter(|l| {
+                !l.trim().is_empty() && !l.split_whitespace().last().is_some_and(|v| v == "25")
+            })
             .collect();
         if ka.trim().is_empty() || !bad.is_empty() {
             dump_diag("assertion4 keepalive-emission", &sc);
@@ -1329,10 +1434,11 @@ async fn t8_keepalive_holds_path_state_under_punch_contention() {
     }
     eprintln!("assertion4: keepalive=25s confirmed on every peer of all three gateways");
 
-    let idle_baseline_ab: [usize; 2] =
-        [punch_attempts(&sc.pa, id_b), punch_attempts(&sc.pb, id_a)];
-    let idle_baseline_c: Vec<usize> =
-        storm_sides.iter().map(|(_, gw, gid)| punch_attempts(gw, *gid)).collect();
+    let idle_baseline_ab: [usize; 2] = [punch_attempts(&sc.pa, id_b), punch_attempts(&sc.pb, id_a)];
+    let idle_baseline_c: Vec<usize> = storm_sides
+        .iter()
+        .map(|(_, gw, gid)| punch_attempts(gw, *gid))
+        .collect();
 
     // The six pair-side expectations during idle: the direct pair must STAY
     // direct (a degraded excursion = keepalives not keeping rx alive); the
@@ -1349,7 +1455,10 @@ async fn t8_keepalive_holds_path_state_under_punch_contention() {
         ("gwB[peer C]", &sc.gwb, id_c, "relayed"),
     ];
     let idle_start = Instant::now();
-    eprintln!("assertion4: entering {IDLE:?} workload-idle at t+{:?}", t0.elapsed());
+    eprintln!(
+        "assertion4: entering {IDLE:?} workload-idle at t+{:?}",
+        t0.elapsed()
+    );
     while idle_start.elapsed() < IDLE {
         std::thread::sleep(Duration::from_secs(5));
         for (name, ns, gid, want) in &idle_expect {
@@ -1402,8 +1511,14 @@ async fn t8_keepalive_holds_path_state_under_punch_contention() {
     // (bound 1 — see IDLE_AB_PUNCH_BOUND's doc comment), and the blocked
     // pairs' attempts across idle+probes stay back-off-bounded.
     let ab_deltas = [
-        ("gwA->B", punch_attempts(&sc.pa, id_b).saturating_sub(idle_baseline_ab[0])),
-        ("gwB->A", punch_attempts(&sc.pb, id_a).saturating_sub(idle_baseline_ab[1])),
+        (
+            "gwA->B",
+            punch_attempts(&sc.pa, id_b).saturating_sub(idle_baseline_ab[0]),
+        ),
+        (
+            "gwB->A",
+            punch_attempts(&sc.pb, id_a).saturating_sub(idle_baseline_ab[1]),
+        ),
     ];
     for (name, delta) in ab_deltas {
         eprintln!("assertion4: {name} punch attempts across idle+probes: {delta}");

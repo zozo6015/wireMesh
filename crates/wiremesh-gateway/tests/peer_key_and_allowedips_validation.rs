@@ -107,7 +107,11 @@ fn peer_proto(gateway_id: u64, pubkey: &str, candidates: &[&str], cidrs: &[&str]
     Peer {
         gateway_id,
         segment_name: format!("s{gateway_id}"),
-        keys: vec![PeerKey { epoch: 0, pubkey: pubkey.to_string(), state: "active".into() }],
+        keys: vec![PeerKey {
+            epoch: 0,
+            pubkey: pubkey.to_string(),
+            state: "active".into(),
+        }],
         candidate_endpoints: candidates.iter().map(|s| s.to_string()).collect(),
         allowed_ips: cidrs.iter().map(|s| s.to_string()).collect(),
     }
@@ -126,8 +130,16 @@ fn peer_proto_with_pending(
         gateway_id,
         segment_name: format!("s{gateway_id}"),
         keys: vec![
-            PeerKey { epoch: 0, pubkey: active_pubkey.to_string(), state: "active".into() },
-            PeerKey { epoch: 1, pubkey: pending_pubkey.to_string(), state: "pending".into() },
+            PeerKey {
+                epoch: 0,
+                pubkey: active_pubkey.to_string(),
+                state: "active".into(),
+            },
+            PeerKey {
+                epoch: 1,
+                pubkey: pending_pubkey.to_string(),
+                state: "pending".into(),
+            },
         ],
         candidate_endpoints: candidates.iter().map(|s| s.to_string()).collect(),
         allowed_ips: cidrs.iter().map(|s| s.to_string()).collect(),
@@ -222,7 +234,12 @@ fn a_delta_upserting_a_peer_with_a_bad_active_pubkey_is_filtered_too() {
 
     ds.apply_delta(&Delta {
         revision: 8,
-        upserted_peers: vec![peer_proto(2, BOGUS_KEY_NOT_B64, &[VALID_EP], &[VALID_CIDR_A])],
+        upserted_peers: vec![peer_proto(
+            2,
+            BOGUS_KEY_NOT_B64,
+            &[VALID_EP],
+            &[VALID_CIDR_A],
+        )],
         removed_peer_ids: vec![],
         deprecated_relays: vec![],
         policy_ir: vec![],
@@ -253,9 +270,8 @@ fn one_peers_bad_active_pubkey_does_not_cost_a_sibling_peer_its_configuration() 
         peer_proto(3, PEER_B_PUB_B64, &[VALID_EP_9], &[VALID_CIDR_B]),
     ]));
 
-    let encoded = encode(&ds).expect(
-        "one peer's unusable key must not fail the whole-device encode for its siblings",
-    );
+    let encoded = encode(&ds)
+        .expect("one peer's unusable key must not fail the whole-device encode for its siblings");
     assert!(
         encoded.contains(&format!("public_key={PEER_B_PUB_HEX}\n")),
         "the healthy sibling peer must keep its key, got:\n{encoded}"
@@ -333,8 +349,11 @@ fn write_state_json_with_pubkey(dir: &std::path::Path, pubkey_b64: &str, cidrs: 
         "relays": [],
         "revoked_serials": [],
     });
-    std::fs::write(dir.join("state.json"), serde_json::to_vec_pretty(&doc).unwrap())
-        .expect("writing the test state.json");
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec_pretty(&doc).unwrap(),
+    )
+    .expect("writing the test state.json");
 }
 
 #[test]
@@ -375,7 +394,10 @@ fn a_persisted_state_where_every_peers_pubkey_is_bad_still_boots_with_an_empty_d
          gateway comes up with an otherwise-empty device (default-deny already covers \
          traffic to a peer it cannot key) rather than refusing to boot at all.",
     );
-    assert!(!encoded.contains("public_key="), "no peer block may survive, got:\n{encoded}");
+    assert!(
+        !encoded.contains("public_key="),
+        "no peer block may survive, got:\n{encoded}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +457,10 @@ fn a_snapshot_peer_whose_allowed_ips_are_all_malformed_still_configures_with_no_
         "the peer itself (key + endpoint) must survive even with zero usable routes, \
          got:\n{encoded}"
     );
-    assert!(!encoded.contains("allowed_ip="), "no allowed_ip line may be emitted, got:\n{encoded}");
+    assert!(
+        !encoded.contains("allowed_ip="),
+        "no allowed_ip line may be emitted, got:\n{encoded}"
+    );
 }
 
 #[test]
@@ -465,11 +490,13 @@ fn a_delta_upserting_a_peer_with_a_malformed_allowed_ip_is_filtered_too() {
         relays_updated: false,
     });
 
-    let encoded = encode(&ds).expect(
-        "a live delta introducing a bad allowed_ip must not kill the steady-state apply",
-    );
+    let encoded = encode(&ds)
+        .expect("a live delta introducing a bad allowed_ip must not kill the steady-state apply");
     assert!(!encoded.contains(BOGUS_CIDR_NOT_CIDR), "got:\n{encoded}");
-    assert!(encoded.contains(&format!("allowed_ip={VALID_CIDR_A}\n")), "got:\n{encoded}");
+    assert!(
+        encoded.contains(&format!("allowed_ip={VALID_CIDR_A}\n")),
+        "got:\n{encoded}"
+    );
 }
 
 #[test]
@@ -515,8 +542,11 @@ fn write_state_json_with_cidrs(dir: &std::path::Path, cidrs: &[&str]) {
         "relays": [],
         "revoked_serials": [],
     });
-    std::fs::write(dir.join("state.json"), serde_json::to_vec_pretty(&doc).unwrap())
-        .expect("writing the test state.json");
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec_pretty(&doc).unwrap(),
+    )
+    .expect("writing the test state.json");
 }
 
 #[test]
@@ -535,7 +565,10 @@ fn a_persisted_malformed_allowed_ip_does_not_block_the_fail_static_boot() {
          so this door is currently open by construction, not merely unfiltered.",
     );
     assert!(!encoded.contains(BOGUS_CIDR_NOT_CIDR), "got:\n{encoded}");
-    assert!(encoded.contains(&format!("allowed_ip={VALID_CIDR_A}\n")), "got:\n{encoded}");
+    assert!(
+        encoded.contains(&format!("allowed_ip={VALID_CIDR_A}\n")),
+        "got:\n{encoded}"
+    );
     assert!(
         encoded.contains(&format!("public_key={PEER_A_PUB_HEX}\n")),
         "the peer's key/endpoint must be unaffected by an allowed_ip problem, got:\n{encoded}"
@@ -545,7 +578,10 @@ fn a_persisted_malformed_allowed_ip_does_not_block_the_fail_static_boot() {
 #[test]
 fn a_persisted_state_whose_allowed_ips_are_all_malformed_still_boots_with_no_routes() {
     let dir = tempfile::tempdir().expect("tempdir");
-    write_state_json_with_cidrs(dir.path(), &[BOGUS_CIDR_NOT_CIDR, BOGUS_CIDR_PREFIX_TOO_LARGE]);
+    write_state_json_with_cidrs(
+        dir.path(),
+        &[BOGUS_CIDR_NOT_CIDR, BOGUS_CIDR_PREFIX_TOO_LARGE],
+    );
 
     let ds = DesiredState::load(dir.path())
         .expect("loading state.json must not error")

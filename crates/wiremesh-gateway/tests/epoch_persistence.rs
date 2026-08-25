@@ -60,7 +60,10 @@ fn promote_then_reload_reports_new_epoch_active() {
         "the active key after a persisted promote must not be the old epoch-0 key"
     );
     assert_eq!(
-        reloaded.by_epoch(0).expect("epoch 0 still present pre-retire").state,
+        reloaded
+            .by_epoch(0)
+            .expect("epoch 0 still present pre-retire")
+            .state,
         "retiring",
         "promote must durably demote the prior active epoch to \"retiring\""
     );
@@ -112,7 +115,9 @@ fn retire_then_reload_scrubs_retired_private_key_from_disk() {
         !reloaded.epochs.iter().any(|k| k.private_key_b64 == priv0),
         "no reloaded entry may carry the retired private key under any epoch number"
     );
-    let active = reloaded.active().expect("epoch 1 must be active after reload");
+    let active = reloaded
+        .active()
+        .expect("epoch 1 must be active after reload");
     assert_eq!(active.epoch, 1);
     assert_eq!(active.private_key_b64, priv1);
 }
@@ -139,7 +144,9 @@ fn promote_persist_reload_retire_persist_reload_converges() {
 
     // "Process 2": reload (reboot), then retire + persist (service_retire).
     {
-        let mut keys = EpochKeys::load(dir.path()).unwrap().expect("store persisted");
+        let mut keys = EpochKeys::load(dir.path())
+            .unwrap()
+            .expect("store persisted");
         assert_eq!(keys.by_epoch(0).unwrap().state, "retiring");
         keys.retire(0)
             .expect("a reloaded \"retiring\" epoch must still be retirable");
@@ -148,9 +155,14 @@ fn promote_persist_reload_retire_persist_reload_converges() {
 
     // "Process 3": the final reboot view — one epoch, active, and no trace
     // of the retired key.
-    let keys = EpochKeys::load(dir.path()).unwrap().expect("store persisted");
+    let keys = EpochKeys::load(dir.path())
+        .unwrap()
+        .expect("store persisted");
     assert_eq!(keys.epochs.len(), 1);
     assert_eq!(keys.active().unwrap().epoch, 1);
     let raw = std::fs::read_to_string(dir.path().join("epoch_keys.json")).unwrap();
-    assert!(!raw.contains(&priv0), "retired key must be scrubbed from disk");
+    assert!(
+        !raw.contains(&priv0),
+        "retired key must be scrubbed from disk"
+    );
 }

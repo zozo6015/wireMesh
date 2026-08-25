@@ -158,7 +158,9 @@ fn raw_client_endpoint(certdir: &Path, my_id: &str) -> quinn::Endpoint {
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
-        Duration::from_secs(30).try_into().expect("30s idle timeout"),
+        Duration::from_secs(30)
+            .try_into()
+            .expect("30s idle timeout"),
     ));
     transport.mtu_discovery_config(Some(quinn::MtuDiscoveryConfig::default()));
     transport.datagram_receive_buffer_size(Some(1 << 20));
@@ -268,8 +270,10 @@ async fn relay_must_not_forward_a_datagram_addressed_outside_the_senders_own_pai
     raw_send_datagram(&attacker_c, legal_dest, b"control-c-to-d");
     let (ctl_src, ctl_data) = tokio::time::timeout(Duration::from_secs(3), peer_d.recv())
         .await
-        .expect("positive control timed out — the raw gw-C client cannot bridge at all, so a \
-                 'victim received nothing' result below would prove nothing")
+        .expect(
+            "positive control timed out — the raw gw-C client cannot bridge at all, so a \
+                 'victim received nothing' result below would prove nothing",
+        )
         .expect("positive control recv errored");
     assert_eq!(
         ctl_data,
@@ -307,8 +311,10 @@ async fn relay_must_not_forward_a_datagram_addressed_outside_the_senders_own_pai
         .expect("gw-B must still be able to send to its own peer");
     let (src, data) = tokio::time::timeout(Duration::from_secs(3), victim_a.recv())
         .await
-        .expect("gw-A received nothing at all — its slot or downlink is broken, which is a \
-                 different failure from the injection this test is about")
+        .expect(
+            "gw-A received nothing at all — its slot or downlink is broken, which is a \
+                 different failure from the injection this test is about",
+        )
         .expect("gw-A recv errored");
     assert_eq!(
         data,
@@ -345,6 +351,12 @@ async fn relay_must_not_forward_a_datagram_addressed_outside_the_senders_own_pai
 
     // The victim pair must still be usable afterwards: rejecting a cross-pair
     // dest must not tear down anybody's connection.
-    assert!(victim_a.is_alive(), "gw-A's relay connection must survive the injection attempt");
-    assert!(victim_b.is_alive(), "gw-B's relay connection must survive the injection attempt");
+    assert!(
+        victim_a.is_alive(),
+        "gw-A's relay connection must survive the injection attempt"
+    );
+    assert!(
+        victim_b.is_alive(),
+        "gw-B's relay connection must survive the injection attempt"
+    );
 }

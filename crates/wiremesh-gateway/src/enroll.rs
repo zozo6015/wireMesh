@@ -63,8 +63,7 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
     let mut raw = [0u8; 32];
     OsRng.fill_bytes(&mut raw);
     let wg_private_key_b64 = base64_encode(&raw);
-    let wg_pubkey =
-        base64_pub_from_priv(&wg_private_key_b64).context("deriving WG public key")?;
+    let wg_pubkey = base64_pub_from_priv(&wg_private_key_b64).context("deriving WG public key")?;
 
     let ca_pem = std::fs::read_to_string(&args.ca_path)
         .with_context(|| format!("reading CA bundle {}", args.ca_path.display()))?;
@@ -109,7 +108,10 @@ pub fn parse_args(mut it: impl Iterator<Item = String>) -> anyhow::Result<Enroll
     let mut state_dir = None;
     let mut cidrs = Vec::new();
     while let Some(flag) = it.next() {
-        let mut val = || it.next().ok_or_else(|| anyhow!("flag {flag} needs a value"));
+        let mut val = || {
+            it.next()
+                .ok_or_else(|| anyhow!("flag {flag} needs a value"))
+        };
         match flag.as_str() {
             "--token" => token = Some(val()?),
             // `--token-file` avoids exposing the token in argv / a shell command

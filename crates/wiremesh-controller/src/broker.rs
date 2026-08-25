@@ -344,8 +344,10 @@ impl Broker {
             // plus — for a snapshot, whose REPLACE semantics can unsettle by
             // OMISSION (the reporter pruned the peer) — every peer currently
             // stored for this reporter.
-            let mut affected: Vec<i64> =
-                peer_paths.iter().map(|pp| pp.peer_gateway_id as i64).collect();
+            let mut affected: Vec<i64> = peer_paths
+                .iter()
+                .map(|pp| pp.peer_gateway_id as i64)
+                .collect();
             if snapshot {
                 if let Some(old) = states.get(&reporter_gateway_id) {
                     affected.extend(old.keys().copied());
@@ -480,17 +482,21 @@ impl Broker {
     /// sweep/timer re-emits KeyRotated on subsequent ticks, and an unconnected
     /// gateway can't be rotating a live session anyway.
     pub fn send_rotate_if_pending(&self, gateway_id: i64, keys: &[(i64, String, String)]) {
-        let Some((epoch, _, _)) = keys
-            .iter()
-            .find(|(_, pubkey, state)| state == "pending" && pubkey == AWAITING_SUBMISSION_SENTINEL)
-        else {
+        let Some((epoch, _, _)) = keys.iter().find(|(_, pubkey, state)| {
+            state == "pending" && pubkey == AWAITING_SUBMISSION_SENTINEL
+        }) else {
             return;
         };
         let msg = SyncMessage {
-            body: Some(Body::Rotate(RotateDirective { epoch: *epoch as u32 })),
+            body: Some(Body::Rotate(RotateDirective {
+                epoch: *epoch as u32,
+            })),
         };
         let sent = match self.registry.lock() {
-            Ok(reg) => reg.get(&gateway_id).map(|tx| tx.try_send(msg).is_ok()).unwrap_or(false),
+            Ok(reg) => reg
+                .get(&gateway_id)
+                .map(|tx| tx.try_send(msg).is_ok())
+                .unwrap_or(false),
             Err(_) => false,
         };
         if sent {

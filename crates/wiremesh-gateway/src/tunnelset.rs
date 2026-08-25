@@ -278,7 +278,11 @@ pub fn plan_tunnel(
             base_port.saturating_add(OWN_TUN_PORT_OFFSET),
         ),
     })?;
-    Ok(TunnelPlan { id, ifname, listen_port })
+    Ok(TunnelPlan {
+        id,
+        ifname,
+        listen_port,
+    })
 }
 
 /// The name axis of [`plan_tunnel`]. Every returned name is
@@ -490,8 +494,14 @@ impl TunnelSet {
             ),
             Ok(_) => {}
         }
-        self.quarantine
-            .push_back((TunnelPlan { id, ifname, listen_port }, Instant::now()));
+        self.quarantine.push_back((
+            TunnelPlan {
+                id,
+                ifname,
+                listen_port,
+            },
+            Instant::now(),
+        ));
         self.prune_quarantine();
         Ok(())
     }
@@ -538,8 +548,10 @@ impl TunnelSet {
         if current == port {
             return Ok(());
         }
-        if let Some((other, t)) =
-            self.tunnels.iter().find(|(k, t)| **k != id && t.listen_port == port)
+        if let Some((other, t)) = self
+            .tunnels
+            .iter()
+            .find(|(k, t)| **k != id && t.listen_port == port)
         {
             anyhow::bail!(
                 "cannot move {id:?} ({ifname}) to listen port {port}: the live {other:?} ({}) \

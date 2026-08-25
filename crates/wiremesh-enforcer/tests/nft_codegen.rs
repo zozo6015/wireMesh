@@ -133,7 +133,10 @@ fn ruleset_matches_design_s5_example_golden_fixture() {
     let script = wiremesh_enforcer::ruleset(&ir, "wg0")
         .expect("ruleset() should succeed for a valid, in-budget PolicyIR");
     let expected = include_str!("fixtures/design_s5_example.nft");
-    assert_eq!(script, expected, "generated script must match the golden fixture byte-for-byte");
+    assert_eq!(
+        script, expected,
+        "generated script must match the golden fixture byte-for-byte"
+    );
 }
 
 /// (b) `proto: any` (no explicit `proto:` in the DSL) explodes into 3
@@ -164,7 +167,10 @@ fn ruleset_explodes_proto_any_into_per_proto_lines_sharing_one_counter() {
     let script = wiremesh_enforcer::ruleset(&ir, "wg0")
         .expect("ruleset() should succeed for a single proto:any rule");
     let expected = include_str!("fixtures/proto_any_explosion.nft");
-    assert_eq!(script, expected, "generated script must match the golden fixture byte-for-byte");
+    assert_eq!(
+        script, expected,
+        "generated script must match the golden fixture byte-for-byte"
+    );
 }
 
 /// (c) carve-out ordering preserved: an explicit `deny` ahead of a broader
@@ -210,7 +216,10 @@ fn ruleset_preserves_carve_out_ordering() {
     let script = wiremesh_enforcer::ruleset(&ir, "wg0")
         .expect("ruleset() should succeed for a 2-rule carve-out policy");
     let expected = include_str!("fixtures/carve_out_ordering.nft");
-    assert_eq!(script, expected, "generated script must match the golden fixture byte-for-byte");
+    assert_eq!(
+        script, expected,
+        "generated script must match the golden fixture byte-for-byte"
+    );
 }
 
 /// (d) empty policy (no blocks at all) -> just the `ct` line + default-deny:
@@ -230,5 +239,8 @@ fn ruleset_for_empty_policy_is_just_ct_line_and_default_deny() {
     let script = wiremesh_enforcer::ruleset(&ir, "eth1")
         .expect("ruleset() should succeed for an empty (zero-block) PolicyIR");
     let expected = include_str!("fixtures/empty_policy.nft");
-    assert_eq!(script, expected, "generated script must match the golden fixture byte-for-byte");
+    assert_eq!(
+        script, expected,
+        "generated script must match the golden fixture byte-for-byte"
+    );
 }

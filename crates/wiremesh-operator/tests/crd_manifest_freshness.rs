@@ -75,8 +75,10 @@ use std::collections::BTreeMap;
 
 /// The generated bundle committed for `kubectl apply` (and the copy
 /// `docs/operator.md` points upgraders at).
-const OPERATOR_CRDS: &str =
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../deploy/operator/crds/wiremesh-crds.yaml");
+const OPERATOR_CRDS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../deploy/operator/crds/wiremesh-crds.yaml"
+);
 /// The Helm chart's own copy. A chart must be self-contained, so this is a
 /// second physical file rather than a symlink.
 const HELM_CRDS: &str = concat!(
@@ -187,7 +189,9 @@ fn describe_mismatch(generated: &str, on_disk: &str, display: &str) -> String {
     // the name is absent entirely.
     let missing = missing_property_names(&want, &got);
     if !missing.is_empty() {
-        out.push_str("schema properties present in the generated bundle but MISSING from this file:\n");
+        out.push_str(
+            "schema properties present in the generated bundle but MISSING from this file:\n",
+        );
         for (name, n) in &missing {
             if *n == 1 {
                 out.push_str(&format!("  - {name}\n"));

@@ -138,7 +138,8 @@ fn dropping_enforcer_detaches_and_allows_reprobe_on_same_iface() {
         .expect("apply of an empty policy IR should succeed on the first instance");
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(
-        a.exec(&["ping", "-c", "2", "-W", "2", "10.10.0.2"]).is_err(),
+        a.exec(&["ping", "-c", "2", "-W", "2", "10.10.0.2"])
+            .is_err(),
         "default-deny from the first Enforcer instance should block ping"
     );
 
@@ -166,7 +167,8 @@ fn dropping_enforcer_detaches_and_allows_reprobe_on_same_iface() {
         .expect("apply on the re-probed instance must succeed");
     std::thread::sleep(std::time::Duration::from_millis(200));
     assert!(
-        a.exec(&["ping", "-c", "2", "-W", "2", "10.10.0.2"]).is_err(),
+        a.exec(&["ping", "-c", "2", "-W", "2", "10.10.0.2"])
+            .is_err(),
         "default-deny from the SECOND Enforcer instance should block ping again"
     );
 

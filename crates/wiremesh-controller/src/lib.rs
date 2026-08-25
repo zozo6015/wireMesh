@@ -10,8 +10,8 @@
 
 pub mod apply;
 pub mod auth;
-pub mod cli;
 pub mod broker;
+pub mod cli;
 pub mod db;
 pub mod db_async;
 pub mod observe;
@@ -1065,7 +1065,10 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     let db_handle = DbHandle::new(db);
 
     let ca_fingerprint = ca_root_fingerprint_hex(&trust).await?;
-    let ca_bundle_pem = trust.trust_bundle().await.context("reading CA trust bundle")?;
+    let ca_bundle_pem = trust
+        .trust_bundle()
+        .await
+        .context("reading CA trust bundle")?;
 
     // The controller's own TLS server identity for the Enrollment/Sync TCP
     // port. `127.0.0.1` covers the loopback address every test/dev
@@ -1087,7 +1090,9 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     let tcp_listener = TcpListener::bind((config.bind_ip, config.tcp_port))
         .await
         .context("binding controller TCP listener")?;
-    let tcp_addr = tcp_listener.local_addr().context("reading bound TCP addr")?;
+    let tcp_addr = tcp_listener
+        .local_addr()
+        .context("reading bound TCP addr")?;
     let tcp_stream = TcpListenerStream::new(tcp_listener);
 
     let sync_tcp_listener = TcpListener::bind((config.bind_ip, config.sync_tcp_port))
@@ -1282,29 +1287,30 @@ pub async fn serve(config: Config) -> Result<RunningController> {
     // PRINT is observable in-process — see `warn_automatic_rotation_disabled`
     // and `RunningController::rotation_disabled_banner`. `None` on the armed
     // arm: nothing was printed there, and nothing should have been.
-    let (rotation_timer_shutdown_tx, rotation_timer_join, rotation_disabled_banner) =
-        match config.rotation_interval {
-            Some(rotation_interval) => {
-                let (tx, mut rotation_timer_shutdown_rx) = oneshot::channel::<()>();
-                let rotation_timer_db = db_handle.clone();
-                let rotation_timer_change_tx = change_tx.clone();
-                let join = tokio::spawn(async move {
-                    let mut ticker = tokio::time::interval(rotation_interval);
-                    ticker.tick().await;
-                    loop {
-                        tokio::select! {
-                            _ = &mut rotation_timer_shutdown_rx => break,
-                            _ = ticker.tick() => {
-                                services::sync::initiate_due_rotations(&rotation_timer_db, &rotation_timer_change_tx)
-                                    .await;
-                            }
+    let (rotation_timer_shutdown_tx, rotation_timer_join, rotation_disabled_banner) = match config
+        .rotation_interval
+    {
+        Some(rotation_interval) => {
+            let (tx, mut rotation_timer_shutdown_rx) = oneshot::channel::<()>();
+            let rotation_timer_db = db_handle.clone();
+            let rotation_timer_change_tx = change_tx.clone();
+            let join = tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(rotation_interval);
+                ticker.tick().await;
+                loop {
+                    tokio::select! {
+                        _ = &mut rotation_timer_shutdown_rx => break,
+                        _ = ticker.tick() => {
+                            services::sync::initiate_due_rotations(&rotation_timer_db, &rotation_timer_change_tx)
+                                .await;
                         }
                     }
-                });
-                (Some(tx), Some(join), None)
-            }
-            None => (None, None, Some(warn_automatic_rotation_disabled())),
-        };
+                }
+            });
+            (Some(tx), Some(join), None)
+        }
+        None => (None, None, Some(warn_automatic_rotation_disabled())),
+    };
 
     // (Key-rotation Task 4) The decision sweep: fires every
     // `config.rotation_sweep_interval` (default 5s) and drives the Task-3
@@ -1457,7 +1463,10 @@ fn owns_dir(dir: &Path, data_dir: &Path) -> bool {
 async fn ca_root_fingerprint_hex(trust: &EmbeddedTrust) -> Result<String> {
     use sha2::{Digest, Sha256};
 
-    let bundle_pem = trust.trust_bundle().await.context("reading CA trust bundle")?;
+    let bundle_pem = trust
+        .trust_bundle()
+        .await
+        .context("reading CA trust bundle")?;
     let der = pem_to_der(&bundle_pem).context("decoding CA trust bundle PEM")?;
     let digest = Sha256::digest(&der);
     Ok(hex_encode(&digest))

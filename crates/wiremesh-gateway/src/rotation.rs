@@ -56,7 +56,9 @@ impl Default for Rotation {
 
 impl Rotation {
     pub fn new() -> Self {
-        Self { phase: RotationPhase::Idle }
+        Self {
+            phase: RotationPhase::Idle,
+        }
     }
 
     /// A `RotateDirective` for `new_epoch` arrived from the controller. Only
@@ -111,7 +113,10 @@ pub enum RoleBDecision {
     Start { pending_epoch: u32 },
     /// We hold an overlap toward a pending epoch the peer has moved past:
     /// retire `stale_epoch`'s overlap and stand one up toward `pending_epoch`.
-    Restart { stale_epoch: u32, pending_epoch: u32 },
+    Restart {
+        stale_epoch: u32,
+        pending_epoch: u32,
+    },
     /// The peer advertises a real-keyed pending epoch we cannot act on — its
     /// pubkey does not decode to a 32-byte WireGuard key, so there is nothing
     /// valid to configure a Device with. Distinct from [`RoleBDecision::Skip`]
@@ -182,7 +187,10 @@ fn decide_role_b(peer: &PeerState, overlapped: Option<u32>) -> RoleBDecision {
         // re-rotated past the one we built for, or the entry leaked from an
         // aborted rotation (F9). Either way the stale entry must not veto the
         // rotation actually in flight.
-        Some(stale) => RoleBDecision::Restart { stale_epoch: stale, pending_epoch },
+        Some(stale) => RoleBDecision::Restart {
+            stale_epoch: stale,
+            pending_epoch,
+        },
         None => RoleBDecision::Start { pending_epoch },
     }
 }
@@ -256,10 +264,7 @@ pub enum WriteBack {
 /// So every write-back states the identity it was computed against, and this
 /// decides. On anything but [`WriteBack::Apply`] the correct action is to leave
 /// the entry alone: the next tick re-reads it and drives it from scratch.
-pub fn overlap_write_back(
-    taken: &OverlapIdentity,
-    current: Option<&OverlapIdentity>,
-) -> WriteBack {
+pub fn overlap_write_back(taken: &OverlapIdentity, current: Option<&OverlapIdentity>) -> WriteBack {
     match current {
         None => WriteBack::Vanished,
         Some(cur) if cur == taken => WriteBack::Apply,

@@ -104,8 +104,9 @@ impl PolicyIR {
     /// `version`), using the same field-order-is-canonical invariant as
     /// [`Self::to_canonical_json`].
     pub fn blocks_fingerprint(&self) -> String {
-        let blocks_json = serde_json::to_string(&self.blocks)
-            .expect("Vec<IrBlock> contains only strings/numbers/vecs — serialization is infallible");
+        let blocks_json = serde_json::to_string(&self.blocks).expect(
+            "Vec<IrBlock> contains only strings/numbers/vecs — serialization is infallible",
+        );
         hex_encode(&Sha256::digest(blocks_json.as_bytes()))
     }
 }

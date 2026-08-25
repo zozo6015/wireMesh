@@ -189,12 +189,16 @@ pub enum Step {
     /// Recompiles `yaml` against the scenario's `segments` (a fresh
     /// `wiremesh_policy::compile` call, incrementing the running policy
     /// version) and `Enforcer::apply`s it — a mid-scenario policy update.
-    ApplyPolicy { yaml: &'static str },
+    ApplyPolicy {
+        yaml: &'static str,
+    },
     /// Calls `Enforcer::flush_flows`. See this module's doc comment for
     /// what "forces re-evaluation" means (and does not mean) identically
     /// across both backends.
     FlushFlows,
-    Sleep { ms: u64 },
+    Sleep {
+        ms: u64,
+    },
     /// Asserts `enforcer.counters().by_rule[rule_id] >= min`, where
     /// `rule_id` is looked up from the MOST RECENTLY applied `PolicyIR`
     /// (the scenario's initial `policy_yaml`, or the yaml of the last
@@ -241,7 +245,8 @@ fn ns_of<'a>(a: &'a Ns, b: &'a Ns, node: Node) -> &'a Ns {
 fn compile_yaml(yaml: &str, segs: &[SegmentDef], version: u64) -> anyhow::Result<PolicyIR> {
     let src = parse_policy(yaml, segs)
         .map_err(|errors| anyhow::anyhow!("policy parse/validate errors: {errors:?}"))?;
-    compile(&src, segs, version).map_err(|errors| anyhow::anyhow!("policy compile errors: {errors:?}"))
+    compile(&src, segs, version)
+        .map_err(|errors| anyhow::anyhow!("policy compile errors: {errors:?}"))
 }
 
 /// Builds the `wg_lab`, compiles `s.policy_yaml`, loads `kind`'s `Enforcer`
@@ -269,8 +274,9 @@ pub fn run_scenario(s: &Scenario, kind: BackendKind) -> anyhow::Result<()> {
             cidrs: cidrs
                 .iter()
                 .map(|c| {
-                    c.parse()
-                        .unwrap_or_else(|e| panic!("scenario {:?}: bad segment CIDR {c:?}: {e}", s.name))
+                    c.parse().unwrap_or_else(|e| {
+                        panic!("scenario {:?}: bad segment CIDR {c:?}: {e}", s.name)
+                    })
                 })
                 .collect(),
         })
@@ -285,7 +291,12 @@ pub fn run_scenario(s: &Scenario, kind: BackendKind) -> anyhow::Result<()> {
 
     for (i, step) in s.steps.iter().enumerate() {
         match step {
-            Step::Send { from, to, proto, expect } => {
+            Step::Send {
+                from,
+                to,
+                proto,
+                expect,
+            } => {
                 let delivered = send_and_observe(&a, &b, *from, *to, *proto);
                 let want = *expect == Expect::Delivered;
                 ensure!(
@@ -299,7 +310,13 @@ pub fn run_scenario(s: &Scenario, kind: BackendKind) -> anyhow::Result<()> {
                     if delivered { "Delivered" } else { "Dropped" }
                 );
             }
-            Step::SendExpectByBackend { from, to, proto, ebpf, nftables } => {
+            Step::SendExpectByBackend {
+                from,
+                to,
+                proto,
+                ebpf,
+                nftables,
+            } => {
                 let delivered = send_and_observe(&a, &b, *from, *to, *proto);
                 let expect = match kind {
                     BackendKind::Ebpf => *ebpf,
@@ -320,11 +337,12 @@ pub fn run_scenario(s: &Scenario, kind: BackendKind) -> anyhow::Result<()> {
             }
             Step::ApplyPolicy { yaml } => {
                 version += 1;
-                current_ir = compile_yaml(yaml, &segs, version)
-                    .with_context(|| format!("scenario {:?} step {i}: compiling ApplyPolicy yaml", s.name))?;
-                enforcer
-                    .apply(&current_ir)
-                    .with_context(|| format!("scenario {:?} step {i}: ApplyPolicy apply()", s.name))?;
+                current_ir = compile_yaml(yaml, &segs, version).with_context(|| {
+                    format!("scenario {:?} step {i}: compiling ApplyPolicy yaml", s.name)
+                })?;
+                enforcer.apply(&current_ir).with_context(|| {
+                    format!("scenario {:?} step {i}: ApplyPolicy apply()", s.name)
+                })?;
             }
             Step::FlushFlows => {
                 enforcer
@@ -388,9 +406,19 @@ fn send_and_observe(a: &Ns, b: &Ns, from: Endpoint, to: Endpoint, proto: L4) -> 
     let to_addr = addr_of(to.node);
     match proto {
         L4::Tcp => check_tcp(from_ns, to_ns, to_addr, to.port),
-        L4::Udp => check_udp(from_ns, to_ns, addr_of(from.node), from.port, to_addr, to.port),
+        L4::Udp => check_udp(
+            from_ns,
+            to_ns,
+            addr_of(from.node),
+            from.port,
+            to_addr,
+            to.port,
+        ),
         L4::Icmp => check_icmp_echo(from_ns, to_addr),
-        L4::IcmpFragNeeded { embedded_src_port, embedded_dst_port } => check_icmp_frag_needed(
+        L4::IcmpFragNeeded {
+            embedded_src_port,
+            embedded_dst_port,
+        } => check_icmp_frag_needed(
             from_ns,
             to_ns,
             addr_of(from.node),
@@ -420,7 +448,8 @@ while True:
     c.close()
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn accept-only listener")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn accept-only listener")
 }
 
 fn tcp_connect(ns: &Ns, dst_addr: &str, port: u16, timeout_s: u32) -> bool {
@@ -457,7 +486,8 @@ s.bind(("{bind_ip}", {bind_port}))
 s.sendto(b"x", ("{dst_ip}", {dst_port}))
 "#
     );
-    ns.exec(&["python3", "-c", &script]).expect("one-shot udp send");
+    ns.exec(&["python3", "-c", &script])
+        .expect("one-shot udp send");
 }
 
 fn spawn_udp_recv_probe(ns: &Ns, port: u16, timeout_s: f64) -> Child {
@@ -475,15 +505,25 @@ except socket.timeout:
     print("TIMEOUT")
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn udp recv probe")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn udp recv probe")
 }
 
 fn probe_received(child: Child) -> bool {
-    let out = child.wait_with_output().expect("udp recv probe should exit");
+    let out = child
+        .wait_with_output()
+        .expect("udp recv probe should exit");
     String::from_utf8_lossy(&out.stdout).trim() == "RECEIVED"
 }
 
-fn check_udp(from_ns: &Ns, to_ns: &Ns, from_addr: &str, src_port: u16, to_addr: &str, dst_port: u16) -> bool {
+fn check_udp(
+    from_ns: &Ns,
+    to_ns: &Ns,
+    from_addr: &str,
+    src_port: u16,
+    to_addr: &str,
+    dst_port: u16,
+) -> bool {
     let probe = spawn_udp_recv_probe(to_ns, dst_port, 2.0);
     std::thread::sleep(Duration::from_millis(150));
     udp_send_from(from_ns, from_addr, src_port, to_addr, dst_port);
@@ -491,7 +531,9 @@ fn check_udp(from_ns: &Ns, to_ns: &Ns, from_addr: &str, src_port: u16, to_addr: 
 }
 
 fn check_icmp_echo(from_ns: &Ns, to_addr: &str) -> bool {
-    from_ns.exec(&["ping", "-c", "1", "-W", "3", to_addr]).is_ok()
+    from_ns
+        .exec(&["ping", "-c", "1", "-W", "3", to_addr])
+        .is_ok()
 }
 
 /// Raw ICMPv4 type probe -- graduated from `tests/nft_backend.rs`'s
@@ -514,7 +556,8 @@ except socket.timeout:
     print("TIMEOUT")
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn icmp type probe")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn icmp type probe")
 }
 
 fn icmp_probe_got(child: Child, want_type: u8) -> bool {
@@ -589,7 +632,7 @@ fn check_icmp_frag_needed(
     send_icmp_dest_unreachable(
         from_ns,
         to_addr,
-        4, // code 4: fragmentation needed (PMTUD)
+        4,         // code 4: fragmentation needed (PMTUD)
         to_addr,   // embedded esrc_ip = the original sender = `to` of this Send
         from_addr, // embedded edst_ip = the original destination = `from` of this Send
         embedded_src_port,
@@ -620,11 +663,14 @@ except socket.timeout:
     print("TIMEOUT")
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn raw ip proto probe")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn raw ip proto probe")
 }
 
 fn raw_probe_received(child: Child) -> bool {
-    let out = child.wait_with_output().expect("raw ip proto probe should exit");
+    let out = child
+        .wait_with_output()
+        .expect("raw ip proto probe should exit");
     String::from_utf8_lossy(&out.stdout).trim() == "RECEIVED"
 }
 
@@ -685,13 +731,22 @@ pub fn flip_under_traffic_zero_loss(kind: BackendKind) -> anyhow::Result<()> {
     //
     // The grace is now HONORED BY THIS CALLER (see the flip loop below)
     // rather than slept out inside `apply()`.
-    let cfg = EnforcerConfig { reap_grace: Duration::from_millis(50), ..EnforcerConfig::default() };
+    let cfg = EnforcerConfig {
+        reap_grace: Duration::from_millis(50),
+        ..EnforcerConfig::default()
+    };
     let mut enforcer = wiremesh_enforcer::probe_with(kind, "wg0", cfg)
         .with_context(|| format!("flip_under_traffic_zero_loss({kind:?}): probe_with"))?;
 
     let segs = vec![
-        SegmentDef { name: "seg-a".into(), cidrs: vec!["10.10.0.1/32".parse().unwrap()] },
-        SegmentDef { name: "seg-b".into(), cidrs: vec!["10.10.0.2/32".parse().unwrap()] },
+        SegmentDef {
+            name: "seg-a".into(),
+            cidrs: vec!["10.10.0.1/32".parse().unwrap()],
+        },
+        SegmentDef {
+            name: "seg-b".into(),
+            cidrs: vec!["10.10.0.2/32".parse().unwrap()],
+        },
     ];
     let yaml = "
 policy:
@@ -702,8 +757,9 @@ policy:
           proto: udp
           ports: [7600]
 ";
-    let ir = compile_yaml(yaml, &segs, 1)
-        .with_context(|| format!("flip_under_traffic_zero_loss({kind:?}): compiling allow-udp policy"))?;
+    let ir = compile_yaml(yaml, &segs, 1).with_context(|| {
+        format!("flip_under_traffic_zero_loss({kind:?}): compiling allow-udp policy")
+    })?;
     enforcer
         .apply(&ir)
         .with_context(|| format!("flip_under_traffic_zero_loss({kind:?}): initial apply"))?;
@@ -737,15 +793,25 @@ policy:
             .with_context(|| format!("flip_under_traffic_zero_loss({kind:?}): flip #{i}"))?;
     }
 
-    let sender_out = sender.wait_with_output().context("udp sender should exit")?;
-    ensure!(sender_out.status.success(), "udp sender exited non-zero: {sender_out:?}");
+    let sender_out = sender
+        .wait_with_output()
+        .context("udp sender should exit")?;
+    ensure!(
+        sender_out.status.success(),
+        "udp sender exited non-zero: {sender_out:?}"
+    );
     let sent: u64 = String::from_utf8_lossy(&sender_out.stdout)
         .trim()
         .parse()
         .context("udp sender should print its packet count")?;
 
-    let receiver_out = receiver.wait_with_output().context("udp receiver should exit after its idle timeout")?;
-    ensure!(receiver_out.status.success(), "udp receiver exited non-zero: {receiver_out:?}");
+    let receiver_out = receiver
+        .wait_with_output()
+        .context("udp receiver should exit after its idle timeout")?;
+    ensure!(
+        receiver_out.status.success(),
+        "udp receiver exited non-zero: {receiver_out:?}"
+    );
     let received: u64 = String::from_utf8_lossy(&receiver_out.stdout)
         .trim()
         .parse()
@@ -778,7 +844,8 @@ except socket.timeout:
 print(count)
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn udp counting receiver")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn udp counting receiver")
 }
 
 fn spawn_udp_sender(ns: &Ns, dst_addr: &str, port: u16, count: u32, interval_s: f64) -> Child {
@@ -793,5 +860,6 @@ for i in range(n):
 print(n)
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn udp sender")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn udp sender")
 }

@@ -28,8 +28,16 @@ use wiremesh_testkit::netns::{join_netns_and_mountns, Lab};
 
 fn gen_keypair() -> (String, String) {
     // wg genkey / pubkey via the tool present in the container.
-    let priv_b64 = String::from_utf8(std::process::Command::new("wg").arg("genkey").output().unwrap().stdout)
-        .unwrap().trim().to_string();
+    let priv_b64 = String::from_utf8(
+        std::process::Command::new("wg")
+            .arg("genkey")
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
     let pub_b64 = base64_pub_from_priv(&priv_b64).unwrap();
     (priv_b64, pub_b64)
 }
@@ -40,7 +48,8 @@ fn two_gateways_handshake_and_ping_over_direct_wg() {
     let a = lab.ns("a").unwrap();
     let b = lab.ns("b").unwrap();
     // underlay veth: a=10.9.0.1, b=10.9.0.2
-    lab.veth((&a, "u0", "10.9.0.1/24"), (&b, "u0", "10.9.0.2/24")).unwrap();
+    lab.veth((&a, "u0", "10.9.0.1/24"), (&b, "u0", "10.9.0.2/24"))
+        .unwrap();
 
     let (a_priv, a_pub) = gen_keypair();
     let (b_priv, b_pub) = gen_keypair();
@@ -51,36 +60,56 @@ fn two_gateways_handshake_and_ping_over_direct_wg() {
         join_netns_and_mountns(&b_ns).unwrap();
         let t = Tunnel::up("wg0", &b_priv, 51820, 1280).unwrap();
         // A is B's peer, reachable at 10.9.0.1:51820, segment 10.10.1.0/24
-        let ds = DesiredState { peers: vec![PeerState {
-            gateway_id: 1, segment_name: "a".into(),
-            active_pubkey_b64: Some(a_pub.clone()),
-            keys: vec![],
-            candidates: vec!["10.9.0.1:51820".into()],
-            allowed_ips: vec!["10.10.1.0/24".into(), "10.10.2.2/32".into()],
-        }], ..Default::default() };
+        let ds = DesiredState {
+            peers: vec![PeerState {
+                gateway_id: 1,
+                segment_name: "a".into(),
+                active_pubkey_b64: Some(a_pub.clone()),
+                keys: vec![],
+                candidates: vec!["10.9.0.1:51820".into()],
+                allowed_ips: vec!["10.10.1.0/24".into(), "10.10.2.2/32".into()],
+            }],
+            ..Default::default()
+        };
         t.reconcile(&ds).unwrap();
-        std::process::Command::new("ip").args(["addr","add","10.10.2.2/24","dev","wg0"]).status().unwrap();
+        std::process::Command::new("ip")
+            .args(["addr", "add", "10.10.2.2/24", "dev", "wg0"])
+            .status()
+            .unwrap();
         routes::add_route("10.10.1.0/24", "wg0").unwrap();
         std::thread::sleep(Duration::from_secs(6));
     });
 
     join_netns_and_mountns(&a).unwrap();
     let ta = Tunnel::up("wg0", &a_priv, 51820, 1280).unwrap();
-    let ds_a = DesiredState { peers: vec![PeerState {
-        gateway_id: 2, segment_name: "b".into(),
-        active_pubkey_b64: Some(b_pub.clone()),
-        keys: vec![],
-        candidates: vec!["10.9.0.2:51820".into()],
-        allowed_ips: vec!["10.10.2.0/24".into(), "10.10.1.1/32".into()],
-    }], ..Default::default() };
+    let ds_a = DesiredState {
+        peers: vec![PeerState {
+            gateway_id: 2,
+            segment_name: "b".into(),
+            active_pubkey_b64: Some(b_pub.clone()),
+            keys: vec![],
+            candidates: vec!["10.9.0.2:51820".into()],
+            allowed_ips: vec!["10.10.2.0/24".into(), "10.10.1.1/32".into()],
+        }],
+        ..Default::default()
+    };
     ta.reconcile(&ds_a).unwrap();
-    std::process::Command::new("ip").args(["addr","add","10.10.1.1/24","dev","wg0"]).status().unwrap();
+    std::process::Command::new("ip")
+        .args(["addr", "add", "10.10.1.1/24", "dev", "wg0"])
+        .status()
+        .unwrap();
     routes::add_route("10.10.2.0/24", "wg0").unwrap();
     std::thread::sleep(Duration::from_secs(2)); // allow handshake
 
     let ping = std::process::Command::new("ping")
-        .args(["-c", "3", "-W", "2", "10.10.2.2"]).output().unwrap();
-    assert!(ping.status.success(), "ping over WG tunnel: {}", String::from_utf8_lossy(&ping.stdout));
+        .args(["-c", "3", "-W", "2", "10.10.2.2"])
+        .output()
+        .unwrap();
+    assert!(
+        ping.status.success(),
+        "ping over WG tunnel: {}",
+        String::from_utf8_lossy(&ping.stdout)
+    );
     hb.join().unwrap();
     drop(lab);
 }

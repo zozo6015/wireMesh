@@ -25,15 +25,17 @@ use wiremesh_proto::v1::{sync_message, StateSnapshot};
 /// initial snapshot) — mirrors the inline pattern `tests/sync_snapshot.rs`
 /// and `tests/sync_delta.rs` already use for the same unwrap, just factored
 /// out since this test needs it for B's snapshot specifically.
-fn expect_snapshot(msg: Option<Result<wiremesh_proto::v1::SyncMessage, tonic::Status>>) -> StateSnapshot {
+fn expect_snapshot(
+    msg: Option<Result<wiremesh_proto::v1::SyncMessage, tonic::Status>>,
+) -> StateSnapshot {
     let msg = msg
         .expect("Sync.Watch stream ended before delivering a message")
         .expect("Sync.Watch stream yielded an error instead of a message");
     match msg.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!(
-            "expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"
-        ),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 }
 
@@ -77,10 +79,7 @@ async fn observation_echoes_source_and_populates_candidate() {
             )
         });
     assert!(
-        a_peer
-            .candidate_endpoints
-            .iter()
-            .any(|c| c == &observed),
+        a_peer.candidate_endpoints.iter().any(|c| c == &observed),
         "A's peer entry in B's snapshot must list the observed address {observed} \
          as a candidate endpoint, got: {:?}",
         a_peer.candidate_endpoints

@@ -81,9 +81,9 @@ pub fn pubkey_b64_to_hex(b64: &str) -> Option<String> {
 fn validate_ipv4_endpoint(ep: &str) -> anyhow::Result<()> {
     match ep.parse::<std::net::SocketAddr>() {
         Ok(std::net::SocketAddr::V4(_)) => Ok(()),
-        Ok(std::net::SocketAddr::V6(_)) => {
-            Err(anyhow!("IPv6 endpoint {ep:?} is unsupported (v1 is IPv4-only)"))
-        }
+        Ok(std::net::SocketAddr::V6(_)) => Err(anyhow!(
+            "IPv6 endpoint {ep:?} is unsupported (v1 is IPv4-only)"
+        )),
         Err(e) => Err(anyhow!("invalid endpoint {ep:?}: {e}")),
     }
 }
@@ -111,12 +111,15 @@ pub fn is_dialable_endpoint(ep: &str) -> bool {
 /// [`validate_ipv4_endpoint`]. An IPv6 CIDR (or malformed entry) is a hard
 /// error.
 fn validate_ipv4_cidr(cidr: &str) -> anyhow::Result<()> {
-    let (ip, len) =
-        cidr.split_once('/').ok_or_else(|| anyhow!("allowed_ip {cidr:?} is not CIDR (a.b.c.d/len)"))?;
+    let (ip, len) = cidr
+        .split_once('/')
+        .ok_or_else(|| anyhow!("allowed_ip {cidr:?} is not CIDR (a.b.c.d/len)"))?;
     let addr = ip
         .parse::<std::net::Ipv4Addr>()
         .map_err(|_| anyhow!("allowed_ip {cidr:?} is not an IPv4 CIDR (v1 is IPv4-only)"))?;
-    let prefix: u8 = len.parse().map_err(|_| anyhow!("allowed_ip {cidr:?} has a non-numeric prefix"))?;
+    let prefix: u8 = len
+        .parse()
+        .map_err(|_| anyhow!("allowed_ip {cidr:?} has a non-numeric prefix"))?;
     if prefix > 32 {
         return Err(anyhow!("allowed_ip {cidr:?} prefix /{prefix} exceeds /32"));
     }
@@ -152,7 +155,10 @@ fn push_peer_block(s: &mut String, p: &PeerConfig) -> anyhow::Result<()> {
     for cidr in &p.allowed_ips {
         validate_ipv4_cidr(cidr)?;
     }
-    s.push_str(&format!("public_key={}\n", key_b64_to_hex(&p.public_key_b64)?));
+    s.push_str(&format!(
+        "public_key={}\n",
+        key_b64_to_hex(&p.public_key_b64)?
+    ));
     if let Some(ep) = &p.endpoint {
         s.push_str(&format!("endpoint={ep}\n"));
     }
@@ -160,13 +166,19 @@ fn push_peer_block(s: &mut String, p: &PeerConfig) -> anyhow::Result<()> {
     for cidr in &p.allowed_ips {
         s.push_str(&format!("allowed_ip={cidr}\n"));
     }
-    s.push_str(&format!("persistent_keepalive_interval={}\n", p.keepalive_secs));
+    s.push_str(&format!(
+        "persistent_keepalive_interval={}\n",
+        p.keepalive_secs
+    ));
     Ok(())
 }
 
 pub fn encode_set(cfg: &DeviceConfig) -> anyhow::Result<String> {
     let mut s = String::new();
-    s.push_str(&format!("private_key={}\n", key_b64_to_hex(&cfg.private_key_b64)?));
+    s.push_str(&format!(
+        "private_key={}\n",
+        key_b64_to_hex(&cfg.private_key_b64)?
+    ));
     s.push_str(&format!("listen_port={}\n", cfg.listen_port));
     s.push_str("replace_peers=true\n");
     for p in &cfg.peers {
@@ -275,7 +287,9 @@ pub fn set_one_peer(ifname: &str, peer: &PeerConfig) -> anyhow::Result<()> {
 /// Derive the base64 WireGuard public key from a base64 private key.
 pub fn base64_pub_from_priv(priv_b64: &str) -> anyhow::Result<String> {
     let raw = base64_decode(priv_b64)?;
-    let arr: [u8; 32] = raw.as_slice().try_into()
+    let arr: [u8; 32] = raw
+        .as_slice()
+        .try_into()
         .map_err(|_| anyhow!("private key must be 32 bytes"))?;
     let secret = boringtun::x25519::StaticSecret::from(arr);
     let public = boringtun::x25519::PublicKey::from(&secret);
@@ -407,9 +421,13 @@ fn send_set(ifname: &str, body: &str) -> anyhow::Result<()> {
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("connecting to WG UAPI socket {path}"))?;
     let req = format!("set=1\n{body}");
-    stream.write_all(req.as_bytes()).context("writing UAPI set request")?;
+    stream
+        .write_all(req.as_bytes())
+        .context("writing UAPI set request")?;
     let mut resp = String::new();
-    stream.read_to_string(&mut resp).context("reading UAPI response")?;
+    stream
+        .read_to_string(&mut resp)
+        .context("reading UAPI response")?;
     // Response is `errno=<n>\n\n`.
     let errno = resp
         .lines()
@@ -535,7 +553,9 @@ pub(crate) fn parse_get_response(resp: &str) -> HashMap<String, PeerGetInfo> {
 /// `main.rs::reported_handshake_age`. (This is also the true mechanism
 /// behind the cycle-4b "handshake time advances every tick with rx flat"
 /// quirk: elapsed time simply grows with the wall clock.)
-pub(crate) fn handshake_times_from(peers: &HashMap<String, PeerGetInfo>) -> HashMap<String, SystemTime> {
+pub(crate) fn handshake_times_from(
+    peers: &HashMap<String, PeerGetInfo>,
+) -> HashMap<String, SystemTime> {
     peers
         .iter()
         .filter(|(_, info)| info.last_handshake_sec != 0 || info.last_handshake_nsec != 0)
@@ -628,9 +648,13 @@ fn read_get_response(ifname: &str) -> anyhow::Result<HashMap<String, PeerGetInfo
     let path = format!("/var/run/wireguard/{ifname}.sock");
     let mut stream = UnixStream::connect(&path)
         .with_context(|| format!("connecting to WG UAPI socket {path}"))?;
-    stream.write_all(b"get=1\n\n").context("writing UAPI get request")?;
+    stream
+        .write_all(b"get=1\n\n")
+        .context("writing UAPI get request")?;
     let mut resp = String::new();
-    stream.read_to_string(&mut resp).context("reading UAPI get response")?;
+    stream
+        .read_to_string(&mut resp)
+        .context("reading UAPI get response")?;
     Ok(parse_get_response(&resp))
 }
 
@@ -640,12 +664,24 @@ const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 pub(crate) fn base64_encode(input: &[u8]) -> String {
     let mut out = String::new();
     for chunk in input.chunks(3) {
-        let b = [chunk[0], *chunk.get(1).unwrap_or(&0), *chunk.get(2).unwrap_or(&0)];
+        let b = [
+            chunk[0],
+            *chunk.get(1).unwrap_or(&0),
+            *chunk.get(2).unwrap_or(&0),
+        ];
         let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
         out.push(B64[((n >> 18) & 63) as usize] as char);
         out.push(B64[((n >> 12) & 63) as usize] as char);
-        out.push(if chunk.len() > 1 { B64[((n >> 6) & 63) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { B64[(n & 63) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 1 {
+            B64[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            B64[(n & 63) as usize] as char
+        } else {
+            '='
+        });
     }
     out
 }
@@ -661,7 +697,10 @@ pub(crate) fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
             _ => Err(anyhow!("invalid base64 char")),
         }
     }
-    let bytes: Vec<u8> = s.bytes().filter(|&c| c != b'=' && !c.is_ascii_whitespace()).collect();
+    let bytes: Vec<u8> = s
+        .bytes()
+        .filter(|&c| c != b'=' && !c.is_ascii_whitespace())
+        .collect();
     let mut out = Vec::new();
     for chunk in bytes.chunks(4) {
         let mut n = 0u32;
@@ -669,8 +708,12 @@ pub(crate) fn base64_decode(s: &str) -> anyhow::Result<Vec<u8>> {
             n |= val(c)? << (18 - 6 * i);
         }
         out.push((n >> 16) as u8);
-        if chunk.len() > 2 { out.push((n >> 8) as u8); }
-        if chunk.len() > 3 { out.push(n as u8); }
+        if chunk.len() > 2 {
+            out.push((n >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(n as u8);
+        }
     }
     Ok(out)
 }
@@ -758,13 +801,25 @@ mod tests {
         // `replace_peers` (which would `clear_peers()` every OTHER session) nor
         // the device header — remove and add are SEPARATE `set=1` messages.
         for op in [&remove, &add] {
-            assert!(!op.contains("replace_peers"), "scoped op must not replace_peers: {op:?}");
-            assert!(!op.contains("private_key="), "scoped op must not carry device header: {op:?}");
-            assert!(!op.contains("listen_port="), "scoped op must not carry device header: {op:?}");
+            assert!(
+                !op.contains("replace_peers"),
+                "scoped op must not replace_peers: {op:?}"
+            );
+            assert!(
+                !op.contains("private_key="),
+                "scoped op must not carry device header: {op:?}"
+            );
+            assert!(
+                !op.contains("listen_port="),
+                "scoped op must not carry device header: {op:?}"
+            );
         }
         // Op 1 removes; op 2 must NOT (it re-adds the peer).
         assert!(remove.contains("remove=true"), "op 1 removes: {remove:?}");
-        assert!(!add.contains("remove=true"), "op 2 must not remove: {add:?}");
+        assert!(
+            !add.contains("remove=true"),
+            "op 2 must not remove: {add:?}"
+        );
     }
 
     #[test]
@@ -780,7 +835,10 @@ mod tests {
             }],
         };
         let out = encode_set(&cfg).unwrap();
-        assert!(!out.contains("endpoint="), "no endpoint line when None:\n{out}");
+        assert!(
+            !out.contains("endpoint="),
+            "no endpoint line when None:\n{out}"
+        );
     }
 
     /// A realistic two-peer `get=1` response: one peer with a recorded
@@ -822,7 +880,10 @@ errno=0\n\
         // the same `get=1` block. The fixture deliberately carries DISTINCT
         // rx/tx values (12345 vs 6789) so a swapped- or shared-prefix parse
         // bug (tx landing in rx or vice versa) cannot pass.
-        assert_eq!(a.tx_bytes, 6789, "peer a's tx_bytes extracted, distinct from rx");
+        assert_eq!(
+            a.tx_bytes, 6789,
+            "peer a's tx_bytes extracted, distinct from rx"
+        );
 
         let b = parsed
             .get("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -830,7 +891,10 @@ errno=0\n\
         assert_eq!(b.last_handshake_sec, 0);
         assert_eq!(b.last_handshake_nsec, 0);
         assert_eq!(b.rx_bytes, 0);
-        assert_eq!(b.tx_bytes, 0, "zero-traffic peer's tx_bytes parsed as 0, not left unset");
+        assert_eq!(
+            b.tx_bytes, 0,
+            "zero-traffic peer's tx_bytes parsed as 0, not left unset"
+        );
     }
 
     #[test]
@@ -838,13 +902,19 @@ errno=0\n\
         let parsed = parse_get_response(GET_RESPONSE_FIXTURE);
         let times = handshake_times_from(&parsed);
 
-        assert_eq!(times.len(), 1, "only the handshaked peer should appear: {times:?}");
+        assert_eq!(
+            times.len(),
+            1,
+            "only the handshaked peer should appear: {times:?}"
+        );
         let a_time = times
             .get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .expect("handshaked peer present");
         assert_eq!(
             *a_time,
-            SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000) + Duration::from_nanos(500000000)
+            SystemTime::UNIX_EPOCH
+                + Duration::from_secs(1700000000)
+                + Duration::from_nanos(500000000)
         );
         assert!(
             !times.contains_key("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
@@ -856,28 +926,48 @@ errno=0\n\
     fn peer_liveness_from_preserves_traffic_counters_for_both_peers() {
         let parsed = parse_get_response(GET_RESPONSE_FIXTURE);
         let liveness = peer_liveness_from(&parsed);
-        assert_eq!(liveness.len(), 2, "both peers present, unlike handshake_times_from: {liveness:?}");
+        assert_eq!(
+            liveness.len(),
+            2,
+            "both peers present, unlike handshake_times_from: {liveness:?}"
+        );
 
         let a = liveness
             .get("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
             .expect("peer a present");
         assert_eq!(
             a.latest_handshake,
-            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000) + Duration::from_nanos(500000000))
+            Some(
+                SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(1700000000)
+                    + Duration::from_nanos(500000000)
+            )
         );
         assert_eq!(a.rx_bytes, 12345, "handshaked peer's rx_bytes preserved");
         // T5 pin: `tx_bytes` rides the same reducer into `PeerLiveness` —
         // the single snapshot both the path SM and the per-peer metrics
         // gauges are sourced from (finding §6: one UAPI fetch, no second
         // socket dance).
-        assert_eq!(a.tx_bytes, 6789, "handshaked peer's tx_bytes preserved, distinct from rx");
+        assert_eq!(
+            a.tx_bytes, 6789,
+            "handshaked peer's tx_bytes preserved, distinct from rx"
+        );
 
         let b = liveness
             .get("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
             .expect("peer b present even though never handshaked");
-        assert_eq!(b.latest_handshake, None, "never-handshaked peer still has no handshake time");
-        assert_eq!(b.rx_bytes, 0, "never-handshaked peer's rx_bytes preserved (0)");
-        assert_eq!(b.tx_bytes, 0, "never-handshaked peer's tx_bytes preserved (0)");
+        assert_eq!(
+            b.latest_handshake, None,
+            "never-handshaked peer still has no handshake time"
+        );
+        assert_eq!(
+            b.rx_bytes, 0,
+            "never-handshaked peer's rx_bytes preserved (0)"
+        );
+        assert_eq!(
+            b.tx_bytes, 0,
+            "never-handshaked peer's tx_bytes preserved (0)"
+        );
     }
 
     /// One-peer `get=1` response carrying an arbitrary `endpoint=` value —
@@ -904,7 +994,10 @@ errno=0\n\
     const PEER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 
     fn endpoint_of(resp: &str) -> Option<SocketAddr> {
-        parse_get_response(resp).get(PEER_A).expect("peer a present").endpoint
+        parse_get_response(resp)
+            .get(PEER_A)
+            .expect("peer a present")
+            .endpoint
     }
 
     /// POSITIVE CONTROL for the IPv6-rejection pins below: a normal IPv4
@@ -958,7 +1051,13 @@ errno=0\n\
     /// yields `None` rather than a partial/guessed pin.
     #[test]
     fn parse_get_response_drops_garbled_endpoint() {
-        for ep in ["not-an-address", "192.0.2.10", "192.0.2.10:", ":51820", "192.0.2.999:51820"] {
+        for ep in [
+            "not-an-address",
+            "192.0.2.10",
+            "192.0.2.10:",
+            ":51820",
+            "192.0.2.999:51820",
+        ] {
             assert_eq!(
                 endpoint_of(&get_response_with_endpoint(ep)),
                 None,
@@ -974,7 +1073,9 @@ errno=0\n\
     fn ipv6_endpoint_peer_keeps_its_other_fields() {
         let resp = get_response_with_endpoint("[fe80::1]:51820");
         let parsed = parse_get_response(&resp);
-        let a = parsed.get(PEER_A).expect("peer still parsed despite bad endpoint");
+        let a = parsed
+            .get(PEER_A)
+            .expect("peer still parsed despite bad endpoint");
         assert_eq!(a.endpoint, None, "endpoint dropped");
         assert_eq!(a.last_handshake_sec, 1700000000, "handshake sec preserved");
         assert_eq!(a.last_handshake_nsec, 500000000, "handshake nsec preserved");
@@ -984,11 +1085,18 @@ errno=0\n\
         // And the same through the reducer the path tick actually consumes.
         let live = peer_liveness_from(&parsed);
         let a = live.get(PEER_A).expect("peer present in liveness snapshot");
-        assert_eq!(a.endpoint, None, "no IPv6 endpoint reaches PeerLiveness either");
+        assert_eq!(
+            a.endpoint, None,
+            "no IPv6 endpoint reaches PeerLiveness either"
+        );
         assert_eq!(a.rx_bytes, 12345);
         assert_eq!(
             a.latest_handshake,
-            Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1700000000) + Duration::from_nanos(500000000))
+            Some(
+                SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(1700000000)
+                    + Duration::from_nanos(500000000)
+            )
         );
     }
 
@@ -1062,7 +1170,10 @@ errno=0\n\
     #[test]
     fn validate_ipv4_endpoint_rejects_every_non_ipv4_socket_address_form() {
         let cases: &[(&str, &str)] = &[
-            ("", "empty string: sorts before every real address, so it takes candidates[0] outright"),
+            (
+                "",
+                "empty string: sorts before every real address, so it takes candidates[0] outright",
+            ),
             (" ", "whitespace only"),
             ("not-an-endpoint", "unstructured garbage: the base case"),
             (
@@ -1073,9 +1184,18 @@ errno=0\n\
                  where the error is fatal. v1 dial targets are IPv4 literals; nothing \
                  resolves names at this layer",
             ),
-            ("controller.example.com:51820", "the plausible-hostname form of the same trap"),
-            ("localhost:51820", "the most plausible one of all — still not a literal"),
-            ("10.0.0.5", "no port: the UAPI `endpoint=` line requires ip:port"),
+            (
+                "controller.example.com:51820",
+                "the plausible-hostname form of the same trap",
+            ),
+            (
+                "localhost:51820",
+                "the most plausible one of all — still not a literal",
+            ),
+            (
+                "10.0.0.5",
+                "no port: the UAPI `endpoint=` line requires ip:port",
+            ),
             ("10.0.0.5:", "a present but empty port"),
             (":51820", "a port with no address"),
             ("10.0.0.5:65536", "one past the top of u16"),
@@ -1083,7 +1203,10 @@ errno=0\n\
             ("10.0.0.5:-1", "a negative port"),
             ("10.0.0.5:0x1", "a hex port — the port is decimal-only"),
             ("10.0.0.5:+1", "a signed port"),
-            ("999.1.1.1:51820", "an out-of-range octet: dotted-quad SHAPE is not enough"),
+            (
+                "999.1.1.1:51820",
+                "an out-of-range octet: dotted-quad SHAPE is not enough",
+            ),
             ("10.0.0.5.6:51820", "five octets"),
             ("10.0.0:51820", "three octets"),
             (
@@ -1094,7 +1217,10 @@ errno=0\n\
                  it. Pinned so a toolchain or hand-rolled-parser change cannot quietly \
                  reintroduce that ambiguity",
             ),
-            (" 10.0.0.5:51820", "leading whitespace: `SocketAddr`'s FromStr does not trim"),
+            (
+                " 10.0.0.5:51820",
+                "leading whitespace: `SocketAddr`'s FromStr does not trim",
+            ),
             ("10.0.0.5:51820 ", "trailing whitespace, same reason"),
             (
                 "10.0.0.5:51820\n",
@@ -1110,14 +1236,19 @@ errno=0\n\
             ("10.0.0.5:51820:51820", "two ports"),
             ("10.0.0.5%eth0:51820", "an IPv4 with a zone index"),
             ("::1:51820", "an unbracketed IPv6-shaped string"),
-            ("[fe80::1%eth0]:51820", "a link-local IPv6 with a zone index"),
+            (
+                "[fe80::1%eth0]:51820",
+                "a link-local IPv6 with a zone index",
+            ),
         ];
 
         // Collected rather than asserted per-iteration so a failure reports
         // EVERY still-accepted form, not just the first — same discipline as
         // `parse_get_response_rejects_ipv6_endpoint_as_unpinnable` above.
-        let accepted: Vec<&(&str, &str)> =
-            cases.iter().filter(|(ep, _)| validate_ipv4_endpoint(ep).is_ok()).collect();
+        let accepted: Vec<&(&str, &str)> = cases
+            .iter()
+            .filter(|(ep, _)| validate_ipv4_endpoint(ep).is_ok())
+            .collect();
         assert!(
             accepted.is_empty(),
             "these must be REJECTED but validated: {accepted:#?}\n\
@@ -1212,15 +1343,26 @@ errno=0\n\
             ("10.0.0.5:0", "port 0 is not a dialable UDP port"),
             ("0.0.0.0:51820", "the unspecified address names no host"),
             ("0.0.0.0:0", "both at once"),
-            ("127.0.0.1:51820", "loopback — on a PEER this points that peer at itself; \
-                                 `netif::is_usable_ipv4` refuses to emit it"),
-            ("169.254.1.1:51820", "link-local — `netif::is_usable_ipv4` refuses this too"),
+            (
+                "127.0.0.1:51820",
+                "loopback — on a PEER this points that peer at itself; \
+                                 `netif::is_usable_ipv4` refuses to emit it",
+            ),
+            (
+                "169.254.1.1:51820",
+                "link-local — `netif::is_usable_ipv4` refuses this too",
+            ),
             ("255.255.255.255:65535", "the broadcast address"),
-            ("224.0.0.1:51820", "multicast is not a unicast peer endpoint"),
+            (
+                "224.0.0.1:51820",
+                "multicast is not a unicast peer endpoint",
+            ),
         ];
 
-        let rejected: Vec<&(&str, &str)> =
-            undialable.iter().filter(|(ep, _)| validate_ipv4_endpoint(ep).is_err()).collect();
+        let rejected: Vec<&(&str, &str)> = undialable
+            .iter()
+            .filter(|(ep, _)| validate_ipv4_endpoint(ep).is_err())
+            .collect();
         assert!(
             rejected.is_empty(),
             "these are accepted TODAY and this test records that gap; they now reject: \

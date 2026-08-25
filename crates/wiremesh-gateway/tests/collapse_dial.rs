@@ -104,7 +104,9 @@ const VALID_ACTIVE_KEY: &str = "7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c7c0=";
 /// used to build the EXPECTED string, so a change to the production split is
 /// visible as a mismatch rather than being silently mirrored.
 fn split_candidate(candidate: &str) -> (&str, u16) {
-    let (ip, port) = candidate.rsplit_once(':').expect("test candidate is ip:port");
+    let (ip, port) = candidate
+        .rsplit_once(':')
+        .expect("test candidate is ip:port");
     (ip, port.parse().expect("test candidate port is a u16"))
 }
 
@@ -117,8 +119,16 @@ fn rotating_peer(gid: u64, candidate: &str) -> PeerState {
         segment_name: format!("seg-{gid}"),
         active_pubkey_b64: Some(VALID_ACTIVE_KEY.to_string()),
         keys: vec![
-            PeerKeyInfo { epoch: 0, pubkey_b64: VALID_ACTIVE_KEY.into(), state: "active".into() },
-            PeerKeyInfo { epoch: 1, pubkey_b64: VALID_PENDING_KEY.into(), state: "pending".into() },
+            PeerKeyInfo {
+                epoch: 0,
+                pubkey_b64: VALID_ACTIVE_KEY.into(),
+                state: "active".into(),
+            },
+            PeerKeyInfo {
+                epoch: 1,
+                pubkey_b64: VALID_PENDING_KEY.into(),
+                state: "pending".into(),
+            },
         ],
         candidates: vec![candidate.to_string()],
         allowed_ips: vec![format!("10.10.{gid}.0/24")],
@@ -126,7 +136,11 @@ fn rotating_peer(gid: u64, candidate: &str) -> PeerState {
 }
 
 fn ds(peers: Vec<PeerState>) -> DesiredState {
-    DesiredState { revision: 1, peers, ..Default::default() }
+    DesiredState {
+        revision: 1,
+        peers,
+        ..Default::default()
+    }
 }
 
 /// The single endpoint `pending_peer_configs` emitted, so the agreement test
@@ -134,7 +148,11 @@ fn ds(peers: Vec<PeerState>) -> DesiredState {
 /// of the formula that produced it.
 fn pending_endpoint(state: &DesiredState) -> String {
     let cfgs = pending_peer_configs(state, 25);
-    assert_eq!(cfgs.len(), 1, "expected exactly one pending peer config, got {cfgs:?}");
+    assert_eq!(
+        cfgs.len(),
+        1,
+        "expected exactly one pending peer config, got {cfgs:?}"
+    );
     cfgs[0]
         .endpoint
         .clone()
@@ -297,7 +315,10 @@ fn an_unparseable_candidate_yields_no_dial_instead_of_a_panic() {
         ("10.9.0.2:-1", "negative port"),
         ("10.9.0.2:65536", "port above the u16 range"),
         ("10.9.0.2: 51820", "whitespace in the port"),
-        ("10.9.0.2:51820\nendpoint=203.0.113.1:9", "UAPI line-injection payload"),
+        (
+            "10.9.0.2:51820\nendpoint=203.0.113.1:9",
+            "UAPI line-injection payload",
+        ),
     ];
     for (candidate, why) in hostile {
         assert_eq!(
@@ -337,7 +358,11 @@ fn a_peer_on_the_last_udp_port_yields_no_dial_rather_than_wrapping_to_zero() {
              offset must be a checked add — a wrapping one dials :0, a wildcard that silently \
              reaches nothing while looking programmed."
         );
-        assert_eq!(own_tun_endpoint(candidate), None, "{candidate}: same, at the extraction");
+        assert_eq!(
+            own_tun_endpoint(candidate),
+            None,
+            "{candidate}: same, at the extraction"
+        );
     }
 
     // The rung immediately below, so the None above is a boundary and not a
@@ -387,7 +412,9 @@ fn collapse_dial_and_pending_peer_configs_emit_the_identical_string() {
     ] {
         let from_overlap_builder = pending_endpoint(&ds(vec![rotating_peer(2, candidate)]));
         let from_collapse = collapse_dial(1, 0, candidate).unwrap_or_else(|| {
-            panic!("collapse_dial must produce an endpoint for the well-formed candidate {candidate}")
+            panic!(
+                "collapse_dial must produce an endpoint for the well-formed candidate {candidate}"
+            )
         });
 
         assert_eq!(
@@ -431,18 +458,30 @@ fn the_port_the_collapse_arm_dials_is_the_port_the_allocator_reserves() {
         for (peer_active_epoch, peer_new_epoch) in [(0u32, 1u32), (1, 2), (2, 4), (5, 11)] {
             // --- Side 1: the peer allocates the tun its new epoch lives on. ---
             let mut live = vec![TunnelPlan {
-                id: TunnelId::Own { epoch: peer_active_epoch },
+                id: TunnelId::Own {
+                    epoch: peer_active_epoch,
+                },
                 ifname: BASE_TUN.to_string(),
                 listen_port: base_port,
             }];
             for gid in [21u64, 22, 23] {
-                let id = TunnelId::Overlap { gateway_id: gid, epoch: peer_new_epoch };
+                let id = TunnelId::Overlap {
+                    gateway_id: gid,
+                    epoch: peer_new_epoch,
+                };
                 let plan = plan_tunnel(id, BASE_TUN, base_port, &live)
                     .unwrap_or_else(|e| panic!("the peer's overlap toward {gid}: {e:#}"));
                 live.push(plan);
             }
-            let peer_own = plan_tunnel(TunnelId::Own { epoch: peer_new_epoch }, BASE_TUN, base_port, &live)
-                .unwrap_or_else(|e| panic!("the peer's own new epoch {peer_new_epoch}: {e:#}"));
+            let peer_own = plan_tunnel(
+                TunnelId::Own {
+                    epoch: peer_new_epoch,
+                },
+                BASE_TUN,
+                base_port,
+                &live,
+            )
+            .unwrap_or_else(|e| panic!("the peer's own new epoch {peer_new_epoch}: {e:#}"));
 
             // --- Side 2: our collapse arm decides where to dial it. ---
             let candidate = format!("10.9.0.7:{base_port}");

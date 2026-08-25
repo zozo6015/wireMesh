@@ -20,15 +20,24 @@ use wiremesh_enforcer::Counters;
 pub fn render(kind: &str, applied_version: u64, counters: &Counters) -> String {
     let mut s = String::new();
     s.push_str("# TYPE wiremesh_gateway_default_deny_total counter\n");
-    s.push_str(&format!("wiremesh_gateway_default_deny_total {}\n", counters.default_deny));
+    s.push_str(&format!(
+        "wiremesh_gateway_default_deny_total {}\n",
+        counters.default_deny
+    ));
     s.push_str("# TYPE wiremesh_gateway_rule_hits_total counter\n");
     for (rule_id, hits) in &counters.by_rule {
-        s.push_str(&format!("wiremesh_gateway_rule_hits_total{{rule_id=\"{rule_id}\"}} {hits}\n"));
+        s.push_str(&format!(
+            "wiremesh_gateway_rule_hits_total{{rule_id=\"{rule_id}\"}} {hits}\n"
+        ));
     }
     s.push_str("# TYPE wiremesh_gateway_applied_policy_version gauge\n");
-    s.push_str(&format!("wiremesh_gateway_applied_policy_version {applied_version}\n"));
+    s.push_str(&format!(
+        "wiremesh_gateway_applied_policy_version {applied_version}\n"
+    ));
     s.push_str("# TYPE wiremesh_gateway_backend_info gauge\n");
-    s.push_str(&format!("wiremesh_gateway_backend_info{{backend=\"{kind}\"}} 1\n"));
+    s.push_str(&format!(
+        "wiremesh_gateway_backend_info{{backend=\"{kind}\"}} 1\n"
+    ));
     s
 }
 
@@ -99,11 +108,17 @@ pub fn render_peer_stats(peers: &[(String, PeerStats)]) -> String {
     let mut s = String::new();
     s.push_str("# TYPE wiremesh_gateway_peer_rx_bytes gauge\n");
     for (peer, stats) in peers {
-        s.push_str(&format!("wiremesh_gateway_peer_rx_bytes{{peer=\"{peer}\"}} {}\n", stats.rx_bytes));
+        s.push_str(&format!(
+            "wiremesh_gateway_peer_rx_bytes{{peer=\"{peer}\"}} {}\n",
+            stats.rx_bytes
+        ));
     }
     s.push_str("# TYPE wiremesh_gateway_peer_tx_bytes gauge\n");
     for (peer, stats) in peers {
-        s.push_str(&format!("wiremesh_gateway_peer_tx_bytes{{peer=\"{peer}\"}} {}\n", stats.tx_bytes));
+        s.push_str(&format!(
+            "wiremesh_gateway_peer_tx_bytes{{peer=\"{peer}\"}} {}\n",
+            stats.tx_bytes
+        ));
     }
     s.push_str("# TYPE wiremesh_gateway_peer_last_handshake_age_seconds gauge\n");
     for (peer, stats) in peers {
@@ -127,7 +142,9 @@ pub fn render_peer_stats(peers: &[(String, PeerStats)]) -> String {
 pub fn render_policy_apply_failures(total: u64) -> String {
     let mut s = String::new();
     s.push_str("# TYPE wiremesh_gateway_policy_apply_failures_total counter\n");
-    s.push_str(&format!("wiremesh_gateway_policy_apply_failures_total {total}\n"));
+    s.push_str(&format!(
+        "wiremesh_gateway_policy_apply_failures_total {total}\n"
+    ));
     s
 }
 
@@ -247,7 +264,10 @@ mod tests {
 
     #[test]
     fn render_emits_prometheus_lines() {
-        let c = Counters { by_rule: BTreeMap::from([("r1".to_string(), 7u64)]), default_deny: 3 };
+        let c = Counters {
+            by_rule: BTreeMap::from([("r1".to_string(), 7u64)]),
+            default_deny: 3,
+        };
         let out = render("ebpf", 5, &c);
         assert!(out.contains("wiremesh_gateway_default_deny_total 3"));
         assert!(out.contains("wiremesh_gateway_rule_hits_total{rule_id=\"r1\"} 7"));
@@ -280,11 +300,15 @@ mod tests {
         ]);
         assert!(out.contains("# TYPE wiremesh_gateway_path_transitions_total counter"));
         assert!(
-            out.contains("wiremesh_gateway_path_transitions_total{from=\"connecting\",to=\"direct\"} 3"),
+            out.contains(
+                "wiremesh_gateway_path_transitions_total{from=\"connecting\",to=\"direct\"} 3"
+            ),
             "body: {out}"
         );
         assert!(
-            out.contains("wiremesh_gateway_path_transitions_total{from=\"direct\",to=\"degraded\"} 1"),
+            out.contains(
+                "wiremesh_gateway_path_transitions_total{from=\"direct\",to=\"degraded\"} 1"
+            ),
             "body: {out}"
         );
     }
@@ -294,8 +318,10 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(serve_metrics(listener, || async {
-            let counters =
-                Counters { by_rule: BTreeMap::from([("r9".to_string(), 2u64)]), default_deny: 1 };
+            let counters = Counters {
+                by_rule: BTreeMap::from([("r9".to_string(), 2u64)]),
+                default_deny: 1,
+            };
             let peer_states = vec![("42".to_string(), PathState::Direct)];
             let transitions = vec![((PathState::Connecting, PathState::Direct), 3u64)];
             // Mechanical +1 tuple element (fix T5); the per-peer-gauge
@@ -318,14 +344,28 @@ mod tests {
             ))
         }));
 
-        let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect to metrics listener");
-        stream.write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n").await.unwrap();
+        let mut stream = tokio::net::TcpStream::connect(addr)
+            .await
+            .expect("connect to metrics listener");
+        stream
+            .write_all(b"GET /metrics HTTP/1.1\r\nHost: x\r\n\r\n")
+            .await
+            .unwrap();
         let mut buf = Vec::new();
         stream.read_to_end(&mut buf).await.unwrap();
         let text = String::from_utf8_lossy(&buf);
-        assert!(text.contains("wiremesh_gateway_applied_policy_version 9"), "body: {text}");
-        assert!(text.contains("wiremesh_gateway_default_deny_total 1"), "body: {text}");
-        assert!(text.contains("wiremesh_gateway_rule_hits_total{rule_id=\"r9\"} 2"), "body: {text}");
+        assert!(
+            text.contains("wiremesh_gateway_applied_policy_version 9"),
+            "body: {text}"
+        );
+        assert!(
+            text.contains("wiremesh_gateway_default_deny_total 1"),
+            "body: {text}"
+        );
+        assert!(
+            text.contains("wiremesh_gateway_rule_hits_total{rule_id=\"r9\"} 2"),
+            "body: {text}"
+        );
         assert!(text.contains("backend=\"ebpf\""), "body: {text}");
         // The review finding this test now guards: path-state gauge +
         // transition counters must reach the actual HTTP scrape body, not
@@ -335,7 +375,9 @@ mod tests {
             "path-state gauge must reach the scrape body: {text}"
         );
         assert!(
-            text.contains("wiremesh_gateway_path_transitions_total{from=\"connecting\",to=\"direct\"} 3"),
+            text.contains(
+                "wiremesh_gateway_path_transitions_total{from=\"connecting\",to=\"direct\"} 3"
+            ),
             "path transitions must reach the scrape body: {text}"
         );
     }

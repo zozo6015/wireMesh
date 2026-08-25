@@ -26,7 +26,11 @@
 use wiremesh_operator::cli::{cli_action, CliAction};
 
 fn argv(tokens: &[&str]) -> impl Iterator<Item = String> {
-    tokens.iter().map(|s| s.to_string()).collect::<Vec<_>>().into_iter()
+    tokens
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .into_iter()
 }
 
 #[test]
@@ -38,7 +42,10 @@ fn long_version_flag_yields_crate_version() {
                 "version output must contain CARGO_PKG_VERSION {:?}, got {s:?}",
                 env!("CARGO_PKG_VERSION")
             );
-            assert!(s.contains("wiremesh-operator"), "version line names the binary, got {s:?}");
+            assert!(
+                s.contains("wiremesh-operator"),
+                "version line names the binary, got {s:?}"
+            );
         }
         other => panic!("--version must yield Version, got {:?}", ActionDbg(&other)),
     }
@@ -72,9 +79,19 @@ fn short_help_flag_names_subcommands() {
 /// dispatch is unaffected.
 #[test]
 fn subcommand_args_yield_run() {
-    assert!(matches!(cli_action(argv(&["wiremesh-operator", "idle"])), CliAction::Run));
+    assert!(matches!(
+        cli_action(argv(&["wiremesh-operator", "idle"])),
+        CliAction::Run
+    ));
     assert!(
-        matches!(cli_action(argv(&["wiremesh-operator", "operator-admin", "list-gateways"])), CliAction::Run),
+        matches!(
+            cli_action(argv(&[
+                "wiremesh-operator",
+                "operator-admin",
+                "list-gateways"
+            ])),
+            CliAction::Run
+        ),
         "operator-admin dispatch must still reach Run"
     );
 }
@@ -82,7 +99,10 @@ fn subcommand_args_yield_run() {
 fn assert_manual(m: &str) {
     assert!(!m.trim().is_empty(), "help manual must be non-empty");
     for needle in ["idle", "operator-admin"] {
-        assert!(m.contains(needle), "operator manual must name the {needle:?} subcommand; got:\n{m}");
+        assert!(
+            m.contains(needle),
+            "operator manual must name the {needle:?} subcommand; got:\n{m}"
+        );
     }
 }
 

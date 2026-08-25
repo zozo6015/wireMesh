@@ -199,7 +199,11 @@ pub fn probe(iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforce
 /// succeeds there) and never exercise the nftables path at all — per
 /// `.superpowers/sdd/task-12-brief.md`'s Interfaces section: "an env/knob-
 /// free forced choice for tests: `probe_with(BackendKind, ...)`".
-pub fn probe_with(kind: BackendKind, iface: &str, cfg: EnforcerConfig) -> anyhow::Result<Box<dyn Enforcer>> {
+pub fn probe_with(
+    kind: BackendKind,
+    iface: &str,
+    cfg: EnforcerConfig,
+) -> anyhow::Result<Box<dyn Enforcer>> {
     // Boundary validation (Backlog 10 PR-A Item 3): both backends'
     // constructors are only ever reached through this function, so this one
     // call guards every constructor path before ANY kernel/filesystem work

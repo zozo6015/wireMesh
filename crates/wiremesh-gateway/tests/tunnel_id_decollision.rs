@@ -123,7 +123,10 @@ fn assert_three_way_distinct(a: &TunnelPlan, b: &TunnelPlan, what: &str) {
 }
 
 fn assert_plan_wellformed(p: &TunnelPlan, id: TunnelId) {
-    assert_eq!(p.id, id, "plan_tunnel must return a plan for the id it was asked about");
+    assert_eq!(
+        p.id, id,
+        "plan_tunnel must return a plan for the id it was asked about"
+    );
     assert!(
         iface_is_valid(&p.ifname),
         "planned ifname {:?} ({} bytes) would be rejected by the enforcer's validate_iface / the \
@@ -149,13 +152,21 @@ fn own_active_and_overlap_at_the_same_epoch_number_coexist() {
         listen_port: BASE_PORT,
     };
 
-    let overlap_id = TunnelId::Overlap { gateway_id: 7, epoch: 1 };
-    let overlap = plan_tunnel(overlap_id, BASE_TUN, BASE_PORT, &[own_active.clone()])
-        .expect("planning a Role-B overlap toward peer 7's pending epoch 1 must succeed even \
-                 though this gateway's OWN active epoch is also 1");
+    let overlap_id = TunnelId::Overlap {
+        gateway_id: 7,
+        epoch: 1,
+    };
+    let overlap = plan_tunnel(overlap_id, BASE_TUN, BASE_PORT, &[own_active.clone()]).expect(
+        "planning a Role-B overlap toward peer 7's pending epoch 1 must succeed even \
+                 though this gateway's OWN active epoch is also 1",
+    );
 
     assert_plan_wellformed(&overlap, overlap_id);
-    assert_three_way_distinct(&own_active, &overlap, "own active epoch 1 vs overlap toward peer 7 epoch 1");
+    assert_three_way_distinct(
+        &own_active,
+        &overlap,
+        "own active epoch 1 vs overlap toward peer 7 epoch 1",
+    );
 }
 
 /// The other half of the same defect: we are Role A rotating to epoch 2 while
@@ -178,14 +189,26 @@ fn own_new_and_overlap_at_the_same_epoch_number_coexist() {
     assert_plan_wellformed(&own_new, own_new_id);
     live.push(own_new.clone());
 
-    let overlap_id = TunnelId::Overlap { gateway_id: 7, epoch: 2 };
-    let overlap = plan_tunnel(overlap_id, BASE_TUN, BASE_PORT, &live)
-        .expect("a Role-B overlap toward peer 7's pending epoch 2 must be plannable while our own \
-                 rotation to epoch 2 is in flight");
+    let overlap_id = TunnelId::Overlap {
+        gateway_id: 7,
+        epoch: 2,
+    };
+    let overlap = plan_tunnel(overlap_id, BASE_TUN, BASE_PORT, &live).expect(
+        "a Role-B overlap toward peer 7's pending epoch 2 must be plannable while our own \
+                 rotation to epoch 2 is in flight",
+    );
     assert_plan_wellformed(&overlap, overlap_id);
 
-    assert_three_way_distinct(&own_new, &overlap, "own new epoch 2 vs overlap toward peer 7 epoch 2");
-    assert_three_way_distinct(&own_active, &overlap, "own active epoch 1 vs overlap toward peer 7 epoch 2");
+    assert_three_way_distinct(
+        &own_new,
+        &overlap,
+        "own new epoch 2 vs overlap toward peer 7 epoch 2",
+    );
+    assert_three_way_distinct(
+        &own_active,
+        &overlap,
+        "own active epoch 1 vs overlap toward peer 7 epoch 2",
+    );
 }
 
 /// Two DIFFERENT peers rotating to the same pending epoch number in the same
@@ -201,12 +224,18 @@ fn two_peers_overlapping_at_the_same_epoch_number_are_distinct() {
         listen_port: BASE_PORT,
     }];
 
-    let a_id = TunnelId::Overlap { gateway_id: 11, epoch: 4 };
+    let a_id = TunnelId::Overlap {
+        gateway_id: 11,
+        epoch: 4,
+    };
     let a = plan_tunnel(a_id, BASE_TUN, BASE_PORT, &live).expect("first peer's overlap");
     assert_plan_wellformed(&a, a_id);
     live.push(a.clone());
 
-    let b_id = TunnelId::Overlap { gateway_id: 12, epoch: 4 };
+    let b_id = TunnelId::Overlap {
+        gateway_id: 12,
+        epoch: 4,
+    };
     let b = plan_tunnel(b_id, BASE_TUN, BASE_PORT, &live).expect("second peer's overlap");
     assert_plan_wellformed(&b, b_id);
 
@@ -234,14 +263,21 @@ fn whole_fabric_rotating_in_step_yields_pairwise_distinct_tuns() {
     live.push(own_new);
 
     for gid in PEERS {
-        let id = TunnelId::Overlap { gateway_id: gid, epoch: 4 };
+        let id = TunnelId::Overlap {
+            gateway_id: gid,
+            epoch: 4,
+        };
         let plan = plan_tunnel(id, BASE_TUN, BASE_PORT, &live)
             .unwrap_or_else(|e| panic!("planning overlap toward peer {gid} at epoch 4: {e:#}"));
         assert_plan_wellformed(&plan, id);
         live.push(plan);
     }
 
-    assert_eq!(live.len(), 2 + PEERS.len(), "every tun in the in-step fabric must have been planned");
+    assert_eq!(
+        live.len(),
+        2 + PEERS.len(),
+        "every tun in the in-step fabric must have been planned"
+    );
     for i in 0..live.len() {
         for j in (i + 1)..live.len() {
             assert_three_way_distinct(&live[i], &live[j], "in-step fabric");
@@ -275,7 +311,10 @@ fn plan_order_does_not_change_the_outcome() {
         listen_port: BASE_PORT,
     };
     let own_id = TunnelId::Own { epoch: 2 };
-    let ovl_id = TunnelId::Overlap { gateway_id: 9, epoch: 2 };
+    let ovl_id = TunnelId::Overlap {
+        gateway_id: 9,
+        epoch: 2,
+    };
 
     // Role A first, then Role B.
     let a1 = plan_tunnel(own_id, BASE_TUN, BASE_PORT, &[boot.clone()]).expect("A first: own");
@@ -316,10 +355,16 @@ fn plan_is_deterministic_for_identical_inputs() {
         ifname: BASE_TUN.to_string(),
         listen_port: BASE_PORT,
     }];
-    let id = TunnelId::Overlap { gateway_id: 42, epoch: 1 };
+    let id = TunnelId::Overlap {
+        gateway_id: 42,
+        epoch: 1,
+    };
     let first = plan_tunnel(id, BASE_TUN, BASE_PORT, &live).expect("first plan");
     let second = plan_tunnel(id, BASE_TUN, BASE_PORT, &live).expect("second plan");
-    assert_eq!(first, second, "plan_tunnel must be a pure function of its inputs");
+    assert_eq!(
+        first, second,
+        "plan_tunnel must be a pure function of its inputs"
+    );
 }
 
 /// IFNAMSIZ budget under a plausible worst case. `wg0e{n}` (the current
@@ -337,9 +382,14 @@ fn ifname_fits_the_15_byte_budget_for_a_plausible_worst_case() {
     }];
     for gid in [1u64, 99, 999] {
         for epoch in [41u32, 99] {
-            let id = TunnelId::Overlap { gateway_id: gid, epoch };
+            let id = TunnelId::Overlap {
+                gateway_id: gid,
+                epoch,
+            };
             let plan = plan_tunnel(id, BASE_TUN, BASE_PORT, &live).unwrap_or_else(|e| {
-                panic!("gateway {gid} at epoch {epoch} on base {BASE_TUN:?} must be plannable: {e:#}")
+                panic!(
+                    "gateway {gid} at epoch {epoch} on base {BASE_TUN:?} must be plannable: {e:#}"
+                )
             });
             assert_plan_wellformed(&plan, id);
         }
@@ -358,10 +408,20 @@ fn plan_never_yields_an_invalid_ifname_for_any_base_name() {
         let base: String = "w".repeat(len);
         for id in [
             TunnelId::Own { epoch: 7 },
-            TunnelId::Overlap { gateway_id: 3, epoch: 7 },
-            TunnelId::Overlap { gateway_id: 123_456, epoch: 4_000_000_000 },
+            TunnelId::Overlap {
+                gateway_id: 3,
+                epoch: 7,
+            },
+            TunnelId::Overlap {
+                gateway_id: 123_456,
+                epoch: 4_000_000_000,
+            },
         ] {
-            let live = vec![TunnelPlan { id: TunnelId::Own { epoch: 0 }, ifname: base.clone(), listen_port: BASE_PORT }];
+            let live = vec![TunnelPlan {
+                id: TunnelId::Own { epoch: 0 },
+                ifname: base.clone(),
+                listen_port: BASE_PORT,
+            }];
             if let Ok(plan) = plan_tunnel(id, &base, BASE_PORT, &live) {
                 assert!(
                     iface_is_valid(&plan.ifname),
@@ -370,7 +430,10 @@ fn plan_never_yields_an_invalid_ifname_for_any_base_name() {
                     plan.ifname,
                     plan.ifname.len()
                 );
-                assert_ne!(plan.ifname, base, "a rotation tun must never reuse the base tun's name");
+                assert_ne!(
+                    plan.ifname, base,
+                    "a rotation tun must never reuse the base tun's name"
+                );
             }
         }
     }
@@ -391,11 +454,23 @@ fn own_and_overlap_stay_distinct_across_different_epoch_numbers() {
     let own = plan_tunnel(own_id, BASE_TUN, BASE_PORT, &[boot.clone()]).expect("own epoch 6");
     // Peer 8 is a laggard: it is only now rotating 5 -> 6 while we are already
     // planning our own 6, and peer 9 is further behind still (4 -> 5).
-    let o6_id = TunnelId::Overlap { gateway_id: 8, epoch: 6 };
-    let o6 = plan_tunnel(o6_id, BASE_TUN, BASE_PORT, &[boot.clone(), own.clone()]).expect("overlap 8@6");
-    let o5_id = TunnelId::Overlap { gateway_id: 9, epoch: 5 };
-    let o5 = plan_tunnel(o5_id, BASE_TUN, BASE_PORT, &[boot.clone(), own.clone(), o6.clone()])
-        .expect("overlap 9@5");
+    let o6_id = TunnelId::Overlap {
+        gateway_id: 8,
+        epoch: 6,
+    };
+    let o6 =
+        plan_tunnel(o6_id, BASE_TUN, BASE_PORT, &[boot.clone(), own.clone()]).expect("overlap 8@6");
+    let o5_id = TunnelId::Overlap {
+        gateway_id: 9,
+        epoch: 5,
+    };
+    let o5 = plan_tunnel(
+        o5_id,
+        BASE_TUN,
+        BASE_PORT,
+        &[boot.clone(), own.clone(), o6.clone()],
+    )
+    .expect("overlap 9@5");
 
     for (i, a) in [&boot, &own, &o6, &o5].iter().enumerate() {
         for b in [&boot, &own, &o6, &o5].iter().skip(i + 1) {

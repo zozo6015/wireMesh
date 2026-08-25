@@ -40,7 +40,10 @@
 use wiremesh_gateway::rotation::{overlap_write_back, OverlapIdentity, WriteBack};
 
 fn ident(pending_epoch: u32, new_tun: &str) -> OverlapIdentity {
-    OverlapIdentity { pending_epoch, new_tun: new_tun.to_string() }
+    OverlapIdentity {
+        pending_epoch,
+        new_tun: new_tun.to_string(),
+    }
 }
 
 /// The ordinary case: nothing moved during the `.await`, so the conclusion the
@@ -164,8 +167,11 @@ fn apply_exactly_when_both_axes_match() {
             for &ce in &epochs {
                 for ct in tuns {
                     let current = ident(ce, ct);
-                    let expected =
-                        if te == ce && tt == ct { WriteBack::Apply } else { WriteBack::Replaced };
+                    let expected = if te == ce && tt == ct {
+                        WriteBack::Apply
+                    } else {
+                        WriteBack::Replaced
+                    };
                     assert_eq!(
                         overlap_write_back(&taken, Some(&current)),
                         expected,

@@ -60,7 +60,9 @@ async fn snapshot_advertises_active_relays() {
         .expect("Sync.Watch stream yielded an error instead of a message");
     let snap_before = match msg.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
     assert!(
         snap_before.relay_infos.is_empty(),
@@ -70,8 +72,7 @@ async fn snapshot_advertises_active_relays() {
 
     // Enroll a relay with a valid ip:port endpoint.
     let endpoint = "203.0.113.9:51820";
-    let (_cert_pem, _ca_bundle_pem, relay_id) =
-        wiremesh_testkit::enroll_relay(&h, endpoint).await;
+    let (_cert_pem, _ca_bundle_pem, relay_id) = wiremesh_testkit::enroll_relay(&h, endpoint).await;
     assert!(
         relay_id > 0,
         "enroll_relay must return a positive relay id, got {relay_id}"
@@ -88,7 +89,9 @@ async fn snapshot_advertises_active_relays() {
         .expect("Sync.Watch stream yielded an error instead of a message");
     let snap_after = match msg2.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
 
     assert_eq!(
@@ -124,7 +127,9 @@ async fn relay_enrollment_pushes_relays_delta_to_connected_gateway() {
         .expect("Sync.Watch stream yielded an error instead of the initial snapshot");
     let snap = match snap_msg.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
     assert!(
         snap.relay_infos.is_empty(),
@@ -138,8 +143,7 @@ async fn relay_enrollment_pushes_relays_delta_to_connected_gateway() {
     // still-open stream, bounded by a timeout so a missing delta fails fast
     // instead of hanging the test suite.
     let endpoint = "198.51.100.7:51820";
-    let (_cert_pem, _ca_bundle_pem, relay_id) =
-        wiremesh_testkit::enroll_relay(&h, endpoint).await;
+    let (_cert_pem, _ca_bundle_pem, relay_id) = wiremesh_testkit::enroll_relay(&h, endpoint).await;
 
     let msg = tokio::time::timeout(SYNC_TIMEOUT, stream.next())
         .await
@@ -199,7 +203,9 @@ async fn register_relay_pushes_relay_infos_delta_to_connected_gateway() {
         .expect("Sync.Watch stream yielded an error instead of the initial snapshot");
     let snap = match snap_msg.body {
         Some(sync_message::Body::Snapshot(s)) => s,
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     };
     assert!(
         snap.relay_infos.is_empty(),
@@ -291,14 +297,12 @@ async fn relay_enrollment_rejects_malformed_endpoint() {
         endpoint: "not-an-address".to_string(),
     })
     .await
-    .expect_err(
-        "a malformed (non ip:port) relay endpoint must be rejected by Enrollment.Enroll",
-    );
+    .expect_err("a malformed (non ip:port) relay endpoint must be rejected by Enrollment.Enroll");
 
     let db_path = h.data_dir().join("controller.db");
     let relay_count = tokio::task::spawn_blocking(move || {
-        let conn = Connection::open(&db_path)
-            .expect("opening controller.db for relay-count inspection");
+        let conn =
+            Connection::open(&db_path).expect("opening controller.db for relay-count inspection");
         conn.query_row("SELECT COUNT(*) FROM relay", [], |row| row.get::<_, i64>(0))
             .expect("counting relay rows")
     })

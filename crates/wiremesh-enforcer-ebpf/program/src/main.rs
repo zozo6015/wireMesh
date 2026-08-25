@@ -37,7 +37,7 @@
 // task's report.)
 use aya_ebpf::{
     bindings::{TC_ACT_PIPE, TC_ACT_SHOT},
-    btf_maps::{lpm_trie::Key as LpmKey, Array as BtfArray, ArrayOfMaps, LpmTrie},
+    btf_maps::{Array as BtfArray, ArrayOfMaps, LpmTrie, lpm_trie::Key as LpmKey},
     helpers::bpf_ktime_get_ns,
     macros::{btf_map, classifier, map},
     maps::{Array, LruHashMap, RingBuf},
@@ -150,11 +150,7 @@ fn bump(idx: u32) {
 #[inline(always)]
 fn cfg_or_default(idx: u32, default: u64) -> u64 {
     let v = CONFIG.get(idx).copied().unwrap_or(0);
-    if v == 0 {
-        default
-    } else {
-        v
-    }
+    if v == 0 { default } else { v }
 }
 
 /// This flow's protocol's configured idle timeout, in nanoseconds
@@ -231,7 +227,15 @@ fn rate_allows(src: u32, now: u64) -> bool {
     let cap = rate_cap();
     match RATE.get_ptr_mut(&src) {
         None => {
-            let _ = RATE.insert(&src, &RateVal { window_start_ns: now, count: 1, _pad: 0 }, 0);
+            let _ = RATE.insert(
+                &src,
+                &RateVal {
+                    window_start_ns: now,
+                    count: 1,
+                    _pad: 0,
+                },
+                0,
+            );
             true
         }
         Some(ptr) => {
@@ -475,16 +479,37 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
     // dport) tuple is carried through unchanged since it's already in the
     // form the original request was recorded under.
     let rev = if proto == 1 {
-        FlowKey { src: dst, dst: src, sport, dport, proto, _pad: [0; 3] }
+        FlowKey {
+            src: dst,
+            dst: src,
+            sport,
+            dport,
+            proto,
+            _pad: [0; 3],
+        }
     } else {
-        FlowKey { src: dst, dst: src, sport: dport, dport: sport, proto, _pad: [0; 3] }
+        FlowKey {
+            src: dst,
+            dst: src,
+            sport: dport,
+            dport: sport,
+            proto,
+            _pad: [0; 3],
+        }
     };
     if flow_hit(&rev, proto, now, true) {
         bump(CTR_FLOW_HIT);
         return Ok(TC_ACT_PIPE);
     }
     // 2) continuation of an inbound-allowed flow?
-    let fwd = FlowKey { src, dst, sport, dport, proto, _pad: [0; 3] };
+    let fwd = FlowKey {
+        src,
+        dst,
+        sport,
+        dport,
+        proto,
+        _pad: [0; 3],
+    };
     if flow_hit(&fwd, proto, now, true) {
         bump(CTR_FLOW_HIT);
         return Ok(TC_ACT_PIPE);
@@ -513,8 +538,14 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
                 let esport: u16 = ctx.load(eoff + eihl).unwrap_or(0);
                 let edport: u16 = ctx.load(eoff + eihl + 2).unwrap_or(0);
                 // original packet was OUTBOUND from this segment => recorded at egress as-is
-                let ekey = FlowKey { src: esrc, dst: edst, sport: esport, dport: edport,
-                                     proto: eproto, _pad: [0; 3] };
+                let ekey = FlowKey {
+                    src: esrc,
+                    dst: edst,
+                    sport: esport,
+                    dport: edport,
+                    proto: eproto,
+                    _pad: [0; 3],
+                };
                 if flow_hit(&ekey, eproto, now, false) {
                     bump(CTR_FLOW_HIT);
                     return Ok(TC_ACT_PIPE);
@@ -545,7 +576,14 @@ fn try_ingress(ctx: &TcContext) -> Result<i32, ()> {
 fn try_egress(ctx: &TcContext) -> Result<(), ()> {
     let (src, dst, proto, ihl) = ipv4_at(ctx)?;
     let (sport, dport) = ports_at(ctx, ihl, proto);
-    let key = FlowKey { src, dst, sport, dport, proto, _pad: [0; 3] };
+    let key = FlowKey {
+        src,
+        dst,
+        sport,
+        dport,
+        proto,
+        _pad: [0; 3],
+    };
     let now = unsafe { bpf_ktime_get_ns() };
 
     match FLOWS.get_ptr_mut(&key) {
@@ -630,14 +668,28 @@ fn scan_generation(src: u32, dst: u32, proto: u8, dport: u16, now: u64) -> u32 {
         if meta_matches(meta, proto, dport) {
             bump(i);
             if meta.action == ACT_DENY {
-                let ev = DenyEventRaw { src, dst, proto, _pad: [0], dport, rule_idx: i };
+                let ev = DenyEventRaw {
+                    src,
+                    dst,
+                    proto,
+                    _pad: [0],
+                    dport,
+                    rule_idx: i,
+                };
                 maybe_emit_deny(&ev, now);
             }
             return meta.action;
         }
     }
     bump(CTR_DEFAULT_DENY);
-    let ev = DenyEventRaw { src, dst, proto, _pad: [0], dport, rule_idx: CTR_DEFAULT_DENY };
+    let ev = DenyEventRaw {
+        src,
+        dst,
+        proto,
+        _pad: [0],
+        dport,
+        rule_idx: CTR_DEFAULT_DENY,
+    };
     maybe_emit_deny(&ev, now);
     ACT_DENY
 }

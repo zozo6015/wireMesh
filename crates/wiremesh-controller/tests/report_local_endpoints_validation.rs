@@ -108,10 +108,12 @@ async fn stored_local_candidates(h: &wiremesh_testkit::TestController, gw_id: u6
                  'local' ORDER BY endpoint",
             )
             .expect("preparing raw local-candidate read");
-        stmt.query_map(rusqlite::params![gw_id as i64], |row| row.get::<_, String>(0))
-            .expect("querying raw local candidates")
-            .collect::<Result<Vec<String>, _>>()
-            .expect("collecting raw local candidate rows")
+        stmt.query_map(rusqlite::params![gw_id as i64], |row| {
+            row.get::<_, String>(0)
+        })
+        .expect("querying raw local candidates")
+        .collect::<Result<Vec<String>, _>>()
+        .expect("collecting raw local candidate rows")
     })
     .await
     .expect("stored_local_candidates blocking task panicked")
@@ -125,8 +127,11 @@ async fn stored_local_candidates(h: &wiremesh_testkit::TestController, gw_id: u6
 /// yield the `V4` variant. Anything else is what kills the gateway process,
 /// so anything else is what the controller must refuse to store.
 const REJECTED: &[(&str, &str)] = &[
-    ("", "an empty string parses as nothing and reaches candidates[0] first of all — \
-          it sorts before every real address"),
+    (
+        "",
+        "an empty string parses as nothing and reaches candidates[0] first of all — \
+          it sorts before every real address",
+    ),
     ("not-an-endpoint", "unstructured garbage: the base case"),
     (
         "abc:123",
@@ -136,31 +141,55 @@ const REJECTED: &[(&str, &str)] = &[
          inside `validate_ipv4_endpoint` — v1 dial targets are IPv4 literals only, \
          resolution never happens here",
     ),
-    ("controller.example.com:51820", "the plausible-looking hostname form of the same trap"),
-    ("10.0.0.5", "an IPv4 address with NO port: WireGuard's UAPI endpoint= needs ip:port"),
+    (
+        "controller.example.com:51820",
+        "the plausible-looking hostname form of the same trap",
+    ),
+    (
+        "10.0.0.5",
+        "an IPv4 address with NO port: WireGuard's UAPI endpoint= needs ip:port",
+    ),
     ("10.0.0.5:", "a present but empty port"),
     (":51820", "a port with no address"),
     ("10.0.0.5:70000", "port above 65535 — out of u16 range"),
     ("10.0.0.5:-1", "a negative port"),
     ("10.0.0.5:0x51820", "a non-decimal port"),
-    ("999.1.1.1:51820", "an out-of-range octet: dotted-quad SHAPE is not enough"),
+    (
+        "999.1.1.1:51820",
+        "an out-of-range octet: dotted-quad SHAPE is not enough",
+    ),
     ("10.0.0.5.6:51820", "five octets"),
-    (" 10.0.0.5:51820", "leading whitespace — `SocketAddr`'s FromStr does not trim, so \
-                         this is a distinct string that fails the parse"),
+    (
+        " 10.0.0.5:51820",
+        "leading whitespace — `SocketAddr`'s FromStr does not trim, so \
+                         this is a distinct string that fails the parse",
+    ),
     ("10.0.0.5:51820 ", "trailing whitespace, same reason"),
-    ("[::1]:51820", "the bracketed IPv6 literal form: parses fine as SocketAddr::V6 and \
+    (
+        "[::1]:51820",
+        "the bracketed IPv6 literal form: parses fine as SocketAddr::V6 and \
                      is then a HARD error in `validate_ipv4_endpoint` — v1 is IPv4-only \
-                     end to end (spec §1)"),
-    ("[2001:db8::1]:51820", "a routable IPv6 literal, same rejection"),
+                     end to end (spec §1)",
+    ),
+    (
+        "[2001:db8::1]:51820",
+        "a routable IPv6 literal, same rejection",
+    ),
     ("::1:51820", "an unbracketed IPv6-shaped string"),
-    ("[fe80::1%eth0]:51820", "a link-local IPv6 with a zone index"),
+    (
+        "[fe80::1%eth0]:51820",
+        "a link-local IPv6 with a zone index",
+    ),
     (
         "10.0.0.5:51820\n",
         "a trailing newline: the UAPI wire protocol is newline-delimited key=value \
          lines, so an endpoint carrying one is a line-injection vector into the \
          boringtun `set` message, not merely a parse failure",
     ),
-    ("10.0.0.5:51820\nendpoint=1.2.3.4:1", "the explicit UAPI line-injection payload"),
+    (
+        "10.0.0.5:51820\nendpoint=1.2.3.4:1",
+        "the explicit UAPI line-injection payload",
+    ),
 ];
 
 #[tokio::test]
@@ -170,7 +199,12 @@ async fn mixed_valid_and_invalid_local_endpoints_keeps_exactly_the_valid_ones() 
 
     a.report(
         0,
-        &["!!! not an endpoint", "10.0.0.5:51820", "abc:123", "10.0.0.6:51820"],
+        &[
+            "!!! not an endpoint",
+            "10.0.0.5:51820",
+            "abc:123",
+            "10.0.0.6:51820",
+        ],
     )
     .await
     .expect(
@@ -203,12 +237,14 @@ async fn every_non_ipv4_socket_form_is_rejected_without_losing_the_valid_sibling
         // Report the bad form alongside a known-good one. `set_local_candidates`
         // is a full REPLACE, so each round stands alone: whatever survives IS
         // the stored set.
-        a.report(version as u64, &[bad, GOOD]).await.unwrap_or_else(|e| {
-            panic!(
-                "reporting the malformed endpoint {bad:?} must not FAIL the RPC \
+        a.report(version as u64, &[bad, GOOD])
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "reporting the malformed endpoint {bad:?} must not FAIL the RPC \
                  (filter-with-a-log, not hard-reject) — {why}. Got: {e}"
-            )
-        });
+                )
+            });
 
         assert_eq!(
             stored_local_candidates(&h, a.id()).await,
@@ -242,7 +278,9 @@ async fn valid_ipv4_socket_endpoints_survive_unchanged() {
         "172.16.4.4:51821",
     ];
 
-    a.report(0, &valid).await.expect("a fully-valid report must succeed");
+    a.report(0, &valid)
+        .await
+        .expect("a fully-valid report must succeed");
 
     let mut expected: Vec<String> = valid.iter().map(|s| s.to_string()).collect();
     expected.sort();
@@ -261,8 +299,13 @@ async fn a_report_of_only_invalid_endpoints_succeeds_and_clears_the_set() {
     let h = wiremesh_testkit::TestController::start().await;
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
 
-    a.report(0, &["10.0.0.5:51820"]).await.expect("baseline report");
-    assert_eq!(stored_local_candidates(&h, a.id()).await, vec!["10.0.0.5:51820".to_string()]);
+    a.report(0, &["10.0.0.5:51820"])
+        .await
+        .expect("baseline report");
+    assert_eq!(
+        stored_local_candidates(&h, a.id()).await,
+        vec!["10.0.0.5:51820".to_string()]
+    );
 
     a.report(1, &["abc:123", "[::1]:51820"]).await.expect(
         "an all-malformed report must still return Ok — the RPC also carries \
@@ -289,13 +332,19 @@ async fn a_local_endpoint_list_at_the_cap_is_stored_in_full() {
     let h = wiremesh_testkit::TestController::start().await;
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
 
-    let owned: Vec<String> =
-        (1..=MAX_LOCAL_CANDIDATES).map(|i| format!("10.0.{}.{}:51820", i / 256, i % 256)).collect();
+    let owned: Vec<String> = (1..=MAX_LOCAL_CANDIDATES)
+        .map(|i| format!("10.0.{}.{}:51820", i / 256, i % 256))
+        .collect();
     let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
 
-    a.report(0, &refs).await.expect("a report exactly at the cap must succeed");
+    a.report(0, &refs)
+        .await
+        .expect("a report exactly at the cap must succeed");
 
-    let stored: BTreeSet<String> = stored_local_candidates(&h, a.id()).await.into_iter().collect();
+    let stored: BTreeSet<String> = stored_local_candidates(&h, a.id())
+        .await
+        .into_iter()
+        .collect();
     let submitted: BTreeSet<String> = owned.iter().cloned().collect();
     assert_eq!(
         stored, submitted,
@@ -312,8 +361,9 @@ async fn a_local_endpoint_list_over_the_cap_is_bounded() {
     let a = wiremesh_testkit::enroll_one(&h, "aws", "10.0.0.0/16").await;
 
     let over = MAX_LOCAL_CANDIDATES + 1;
-    let owned: Vec<String> =
-        (1..=over).map(|i| format!("10.0.{}.{}:51820", i / 256, i % 256)).collect();
+    let owned: Vec<String> = (1..=over)
+        .map(|i| format!("10.0.{}.{}:51820", i / 256, i % 256))
+        .collect();
     let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
 
     a.report(0, &refs).await.expect(
@@ -364,7 +414,9 @@ async fn an_oversized_report_of_mixed_validity_keeps_only_valid_endpoints_within
     }
     let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
 
-    a.report(0, &refs).await.expect("a mixed oversized report must still succeed");
+    a.report(0, &refs)
+        .await
+        .expect("a mixed oversized report must still succeed");
 
     let stored = stored_local_candidates(&h, a.id()).await;
     assert!(

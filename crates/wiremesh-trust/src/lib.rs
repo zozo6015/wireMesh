@@ -17,8 +17,8 @@ use std::time::Duration as StdDuration;
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use rcgen::{
-    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName, DnType,
-    IsCa, KeyPair,
+    BasicConstraints, CertificateParams, CertificateSigningRequestParams, DistinguishedName,
+    DnType, IsCa, KeyPair,
 };
 use time::{Duration as TimeDuration, OffsetDateTime};
 
@@ -227,8 +227,8 @@ impl EmbeddedTrust {
         ttl: StdDuration,
     ) -> Result<(String, String)> {
         let key = KeyPair::generate().context("generating server key pair")?;
-        let mut params = CertificateParams::new(subject_alt_names)
-            .context("building server cert SAN params")?;
+        let mut params =
+            CertificateParams::new(subject_alt_names).context("building server cert SAN params")?;
         let mut dn = DistinguishedName::new();
         dn.push(DnType::CommonName, common_name);
         params.distinguished_name = dn;
@@ -267,8 +267,7 @@ impl CertificateIssuer for EmbeddedTrust {
             );
         }
 
-        let csr = CertificateSigningRequestParams::from_pem(csr_pem)
-            .context("parsing CSR PEM")?;
+        let csr = CertificateSigningRequestParams::from_pem(csr_pem).context("parsing CSR PEM")?;
 
         // The CA fully controls leaf identity: take ONLY the subject public
         // key from the CSR and rebuild the leaf's parameters from scratch.
@@ -372,10 +371,8 @@ impl SecretStore for EmbeddedTrust {
             .to_string_lossy();
         let tmp_path = path.with_file_name(format!("{leaf_name}.{pid}.{uniq}.tmp"));
 
-        write_private_file(&tmp_path, &buf)
-            .with_context(|| format!("writing secret {key}"))?;
-        fs::rename(&tmp_path, &path)
-            .with_context(|| format!("committing secret {key}"))?;
+        write_private_file(&tmp_path, &buf).with_context(|| format!("writing secret {key}"))?;
+        fs::rename(&tmp_path, &path).with_context(|| format!("committing secret {key}"))?;
 
         Ok(next_version)
     }
@@ -578,8 +575,8 @@ fn load_or_create_ca(
         }
     }
 
-    let mut ca_params = CertificateParams::new(Vec::<String>::new())
-        .context("building CA certificate params")?;
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).context("building CA certificate params")?;
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
         .distinguished_name

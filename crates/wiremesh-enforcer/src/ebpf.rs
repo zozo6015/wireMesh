@@ -30,9 +30,9 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::time::{Duration, Instant};
 use wiremesh_enforcer_common::{
-    bit_set, DenyEventRaw, FlowKey, FlowVal, RuleBits, RuleMeta, ACT_ALLOW, ACT_DENY,
-    BITSET_WORDS, CFG_ICMP_NS, CFG_LOG_AGGREGATE, CFG_LOG_PER_RULE, CFG_RATE_CAP, CFG_TCP_NS,
-    CFG_UDP_NS, CTR_DEFAULT_DENY, LPM_MAX_ENTRIES, MAX_RULES,
+    bit_set, DenyEventRaw, FlowKey, FlowVal, RuleBits, RuleMeta, ACT_ALLOW, ACT_DENY, BITSET_WORDS,
+    CFG_ICMP_NS, CFG_LOG_AGGREGATE, CFG_LOG_PER_RULE, CFG_RATE_CAP, CFG_TCP_NS, CFG_UDP_NS,
+    CTR_DEFAULT_DENY, LPM_MAX_ENTRIES, MAX_RULES,
 };
 use wiremesh_policy::{IrAction, IrProto, PolicyIR};
 
@@ -58,13 +58,22 @@ const BPF_F_NO_PREALLOC: u32 = 1;
 pub(crate) const REAP_GRACE: Duration = Duration::from_secs(10);
 
 const PINNED_MAPS: [&str; 12] = [
-    "COUNTERS", "ACTIVE", "GEN_SRC", "GEN_DST", "GEN_RULES", "GEN_META", "FLOWS",
+    "COUNTERS",
+    "ACTIVE",
+    "GEN_SRC",
+    "GEN_DST",
+    "GEN_RULES",
+    "GEN_META",
+    "FLOWS",
     // Task 9 additions: the per-protocol-idle-timeout/rate-cap config map
     // and the per-source rate-cap bookkeeping map.
-    "CONFIG", "RATE",
+    "CONFIG",
+    "RATE",
     // Task 10 additions: the deny-event ring buffer and its two log
     // sampling token-bucket maps.
-    "DENY_RB", "LOG_RULE_BUDGET", "LOG_AGG_BUDGET",
+    "DENY_RB",
+    "LOG_RULE_BUDGET",
+    "LOG_AGG_BUDGET",
 ];
 
 /// The live eBPF backend: one loaded+attached [`Ebpf`] instance per
@@ -219,7 +228,11 @@ impl EbpfEnforcer {
             );
         }
 
-        Ok(Self { ebpf, cfg, gen: GenerationState::default() })
+        Ok(Self {
+            ebpf,
+            cfg,
+            gen: GenerationState::default(),
+        })
     }
 }
 
@@ -331,7 +344,10 @@ impl Enforcer for EbpfEnforcer {
     /// already-satisfied deadline authorize overwriting a slot vacated
     /// moments ago.
     fn apply_ready_at(&self) -> Option<Instant> {
-        self.gen.pending_reap.as_ref().map(|p| p.flipped_at + self.cfg.reap_grace)
+        self.gen
+            .pending_reap
+            .as_ref()
+            .map(|p| p.flipped_at + self.cfg.reap_grace)
     }
 
     /// Real (Task 8, fixed post-review): reads the 258-entry `COUNTERS`
@@ -372,7 +388,10 @@ impl Enforcer for EbpfEnforcer {
                 *by_rule.entry(rule_id.clone()).or_insert(0) += c;
             }
         }
-        Ok(Counters { by_rule, default_deny })
+        Ok(Counters {
+            by_rule,
+            default_deny,
+        })
     }
 
     /// Minimal-real (Task 7 brief): clears every entry in `FLOWS`, forcing
@@ -397,8 +416,7 @@ impl Enforcer for EbpfEnforcer {
                 // as `bpf_map_delete_elem` failing ENOENT, not a real flush
                 // failure (the entry is gone either way, which is the goal).
                 Err(aya::maps::MapError::SyscallError(aya::sys::SyscallError {
-                    io_error,
-                    ..
+                    io_error, ..
                 })) if io_error.raw_os_error() == Some(libc::ENOENT) => {}
                 Err(e) => {
                     return Err(e).context("removing FLOWS entry during flush_flows");
@@ -766,7 +784,11 @@ fn install_generation(
 /// this same atomic-flip design. The read-then-immediate-zero-per-slot
 /// loop below (rather than reading the whole range then zeroing the whole
 /// range) keeps this as tight as the mechanism allows.
-fn fold_and_reset_counters(ebpf: &mut Ebpf, gen: &mut GenerationState, new_len: usize) -> Result<()> {
+fn fold_and_reset_counters(
+    ebpf: &mut Ebpf,
+    gen: &mut GenerationState,
+    new_len: usize,
+) -> Result<()> {
     let old_len = gen.idx_to_rule_id.len();
     let reset_len = old_len.max(new_len).min(MAX_RULES);
 
@@ -779,7 +801,9 @@ fn fold_and_reset_counters(ebpf: &mut Ebpf, gen: &mut GenerationState, new_len: 
         if val > 0 {
             counters.set(idx_u32, 0u64, 0)?; // zero immediately: minimize the read-to-zero window
             if idx < old_len {
-                *gen.counter_accum.entry(gen.idx_to_rule_id[idx].clone()).or_insert(0) += val;
+                *gen.counter_accum
+                    .entry(gen.idx_to_rule_id[idx].clone())
+                    .or_insert(0) += val;
             }
             // idx >= old_len: stale value from an even-older generation,
             // with no rule_id in the OLD mapping to attribute it to --
@@ -826,7 +850,8 @@ fn fold_and_reset_counters(ebpf: &mut Ebpf, gen: &mut GenerationState, new_len: 
 fn prune_retired_counters(gen: &mut GenerationState, new_idx_to_rule_id: &[String]) {
     let live: std::collections::BTreeSet<&str> =
         new_idx_to_rule_id.iter().map(String::as_str).collect();
-    gen.counter_accum.retain(|rule_id, _| live.contains(rule_id.as_str()));
+    gen.counter_accum
+        .retain(|rule_id, _| live.contains(rule_id.as_str()));
 }
 
 /// Builds a fresh generation from `flat` and installs it via a single
@@ -900,7 +925,10 @@ fn apply_generation(ebpf: &mut Ebpf, flat: &[FlatRule], gen: &mut GenerationStat
         active.set(0, target, 0)?; // ATOMIC FLIP
     }
 
-    gen.pending_reap = Some(PendingReap { slot: active_now, flipped_at: Instant::now() });
+    gen.pending_reap = Some(PendingReap {
+        slot: active_now,
+        flipped_at: Instant::now(),
+    });
     gen.idx_to_rule_id = idx_to_rule_id; // published only now, AFTER the flip
 
     Ok(())

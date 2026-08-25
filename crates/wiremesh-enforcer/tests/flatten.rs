@@ -13,7 +13,9 @@
 
 use ipnet::Ipv4Net;
 use wiremesh_enforcer::flatten;
-use wiremesh_policy::{compile, parse_policy, IrAction, IrBlock, IrProto, IrRule, PolicyIR, SegmentDef};
+use wiremesh_policy::{
+    compile, parse_policy, IrAction, IrBlock, IrProto, IrRule, PolicyIR, SegmentDef,
+};
 
 /// Two non-overlapping /16s, named so `from`/`to` read naturally — mirrors
 /// `wiremesh-policy/tests/golden.rs`'s `segments()` convention (this crate's
@@ -123,7 +125,11 @@ policy:
     let ir = compile_ok(yaml, 1);
     let flat = flatten(&ir).expect("flatten should succeed for 2 single-rule blocks");
 
-    assert_eq!(flat.len(), 2, "one FlatRule per rule, no explosion (no ports)");
+    assert_eq!(
+        flat.len(),
+        2,
+        "one FlatRule per rule, no explosion (no ports)"
+    );
     assert_eq!(flat[0].idx, 0);
     assert_eq!(flat[1].idx, 1);
     assert_eq!(
@@ -199,7 +205,10 @@ policy:
     assert_eq!(flat[2].idx, 2);
 
     for f in &flat {
-        assert_eq!(&f.rule_id, expected_rule_id, "all 3 must share the one rule_id");
+        assert_eq!(
+            &f.rule_id, expected_rule_id,
+            "all 3 must share the one rule_id"
+        );
         assert_eq!(f.action, ir.blocks[0].rules[0].action);
         assert_eq!(f.proto, ir.blocks[0].rules[0].proto);
         assert_eq!(f.src_cidrs, vec![cidr("10.0.0.0/16")]); // block fallback (rule omits src)

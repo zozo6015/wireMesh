@@ -37,7 +37,11 @@ pub fn token_secret_name(relay_name: &str) -> String {
 pub fn needs_token(existing: Option<&Secret>) -> bool {
     match existing {
         None => true,
-        Some(s) => !s.data.as_ref().map(|d| d.contains_key("token")).unwrap_or(false),
+        Some(s) => !s
+            .data
+            .as_ref()
+            .map(|d| d.contains_key("token"))
+            .unwrap_or(false),
     }
 }
 
@@ -98,7 +102,10 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
     // surfaces the reason on the CR's reconcile instead. Validated BEFORE any
     // mint/PVC/Deployment side effect — first thing in the function, ahead of
     // even the roster/PVC observation reads below.
-    for (field, value) in [("controllerEndpoint", relay.spec.controller_endpoint.as_deref())] {
+    for (field, value) in [(
+        "controllerEndpoint",
+        relay.spec.controller_endpoint.as_deref(),
+    )] {
         if let Some(v) = value {
             workloads::validate_dial_target(v).map_err(|e| {
                 Error::Admin(anyhow::anyhow!("WiremeshRelay {name}: spec.{field}: {e}"))
@@ -164,13 +171,15 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
             Vec::new()
         }
     };
-    let identity_persisted =
-        relay_identity_persisted(pvc_exists, &roster, &relay.spec.endpoint);
+    let identity_persisted = relay_identity_persisted(pvc_exists, &roster, &relay.spec.endpoint);
 
     // Mint whenever the identity is not durably persisted OR no populated token
     // Secret exists (`should_mint_token`, the gateway contract). The force-
     // apply replaces any stale (spent) token — the wedge-killer.
-    if should_mint_token(identity_persisted, secrets.get_opt(&token_secret).await?.as_ref()) {
+    if should_mint_token(
+        identity_persisted,
+        secrets.get_opt(&token_secret).await?.as_ref(),
+    ) {
         let token = ctx.admin.mint_relay_token().await.map_err(Error::Admin)?;
         let mut data = BTreeMap::new();
         data.insert("token".to_string(), ByteString(token.into_bytes()));
@@ -202,8 +211,14 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
 
     // Deploy the relay (fails closed on an invalid endpoint — v1 IPv4 only).
     let addrs = super::controller_endpoints(&ctx).await?;
-    let mut dep = workloads::relay_deployment(relay.as_ref(), &addrs.sync, &addrs.enroll, crate::workloads::CONTROLLER_CA_SECRET, &token_secret)
-        .map_err(Error::Admin)?;
+    let mut dep = workloads::relay_deployment(
+        relay.as_ref(),
+        &addrs.sync,
+        &addrs.enroll,
+        crate::workloads::CONTROLLER_CA_SECRET,
+        &token_secret,
+    )
+    .map_err(Error::Admin)?;
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![owner_ref(relay.as_ref())?]);
     // Route through deployment_apply_body (`apply_deployment`) so the Recreate
@@ -247,16 +262,22 @@ async fn reconcile(relay: Arc<WiremeshRelay>, ctx: Arc<Context>) -> Result<Actio
         }),
     };
     Api::<WiremeshRelay>::all(client.clone())
-        .patch_status(&name, &PatchParams::default(), &Patch::Merge(serde_json::json!({ "status": status })))
+        .patch_status(
+            &name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": status })),
+        )
         .await?;
     // A scale-down requeues on the settled cadence, not the 15s not-ready one:
     // nothing will change until a human scales back up, and that arrives through
     // the Deployment watch (`.owns` below) rather than by polling.
-    Ok(Action::requeue(Duration::from_secs(if ready || scaled_down {
-        super::SETTLED_REQUEUE_SECS
-    } else {
-        15
-    })))
+    Ok(Action::requeue(Duration::from_secs(
+        if ready || scaled_down {
+            super::SETTLED_REQUEUE_SECS
+        } else {
+            15
+        },
+    )))
 }
 
 fn error_policy(_relay: Arc<WiremeshRelay>, err: &Error, _ctx: Arc<Context>) -> Action {
@@ -266,16 +287,25 @@ fn error_policy(_relay: Arc<WiremeshRelay>, err: &Error, _ctx: Arc<Context>) -> 
 
 pub async fn run(ctx: Arc<Context>) {
     let client = ctx.client.clone();
-    Controller::new(Api::<WiremeshRelay>::all(client.clone()), watcher::Config::default())
-        .owns(Api::<Deployment>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
-        .owns(Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
-        .run(reconcile, error_policy, ctx)
-        .for_each(|res| async move {
-            if let Err(e) = res {
-                tracing::warn!("WiremeshRelay reconcile failed: {e}");
-            }
-        })
-        .await;
+    Controller::new(
+        Api::<WiremeshRelay>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .owns(
+        Api::<Deployment>::namespaced(client.clone(), &ctx.namespace),
+        watcher::Config::default(),
+    )
+    .owns(
+        Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ctx.namespace),
+        watcher::Config::default(),
+    )
+    .run(reconcile, error_policy, ctx)
+    .for_each(|res| async move {
+        if let Err(e) = res {
+            tracing::warn!("WiremeshRelay reconcile failed: {e}");
+        }
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -284,7 +314,10 @@ mod tests {
 
     #[test]
     fn relay_token_secret_name_is_stable() {
-        assert_eq!(token_secret_name("relay-eu"), "wiremesh-relay-relay-eu-token");
+        assert_eq!(
+            token_secret_name("relay-eu"),
+            "wiremesh-relay-relay-eu-token"
+        );
     }
 
     #[test]
@@ -292,7 +325,10 @@ mod tests {
         assert!(needs_token(None));
         let mut data = BTreeMap::new();
         data.insert("token".to_string(), ByteString(b"tok".to_vec()));
-        let populated = Secret { data: Some(data), ..Default::default() };
+        let populated = Secret {
+            data: Some(data),
+            ..Default::default()
+        };
         assert!(!needs_token(Some(&populated)));
     }
 }

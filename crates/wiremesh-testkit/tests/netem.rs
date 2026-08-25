@@ -26,7 +26,9 @@ fn nat_router_delayed_installs_netem_on_out0() {
         .nat_router_delayed("r", NatKind::PortRestricted, 20)
         .unwrap();
 
-    let out = router.exec(&["tc", "qdisc", "show", "dev", "out0"]).unwrap();
+    let out = router
+        .exec(&["tc", "qdisc", "show", "dev", "out0"])
+        .unwrap();
     let text = String::from_utf8_lossy(&out.stdout);
     println!("tc qdisc show dev out0: {text}");
     assert!(text.contains("netem"), "expected netem qdisc, got: {text}");

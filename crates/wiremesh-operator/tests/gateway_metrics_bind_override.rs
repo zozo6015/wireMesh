@@ -135,7 +135,10 @@ fn pod_of(s: WiremeshGatewaySpec) -> k8s_openapi::api::core::v1::PodSpec {
 
 /// The value following `flag` in an argv list (flag/value pairs).
 fn arg_after(args: &[String], flag: &str) -> Option<String> {
-    args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).cloned()
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +148,11 @@ fn arg_after(args: &[String], flag: &str) -> Option<String> {
 #[test]
 fn metrics_bind_override_flows_into_gateway_arg() {
     let pod = pod_of(spec(Some("10.0.9.9:9191".into())));
-    let main = pod.containers.iter().find(|c| c.name == "gateway").expect("gateway container");
+    let main = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "gateway")
+        .expect("gateway container");
     let args = main.args.as_ref().expect("gateway args");
     assert_eq!(
         arg_after(args, "--metrics").as_deref(),
@@ -161,7 +168,11 @@ fn metrics_bind_override_flows_into_gateway_arg() {
 #[test]
 fn absent_metrics_bind_keeps_todays_default_unchanged() {
     let pod = pod_of(spec(None));
-    let main = pod.containers.iter().find(|c| c.name == "gateway").expect("gateway container");
+    let main = pod
+        .containers
+        .iter()
+        .find(|c| c.name == "gateway")
+        .expect("gateway container");
     let args = main.args.as_ref().expect("gateway args");
     assert_eq!(
         arg_after(args, "--metrics").as_deref(),
@@ -184,7 +195,10 @@ fn metrics_bind_serializes_camel_case_and_omits_when_unset() {
     );
 
     let bare = serde_json::to_value(spec(None)).unwrap();
-    assert!(bare.get("metricsBind").is_none(), "metricsBind omitted when unset");
+    assert!(
+        bare.get("metricsBind").is_none(),
+        "metricsBind omitted when unset"
+    );
 
     // A legacy CR without the field still deserializes (additive change —
     // required for crd_manifest_freshness.rs's no-conversion-webhook,
@@ -263,8 +277,7 @@ fn spec_key_set_has_no_extra_args_field() {
         metrics_bind: Some("10.0.0.1:9090".into()),
     };
     let v = serde_json::to_value(&full).unwrap();
-    let keys: std::collections::BTreeSet<String> =
-        v.as_object().unwrap().keys().cloned().collect();
+    let keys: std::collections::BTreeSet<String> = v.as_object().unwrap().keys().cloned().collect();
     let expected: std::collections::BTreeSet<String> = [
         "segmentRef",
         "nodeName",
@@ -354,6 +367,12 @@ fn validate_bind_target_rejects_dns_names() {
 
 #[test]
 fn validate_bind_target_rejects_bare_or_missing_port() {
-    assert!(validate_bind_target("9090").is_err(), "a bare port with no host must be rejected");
-    assert!(validate_bind_target("0.0.0.0").is_err(), "a host with no port must be rejected");
+    assert!(
+        validate_bind_target("9090").is_err(),
+        "a bare port with no host must be rejected"
+    );
+    assert!(
+        validate_bind_target("0.0.0.0").is_err(),
+        "a host with no port must be rejected"
+    );
 }

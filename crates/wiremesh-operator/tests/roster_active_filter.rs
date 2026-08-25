@@ -51,7 +51,10 @@ fn picks_active_row_over_older_drained_row_in_same_segment() {
     // the exact status/drain mis-report. The selector must skip to the active row.
     let roster = vec![row(3, "home", "drained"), row(7, "home", "active")];
     let got = active_in_segment(&roster, "home").expect("the active row must be found");
-    assert_eq!(got.id, 7, "must select the ACTIVE row, not the older drained first-match");
+    assert_eq!(
+        got.id, 7,
+        "must select the ACTIVE row, not the older drained first-match"
+    );
     assert_eq!(got.status, "active");
 }
 
@@ -87,7 +90,10 @@ fn matches_only_the_requested_segment() {
     let roster = vec![row(1, "aws", "active"), row(2, "home", "active")];
     assert_eq!(active_in_segment(&roster, "home").map(|g| g.id), Some(2));
     assert_eq!(active_in_segment(&roster, "aws").map(|g| g.id), Some(1));
-    assert!(active_in_segment(&roster, "gcp").is_none(), "unknown segment → None");
+    assert!(
+        active_in_segment(&roster, "gcp").is_none(),
+        "unknown segment → None"
+    );
 }
 
 #[test]

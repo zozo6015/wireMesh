@@ -2,6 +2,7 @@
 name = "wiremesh-enforcer"
 version = "0.1.0"
 edition = "2021"
+rust-version.workspace = true
 
 [dependencies]
 # `flatten()`'s input (`PolicyIR`) and the `Enforcer::apply` trait method's

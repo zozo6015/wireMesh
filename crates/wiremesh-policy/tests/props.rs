@@ -52,8 +52,8 @@ enum PortLit {
 
 #[derive(Debug, Clone)]
 struct GenRule {
-    action: &'static str,          // "allow" | "deny"
-    proto: Option<&'static str>,   // None | "tcp" | "udp" | "icmp"
+    action: &'static str,        // "allow" | "deny"
+    proto: Option<&'static str>, // None | "tcp" | "udp" | "icmp"
     src: Vec<String>,
     dst: Vec<String>,
     ports: Vec<PortLit>,
@@ -245,7 +245,13 @@ fn resolve_indices(idxs: &[usize], cidrs: &[String]) -> Vec<String> {
 /// Normalized content signature used to dedupe rules within a block (see
 /// module doc comment) — deliberately mirrors `compile.rs::rule_id`'s
 /// preimage shape (minus `from`/`to`, which are already fixed per block).
-fn rule_signature(action: &str, proto: Option<&str>, src: &[String], dst: &[String], ports: &[PortLit]) -> String {
+fn rule_signature(
+    action: &str,
+    proto: Option<&str>,
+    src: &[String],
+    dst: &[String],
+    ports: &[PortLit],
+) -> String {
     let proto = proto.unwrap_or("any");
     let ports = ports
         .iter()
@@ -255,12 +261,20 @@ fn rule_signature(action: &str, proto: Option<&str>, src: &[String], dst: &[Stri
         })
         .collect::<Vec<_>>()
         .join(",");
-    format!("{action}|{proto}|{}|{}|{ports}", src.join(","), dst.join(","))
+    format!(
+        "{action}|{proto}|{}|{}|{ports}",
+        src.join(","),
+        dst.join(",")
+    )
 }
 
 /// One `(from, to)` block plus its resolved, deduped rules.
 fn block_strategy(n: usize) -> impl Strategy<Value = (usize, usize, Vec<RawRule>)> {
-    (0..n, 0..n, proptest::collection::vec(raw_rule_strategy(), 0..=6))
+    (
+        0..n,
+        0..n,
+        proptest::collection::vec(raw_rule_strategy(), 0..=6),
+    )
 }
 
 fn blocks_strategy(n: usize) -> impl Strategy<Value = Vec<(usize, usize, Vec<RawRule>)>> {
@@ -293,8 +307,7 @@ fn gen_policy_strategy() -> impl Strategy<Value = GenPolicy> {
                         .filter_map(|r| {
                             let src = resolve_indices(&r.src_idx, from_cidrs);
                             let dst = resolve_indices(&r.dst_idx, to_cidrs);
-                            let signature =
-                                rule_signature(r.action, r.proto, &src, &dst, &r.ports);
+                            let signature = rule_signature(r.action, r.proto, &src, &dst, &r.ports);
                             if seen_signatures.insert(signature) {
                                 Some(GenRule {
                                     action: r.action,

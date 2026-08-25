@@ -210,7 +210,11 @@ const COUNTER_SETTLE: Duration = Duration::from_millis(100);
 const FAR_DEADLINE: Duration = Duration::from_secs(10);
 
 fn ds(version: u64) -> DesiredState {
-    DesiredState { revision: version, policy_version: version, ..Default::default() }
+    DesiredState {
+        revision: version,
+        policy_version: version,
+        ..Default::default()
+    }
 }
 
 /// One recorded `install` call.
@@ -247,7 +251,10 @@ impl FakeEntry {
     /// The default single-entry map every test that does not care about
     /// per-entry behaviour gets.
     fn fresh() -> FakeEntry {
-        FakeEntry { applied_version: None, ready_at: None }
+        FakeEntry {
+            applied_version: None,
+            ready_at: None,
+        }
     }
 }
 
@@ -310,14 +317,25 @@ impl FakeTarget {
             panic_ready_at: AtomicU64::new(0),
             insert_after_next_ready_at: Mutex::new(None),
         });
-        (t, Signals { ready_rx, started_rx, done_rx })
+        (
+            t,
+            Signals {
+                ready_rx,
+                started_rx,
+                done_rx,
+            },
+        )
     }
 
     /// Convenience for the single-entry tests: set the one default
     /// enforcer's pending-reap deadline.
     fn set_ready_at(&self, t: Option<Instant>) {
         let mut entries = self.entries.lock().unwrap();
-        assert_eq!(entries.len(), 1, "set_ready_at is the single-entry convenience");
+        assert_eq!(
+            entries.len(),
+            1,
+            "set_ready_at is the single-entry convenience"
+        );
         entries[0].ready_at = t;
     }
 
@@ -346,7 +364,12 @@ impl FakeTarget {
 
     /// Every `ds.policy_version` the worker asked a deadline for, in order.
     fn ready_at_versions(&self) -> Vec<u64> {
-        self.ready_at_calls.lock().unwrap().iter().map(|(v, _)| *v).collect()
+        self.ready_at_calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(v, _)| *v)
+            .collect()
     }
 
     /// The same calls with the `ds_is_newest` flag the worker reported.
@@ -382,7 +405,11 @@ impl FakeTarget {
     }
 
     fn ok_versions(&self) -> Vec<u64> {
-        self.installs().iter().filter(|i| i.ok).map(|i| i.version).collect()
+        self.installs()
+            .iter()
+            .filter(|i| i.ok)
+            .map(|i| i.version)
+            .collect()
     }
 }
 
@@ -402,7 +429,10 @@ impl PolicyApplyTarget for FakeTarget {
             if panics != u64::MAX {
                 self.panic_ready_at.store(panics - 1, Ordering::SeqCst);
             }
-            self.ready_at_calls.lock().unwrap().push((version, ds_is_newest));
+            self.ready_at_calls
+                .lock()
+                .unwrap()
+                .push((version, ds_is_newest));
             let _ = self.ready_calls.send(());
             panic!("fake ready_at panic (policy version {version})");
         }
@@ -424,7 +454,10 @@ impl PolicyApplyTarget for FakeTarget {
             self.entries.lock().unwrap().push(entry);
         }
 
-        self.ready_at_calls.lock().unwrap().push((version, ds_is_newest));
+        self.ready_at_calls
+            .lock()
+            .unwrap()
+            .push((version, ds_is_newest));
         // Send AFTER reading, so a test woken by this signal is guaranteed
         // the worker has already taken the value it will wait on.
         let _ = self.ready_calls.send(());
@@ -501,7 +534,9 @@ impl PolicyApplyTarget for FakeTarget {
         if ok {
             Ok(())
         } else if forced_fail {
-            Err(anyhow::anyhow!("fake install failure for policy version {version}"))
+            Err(anyhow::anyhow!(
+                "fake install failure for policy version {version}"
+            ))
         } else {
             Err(anyhow::anyhow!(
                 "{deferred} entr(ies) were still inside their reap grace; deferring policy \
@@ -581,9 +616,16 @@ async fn await_failures(handle: &PolicyApplyHandle, want: u64) -> u64 {
 /// "the next signal" is not reliably the one under test.
 async fn next_failed_attempt_at(sig: &mut Signals, version: u64) {
     loop {
-        let (v, ok) =
-            recv_within(&mut sig.done_rx, Duration::from_secs(10), "an install attempt").await;
-        assert!(!ok, "the backend is still failing, so no attempt may succeed yet");
+        let (v, ok) = recv_within(
+            &mut sig.done_rx,
+            Duration::from_secs(10),
+            "an install attempt",
+        )
+        .await;
+        assert!(
+            !ok,
+            "the backend is still failing, so no attempt may succeed yet"
+        );
         if v == version {
             return;
         }
@@ -679,28 +721,61 @@ fn needs_policy_write_boundaries() {
     // equality test (`applied != target`) would return true here and write
     // the OLDER policy. This is also where an off-by-one (`<=` for `<`,
     // `>=` for `>`) at either boundary shows up.
-    assert!(needs_policy_write(Some(41), 42, false), "one behind is behind");
-    assert!(!needs_policy_write(Some(42), 42, false), "exactly equal is not behind");
-    assert!(!needs_policy_write(Some(43), 42, false), "one ahead of a stale snapshot: skip");
-    assert!(needs_policy_write(Some(43), 42, true), "one ahead of the newest: rollback write");
+    assert!(
+        needs_policy_write(Some(41), 42, false),
+        "one behind is behind"
+    );
+    assert!(
+        !needs_policy_write(Some(42), 42, false),
+        "exactly equal is not behind"
+    );
+    assert!(
+        !needs_policy_write(Some(43), 42, false),
+        "one ahead of a stale snapshot: skip"
+    );
+    assert!(
+        needs_policy_write(Some(43), 42, true),
+        "one ahead of the newest: rollback write"
+    );
 
     // TARGET 0 — reachable: a boot snapshot carrying no policy yet has
     // `policy_version: 0`, and `apply_if_changed` installs an empty IR at
     // that version. Also the case an implementation doing subtraction
     // instead of comparison (`target - av`) would underflow on.
-    assert!(needs_policy_write(None, 0, false), "never-applied at version 0 must be written");
-    assert!(!needs_policy_write(Some(0), 0, true), "already at version 0: skip");
-    assert!(!needs_policy_write(Some(1), 0, false), "ahead of a stale version-0 snapshot: skip");
-    assert!(needs_policy_write(Some(1), 0, true), "ahead of the newest version-0 snapshot: write");
+    assert!(
+        needs_policy_write(None, 0, false),
+        "never-applied at version 0 must be written"
+    );
+    assert!(
+        !needs_policy_write(Some(0), 0, true),
+        "already at version 0: skip"
+    );
+    assert!(
+        !needs_policy_write(Some(1), 0, false),
+        "ahead of a stale version-0 snapshot: skip"
+    );
+    assert!(
+        needs_policy_write(Some(1), 0, true),
+        "ahead of the newest version-0 snapshot: write"
+    );
 
     // u64::MAX — NOT reachable (the controller's version counter is
     // `MAX(version) + 1` in SQLite and `set_applied_version` rejects
     // anything past the INTEGER range). Kept as one cheap line because a
     // saturating or wrapping arithmetic implementation would misbehave at
     // the extreme while looking correct everywhere else.
-    assert!(needs_policy_write(Some(0), u64::MAX, false), "0 is behind the maximum");
-    assert!(!needs_policy_write(Some(u64::MAX), u64::MAX, false), "the maximum equals itself");
-    assert!(!needs_policy_write(Some(u64::MAX), 0, false), "the maximum is ahead of 0: skip");
+    assert!(
+        needs_policy_write(Some(0), u64::MAX, false),
+        "0 is behind the maximum"
+    );
+    assert!(
+        !needs_policy_write(Some(u64::MAX), u64::MAX, false),
+        "the maximum equals itself"
+    );
+    assert!(
+        !needs_policy_write(Some(u64::MAX), 0, false),
+        "the maximum is ahead of 0: skip"
+    );
 }
 
 /// Exhaustive sweep of a small domain, as a guard against a mis-ordered or
@@ -752,7 +827,11 @@ async fn a_published_state_is_installed() {
     // worker that wrongly counted this SUCCESS as a failure would increment
     // one scheduling hop after a naive read — see `settle_counters`.
     settle_counters().await;
-    assert_eq!(handle.failures(), 0, "a successful install must not count as a failure");
+    assert_eq!(
+        handle.failures(),
+        0,
+        "a successful install must not count as a failure"
+    );
 }
 
 // --- (C) latest-wins ------------------------------------------------------
@@ -774,8 +853,16 @@ async fn a_burst_published_during_an_install_collapses_to_the_newest() {
     let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
 
     handle.publish(ds(1));
-    let started = recv_within(&mut sig.started_rx, Duration::from_secs(5), "install #1 to start").await;
-    assert_eq!(started, 1, "the first published state must be the first installed");
+    let started = recv_within(
+        &mut sig.started_rx,
+        Duration::from_secs(5),
+        "install #1 to start",
+    )
+    .await;
+    assert_eq!(
+        started, 1,
+        "the first published state must be the first installed"
+    );
 
     // The Sync loop keeps receiving snapshots while the install runs.
     handle.publish(ds(2));
@@ -783,10 +870,20 @@ async fn a_burst_published_during_an_install_collapses_to_the_newest() {
     handle.publish(ds(4));
 
     release.send(()).expect("release the gated install");
-    let (v1, _) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "install #1 to finish").await;
+    let (v1, _) = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "install #1 to finish",
+    )
+    .await;
     assert_eq!(v1, 1);
 
-    let (v2, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the follow-up install").await;
+    let (v2, ok) = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "the follow-up install",
+    )
+    .await;
     assert_eq!(
         (v2, ok),
         (4, true),
@@ -821,7 +918,12 @@ async fn a_state_published_during_the_grace_wait_supersedes_the_waiting_one() {
     let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
 
     handle.publish(ds(1));
-    recv_within(&mut sig.ready_rx, Duration::from_secs(5), "the worker's deadline query").await;
+    recv_within(
+        &mut sig.ready_rx,
+        Duration::from_secs(5),
+        "the worker's deadline query",
+    )
+    .await;
 
     // The worker is now parked on the deadline. A fresher snapshot arrives.
     handle.publish(ds(2));
@@ -935,7 +1037,10 @@ async fn an_entry_already_on_the_target_version_does_not_gate_the_install() {
     target.set_entries(vec![
         // The rotation newcomer: just flipped, a full grace pending — but it
         // is ALREADY on the version we are about to install.
-        FakeEntry { applied_version: Some(2), ready_at: Some(far) },
+        FakeEntry {
+            applied_version: Some(2),
+            ready_at: Some(far),
+        },
         // The boot tun: nothing applied yet, no pending reap. This is the
         // one the install must reach, promptly.
         FakeEntry::fresh(),
@@ -947,7 +1052,9 @@ async fn an_entry_already_on_the_target_version_does_not_gate_the_install() {
 
     let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(3), "the install").await;
     assert_eq!((v, ok), (2, true));
-    let waited = target.installs()[0].started_at.saturating_duration_since(published_at);
+    let waited = target.installs()[0]
+        .started_at
+        .saturating_duration_since(published_at);
     assert!(
         waited < RESPONSIVE_WITHIN,
         "the install waited {waited:?} on a deadline belonging to an enforcer that was \
@@ -991,22 +1098,37 @@ async fn re_adopting_a_newer_state_re_reads_the_deadline_for_that_newer_state() 
     target.set_entries(vec![
         // Nothing applied yet: gates BOTH states, and its short deadline is
         // what the worker parks on for v1.
-        FakeEntry { applied_version: None, ready_at: Some(gates_v1) },
+        FakeEntry {
+            applied_version: None,
+            ready_at: Some(gates_v1),
+        },
         // Already on v1, so filtered out while v1 is the target — and NOT
         // filtered once v2 is adopted, at which point its later deadline
         // becomes the binding one.
-        FakeEntry { applied_version: Some(1), ready_at: Some(gates_v2) },
+        FakeEntry {
+            applied_version: Some(1),
+            ready_at: Some(gates_v2),
+        },
     ]);
     let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
 
     handle.publish(ds(1));
-    recv_within(&mut sig.ready_rx, Duration::from_secs(5), "the deadline query for v1").await;
+    recv_within(
+        &mut sig.ready_rx,
+        Duration::from_secs(5),
+        "the deadline query for v1",
+    )
+    .await;
 
     // Supersede during the (200ms) wait.
     handle.publish(ds(2));
 
     let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the install").await;
-    assert_eq!((v, ok), (2, true), "the superseding state is the one installed");
+    assert_eq!(
+        (v, ok),
+        (2, true),
+        "the superseding state is the one installed"
+    );
 
     let started = target.installs()[0].started_at;
     assert!(
@@ -1020,7 +1142,11 @@ async fn re_adopting_a_newer_state_re_reads_the_deadline_for_that_newer_state() 
         vec![1, 2],
         "exactly one deadline read per adopted state, each for that state's own version"
     );
-    assert_eq!(target.installs().len(), 1, "one clean install, no deferral round trip");
+    assert_eq!(
+        target.installs().len(),
+        1,
+        "one clean install, no deferral round trip"
+    );
     settle_counters().await;
     assert_eq!(
         handle.failures(),
@@ -1061,7 +1187,12 @@ async fn an_entry_inserted_after_the_deadline_read_is_deferred_then_landed_by_th
 
     handle.publish(ds(1));
 
-    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the first attempt").await;
+    let (v, ok) = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "the first attempt",
+    )
+    .await;
     assert_eq!(
         (v, ok),
         (1, false),
@@ -1074,7 +1205,11 @@ async fn an_entry_inserted_after_the_deadline_read_is_deferred_then_landed_by_th
     );
 
     let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the retry").await;
-    assert_eq!((v, ok), (1, true), "the retry must land the state once the grace elapses");
+    assert_eq!(
+        (v, ok),
+        (1, true),
+        "the retry must land the state once the grace elapses"
+    );
 
     let landed_at = target.installs()[1].started_at;
     assert!(
@@ -1129,14 +1264,22 @@ async fn an_entry_inserted_after_the_deadline_read_is_deferred_then_landed_by_th
 async fn a_rollback_is_installed_when_our_snapshot_is_the_newest() {
     let (target, mut sig) = FakeTarget::new();
     // The datapath is ahead: the controller was at v100 before the restore.
-    target.set_entries(vec![FakeEntry { applied_version: Some(100), ready_at: None }]);
+    target.set_entries(vec![FakeEntry {
+        applied_version: Some(100),
+        ready_at: None,
+    }]);
     let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
 
     // The post-restore push. Nothing else is published, so this IS the
     // newest state.
     handle.publish(ds(51));
 
-    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the rollback install").await;
+    let (v, ok) = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "the rollback install",
+    )
+    .await;
     assert_eq!((v, ok), (51, true));
     assert_eq!(
         target.entries()[0].applied_version,
@@ -1151,9 +1294,17 @@ async fn a_rollback_is_installed_when_our_snapshot_is_the_newest() {
          thing distinguishing an authorized rollback from a stale snapshot racing a \
          rotation insert"
     );
-    assert_eq!(target.ready_at_calls(), vec![(51, true)], "one deadline read, same verdict");
+    assert_eq!(
+        target.ready_at_calls(),
+        vec![(51, true)],
+        "one deadline read, same verdict"
+    );
     settle_counters().await;
-    assert_eq!(handle.failures(), 0, "a rollback is a normal install, not a failure");
+    assert_eq!(
+        handle.failures(),
+        0,
+        "a rollback is a normal install, not a failure"
+    );
 }
 
 /// The mixed datapath the coordinator called out: one enforcer AHEAD (v100,
@@ -1181,8 +1332,14 @@ async fn a_rollback_is_installed_when_our_snapshot_is_the_newest() {
 async fn a_rollback_converges_a_mixed_ahead_and_behind_datapath() {
     let (target, mut sig) = FakeTarget::new();
     target.set_entries(vec![
-        FakeEntry { applied_version: Some(100), ready_at: None }, // ahead
-        FakeEntry { applied_version: Some(40), ready_at: None },  // behind
+        FakeEntry {
+            applied_version: Some(100),
+            ready_at: None,
+        }, // ahead
+        FakeEntry {
+            applied_version: Some(40),
+            ready_at: None,
+        }, // behind
     ]);
     let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
 
@@ -1199,7 +1356,11 @@ async fn a_rollback_converges_a_mixed_ahead_and_behind_datapath() {
              reports wrongly, and it must not arise in the first place"
         );
     }
-    assert_eq!(target.installs().len(), 1, "one pass writes both directions");
+    assert_eq!(
+        target.installs().len(),
+        1,
+        "one pass writes both directions"
+    );
     settle_counters().await;
     assert_eq!(handle.failures(), 0);
 }
@@ -1232,7 +1393,12 @@ async fn a_rollback_write_still_waits_out_the_ahead_entrys_reap_grace() {
 
     handle.publish(ds(51));
 
-    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the rollback install").await;
+    let (v, ok) = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "the rollback install",
+    )
+    .await;
     assert_eq!((v, ok), (51, true));
 
     let started = target.installs()[0].started_at;
@@ -1251,7 +1417,11 @@ async fn a_rollback_write_still_waits_out_the_ahead_entrys_reap_grace() {
          and `install` disagree about the entry set and the re-check had to catch it"
     );
     settle_counters().await;
-    assert_eq!(handle.failures(), 0, "a correctly-scheduled rollback defers nothing");
+    assert_eq!(
+        handle.failures(),
+        0,
+        "a correctly-scheduled rollback defers nothing"
+    );
 }
 
 // --- (D) the Sync loop keeps running while an apply is in flight ----------
@@ -1326,7 +1496,12 @@ async fn a_concurrent_task_is_serviced_while_the_install_itself_runs() {
 
     // Wait until the install has genuinely started, so the stand-in task is
     // spawned INSIDE the blocking window rather than before it.
-    recv_within(&mut sig.started_rx, Duration::from_secs(5), "the install to start").await;
+    recv_within(
+        &mut sig.started_rx,
+        Duration::from_secs(5),
+        "the install to start",
+    )
+    .await;
 
     let (tx, rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
@@ -1360,7 +1535,12 @@ async fn publishing_never_blocks_the_sync_loop() {
     let handle = spawn_policy_apply_worker(target.clone(), RETRY_AFTER);
 
     handle.publish(ds(1));
-    recv_within(&mut sig.started_rx, Duration::from_secs(5), "install #1 to start").await;
+    recv_within(
+        &mut sig.started_rx,
+        Duration::from_secs(5),
+        "install #1 to start",
+    )
+    .await;
 
     let t0 = Instant::now();
     for v in 2..=6 {
@@ -1375,7 +1555,12 @@ async fn publishing_never_blocks_the_sync_loop() {
 
     release.send(()).expect("release the gated install");
     recv_within(&mut sig.done_rx, Duration::from_secs(5), "install #1").await;
-    let (v, _) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the follow-up install").await;
+    let (v, _) = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "the follow-up install",
+    )
+    .await;
     assert_eq!(v, 6, "and the newest of the burst is what lands");
 }
 
@@ -1397,11 +1582,30 @@ async fn install_failures_are_counted_and_retried_and_never_kill_the_worker() {
 
     handle.publish(ds(1));
 
-    let a = recv_within(&mut sig.done_rx, Duration::from_secs(5), "install attempt 1").await;
-    let b = recv_within(&mut sig.done_rx, Duration::from_secs(5), "install attempt 2 (retry)").await;
-    let c = recv_within(&mut sig.done_rx, Duration::from_secs(5), "install attempt 3 (retry)").await;
+    let a = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "install attempt 1",
+    )
+    .await;
+    let b = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "install attempt 2 (retry)",
+    )
+    .await;
+    let c = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "install attempt 3 (retry)",
+    )
+    .await;
     assert_eq!(a, (1, false), "attempt 1 fails");
-    assert_eq!(b, (1, false), "attempt 2 retries the SAME desired state and fails");
+    assert_eq!(
+        b,
+        (1, false),
+        "attempt 2 retries the SAME desired state and fails"
+    );
     assert_eq!(c, (1, true), "attempt 3 retries again and succeeds");
 
     // WORKER-side read behind a TARGET-side signal — barrier per
@@ -1421,9 +1625,17 @@ async fn install_failures_are_counted_and_retried_and_never_kill_the_worker() {
     // The worker is still alive and still serving: a later state applies.
     handle.publish(ds(2));
     let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the next install").await;
-    assert_eq!((v, ok), (2, true), "the worker must keep serving after a failure");
+    assert_eq!(
+        (v, ok),
+        (2, true),
+        "the worker must keep serving after a failure"
+    );
     settle_counters().await;
-    assert_eq!(handle.failures(), 2, "a success must not change the failure count");
+    assert_eq!(
+        handle.failures(),
+        2,
+        "a success must not change the failure count"
+    );
 }
 
 /// A state that can NEVER be installed (an unconsumable IR, a policy the
@@ -1439,9 +1651,17 @@ async fn a_permanently_failing_state_does_not_wedge_the_worker() {
 
     handle.publish(ds(1));
     for attempt in 1..=3 {
-        let (v, ok) =
-            recv_within(&mut sig.done_rx, Duration::from_secs(5), "a retry of the bad state").await;
-        assert_eq!((v, ok), (1, false), "attempt {attempt} must keep retrying the bad state");
+        let (v, ok) = recv_within(
+            &mut sig.done_rx,
+            Duration::from_secs(5),
+            "a retry of the bad state",
+        )
+        .await;
+        assert_eq!(
+            (v, ok),
+            (1, false),
+            "attempt {attempt} must keep retrying the bad state"
+        );
     }
     // WORKER-side read behind a TARGET-side signal — barrier per
     // `await_failures`. This is the exact race that made the assertion
@@ -1458,10 +1678,16 @@ async fn a_permanently_failing_state_does_not_wedge_the_worker() {
     // a failed attempt carrying version 2 must appear.
     handle.publish(ds(2));
     loop {
-        let (v, ok) =
-            recv_within(&mut sig.done_rx, Duration::from_secs(5), "an attempt at the new state")
-                .await;
-        assert!(!ok, "the backend is still failing, so no attempt may succeed yet");
+        let (v, ok) = recv_within(
+            &mut sig.done_rx,
+            Duration::from_secs(5),
+            "an attempt at the new state",
+        )
+        .await;
+        assert!(
+            !ok,
+            "the backend is still failing, so no attempt may succeed yet"
+        );
         if v == 2 {
             break; // the retry loop picked the newer state up — latest-wins holds on retry too
         }
@@ -1531,7 +1757,12 @@ async fn an_unreadable_deadline_is_a_counted_retry_and_never_an_ungated_apply() 
     // Retried: once the query works again the state lands, with no further
     // intervention.
     target.stop_panicking();
-    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the recovered install").await;
+    let (v, ok) = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "the recovered install",
+    )
+    .await;
     assert_eq!(
         (v, ok),
         (1, true),
@@ -1593,8 +1824,12 @@ async fn a_corrected_policy_wakes_the_retry_pause_and_gets_a_fresh_cadence() {
 
     handle.publish(ds(1));
     for attempt in 1..=5 {
-        let (v, ok) =
-            recv_within(&mut sig.done_rx, Duration::from_secs(10), "a wedged attempt").await;
+        let (v, ok) = recv_within(
+            &mut sig.done_rx,
+            Duration::from_secs(10),
+            "a wedged attempt",
+        )
+        .await;
         assert_eq!((v, ok), (1, false), "wedged attempt {attempt} must fail");
     }
 
@@ -1686,15 +1921,20 @@ async fn a_corrected_policy_wakes_the_retry_pause_and_gets_a_fresh_cadence() {
 async fn waking_early_still_waits_out_an_outstanding_reap_grace() {
     let (target, mut sig) = FakeTarget::new();
     target.fail_next(1); // exactly one wedged attempt, then the backend is fine
-    // A deliberately roomy `retry_after` for this test only: it is the window
-    // the test has to arm the fixture and publish before the pause could
-    // elapse on its own. Nothing here measures the backoff — the grace does
-    // all the gating — so a longer one costs nothing and removes a race that
-    // would otherwise show up as the wrong version being installed.
+                         // A deliberately roomy `retry_after` for this test only: it is the window
+                         // the test has to arm the fixture and publish before the pause could
+                         // elapse on its own. Nothing here measures the backoff — the grace does
+                         // all the gating — so a longer one costs nothing and removes a race that
+                         // would otherwise show up as the wrong version being installed.
     let handle = spawn_policy_apply_worker(target.clone(), Duration::from_millis(300));
 
     handle.publish(ds(1));
-    let (v, ok) = recv_within(&mut sig.done_rx, Duration::from_secs(5), "the wedged attempt").await;
+    let (v, ok) = recv_within(
+        &mut sig.done_rx,
+        Duration::from_secs(5),
+        "the wedged attempt",
+    )
+    .await;
     assert_eq!((v, ok), (1, false));
 
     // Armed BEFORE the publish (which is what wakes the worker), so both
@@ -1704,11 +1944,17 @@ async fn waking_early_still_waits_out_an_outstanding_reap_grace() {
     target.set_entries(vec![
         // The enforcer the corrected state must write: a real grace
         // outstanding, as if the failed attempt had flipped it.
-        FakeEntry { applied_version: None, ready_at: Some(grace_until) },
+        FakeEntry {
+            applied_version: None,
+            ready_at: Some(grace_until),
+        },
         // Already on v2, so irrelevant to the state being installed — but it
         // gates the superseded v1 heavily. Only a worker still holding the
         // dead state when it queries the deadline can see this.
-        FakeEntry { applied_version: Some(2), ready_at: Some(dead_state_grace) },
+        FakeEntry {
+            applied_version: Some(2),
+            ready_at: Some(dead_state_grace),
+        },
     ]);
     handle.publish(ds(2));
 
@@ -1733,7 +1979,11 @@ async fn waking_early_still_waits_out_an_outstanding_reap_grace() {
         landed.saturating_duration_since(grace_until)
     );
     settle_counters().await;
-    assert_eq!(handle.failures(), 1, "only the original wedged attempt failed");
+    assert_eq!(
+        handle.failures(),
+        1,
+        "only the original wedged attempt failed"
+    );
 }
 
 // --- (E) the metric ------------------------------------------------------
@@ -1750,11 +2000,17 @@ fn policy_apply_failures_render_as_a_prometheus_counter() {
         out.contains("# TYPE wiremesh_gateway_policy_apply_failures_total counter"),
         "body: {out}"
     );
-    assert!(out.contains("wiremesh_gateway_policy_apply_failures_total 3"), "body: {out}");
+    assert!(
+        out.contains("wiremesh_gateway_policy_apply_failures_total 3"),
+        "body: {out}"
+    );
 
     // Zero must still be emitted: an absent series is indistinguishable from
     // a dead exporter, and "policy applies are failing" is exactly the alert
     // an operator needs to be able to write against a always-present series.
     let zero = wiremesh_gateway::metrics::render_policy_apply_failures(0);
-    assert!(zero.contains("wiremesh_gateway_policy_apply_failures_total 0"), "body: {zero}");
+    assert!(
+        zero.contains("wiremesh_gateway_policy_apply_failures_total 0"),
+        "body: {zero}"
+    );
 }

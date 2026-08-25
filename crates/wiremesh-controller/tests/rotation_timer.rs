@@ -63,7 +63,10 @@ async fn poll_key_states(
 /// must fire) or two-plus (it must not stack onto a gateway already
 /// mid-rotation).
 fn pending_count(states: &[(u32, String, String)]) -> usize {
-    states.iter().filter(|(_, _, state)| state == "pending").count()
+    states
+        .iter()
+        .filter(|(_, _, state)| state == "pending")
+        .count()
 }
 
 /// The rotation-initiation timer must, on its own — with no `Admin.RotateKey`
@@ -199,9 +202,9 @@ async fn sweep_retires_orphaned_retiring_row_after_crash() {
         .expect("Sync.Watch stream yielded an error instead of B's initial snapshot");
     match _initial_snapshot.body {
         Some(sync_message::Body::Snapshot(_)) => {}
-        other => panic!(
-            "expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"
-        ),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 
     h.admin_client()
@@ -293,9 +296,7 @@ async fn sweep_retires_orphaned_retiring_row_after_crash() {
     .await;
 
     assert!(
-        !post_restart_states
-            .iter()
-            .any(|(epoch, _, _)| *epoch == 0),
+        !post_restart_states.iter().any(|(epoch, _, _)| *epoch == 0),
         "expected the sweep to retire (delete) the orphaned 'retiring' epoch-0 row \
          (its RotationTracker was lost on restart) within 5s of a 500ms sweep interval, \
          got: {post_restart_states:?}"

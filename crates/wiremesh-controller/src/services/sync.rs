@@ -32,8 +32,8 @@ use tokio_stream::wrappers::{BroadcastStream, ReceiverStream};
 use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status};
 
-use wiremesh_proto::v1::sync_server::Sync;
 use wiremesh_proto::v1::sync_message::Body;
+use wiremesh_proto::v1::sync_server::Sync;
 use wiremesh_proto::v1::{
     ReportRequest, ReportResponse, SubmitEpochKeyRequest, SubmitEpochKeyResponse, SyncMessage,
     WatchRequest,
@@ -105,7 +105,11 @@ const REJECTED_SAMPLE_BYTES: usize = 64;
 /// `Db::set_local_candidates`' full-REPLACE contract CLEARS — deliberately
 /// the same as an explicitly-empty report (cycle-4b Task 8), and the only
 /// party it costs is the gateway that sent it.
-fn usable_local_candidates(gateway_id: i64, gateway_name: &str, reported: Vec<String>) -> Vec<String> {
+fn usable_local_candidates(
+    gateway_id: i64,
+    gateway_name: &str,
+    reported: Vec<String>,
+) -> Vec<String> {
     let mut kept: Vec<String> = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
     let mut rejected = 0usize;
@@ -632,9 +636,10 @@ impl SyncSvc {
                     endpoint,
                 })
                 .collect();
-            let _ = self
-                .change_tx
-                .send(ChangeEvent::RelaysChanged { relay_infos, revision });
+            let _ = self.change_tx.send(ChangeEvent::RelaysChanged {
+                relay_infos,
+                revision,
+            });
         }
     }
 
@@ -821,10 +826,9 @@ pub(crate) async fn drive_rotation_for(
         // that is talking about a DIFFERENT rotation than the one the DB
         // currently has pending — the predicate, and the two reasons it is
         // asymmetric rather than a plain `!=`, live in `evict_decision`.
-        if rotations
-            .get(&rotating_gateway_id)
-            .is_some_and(|t| evict_decision(t.pending_epoch, t.installed_at, db_pending_epoch, read_at))
-        {
+        if rotations.get(&rotating_gateway_id).is_some_and(|t| {
+            evict_decision(t.pending_epoch, t.installed_at, db_pending_epoch, read_at)
+        }) {
             rotations.remove(&rotating_gateway_id);
         }
 
@@ -893,74 +897,92 @@ pub(crate) async fn drive_rotation_for(
     // --- Execute, guard RELEASED. ---
     match decision {
         RotationDecision::Wait => {}
-        RotationDecision::Promote { epoch } => match db.promote_epoch(rotating_gateway_id, epoch).await {
-            Ok(CasOutcome::Applied) => {
-                apply_tracker_effect(rotations, rotating_gateway_id, taken, TrackerEffect::Promoted)
+        RotationDecision::Promote { epoch } => {
+            match db.promote_epoch(rotating_gateway_id, epoch).await {
+                Ok(CasOutcome::Applied) => {
+                    apply_tracker_effect(
+                        rotations,
+                        rotating_gateway_id,
+                        taken,
+                        TrackerEffect::Promoted,
+                    )
                     .await;
-                if let Err(e) = projection::emit_key_rotated(db, change_tx, rotating_gateway_id).await {
-                    eprintln!(
+                    if let Err(e) =
+                        projection::emit_key_rotated(db, change_tx, rotating_gateway_id).await
+                    {
+                        eprintln!(
                         "wiremesh-controller: emit_key_rotated after promote({rotating_gateway_id}, \
                          {epoch}) failed: {e}"
                     );
+                    }
                 }
-            }
-            // A CONFIRMED bail. Another driver reached the same decision first
-            // (or the epoch is no longer a real-keyed `pending` row at all).
-            // The loser must NOT stamp `promoted_at` — that is the "stale
-            // decision mutating the tracker to match a DB state that never
-            // happened" this function's locking discussion warns about — and
-            // must not remove the tracker either: if the winner promoted, the
-            // tracker it left behind is the only thing holding the new
-            // `retiring` row's grace open.
-            Ok(CasOutcome::NoMatch) => eprintln!(
+                // A CONFIRMED bail. Another driver reached the same decision first
+                // (or the epoch is no longer a real-keyed `pending` row at all).
+                // The loser must NOT stamp `promoted_at` — that is the "stale
+                // decision mutating the tracker to match a DB state that never
+                // happened" this function's locking discussion warns about — and
+                // must not remove the tracker either: if the winner promoted, the
+                // tracker it left behind is the only thing holding the new
+                // `retiring` row's grace open.
+                Ok(CasOutcome::NoMatch) => eprintln!(
                 "wiremesh-controller: promote_epoch({rotating_gateway_id}, {epoch}) matched no \
                  row (another driver got there first, or the epoch is no longer a real-keyed \
                  pending row) — leaving the tracker alone"
             ),
-            Err(e) => eprintln!(
+                Err(e) => eprintln!(
                 "wiremesh-controller: promote_epoch({rotating_gateway_id}, {epoch}) failed: {e}"
             ),
-        },
-        RotationDecision::Retire { epoch } => match db.retire_epoch(rotating_gateway_id, epoch).await {
-            Ok(CasOutcome::Applied) => {
-                apply_tracker_effect(rotations, rotating_gateway_id, taken, TrackerEffect::Finished)
+            }
+        }
+        RotationDecision::Retire { epoch } => {
+            match db.retire_epoch(rotating_gateway_id, epoch).await {
+                Ok(CasOutcome::Applied) => {
+                    apply_tracker_effect(
+                        rotations,
+                        rotating_gateway_id,
+                        taken,
+                        TrackerEffect::Finished,
+                    )
                     .await;
-                if let Err(e) = projection::emit_key_rotated(db, change_tx, rotating_gateway_id).await {
-                    eprintln!(
+                    if let Err(e) =
+                        projection::emit_key_rotated(db, change_tx, rotating_gateway_id).await
+                    {
+                        eprintln!(
                         "wiremesh-controller: emit_key_rotated after retire({rotating_gateway_id}, \
                          {epoch}) failed: {e}"
                     );
+                    }
                 }
-            }
-            // DO NOT "clean up" the tracker on EITHER of the two arms below —
-            // and note they are now genuinely different things (task #32 made
-            // `retire_epoch` return the distinction this comment used to ask
-            // for), yet the verdict is the same for both:
-            //
-            //  - `NoMatch` is a CONFIRMED bail, but unlike the `Abort` arm's
-            //    this one gets no safety argument: a tracker that reached
-            //    `Retire` HAS promoted (`decide`'s rule 1), so it may well own
-            //    a live `retiring` row, and it can own an OLDER one besides.
-            //    It also needs no removal — whichever driver WON the CAS
-            //    removes the tracker through its own `TrackerToken`.
-            //  - `Err` is evidence of nothing at all; the next sweep tick
-            //    retries.
-            //
-            // A removed tracker hands any live `retiring` row straight to
-            // `sweep_rotations`' step-3 orphan path, which deletes grace-free.
-            // That collapses `RETIRE_GRACE` from 30s to ~0 on a normal
-            // rotation. Leaving the tracker in place costs one retry on the
-            // next sweep tick; removing it costs make-before-break. See
-            // `evict_decision`, whose `None`-means-keep leg exists for the same
-            // reason and IS unit-pinned.
-            Ok(CasOutcome::NoMatch) => eprintln!(
+                // DO NOT "clean up" the tracker on EITHER of the two arms below —
+                // and note they are now genuinely different things (task #32 made
+                // `retire_epoch` return the distinction this comment used to ask
+                // for), yet the verdict is the same for both:
+                //
+                //  - `NoMatch` is a CONFIRMED bail, but unlike the `Abort` arm's
+                //    this one gets no safety argument: a tracker that reached
+                //    `Retire` HAS promoted (`decide`'s rule 1), so it may well own
+                //    a live `retiring` row, and it can own an OLDER one besides.
+                //    It also needs no removal — whichever driver WON the CAS
+                //    removes the tracker through its own `TrackerToken`.
+                //  - `Err` is evidence of nothing at all; the next sweep tick
+                //    retries.
+                //
+                // A removed tracker hands any live `retiring` row straight to
+                // `sweep_rotations`' step-3 orphan path, which deletes grace-free.
+                // That collapses `RETIRE_GRACE` from 30s to ~0 on a normal
+                // rotation. Leaving the tracker in place costs one retry on the
+                // next sweep tick; removing it costs make-before-break. See
+                // `evict_decision`, whose `None`-means-keep leg exists for the same
+                // reason and IS unit-pinned.
+                Ok(CasOutcome::NoMatch) => eprintln!(
                 "wiremesh-controller: retire_epoch({rotating_gateway_id}, {epoch}) matched no row \
                  (another driver retired it first) — leaving the tracker alone"
             ),
-            Err(e) => eprintln!(
-                "wiremesh-controller: retire_epoch({rotating_gateway_id}, {epoch}) failed: {e}"
-            ),
-        },
+                Err(e) => eprintln!(
+                    "wiremesh-controller: retire_epoch({rotating_gateway_id}, {epoch}) failed: {e}"
+                ),
+            }
+        }
         RotationDecision::Abort { epoch, reason } => {
             match db.drop_pending_epoch(rotating_gateway_id, epoch).await {
                 Ok(DropPendingOutcome::Dropped) => {
@@ -971,7 +993,8 @@ pub(crate) async fn drive_rotation_for(
                         TrackerEffect::Finished,
                     )
                     .await;
-                    if let Err(e) = projection::emit_key_rotated(db, change_tx, rotating_gateway_id).await
+                    if let Err(e) =
+                        projection::emit_key_rotated(db, change_tx, rotating_gateway_id).await
                     {
                         eprintln!(
                             "wiremesh-controller: emit_key_rotated after abort({rotating_gateway_id}, \
@@ -1168,7 +1191,12 @@ pub(crate) async fn sweep_rotations(
             // observe (or re-ack into) the evicted-but-not-yet-rebuilt
             // window, and with NO `.await` anywhere inside the hold.
             if guard.get(&gateway_id).is_some_and(|t| {
-                evict_decision(t.pending_epoch, t.installed_at, Some(pending_epoch), read_at)
+                evict_decision(
+                    t.pending_epoch,
+                    t.installed_at,
+                    Some(pending_epoch),
+                    read_at,
+                )
             }) {
                 guard.remove(&gateway_id);
             }
@@ -1286,8 +1314,12 @@ pub(crate) async fn sweep_rotations(
 /// stacking a second rotation on top of an in-flight one would leave more
 /// than one non-`active` epoch in flight at once, which nothing in this
 /// crate's promote/retire/abort model is designed to reason about.
-pub(crate) async fn initiate_due_rotations(db: &DbHandle, change_tx: &broadcast::Sender<ChangeEvent>) {
-    let mid_rotation: std::collections::HashSet<i64> = match db.gateways_with_rotation_state().await {
+pub(crate) async fn initiate_due_rotations(
+    db: &DbHandle,
+    change_tx: &broadcast::Sender<ChangeEvent>,
+) {
+    let mid_rotation: std::collections::HashSet<i64> = match db.gateways_with_rotation_state().await
+    {
         Ok(ids) => ids.into_iter().collect(),
         Err(e) => {
             eprintln!(
@@ -1300,7 +1332,9 @@ pub(crate) async fn initiate_due_rotations(db: &DbHandle, change_tx: &broadcast:
     let active_ids = match db.active_gateway_ids().await {
         Ok(ids) => ids,
         Err(e) => {
-            eprintln!("wiremesh-controller: initiate_due_rotations failed reading active gateways: {e}");
+            eprintln!(
+                "wiremesh-controller: initiate_due_rotations failed reading active gateways: {e}"
+            );
             return;
         }
     };
@@ -1310,7 +1344,8 @@ pub(crate) async fn initiate_due_rotations(db: &DbHandle, change_tx: &broadcast:
             continue;
         }
 
-        let now = match OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339)
+        let now = match OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
         {
             Ok(now) => now,
             Err(e) => {
@@ -1487,8 +1522,7 @@ impl SyncSvc {
         let punch_stream = ReceiverStream::new(punch_rx).map(Ok::<SyncMessage, Status>);
         let merged = delta_stream.merge(punch_stream);
 
-        let inner: WatchStream =
-            Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(merged));
+        let inner: WatchStream = Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(merged));
 
         // (Cycle-4b Task 5) Trigger (a): now that this connection is registered,
         // give the broker a chance to punch any peer that is already connected
@@ -1592,8 +1626,7 @@ impl SyncSvc {
         // No broker registration, no punch stream, no `on_gateway_connected`
         // — see this method's doc comment. Nothing to guard on drop (there is
         // no registry entry), so the raw stream is returned directly.
-        let inner: WatchStream =
-            Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(delta_stream));
+        let inner: WatchStream = Box::pin(tokio_stream::once(Ok(snapshot_msg)).chain(delta_stream));
         Ok(Response::new(inner))
     }
 }
@@ -1629,7 +1662,9 @@ impl Sync for SyncSvc {
             .await
             .map_err(|e| Status::internal(format!("looking up gateway by cert CN: {e}")))?
         {
-            return self.watch_gateway(gw, self_cert_pem, session_generation).await;
+            return self
+                .watch_gateway(gw, self_cert_pem, session_generation)
+                .await;
         }
 
         if let Some(relay_id) = self
@@ -1886,17 +1921,16 @@ impl Sync for SyncSvc {
                 Vec::with_capacity(touched_rotating_gateways.len());
             for &rotating_id in &touched_rotating_gateways {
                 let seed = match self.db.all_keys_for_gateway(rotating_id).await {
-                    Ok(keys) => keys
-                        .iter()
-                        .find(|(_, _, state)| state == "pending")
-                        .map(|(pending_epoch, _, _)| {
+                    Ok(keys) => keys.iter().find(|(_, _, state)| state == "pending").map(
+                        |(pending_epoch, _, _)| {
                             let prior_active_epoch = keys
                                 .iter()
                                 .find(|(_, _, state)| state == "active")
                                 .map(|(epoch, _, _)| *epoch as u32)
                                 .unwrap_or(0);
                             (*pending_epoch as u32, prior_active_epoch)
-                        }),
+                        },
+                    ),
                     Err(_) => None,
                 };
                 seeds.push((rotating_id, seed));
@@ -2340,7 +2374,10 @@ mod tests {
     // --- tracker_write_back ----------------------------------------------
 
     fn token(pending_epoch: u32, installed_at: Instant) -> TrackerToken {
-        TrackerToken { pending_epoch, installed_at }
+        TrackerToken {
+            pending_epoch,
+            installed_at,
+        }
     }
 
     /// The ordinary case: nothing moved while the caller was awaiting, so the
@@ -2766,10 +2803,7 @@ mod tests {
         // `a_promote_that_won_the_abort_cas_keeps_the_tracker`). Stated here so
         // the two cases cannot be conflated by a future edit to this setup.
         assert!(
-            !key_states(&db)
-                .await
-                .iter()
-                .any(|(epoch, _)| *epoch == 1),
+            !key_states(&db).await.iter().any(|(epoch, _)| *epoch == 1),
             "this test's premise is that epoch 1 has NO row at all — if a row exists in any \
              state, this is the superseded-by-promote case and expects the opposite outcome"
         );

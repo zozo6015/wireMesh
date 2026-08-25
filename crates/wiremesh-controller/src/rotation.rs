@@ -28,8 +28,8 @@ pub const ABORT_AFTER: Duration = Duration::from_secs(300);
 pub enum RotationDecision {
     Wait,
     Promote { epoch: u32 },
-    Retire { epoch: u32 },              // the OLD (prior-active) epoch to delete
-    Abort  { epoch: u32, reason: String }, // the pending epoch to drop
+    Retire { epoch: u32 }, // the OLD (prior-active) epoch to delete
+    Abort { epoch: u32, reason: String }, // the pending epoch to drop
 }
 
 /// Immutable snapshot of one gateway's in-flight rotation — everything
@@ -37,12 +37,12 @@ pub enum RotationDecision {
 /// itself holds no DB handle and does no I/O).
 pub struct RotationState {
     pub pending_epoch: u32,
-    pub pending_has_real_key: bool,       // pubkey != "awaiting-submission"
+    pub pending_has_real_key: bool, // pubkey != "awaiting-submission"
     pub prior_active_epoch: u32,
     pub started_at: Instant,
-    pub promoted_at: Option<Instant>,     // Some once promote executed
-    pub expected_peers: BTreeSet<u64>,    // currently-connected peers that must ack
-    pub live_acks: BTreeSet<u64>,         // peers that have acked pending_epoch live
+    pub promoted_at: Option<Instant>,  // Some once promote executed
+    pub expected_peers: BTreeSet<u64>, // currently-connected peers that must ack
+    pub live_acks: BTreeSet<u64>,      // peers that have acked pending_epoch live
 }
 
 /// The pure ack-driven promote/retire/abort decision, evaluated against
@@ -57,7 +57,9 @@ pub fn decide(s: &RotationState, now: Instant) -> RotationDecision {
     // prior active epoch's retire grace has elapsed.
     if let Some(promoted_at) = s.promoted_at {
         return if now.saturating_duration_since(promoted_at) >= RETIRE_GRACE {
-            RotationDecision::Retire { epoch: s.prior_active_epoch }
+            RotationDecision::Retire {
+                epoch: s.prior_active_epoch,
+            }
         } else {
             RotationDecision::Wait
         };
@@ -80,10 +82,12 @@ pub fn decide(s: &RotationState, now: Instant) -> RotationDecision {
 
     // Rule 3: real key present. Promote immediately once every currently
     // expected peer has acked the new epoch live.
-    let all_acked = !s.expected_peers.is_empty()
-        && s.expected_peers.iter().all(|p| s.live_acks.contains(p));
+    let all_acked =
+        !s.expected_peers.is_empty() && s.expected_peers.iter().all(|p| s.live_acks.contains(p));
     if all_acked {
-        return RotationDecision::Promote { epoch: s.pending_epoch };
+        return RotationDecision::Promote {
+            epoch: s.pending_epoch,
+        };
     }
 
     // Rule 4: otherwise, promote on the grace timeout regardless of ack
@@ -102,7 +106,9 @@ pub fn decide(s: &RotationState, now: Instant) -> RotationDecision {
     // 4 legitimately exists so an offline peer cannot block a rotation
     // forever.
     if now.saturating_duration_since(s.started_at) >= GRACE_PROMOTE {
-        return RotationDecision::Promote { epoch: s.pending_epoch };
+        return RotationDecision::Promote {
+            epoch: s.pending_epoch,
+        };
     }
 
     // Rule 5: nothing has triggered yet.
@@ -141,7 +147,9 @@ mod tests {
         };
         assert_eq!(
             decide(&s, t0 + Duration::from_secs(10)),
-            RotationDecision::Promote { epoch: s.pending_epoch },
+            RotationDecision::Promote {
+                epoch: s.pending_epoch
+            },
             "all expected peers have acked the real-keyed pending epoch — must promote \
              immediately, well before the 90s grace deadline"
         );
@@ -173,7 +181,9 @@ mod tests {
         };
         assert_eq!(
             decide(&s, t0 + Duration::from_secs(91)),
-            RotationDecision::Promote { epoch: s.pending_epoch },
+            RotationDecision::Promote {
+                epoch: s.pending_epoch
+            },
             "no peer has acked at all, but GRACE_PROMOTE (90s) has elapsed since \
              started_at — the real-keyed pending epoch must promote on the grace \
              timeout regardless of ack state"
@@ -242,7 +252,9 @@ mod tests {
         };
         assert_eq!(
             decide(&s, t0 + Duration::from_secs(31)),
-            RotationDecision::Retire { epoch: s.prior_active_epoch },
+            RotationDecision::Retire {
+                epoch: s.prior_active_epoch
+            },
             "RETIRE_GRACE (30s) has elapsed since promotion — the prior active epoch \
              must now be retired"
         );

@@ -49,7 +49,10 @@ use wiremesh_proto::v1::{sync_message, RotateKeyRequest};
 /// initiated-but-not-yet-promoted rotation. With the timer disabled and no
 /// admin action, this must stay `0` forever.
 fn pending_count(states: &[(u32, String, String)]) -> usize {
-    states.iter().filter(|(_, _, state)| state == "pending").count()
+    states
+        .iter()
+        .filter(|(_, _, state)| state == "pending")
+        .count()
 }
 
 /// Polls `h.debug_key_states(gateway_id)` until `predicate` holds or `budget`

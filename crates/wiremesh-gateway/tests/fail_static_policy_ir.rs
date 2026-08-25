@@ -118,13 +118,18 @@ fn rich_state(revision: u64, policy_version: u64, policy_ir: Vec<u8>) -> Desired
         ],
         policy_ir,
         policy_version,
-        relays: vec![RelayInfo { relay_id: 7, endpoint: "203.0.113.7:7777".into() }],
+        relays: vec![RelayInfo {
+            relay_id: 7,
+            endpoint: "203.0.113.7:7777".into(),
+        }],
         revoked_serials: vec!["AA:BB".into(), "CC:DD".into()],
     }
 }
 
 fn load(dir: &Path) -> DesiredState {
-    DesiredState::load(dir).expect("reading state.json").expect("state.json must exist")
+    DesiredState::load(dir)
+        .expect("reading state.json")
+        .expect("state.json must exist")
 }
 
 // --- (a) `policy_ir_is_decodable` truth table ------------------------------
@@ -142,8 +147,14 @@ fn canonical_schema_1_is_decodable() {
     assert!(policy_ir_is_decodable(&good_ir_bytes(1)));
     // Including the degenerate no-blocks form the writer's `(0, empty)`
     // fallback is conceptually equivalent to.
-    let empty_blocks = PolicyIR { schema: 1, version: 1, blocks: vec![] };
-    assert!(policy_ir_is_decodable(empty_blocks.to_canonical_json().as_bytes()));
+    let empty_blocks = PolicyIR {
+        schema: 1,
+        version: 1,
+        blocks: vec![],
+    };
+    assert!(policy_ir_is_decodable(
+        empty_blocks.to_canonical_json().as_bytes()
+    ));
 }
 
 /// **The motivating case.** A newer controller's schema-2 IR is well-formed
@@ -201,7 +212,9 @@ fn valid_but_non_canonical_schema_1_still_decodes() {
         "a valid schema-1 IR in non-canonical byte form must still be persistable"
     );
     // Field order is not part of the contract either — serde accepts any.
-    assert!(policy_ir_is_decodable(br#"{"blocks":[],"version":4,"schema":1}"#));
+    assert!(policy_ir_is_decodable(
+        br#"{"blocks":[],"version":4,"schema":1}"#
+    ));
 }
 
 /// **The cases the old prefix heuristic waved through.** Each of these
@@ -243,8 +256,12 @@ fn prefix_matching_but_broken_documents_are_not_decodable() {
 #[test]
 fn broken_schema_1_documents_are_not_decodable() {
     assert!(!policy_ir_is_decodable(br#"{"schema": 1, "version": 4"#));
-    assert!(!policy_ir_is_decodable(br#"{"schema": 1, "version": "four", "blocks": []}"#));
-    assert!(!policy_ir_is_decodable(br#"{"schema": 1, "version": 4, "blocks": {}}"#));
+    assert!(!policy_ir_is_decodable(
+        br#"{"schema": 1, "version": "four", "blocks": []}"#
+    ));
+    assert!(!policy_ir_is_decodable(
+        br#"{"schema": 1, "version": 4, "blocks": {}}"#
+    ));
 }
 
 /// **The property that actually matters**: a save carrying one of those
@@ -259,18 +276,32 @@ fn broken_schema_1_documents_are_not_decodable() {
 fn a_save_carrying_a_prefix_matching_but_broken_ir_substitutes() {
     for (name, bad) in [
         ("bare prefix", br#"{"schema":1,"#.to_vec()),
-        ("truncated", br#"{"schema":1,"version":1,"blocks":"#.to_vec()),
-        ("wrong type", br#"{"schema":1,"version":"four","blocks":[]}"#.to_vec()),
+        (
+            "truncated",
+            br#"{"schema":1,"version":1,"blocks":"#.to_vec(),
+        ),
+        (
+            "wrong type",
+            br#"{"schema":1,"version":"four","blocks":[]}"#.to_vec(),
+        ),
     ] {
         let dir = TempDir::new().unwrap();
         let mut w = FailStaticWriter::default();
-        w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("save good");
+        w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path())
+            .expect("save good");
 
-        w.save(&rich_state(12, 9, bad.clone()), dir.path()).expect("save bad");
+        w.save(&rich_state(12, 9, bad.clone()), dir.path())
+            .expect("save bad");
 
         let got = load(dir.path());
-        assert_ne!(got.policy_ir, bad, "{name}: broken bytes must never reach state.json");
-        assert_eq!(got.policy_version, 5, "{name}: the last good version is what is written");
+        assert_ne!(
+            got.policy_ir, bad,
+            "{name}: broken bytes must never reach state.json"
+        );
+        assert_eq!(
+            got.policy_version, 5,
+            "{name}: the last good version is what is written"
+        );
         assert_eq!(got.policy_ir, good_ir_bytes(5), "{name}: with its IR");
         assert!(
             policy_ir_is_decodable(&got.policy_ir),
@@ -300,7 +331,11 @@ fn ir_bytes_encode_the_policy_version() {
         "two IRs differing only in version must differ in bytes — otherwise a byte-keyed \
          `last_good` could hold a version number that does not describe its own IR"
     );
-    assert_eq!(good_ir_bytes(5), good_ir_bytes(5), "and the encoding is deterministic");
+    assert_eq!(
+        good_ir_bytes(5),
+        good_ir_bytes(5),
+        "and the encoding is deterministic"
+    );
 }
 
 // --- (b) the three substitution outcomes -----------------------------------
@@ -314,7 +349,11 @@ fn a_decodable_ir_is_persisted_verbatim() {
 
     w.save(&ds, dir.path()).expect("save");
 
-    assert_eq!(load(dir.path()), ds, "a decodable snapshot must reach disk unchanged");
+    assert_eq!(
+        load(dir.path()),
+        ds,
+        "a decodable snapshot must reach disk unchanged"
+    );
 }
 
 /// Undecodable WITH a prior good pair: that pair is substituted, so a boot
@@ -329,12 +368,21 @@ fn an_undecodable_ir_is_replaced_by_the_last_good_pair() {
     let dir = TempDir::new().unwrap();
     let mut w = FailStaticWriter::default();
 
-    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("save good");
-    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path()).expect("save bad");
+    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path())
+        .expect("save good");
+    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path())
+        .expect("save bad");
 
     let got = load(dir.path());
-    assert_eq!(got.policy_version, 5, "the last DECODABLE version must be what is persisted");
-    assert_eq!(got.policy_ir, good_ir_bytes(5), "and its IR bytes alongside it");
+    assert_eq!(
+        got.policy_version, 5,
+        "the last DECODABLE version must be what is persisted"
+    );
+    assert_eq!(
+        got.policy_ir,
+        good_ir_bytes(5),
+        "and its IR bytes alongside it"
+    );
     assert!(
         policy_ir_is_decodable(&got.policy_ir),
         "whatever reaches disk must, by construction, be installable on the next boot"
@@ -357,10 +405,14 @@ fn an_undecodable_ir_with_no_prior_good_pair_falls_back_to_no_policy() {
     let dir = TempDir::new().unwrap();
     let mut w = FailStaticWriter::default();
 
-    w.save(&rich_state(3, 9, schema2_ir_bytes()), dir.path()).expect("save bad");
+    w.save(&rich_state(3, 9, schema2_ir_bytes()), dir.path())
+        .expect("save bad");
 
     let got = load(dir.path());
-    assert_eq!(got.policy_version, 0, "no prior good policy reads as version 0, never as 9");
+    assert_eq!(
+        got.policy_version, 0,
+        "no prior good policy reads as version 0, never as 9"
+    );
     assert!(got.policy_ir.is_empty(), "and with no IR bytes at all");
 }
 
@@ -376,18 +428,29 @@ fn the_fallback_pair_advances_as_new_good_policies_arrive() {
     let dir = TempDir::new().unwrap();
     let mut w = FailStaticWriter::default();
 
-    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("good v5");
-    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path()).expect("bad v9");
+    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path())
+        .expect("good v5");
+    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path())
+        .expect("bad v9");
     assert_eq!(load(dir.path()).policy_version, 5);
 
     // The controller is fixed and pushes a readable v6.
-    w.save(&rich_state(13, 6, good_ir_bytes(6)), dir.path()).expect("good v6");
-    assert_eq!(load(dir.path()).policy_version, 6, "a good save resumes writing verbatim");
+    w.save(&rich_state(13, 6, good_ir_bytes(6)), dir.path())
+        .expect("good v6");
+    assert_eq!(
+        load(dir.path()).policy_version,
+        6,
+        "a good save resumes writing verbatim"
+    );
 
     // It breaks again.
-    w.save(&rich_state(14, 10, schema2_ir_bytes()), dir.path()).expect("bad v10");
+    w.save(&rich_state(14, 10, schema2_ir_bytes()), dir.path())
+        .expect("bad v10");
     let got = load(dir.path());
-    assert_eq!(got.policy_version, 6, "the fallback must be the NEWEST good pair, not the first");
+    assert_eq!(
+        got.policy_version, 6,
+        "the fallback must be the NEWEST good pair, not the first"
+    );
     assert_eq!(got.policy_ir, good_ir_bytes(6));
 }
 
@@ -411,7 +474,8 @@ fn substitution_preserves_peers_relays_serials_and_revision() {
     let dir = TempDir::new().unwrap();
     let mut w = FailStaticWriter::default();
 
-    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("save good");
+    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path())
+        .expect("save good");
 
     let bad = rich_state(12, 9, schema2_ir_bytes());
     w.save(&bad, dir.path()).expect("save bad");
@@ -459,17 +523,25 @@ fn seeded_from_a_good_state_json_restores_the_fallback_across_a_restart() {
     let dir = TempDir::new().unwrap();
 
     // Pre-restart: a good policy on disk.
-    rich_state(11, 5, good_ir_bytes(5)).save(dir.path()).expect("seed state.json");
+    rich_state(11, 5, good_ir_bytes(5))
+        .save(dir.path())
+        .expect("seed state.json");
 
     // Restart: boot loads it, and the writer is seeded from it.
-    let booted = DesiredState::load(dir.path()).expect("load").expect("present");
+    let booted = DesiredState::load(dir.path())
+        .expect("load")
+        .expect("present");
     let mut w = FailStaticWriter::seeded_from(Some(&booted));
 
     // The controller is still broken.
-    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path()).expect("save bad");
+    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path())
+        .expect("save bad");
 
     let got = load(dir.path());
-    assert_eq!(got.policy_version, 5, "the pre-restart policy must survive the reboot");
+    assert_eq!(
+        got.policy_version, 5,
+        "the pre-restart policy must survive the reboot"
+    );
     assert_eq!(got.policy_ir, good_ir_bytes(5));
 }
 
@@ -486,15 +558,23 @@ fn seeded_from_a_state_json_carrying_a_bad_ir_seeds_nothing() {
     let dir = TempDir::new().unwrap();
 
     // What a pre-fix binary would have left behind.
-    rich_state(11, 9, schema2_ir_bytes()).save(dir.path()).expect("seed bad state.json");
+    rich_state(11, 9, schema2_ir_bytes())
+        .save(dir.path())
+        .expect("seed bad state.json");
 
-    let booted = DesiredState::load(dir.path()).expect("load").expect("present");
+    let booted = DesiredState::load(dir.path())
+        .expect("load")
+        .expect("present");
     let mut w = FailStaticWriter::seeded_from(Some(&booted));
 
-    w.save(&rich_state(12, 10, schema2_ir_bytes()), dir.path()).expect("save bad");
+    w.save(&rich_state(12, 10, schema2_ir_bytes()), dir.path())
+        .expect("save bad");
 
     let got = load(dir.path());
-    assert_eq!(got.policy_version, 0, "an undecodable persisted IR must not become the fallback");
+    assert_eq!(
+        got.policy_version, 0,
+        "an undecodable persisted IR must not become the fallback"
+    );
     assert!(got.policy_ir.is_empty());
     assert!(
         policy_ir_is_decodable(&got.policy_ir),
@@ -508,7 +588,8 @@ fn seeded_from_nothing_has_no_fallback() {
     let dir = TempDir::new().unwrap();
     let mut w = FailStaticWriter::seeded_from(None);
 
-    w.save(&rich_state(1, 9, schema2_ir_bytes()), dir.path()).expect("save bad");
+    w.save(&rich_state(1, 9, schema2_ir_bytes()), dir.path())
+        .expect("save bad");
 
     assert_eq!(load(dir.path()).policy_version, 0);
 }
@@ -523,10 +604,13 @@ fn seeded_from_an_empty_ir_state_json_is_equivalent_to_no_policy() {
     let dir = TempDir::new().unwrap();
     rich_state(2, 0, Vec::new()).save(dir.path()).expect("seed");
 
-    let booted = DesiredState::load(dir.path()).expect("load").expect("present");
+    let booted = DesiredState::load(dir.path())
+        .expect("load")
+        .expect("present");
     let mut w = FailStaticWriter::seeded_from(Some(&booted));
 
-    w.save(&rich_state(3, 9, schema2_ir_bytes()), dir.path()).expect("save bad");
+    w.save(&rich_state(3, 9, schema2_ir_bytes()), dir.path())
+        .expect("save bad");
 
     let got = load(dir.path());
     assert_eq!(got.policy_version, 0);
@@ -554,21 +638,30 @@ fn byte_identical_resaves_are_persisted_verbatim() {
     let ir = good_ir_bytes(5);
 
     // First save: the decode path.
-    w.save(&rich_state(11, 5, ir.clone()), dir.path()).expect("first save");
+    w.save(&rich_state(11, 5, ir.clone()), dir.path())
+        .expect("first save");
 
     // Ten more State events carrying the SAME policy bytes and an advancing
     // revision — the memcmp path.
     for revision in 12..=21 {
         let ds = rich_state(revision, 5, ir.clone());
         w.save(&ds, dir.path()).expect("re-save");
-        assert_eq!(load(dir.path()), ds, "revision {revision}: persisted verbatim");
+        assert_eq!(
+            load(dir.path()),
+            ds,
+            "revision {revision}: persisted verbatim"
+        );
     }
 
     // The fast path must not have become an unconditional accept: a genuinely
     // different, undecodable IR still substitutes.
-    w.save(&rich_state(22, 9, schema2_ir_bytes()), dir.path()).expect("save bad");
+    w.save(&rich_state(22, 9, schema2_ir_bytes()), dir.path())
+        .expect("save bad");
     let got = load(dir.path());
-    assert_eq!(got.policy_version, 5, "different bytes must be decoded, not waved through");
+    assert_eq!(
+        got.policy_version, 5,
+        "different bytes must be decoded, not waved through"
+    );
     assert_eq!(got.policy_ir, ir);
 }
 
@@ -587,16 +680,23 @@ fn byte_identical_resaves_are_persisted_verbatim() {
 fn the_warning_is_deduplicated_per_distinct_bad_version() {
     let dir = TempDir::new().unwrap();
     let mut w = FailStaticWriter::default();
-    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("save good");
-    assert_eq!(w.warned_version(), None, "a clean save has nothing to warn about");
+    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path())
+        .expect("save good");
+    assert_eq!(
+        w.warned_version(),
+        None,
+        "a clean save has nothing to warn about"
+    );
 
     // First bad save at version 9: warned.
-    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path()).expect("bad v9");
+    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path())
+        .expect("bad v9");
     assert_eq!(w.warned_version(), Some(9));
 
     // Repeats at the SAME bad version: still 9, i.e. no new line.
     for revision in 13..=16 {
-        w.save(&rich_state(revision, 9, schema2_ir_bytes()), dir.path()).expect("bad v9 again");
+        w.save(&rich_state(revision, 9, schema2_ir_bytes()), dir.path())
+            .expect("bad v9 again");
         assert_eq!(
             w.warned_version(),
             Some(9),
@@ -607,9 +707,16 @@ fn the_warning_is_deduplicated_per_distinct_bad_version() {
     // A DIFFERENT bad version is a new fact and moves the marker.
     let mut other_bad = good_ir(10);
     other_bad.schema = 2;
-    w.save(&rich_state(17, 10, other_bad.to_canonical_json().into_bytes()), dir.path())
-        .expect("bad v10");
-    assert_eq!(w.warned_version(), Some(10), "a new bad version must warn again");
+    w.save(
+        &rich_state(17, 10, other_bad.to_canonical_json().into_bytes()),
+        dir.path(),
+    )
+    .expect("bad v10");
+    assert_eq!(
+        w.warned_version(),
+        Some(10),
+        "a new bad version must warn again"
+    );
 }
 
 /// Reset on a clean save, via the DECODE path: the controller is fixed, a
@@ -619,16 +726,20 @@ fn the_warning_is_deduplicated_per_distinct_bad_version() {
 fn a_clean_save_via_the_decode_path_resets_the_warning() {
     let dir = TempDir::new().unwrap();
     let mut w = FailStaticWriter::default();
-    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("good v5");
-    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path()).expect("bad v9");
+    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path())
+        .expect("good v5");
+    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path())
+        .expect("bad v9");
     assert_eq!(w.warned_version(), Some(9));
 
     // New, decodable bytes → decode path.
-    w.save(&rich_state(13, 6, good_ir_bytes(6)), dir.path()).expect("good v6");
+    w.save(&rich_state(13, 6, good_ir_bytes(6)), dir.path())
+        .expect("good v6");
     assert_eq!(w.warned_version(), None, "recovery clears the marker");
 
     // Same bad version returns: a fresh incident, warned again.
-    w.save(&rich_state(14, 9, schema2_ir_bytes()), dir.path()).expect("bad v9 again");
+    w.save(&rich_state(14, 9, schema2_ir_bytes()), dir.path())
+        .expect("bad v9 again");
     assert_eq!(w.warned_version(), Some(9));
 }
 
@@ -643,12 +754,15 @@ fn a_clean_save_via_the_memcmp_path_resets_the_warning() {
     let dir = TempDir::new().unwrap();
     let mut w = FailStaticWriter::default();
     let ir = good_ir_bytes(5);
-    w.save(&rich_state(11, 5, ir.clone()), dir.path()).expect("good v5");
-    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path()).expect("bad v9");
+    w.save(&rich_state(11, 5, ir.clone()), dir.path())
+        .expect("good v5");
+    w.save(&rich_state(12, 9, schema2_ir_bytes()), dir.path())
+        .expect("bad v9");
     assert_eq!(w.warned_version(), Some(9));
 
     // The SAME policy bytes arrive again — the memcmp branch, no decode.
-    w.save(&rich_state(13, 5, ir.clone()), dir.path()).expect("re-send of v5");
+    w.save(&rich_state(13, 5, ir.clone()), dir.path())
+        .expect("re-send of v5");
     assert_eq!(
         w.warned_version(),
         None,
@@ -657,7 +771,8 @@ fn a_clean_save_via_the_memcmp_path_resets_the_warning() {
     );
 
     // Proof that it would now warn again rather than staying silent.
-    w.save(&rich_state(14, 9, schema2_ir_bytes()), dir.path()).expect("bad v9 again");
+    w.save(&rich_state(14, 9, schema2_ir_bytes()), dir.path())
+        .expect("bad v9 again");
     assert_eq!(w.warned_version(), Some(9));
 }
 
@@ -670,7 +785,8 @@ fn a_clean_save_via_the_memcmp_path_resets_the_warning() {
 fn repeated_saves_under_a_broken_controller_stay_correct() {
     let dir = TempDir::new().unwrap();
     let mut w = FailStaticWriter::default();
-    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path()).expect("save good");
+    w.save(&rich_state(11, 5, good_ir_bytes(5)), dir.path())
+        .expect("save good");
 
     // Five more State events: same bad policy version, advancing revision
     // (peer churn), each of which must still land the good policy plus the
@@ -680,13 +796,20 @@ fn repeated_saves_under_a_broken_controller_stay_correct() {
         w.save(&bad, dir.path()).expect("save bad");
 
         let got = load(dir.path());
-        assert_eq!(got.policy_version, 5, "revision {revision}: policy stays on the last good");
-        assert_eq!(got.revision, revision, "revision {revision}: device half stays current");
+        assert_eq!(
+            got.policy_version, 5,
+            "revision {revision}: policy stays on the last good"
+        );
+        assert_eq!(
+            got.revision, revision,
+            "revision {revision}: device half stays current"
+        );
     }
 
     // A DIFFERENT bad version must still substitute correctly (the dedupe
     // must not suppress the substitution itself, only the repeated log).
-    w.save(&rich_state(17, 10, schema2_ir_bytes()), dir.path()).expect("save other bad");
+    w.save(&rich_state(17, 10, schema2_ir_bytes()), dir.path())
+        .expect("save other bad");
     let got = load(dir.path());
     assert_eq!(got.policy_version, 5);
     assert_eq!(got.revision, 17);

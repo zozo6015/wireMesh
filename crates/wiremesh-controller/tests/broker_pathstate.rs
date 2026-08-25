@@ -125,8 +125,12 @@ async fn both_settled_pair_skips_periodic_and_candidate_change_repunch() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+    a.report(0, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
 
     // The pre-settlement punch pair is legitimate and expected.
     next_punch(&mut a_stream, PUNCH_TIMEOUT)
@@ -200,8 +204,12 @@ async fn mixed_direct_and_relayed_still_counts_as_settled() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+    a.report(0, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
     next_punch(&mut a_stream, PUNCH_TIMEOUT)
         .await
         .expect("A must receive the initial pre-settlement punch");
@@ -255,7 +263,9 @@ async fn one_sided_settled_report_still_emits() {
     a.report_with_peer_paths(0, &["10.0.0.1:51820"], &[(b.id(), "direct")])
         .await
         .expect("A reports candidate + settled peer_path");
-    b.report(0, &["10.1.0.1:51820"]).await.expect("B reports candidate");
+    b.report(0, &["10.1.0.1:51820"])
+        .await
+        .expect("B reports candidate");
 
     let a_punch = next_punch(&mut a_stream, PUNCH_TIMEOUT)
         .await
@@ -310,8 +320,12 @@ async fn reporter_disconnect_clears_stored_states_and_pair_repunches() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+    a.report(0, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
     next_punch(&mut a_stream, PUNCH_TIMEOUT)
         .await
         .expect("A must receive the initial pre-settlement punch");
@@ -365,8 +379,12 @@ async fn no_peer_paths_old_client_keeps_todays_periodic_repunch() {
     let mut a_stream = a.open_sync().await;
     let mut b_stream = b.open_sync().await;
 
-    a.report(0, &["10.0.0.1:51820"]).await.expect("A reports candidate");
-    b.report(0, &["10.1.0.1:51820"]).await.expect("B reports candidate");
+    a.report(0, &["10.0.0.1:51820"])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &["10.1.0.1:51820"])
+        .await
+        .expect("B reports candidate");
 
     next_punch(&mut a_stream, PUNCH_TIMEOUT)
         .await
@@ -403,8 +421,12 @@ async fn snapshot_report_dropping_the_peer_reopens_the_pair() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+    a.report(0, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
     next_punch(&mut a_stream, PUNCH_TIMEOUT)
         .await
         .expect("A must receive the initial pre-settlement punch");
@@ -465,8 +487,12 @@ async fn non_snapshot_empty_report_keeps_settled_skip() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+    a.report(0, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
     next_punch(&mut a_stream, PUNCH_TIMEOUT)
         .await
         .expect("A must receive the initial pre-settlement punch");
@@ -543,13 +569,20 @@ async fn unsettle_report_rebrokes_pair_despite_exhausted_budget() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+    a.report(0, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
 
     // Exhaust the pair's periodic budget while it is still unsettled: the
     // sweep re-punches every 5s until MAX_PERIODIC_ATTEMPTS (5) is spent,
     // after which a full sweep interval of silence proves exhaustion.
-    tokio::join!(drain_periodic_budget(&mut a_stream), drain_periodic_budget(&mut b_stream));
+    tokio::join!(
+        drain_periodic_budget(&mut a_stream),
+        drain_periodic_budget(&mut b_stream)
+    );
 
     // NOW settle both sides (each marks the other "relayed" — the case-4
     // establishment shape). Settling consumes no budget and emits nothing.
@@ -597,9 +630,16 @@ async fn unsettle_edge_resets_periodic_budget_for_further_sweeps() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
-    tokio::join!(drain_periodic_budget(&mut a_stream), drain_periodic_budget(&mut b_stream));
+    a.report(0, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
+    tokio::join!(
+        drain_periodic_budget(&mut a_stream),
+        drain_periodic_budget(&mut b_stream)
+    );
 
     a.report_with_peer_paths(0, &[a_endpoint], &[(b.id(), "relayed")])
         .await
@@ -629,12 +669,20 @@ async fn unsettle_edge_resets_periodic_budget_for_further_sweeps() {
     // left, so this is where a one-shot implementation — and the current
     // broker — go red.
     for round in 1..=2 {
-        next_punch(&mut a_stream, PUNCH_TIMEOUT).await.unwrap_or_else(|e| {
-            panic!("post-edge periodic re-punch #{round} missing on A (budget not reset?): {e:?}")
-        });
-        next_punch(&mut b_stream, PUNCH_TIMEOUT).await.unwrap_or_else(|e| {
-            panic!("post-edge periodic re-punch #{round} missing on B (budget not reset?): {e:?}")
-        });
+        next_punch(&mut a_stream, PUNCH_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "post-edge periodic re-punch #{round} missing on A (budget not reset?): {e:?}"
+                )
+            });
+        next_punch(&mut b_stream, PUNCH_TIMEOUT)
+            .await
+            .unwrap_or_else(|e| {
+                panic!(
+                    "post-edge periodic re-punch #{round} missing on B (budget not reset?): {e:?}"
+                )
+            });
     }
 }
 
@@ -667,7 +715,10 @@ async fn report_keeping_pair_unsettled_grants_no_fresh_budget() {
 
     // Exhaust the periodic budget (the unsettled pair is re-punched by the
     // sweep until the 5 attempts are spent).
-    tokio::join!(drain_periodic_budget(&mut a_stream), drain_periodic_budget(&mut b_stream));
+    tokio::join!(
+        drain_periodic_budget(&mut a_stream),
+        drain_periodic_budget(&mut b_stream)
+    );
 
     // B's stored peer state CHANGES, but stays outside {direct, relayed}:
     // unsettled -> unsettled is not an edge. Same candidates, so no
@@ -773,8 +824,12 @@ async fn settle_pair(
     b_endpoint: &str,
     applied_version: u64,
 ) {
-    a.report(applied_version, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(applied_version, &[b_endpoint]).await.expect("B reports candidate");
+    a.report(applied_version, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(applied_version, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
     next_punch(a_stream, PUNCH_TIMEOUT)
         .await
         .expect("A must receive the initial pre-settlement punch");
@@ -820,7 +875,16 @@ async fn stale_generation_report_cannot_resettle_a_restarted_gateways_pair() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    settle_pair(&a, &b, &mut a_stream, &mut b_stream, a_endpoint, b_endpoint, 0).await;
+    settle_pair(
+        &a,
+        &b,
+        &mut a_stream,
+        &mut b_stream,
+        a_endpoint,
+        b_endpoint,
+        0,
+    )
+    .await;
 
     // B's PREVIOUS process's nonce — captured BEFORE the restart, because
     // that is the value the delayed report carries.
@@ -853,7 +917,10 @@ async fn stale_generation_report_cannot_resettle_a_restarted_gateways_pair() {
             local_endpoints: vec![b_endpoint.to_string()],
             relay_health: vec![],
             epoch_acks: vec![],
-            peer_paths: vec![PeerPath { peer_gateway_id: a.id(), state: "direct".into() }],
+            peer_paths: vec![PeerPath {
+                peer_gateway_id: a.id(),
+                state: "direct".into(),
+            }],
             peer_paths_snapshot: true,
             session_generation: stale_generation,
         })
@@ -901,8 +968,12 @@ async fn matching_generation_report_is_accepted_and_settles() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+    a.report(0, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
     next_punch(&mut a_stream, PUNCH_TIMEOUT)
         .await
         .expect("A must receive the initial pre-settlement punch");
@@ -917,7 +988,10 @@ async fn matching_generation_report_is_accepted_and_settles() {
         local_endpoints: vec![b_endpoint.to_string()],
         relay_health: vec![],
         epoch_acks: vec![],
-        peer_paths: vec![PeerPath { peer_gateway_id: a.id(), state: "direct".into() }],
+        peer_paths: vec![PeerPath {
+            peer_gateway_id: a.id(),
+            state: "direct".into(),
+        }],
         peer_paths_snapshot: true,
         session_generation: b.session_generation(),
     })
@@ -982,7 +1056,16 @@ async fn legacy_zero_generation_client_behaves_exactly_as_today() {
     // Every step below is byte-for-byte what
     // `both_settled_pair_skips_periodic_and_candidate_change_repunch` does —
     // the point is that a zero-generation client's flow is unchanged.
-    settle_pair(&a, &b, &mut a_stream, &mut b_stream, a_endpoint, b_endpoint, 0).await;
+    settle_pair(
+        &a,
+        &b,
+        &mut a_stream,
+        &mut b_stream,
+        a_endpoint,
+        b_endpoint,
+        0,
+    )
+    .await;
 
     let (a_quiet, b_quiet) = tokio::join!(
         next_punch(&mut a_stream, SETTLED_SILENCE),
@@ -1027,7 +1110,10 @@ async fn report_before_any_watch_is_accepted_so_a_controller_restart_cannot_stal
     // Deliberately NO `open_sync()`: nothing has ever recorded a generation
     // for this gateway, exactly as after a controller restart.
     let generation = gw.session_generation();
-    assert_ne!(generation, 0, "the request side must be NONZERO or this test proves nothing");
+    assert_ne!(
+        generation, 0,
+        "the request side must be NONZERO or this test proves nothing"
+    );
 
     gw.report_raw(ReportRequest {
         applied_version: 42,
@@ -1118,7 +1204,10 @@ async fn a_rejected_report_touches_no_other_state() {
             local_endpoints: vec![BOGUS_ENDPOINT.to_string()],
             relay_health: vec![],
             epoch_acks: vec![],
-            peer_paths: vec![PeerPath { peer_gateway_id: a.id(), state: "direct".into() }],
+            peer_paths: vec![PeerPath {
+                peer_gateway_id: a.id(),
+                state: "direct".into(),
+            }],
             peer_paths_snapshot: true,
             session_generation: stale_generation,
         })
@@ -1145,7 +1234,10 @@ async fn a_rejected_report_touches_no_other_state() {
     );
     assert_eq!(a_punch.peer_gateway_id, b.id(), "A's punch must target B");
     assert!(
-        !a_punch.candidates.iter().any(|c| c.as_str() == BOGUS_ENDPOINT),
+        !a_punch
+            .candidates
+            .iter()
+            .any(|c| c.as_str() == BOGUS_ENDPOINT),
         "a rejected report must not reach `set_local_candidates`: the dead process's address \
          {BOGUS_ENDPOINT} was published to B's peer as a punch candidate ({:?})",
         a_punch.candidates

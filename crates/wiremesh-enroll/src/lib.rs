@@ -113,7 +113,9 @@ pub fn validate_host_port(s: &str) -> anyhow::Result<()> {
         return Err(anyhow!("port 0 in {s:?} is not a dialable target"));
     }
     if host.starts_with('[') || matches!(host.parse(), Ok(std::net::IpAddr::V6(_))) {
-        return Err(anyhow!("IPv6 dial target {s:?} is unsupported (v1 is IPv4-only)"));
+        return Err(anyhow!(
+            "IPv6 dial target {s:?} is unsupported (v1 is IPv4-only)"
+        ));
     }
     if host.chars().all(|c| c.is_ascii_digit() || c == '.') {
         s.parse::<SocketAddr>()

@@ -56,7 +56,11 @@ impl EnrollmentSvc {
         trust: Arc<dyn CertificateIssuer>,
         change_tx: broadcast::Sender<ChangeEvent>,
     ) -> Self {
-        Self { db, trust, change_tx }
+        Self {
+            db,
+            trust,
+            change_tx,
+        }
     }
 }
 
@@ -190,7 +194,9 @@ impl Enrollment for EnrollmentSvc {
                     return Err(Status::internal(format!("relay enrollment failed: {e}")));
                 }
                 Err(other) => {
-                    return Err(Status::internal(format!("relay enrollment failed: {other:?}")));
+                    return Err(Status::internal(format!(
+                        "relay enrollment failed: {other:?}"
+                    )));
                 }
             };
 
@@ -225,9 +231,10 @@ impl Enrollment for EnrollmentSvc {
                 // `Sync.Watch` subscribers — nobody to notify, which is
                 // not a failure (mirrors the gateway path's identical
                 // rationale below).
-                let _ = self
-                    .change_tx
-                    .send(ChangeEvent::RelaysChanged { relay_infos, revision });
+                let _ = self.change_tx.send(ChangeEvent::RelaysChanged {
+                    relay_infos,
+                    revision,
+                });
             }
 
             return Ok(Response::new(EnrollResponse {

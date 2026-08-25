@@ -85,7 +85,10 @@ fn retiring_entry_does_not_shadow_the_active_epoch() {
     store.promote(1).unwrap(); // epoch 0 now "retiring", epoch 1 "active"
 
     let boot = EpochKeys::select_boot_key(Some(&store), &legacy).unwrap();
-    assert_eq!(boot.epoch, 1, "the active epoch, not the retiring one, boots");
+    assert_eq!(
+        boot.epoch, 1,
+        "the active epoch, not the retiring one, boots"
+    );
     assert_ne!(boot.private_key_b64, legacy);
 }
 
@@ -104,7 +107,10 @@ fn no_store_falls_back_to_legacy_identity_key() {
         base64_pub_from_priv(&legacy).unwrap(),
         "fallback entry must carry the real derived pubkey"
     );
-    assert_eq!(boot.state, "active", "the selected boot key is by definition active");
+    assert_eq!(
+        boot.state, "active",
+        "the selected boot key is by definition active"
+    );
 }
 
 /// A store that exists but has only the migrated epoch 0 (the steady-state

@@ -71,7 +71,10 @@ use wiremesh_operator::controllers::gateway::{mint_action, MintAction};
 fn populated() -> Secret {
     let mut data = BTreeMap::new();
     data.insert("token".to_string(), ByteString(b"wiremesh://tok".to_vec()));
-    Secret { data: Some(data), ..Default::default() }
+    Secret {
+        data: Some(data),
+        ..Default::default()
+    }
 }
 
 #[test]
@@ -183,7 +186,13 @@ fn defer_takes_precedence_over_every_other_arm() {
         for identity_persisted in [false, true] {
             for secret in [None, Some(populated())] {
                 assert_eq!(
-                    mint_action(false, gateway_active, identity_persisted, true, secret.as_ref()),
+                    mint_action(
+                        false,
+                        gateway_active,
+                        identity_persisted,
+                        true,
+                        secret.as_ref()
+                    ),
                     MintAction::Defer,
                     "roster unreadable + rebind pending must DEFER for every other input \
                      combination (gateway_active={gateway_active}, \

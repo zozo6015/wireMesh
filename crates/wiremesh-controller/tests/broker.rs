@@ -42,8 +42,12 @@ async fn both_pair_members_receive_a_punch_with_a_common_go() {
 
     let a_endpoint = "10.0.0.1:51820";
     let b_endpoint = "10.1.0.1:51820";
-    a.report(0, &[a_endpoint]).await.expect("A reports candidate");
-    b.report(0, &[b_endpoint]).await.expect("B reports candidate");
+    a.report(0, &[a_endpoint])
+        .await
+        .expect("A reports candidate");
+    b.report(0, &[b_endpoint])
+        .await
+        .expect("B reports candidate");
 
     let a_punch = next_punch(&mut a_stream, PUNCH_TIMEOUT)
         .await

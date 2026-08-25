@@ -48,7 +48,10 @@ fn boot() -> TunnelPlan {
 }
 
 fn overlap(gid: u64) -> TunnelId {
-    TunnelId::Overlap { gateway_id: gid, epoch: 1 }
+    TunnelId::Overlap {
+        gateway_id: gid,
+        epoch: 1,
+    }
 }
 
 /// A plan never collides with ANYTHING it was told is reserved, on any of the
@@ -87,7 +90,11 @@ fn a_reserved_freed_plan_is_reused_on_neither_axis() {
         .expect("a re-rotation must still be plannable while the previous slot is quarantined");
 
     assert_disjoint_from_reserved(&next, &reserved, "re-rotation over a quarantined slot");
-    assert_eq!(next.id, overlap(7), "the plan is for the id it was asked about");
+    assert_eq!(
+        next.id,
+        overlap(7),
+        "the plan is for the id it was asked about"
+    );
 }
 
 /// The PORT axis in isolation. The reserved entry holds `base+1` under a name
@@ -148,7 +155,10 @@ fn restarting_the_same_peer_gets_a_fresh_device() {
     // The Restart tears the first one down; the quarantine keeps reporting it.
     reserved.push(first.clone());
     let second = plan_tunnel(
-        TunnelId::Overlap { gateway_id: 7, epoch: 2 },
+        TunnelId::Overlap {
+            gateway_id: 7,
+            epoch: 2,
+        },
         BASE_TUN,
         BASE_PORT,
         &reserved,
@@ -160,7 +170,10 @@ fn restarting_the_same_peer_gets_a_fresh_device() {
         "a Restart must land on a different ifname than the one it just released — reusing it \
          races boringtun's UAPI socket unlink, which Tunnel::up cannot distinguish from success"
     );
-    assert_ne!(first.listen_port, second.listen_port, "and on a different UDP port");
+    assert_ne!(
+        first.listen_port, second.listen_port,
+        "and on a different UDP port"
+    );
 }
 
 /// **MAX_QUARANTINE cannot starve the allocator.** The quarantine is capped at
@@ -254,7 +267,10 @@ fn every_planned_port_stays_inside_the_rotation_window() {
             BASE_PORT + 1,
             BASE_PORT + MAX_ROTATION_TUNS
         );
-        assert_ne!(plan.listen_port, BASE_PORT, "the boot tun's port must never be re-planned");
+        assert_ne!(
+            plan.listen_port, BASE_PORT,
+            "the boot tun's port must never be re-planned"
+        );
         reserved.push(plan);
     }
 }
@@ -325,7 +341,10 @@ fn a_truncated_port_window_allocates_only_what_fits() {
     // ...leaving exactly two overlap ports, 65534 and 65535.
     for n in 0..2u64 {
         let plan = plan_tunnel(overlap(n), BASE_TUN, base, &reserved).unwrap_or_else(|e| {
-            panic!("overlap {} of the truncated window must be usable: {e:#}", n + 1)
+            panic!(
+                "overlap {} of the truncated window must be usable: {e:#}",
+                n + 1
+            )
         });
         assert!(
             plan.listen_port > base + OWN_TUN_PORT_OFFSET,

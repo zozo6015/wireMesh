@@ -80,7 +80,11 @@ fn peer_proto(gateway_id: u64, pubkey: &str, candidates: &[&str], cidr: &str) ->
     Peer {
         gateway_id,
         segment_name: format!("s{gateway_id}"),
-        keys: vec![PeerKey { epoch: 0, pubkey: pubkey.to_string(), state: "active".into() }],
+        keys: vec![PeerKey {
+            epoch: 0,
+            pubkey: pubkey.to_string(),
+            state: "active".into(),
+        }],
         candidate_endpoints: candidates.iter().map(|s| s.to_string()).collect(),
         allowed_ips: vec![cidr.to_string()],
     }
@@ -209,7 +213,12 @@ fn a_delta_upserting_a_peer_with_a_malformed_candidate_is_filtered_too() {
 
     ds.apply_delta(&Delta {
         revision: 8,
-        upserted_peers: vec![peer_proto(2, PEER_A_PUB_B64, &[BOGUS_FIRST, VALID], "10.10.2.0/24")],
+        upserted_peers: vec![peer_proto(
+            2,
+            PEER_A_PUB_B64,
+            &[BOGUS_FIRST, VALID],
+            "10.10.2.0/24",
+        )],
         removed_peer_ids: vec![],
         deprecated_relays: vec![],
         policy_ir: vec![],
@@ -278,8 +287,11 @@ fn write_state_json(dir: &std::path::Path, candidates: &[&str]) {
         "relays": [],
         "revoked_serials": [],
     });
-    std::fs::write(dir.join("state.json"), serde_json::to_vec_pretty(&doc).unwrap())
-        .expect("writing the test state.json");
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec_pretty(&doc).unwrap(),
+    )
+    .expect("writing the test state.json");
 }
 
 #[test]
@@ -371,8 +383,11 @@ fn a_backward_compatible_state_json_without_candidates_still_loads() {
         "policy_version": 0,
         "revoked_serials": [],
     });
-    std::fs::write(dir.path().join("state.json"), serde_json::to_vec_pretty(&doc).unwrap())
-        .expect("writing the legacy state.json");
+    std::fs::write(
+        dir.path().join("state.json"),
+        serde_json::to_vec_pretty(&doc).unwrap(),
+    )
+    .expect("writing the legacy state.json");
 
     let ds = DesiredState::load(dir.path())
         .expect(

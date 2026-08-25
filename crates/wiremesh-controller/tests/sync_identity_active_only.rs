@@ -32,13 +32,10 @@ async fn drained_gateway_can_no_longer_open_sync_watch() {
         .await
         .expect("Admin.Drain(gateway_id = a.id()) must succeed");
 
-    let err = a
-        .reconnect(&h)
-        .await
-        .expect_err(
-            "a drained gateway must no longer be able to open Sync.Watch — its identity \
+    let err = a.reconnect(&h).await.expect_err(
+        "a drained gateway must no longer be able to open Sync.Watch — its identity \
              must no longer resolve on the Sync path",
-        );
+    );
     let msg = err.to_string();
     assert!(
         msg.contains("PermissionDenied") || msg.contains("permission_denied"),

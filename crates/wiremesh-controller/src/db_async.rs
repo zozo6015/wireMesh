@@ -27,7 +27,9 @@ pub struct DbHandle {
 
 impl DbHandle {
     pub fn new(db: Db) -> Self {
-        Self { inner: Arc::new(db) }
+        Self {
+            inner: Arc::new(db),
+        }
     }
 
     /// See [`Db::insert_segment`]. Returns the new segment's id.
@@ -422,7 +424,8 @@ impl DbHandle {
         now: String,
     ) -> Result<Option<String>> {
         let db = self.inner.clone();
-        tokio::task::spawn_blocking(move || db.find_active_api_token_role(&secret_hash, &now)).await?
+        tokio::task::spawn_blocking(move || db.find_active_api_token_role(&secret_hash, &now))
+            .await?
     }
 
     /// See [`Db::find_active_api_token`].
@@ -474,10 +477,7 @@ impl DbHandle {
     }
 
     /// See [`Db::candidate_endpoint_for_gateway`].
-    pub async fn candidate_endpoint_for_gateway(
-        &self,
-        gateway_id: i64,
-    ) -> Result<Option<String>> {
+    pub async fn candidate_endpoint_for_gateway(&self, gateway_id: i64) -> Result<Option<String>> {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.candidate_endpoint_for_gateway(gateway_id)).await?
     }

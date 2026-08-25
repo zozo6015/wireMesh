@@ -249,7 +249,12 @@ async fn fabricctl_policy_status_prints_gateway_and_applied_version() {
     let gw_info = gateways
         .into_iter()
         .find(|g| g.id == gw.id())
-        .unwrap_or_else(|| panic!("expected the enrolled gateway (id={}) in ListGateways", gw.id()));
+        .unwrap_or_else(|| {
+            panic!(
+                "expected the enrolled gateway (id={}) in ListGateways",
+                gw.id()
+            )
+        });
 
     let status = run_fabricctl(&["--socket", &socket, "policy", "status"]);
     assert!(

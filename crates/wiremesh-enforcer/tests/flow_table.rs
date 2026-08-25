@@ -102,13 +102,23 @@ fn tiny_cfg() -> EnforcerConfig {
 /// far less likely, NOT impossible, so the large window stays: it is cheap
 /// insurance, and (c)'s subject has not changed.)
 fn flush_test_cfg() -> EnforcerConfig {
-    EnforcerConfig { flow_max: 64, rate_cap_per_src: 8, ..EnforcerConfig::default() }
+    EnforcerConfig {
+        flow_max: 64,
+        rate_cap_per_src: 8,
+        ..EnforcerConfig::default()
+    }
 }
 
 fn segments_exact() -> Vec<SegmentDef> {
     vec![
-        SegmentDef { name: "seg-a".into(), cidrs: vec!["10.10.0.1/32".parse().unwrap()] },
-        SegmentDef { name: "seg-b".into(), cidrs: vec!["10.10.0.2/32".parse().unwrap()] },
+        SegmentDef {
+            name: "seg-a".into(),
+            cidrs: vec!["10.10.0.1/32".parse().unwrap()],
+        },
+        SegmentDef {
+            name: "seg-b".into(),
+            cidrs: vec!["10.10.0.2/32".parse().unwrap()],
+        },
     ]
 }
 
@@ -120,7 +130,11 @@ fn compile_with(yaml: &str, segs: &[SegmentDef], version: u64) -> PolicyIR {
 }
 
 fn empty_ir(version: u64) -> PolicyIR {
-    PolicyIR { schema: 1, version, blocks: vec![] }
+    PolicyIR {
+        schema: 1,
+        version,
+        blocks: vec![],
+    }
 }
 
 // --- packet-level helpers (no `nc`/`ncat`/`socat` in this image — python3
@@ -141,7 +155,8 @@ s.bind(("{bind_ip}", {bind_port}))
 s.sendto(b"x", ("{dst_ip}", {dst_port}))
 "#
     );
-    ns.exec(&["python3", "-c", &script]).expect("one-shot udp send");
+    ns.exec(&["python3", "-c", &script])
+        .expect("one-shot udp send");
 }
 
 /// Spawns a one-shot UDP receiver bound to `0.0.0.0:port`, blocking up to
@@ -163,11 +178,14 @@ except socket.timeout:
     print("TIMEOUT")
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn udp recv probe")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn udp recv probe")
 }
 
 fn probe_received(child: Child) -> bool {
-    let out = child.wait_with_output().expect("udp recv probe should exit");
+    let out = child
+        .wait_with_output()
+        .expect("udp recv probe should exit");
     String::from_utf8_lossy(&out.stdout).trim() == "RECEIVED"
 }
 
@@ -390,7 +408,9 @@ policy:
     );
 
     // flush_flows(): clears FLOWS outright.
-    enforcer.flush_flows().expect("flush_flows() should succeed");
+    enforcer
+        .flush_flows()
+        .expect("flush_flows() should succeed");
 
     // Post-flush: the SAME 5-tuple must now be denied -- the entry is gone,
     // so this falls through to the rule scan against v2 (no rule), which
@@ -454,10 +474,10 @@ fn per_source_rate_cap_prevents_one_blasting_source_from_evicting_another_source
 
     let mut enforcer = wiremesh_enforcer::probe("wg0", tiny_cfg())
         .expect("probe should load + attach eBPF on wg0");
-    enforcer
-        .apply(&empty_ir(1))
-        .expect("empty (default-deny) policy should apply -- rate capping is an egress-side \
-                 concern, independent of any rule content");
+    enforcer.apply(&empty_ir(1)).expect(
+        "empty (default-deny) policy should apply -- rate capping is an egress-side \
+                 concern, independent of any rule content",
+    );
 
     // alias2 establishes ONE flow, well before the blast:
     // FLOWS{src=10.10.0.22,dst=a,sport=6100,dport=7100}.
@@ -620,7 +640,9 @@ policy:
     // before flushing -- r2 must observe the still-established flow, not a
     // just-flushed one.
     std::thread::sleep(Duration::from_millis(1500));
-    enforcer.flush_flows().expect("flush_flows() should succeed");
+    enforcer
+        .flush_flows()
+        .expect("flush_flows() should succeed");
 
     let out = client
         .wait_with_output()
@@ -671,7 +693,8 @@ except Exception:
     pass
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn ack-echo listener")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn ack-echo listener")
 }
 
 /// Connects to `dst_addr:port` and performs THREE request/ack round trips
@@ -727,5 +750,6 @@ print(f"R2={{'OK' if r2_ok else 'FAIL'}}")
 print(f"R3={{'DENIED' if r3_denied else 'PASSED'}}")
 "#
     );
-    ns.spawn(&["python3", "-c", &script]).expect("spawn flow-persistence client")
+    ns.spawn(&["python3", "-c", &script])
+        .expect("spawn flow-persistence client")
 }

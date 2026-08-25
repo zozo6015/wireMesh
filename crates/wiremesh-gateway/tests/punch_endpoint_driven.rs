@@ -87,10 +87,16 @@ struct RecordingSink {
 
 impl RecordingSink {
     fn new() -> Self {
-        RecordingSink { calls: RefCell::new(Vec::new()), fail: false }
+        RecordingSink {
+            calls: RefCell::new(Vec::new()),
+            fail: false,
+        }
     }
     fn failing() -> Self {
-        RecordingSink { calls: RefCell::new(Vec::new()), fail: true }
+        RecordingSink {
+            calls: RefCell::new(Vec::new()),
+            fail: true,
+        }
     }
     fn calls(&self) -> Vec<Ipv4Addr> {
         self.calls.borrow().clone()
@@ -158,7 +164,11 @@ fn nudge_target_skips_malformed_and_is_none_without_a_cidr() {
     // NIT-8: a `/0` default route is skipped (its first host `0.0.0.1` is never
     // a real overlay peer), in favor of the next valid CIDR — or None if it's
     // the only entry.
-    assert_eq!(nudge_target(&["0.0.0.0/0".to_string()]), None, "a lone /0 yields no target");
+    assert_eq!(
+        nudge_target(&["0.0.0.0/0".to_string()]),
+        None,
+        "a lone /0 yields no target"
+    );
     assert_eq!(
         nudge_target(&["0.0.0.0/0".to_string(), "10.10.9.0/24".to_string()]),
         Some(Ipv4Addr::new(10, 10, 9, 1)),
@@ -191,7 +201,10 @@ fn nudge_peer_without_a_target_is_a_no_op() {
     let sink = RecordingSink::new();
     let emitted = nudge_peer(&sink, &[]).expect("no-target nudge is not an error");
     assert!(!emitted, "no target → nothing emitted");
-    assert!(sink.calls().is_empty(), "the sink must not be touched when there is no target");
+    assert!(
+        sink.calls().is_empty(),
+        "the sink must not be touched when there is no target"
+    );
 }
 
 /// A failing tun-write surfaces as an error (the driver logs it and lets the
@@ -200,8 +213,15 @@ fn nudge_peer_without_a_target_is_a_no_op() {
 fn nudge_peer_propagates_a_sink_error_after_one_attempt() {
     let sink = RecordingSink::failing();
     let r = nudge_peer(&sink, &["10.10.2.0/24".to_string()]);
-    assert!(r.is_err(), "a sink failure must propagate, not be swallowed");
-    assert_eq!(sink.calls().len(), 1, "the nudge is attempted once before failing, never spammed");
+    assert!(
+        r.is_err(),
+        "a sink failure must propagate, not be swallowed"
+    );
+    assert_eq!(
+        sink.calls().len(),
+        1,
+        "the nudge is attempted once before failing, never spammed"
+    );
 }
 
 // --- T3: sequential candidate trial ------------------------------------------
@@ -231,21 +251,51 @@ fn trial_advances_through_candidates_one_at_a_time() {
     );
 
     // First poll: punch candidate 0.
-    assert_eq!(trial.poll(t0, TO), TrialStep::Punch(cand("198.51.100.1:51820")));
+    assert_eq!(
+        trial.poll(t0, TO),
+        TrialStep::Punch(cand("198.51.100.1:51820"))
+    );
     // Inside candidate 0's window: keep waiting — do NOT re-punch (no spam).
-    assert_eq!(trial.poll(t0 + Duration::from_secs(1), TO), TrialStep::Waiting);
-    assert_eq!(trial.poll(t0 + Duration::from_secs(4), TO), TrialStep::Waiting);
+    assert_eq!(
+        trial.poll(t0 + Duration::from_secs(1), TO),
+        TrialStep::Waiting
+    );
+    assert_eq!(
+        trial.poll(t0 + Duration::from_secs(4), TO),
+        TrialStep::Waiting
+    );
     // Candidate 0's window elapses with no handshake: advance to candidate 1.
-    assert_eq!(trial.poll(t0 + Duration::from_secs(5), TO), TrialStep::Punch(cand("198.51.100.2:51820")));
+    assert_eq!(
+        trial.poll(t0 + Duration::from_secs(5), TO),
+        TrialStep::Punch(cand("198.51.100.2:51820"))
+    );
     // Candidate 1's window (relative to when it started, t0+5).
-    assert_eq!(trial.poll(t0 + Duration::from_secs(9), TO), TrialStep::Waiting);
-    assert_eq!(trial.poll(t0 + Duration::from_secs(10), TO), TrialStep::Punch(cand("198.51.100.3:51820")));
+    assert_eq!(
+        trial.poll(t0 + Duration::from_secs(9), TO),
+        TrialStep::Waiting
+    );
+    assert_eq!(
+        trial.poll(t0 + Duration::from_secs(10), TO),
+        TrialStep::Punch(cand("198.51.100.3:51820"))
+    );
     // Last candidate times out: exhausted → Relayed fallback.
-    assert!(!trial.is_exhausted(), "not exhausted while candidate 2's window is open");
-    assert_eq!(trial.poll(t0 + Duration::from_secs(15), TO), TrialStep::Exhausted);
-    assert!(trial.is_exhausted(), "all candidates tried without a handshake");
+    assert!(
+        !trial.is_exhausted(),
+        "not exhausted while candidate 2's window is open"
+    );
+    assert_eq!(
+        trial.poll(t0 + Duration::from_secs(15), TO),
+        TrialStep::Exhausted
+    );
+    assert!(
+        trial.is_exhausted(),
+        "all candidates tried without a handshake"
+    );
     // Stays exhausted on further polls (idempotent terminal state).
-    assert_eq!(trial.poll(t0 + Duration::from_secs(30), TO), TrialStep::Exhausted);
+    assert_eq!(
+        trial.poll(t0 + Duration::from_secs(30), TO),
+        TrialStep::Exhausted
+    );
 }
 
 /// MAJOR-4 regression: candidate 0's per-candidate window must begin when its
@@ -259,21 +309,33 @@ fn trial_advances_through_candidates_one_at_a_time() {
 fn trial_first_candidate_gets_full_window_from_first_punch() {
     let t0 = Instant::now();
     let mut trial = CandidateTrial::new(
-        &["198.51.100.1:51820".to_string(), "198.51.100.2:51820".to_string()],
+        &[
+            "198.51.100.1:51820".to_string(),
+            "198.51.100.2:51820".to_string(),
+        ],
         t0,
     );
 
     // First poll happens 3s AFTER construction: this is when candidate 0 is
     // punched, so its window is [t0+3, t0+3+TO).
     let first_punch = t0 + Duration::from_secs(3);
-    assert_eq!(trial.poll(first_punch, TO), TrialStep::Punch(cand("198.51.100.1:51820")));
+    assert_eq!(
+        trial.poll(first_punch, TO),
+        TrialStep::Punch(cand("198.51.100.1:51820"))
+    );
 
     // Just before the window (measured from first_punch, NOT t0) elapses:
     // still waiting on candidate 0 — a `new`-seeded window would have advanced
     // by now (t0 + 3 + 4 = t0 + 7 > t0 + TO=5).
-    assert_eq!(trial.poll(first_punch + TO - Duration::from_secs(1), TO), TrialStep::Waiting);
+    assert_eq!(
+        trial.poll(first_punch + TO - Duration::from_secs(1), TO),
+        TrialStep::Waiting
+    );
     // Exactly at the full window from first_punch: advance to candidate 1.
-    assert_eq!(trial.poll(first_punch + TO, TO), TrialStep::Punch(cand("198.51.100.2:51820")));
+    assert_eq!(
+        trial.poll(first_punch + TO, TO),
+        TrialStep::Punch(cand("198.51.100.2:51820"))
+    );
 }
 
 /// MAJOR-5 regression: v1 is IPv4-only, so an IPv6 `SocketAddr` candidate must
@@ -285,17 +347,25 @@ fn trial_rejects_ipv6_candidates() {
     let t0 = Instant::now();
 
     // IPv6-only: nothing dialable → immediately exhausted, never a Punch.
-    let mut ipv6_only =
-        CandidateTrial::new(&["[2001:db8::1]:51820".to_string()], t0);
+    let mut ipv6_only = CandidateTrial::new(&["[2001:db8::1]:51820".to_string()], t0);
     assert_eq!(ipv6_only.poll(t0, TO), TrialStep::Exhausted);
-    assert!(ipv6_only.is_exhausted(), "an IPv6 candidate must never be punched");
+    assert!(
+        ipv6_only.is_exhausted(),
+        "an IPv6 candidate must never be punched"
+    );
 
     // Mixed: the IPv6 entry is dropped, the IPv4 one is trialed.
     let mut mixed = CandidateTrial::new(
-        &["[2001:db8::2]:51820".to_string(), "198.51.100.9:51820".to_string()],
+        &[
+            "[2001:db8::2]:51820".to_string(),
+            "198.51.100.9:51820".to_string(),
+        ],
         t0,
     );
-    assert_eq!(mixed.poll(t0, TO), TrialStep::Punch(cand("198.51.100.9:51820")));
+    assert_eq!(
+        mixed.poll(t0, TO),
+        TrialStep::Punch(cand("198.51.100.9:51820"))
+    );
     assert_eq!(mixed.poll(t0 + TO, TO), TrialStep::Exhausted);
 }
 
@@ -304,8 +374,14 @@ fn trial_rejects_ipv6_candidates() {
 fn trial_single_candidate_then_exhausted() {
     let t0 = Instant::now();
     let mut trial = CandidateTrial::new(&["198.51.100.7:51820".to_string()], t0);
-    assert_eq!(trial.poll(t0, TO), TrialStep::Punch(cand("198.51.100.7:51820")));
-    assert_eq!(trial.poll(t0 + Duration::from_secs(4), TO), TrialStep::Waiting);
+    assert_eq!(
+        trial.poll(t0, TO),
+        TrialStep::Punch(cand("198.51.100.7:51820"))
+    );
+    assert_eq!(
+        trial.poll(t0 + Duration::from_secs(4), TO),
+        TrialStep::Waiting
+    );
     assert_eq!(trial.poll(t0 + TO, TO), TrialStep::Exhausted);
     assert!(trial.is_exhausted());
 }
@@ -326,7 +402,10 @@ fn trial_filters_unspecified_loopback_and_malformed_candidates() {
         t0,
     );
     // Only the one dialable candidate is trialed.
-    assert_eq!(trial.poll(t0, TO), TrialStep::Punch(cand("198.51.100.7:51820")));
+    assert_eq!(
+        trial.poll(t0, TO),
+        TrialStep::Punch(cand("198.51.100.7:51820"))
+    );
     assert_eq!(trial.poll(t0 + TO, TO), TrialStep::Exhausted);
     assert!(trial.is_exhausted());
 }
@@ -341,8 +420,7 @@ fn trial_with_no_dialable_candidates_is_immediately_exhausted() {
     assert_eq!(empty.poll(t0, TO), TrialStep::Exhausted);
     assert!(empty.is_exhausted());
 
-    let mut all_invalid =
-        CandidateTrial::new(&["nope".to_string(), "0.0.0.0:1".to_string()], t0);
+    let mut all_invalid = CandidateTrial::new(&["nope".to_string(), "0.0.0.0:1".to_string()], t0);
     assert_eq!(all_invalid.poll(t0, TO), TrialStep::Exhausted);
     assert!(all_invalid.is_exhausted());
 }

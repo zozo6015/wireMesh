@@ -23,7 +23,9 @@
 
 use std::time::Duration;
 
-use wiremesh_proto::v1::{sync_message, Delta, RotateKeyRequest, SubmitEpochKeyRequest, SyncMessage};
+use wiremesh_proto::v1::{
+    sync_message, Delta, RotateKeyRequest, SubmitEpochKeyRequest, SyncMessage,
+};
 use wiremesh_testkit::{enroll_one, StubGateway, TestController};
 
 /// A gateway can submit its real pubkey for a pending epoch, and that
@@ -47,9 +49,7 @@ async fn rotate_then_submit_replaces_sentinel_with_real_pubkey() {
 
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest {
-            gateway_id: a.id(),
-        })
+        .rotate_key(RotateKeyRequest { gateway_id: a.id() })
         .await
         .expect("Admin.RotateKey(gateway_id = a.id()) must succeed");
 
@@ -87,10 +87,10 @@ async fn rotate_then_submit_replaces_sentinel_with_real_pubkey() {
     );
 
     // The gateway submits its real pubkey for the pending epoch.
-    a.submit_epoch_key(pending_epoch, "REALKEY==")
-        .await
-        .expect("Sync.SubmitEpochKey must succeed for a genuinely pending, \
-                 sentinel-holding epoch");
+    a.submit_epoch_key(pending_epoch, "REALKEY==").await.expect(
+        "Sync.SubmitEpochKey must succeed for a genuinely pending, \
+                 sentinel-holding epoch",
+    );
 
     // The sentinel must now be overwritten with the real pubkey, and the
     // epoch must STILL be 'pending' — submitting a key is not the same as
@@ -314,7 +314,10 @@ async fn rotate_and_pending_epoch(h: &TestController, gateway_id: u64) -> u32 {
         .iter()
         .max_by_key(|(epoch, _, _)| *epoch)
         .unwrap_or_else(|| panic!("no GATEWAY_KEY rows after rotation: {states:?}"));
-    assert_eq!(state, "pending", "the freshly rotated epoch must be pending: {states:?}");
+    assert_eq!(
+        state, "pending",
+        "the freshly rotated epoch must be pending: {states:?}"
+    );
     assert_eq!(
         pubkey, SENTINEL,
         "the freshly rotated epoch must hold the sentinel — this fixture exists to race the \
@@ -453,9 +456,8 @@ async fn stale_generation_submission_is_rejected_and_the_sentinel_survives() {
     let h = TestController::start().await;
     let f = rotation_in_flight_across_a_gateway_restart(&h).await;
 
-    let err = f
-        .a
-        .submit_epoch_key_raw(SubmitEpochKeyRequest {
+    let err =
+        f.a.submit_epoch_key_raw(SubmitEpochKeyRequest {
             epoch: f.pending_epoch,
             pubkey: STALE_KEY.to_string(),
             session_generation: f.stale_generation,
@@ -485,17 +487,22 @@ async fn stale_generation_submission_is_rejected_and_the_sentinel_survives() {
     );
 
     // Anti-vacuity: the row was claimable all along.
-    f.a.submit_epoch_key(f.pending_epoch, FRESH_KEY).await.expect(
-        "the LIVE process's submission (matching generation) must succeed — if this fails, \
+    f.a.submit_epoch_key(f.pending_epoch, FRESH_KEY)
+        .await
+        .expect(
+            "the LIVE process's submission (matching generation) must succeed — if this fails, \
          the sentinel assertion above proved nothing, because the row was not claimable at \
          the moment the stale submission was refused",
-    );
+        );
     let (pubkey, state) = epoch_row(&h, f.a.id(), f.pending_epoch).await;
     assert_eq!(
         pubkey, FRESH_KEY,
         "the live process's key must be the one that wins the swap, got {pubkey:?}"
     );
-    assert_eq!(state, "pending", "submitting a key must not promote it, got {state:?}");
+    assert_eq!(
+        state, "pending",
+        "submitting a key must not promote it, got {state:?}"
+    );
 }
 
 /// (d) A rejected submission must produce NO rotation side effects — the gate
@@ -529,9 +536,8 @@ async fn a_rejected_submission_publishes_no_key_delta_to_peers() {
     let mut f = rotation_in_flight_across_a_gateway_restart(&h).await;
     let a_id = f.a.id();
 
-    let err = f
-        .a
-        .submit_epoch_key_raw(SubmitEpochKeyRequest {
+    let err =
+        f.a.submit_epoch_key_raw(SubmitEpochKeyRequest {
             epoch: f.pending_epoch,
             pubkey: STALE_KEY.to_string(),
             session_generation: f.stale_generation,

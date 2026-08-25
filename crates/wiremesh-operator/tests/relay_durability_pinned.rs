@@ -77,8 +77,14 @@ fn relay_spec_carries_storage_fields_camel_case() {
     );
 
     let bare = serde_json::to_value(spec(None, None)).unwrap();
-    assert!(bare.get("storageClass").is_none(), "storageClass omitted when unset");
-    assert!(bare.get("storageSize").is_none(), "storageSize omitted when unset");
+    assert!(
+        bare.get("storageClass").is_none(),
+        "storageClass omitted when unset"
+    );
+    assert!(
+        bare.get("storageSize").is_none(),
+        "storageSize omitted when unset"
+    );
 
     // Roundtrip: a legacy CR without the new fields still deserializes.
     let legacy: WiremeshRelaySpec =
@@ -103,8 +109,15 @@ fn relay_pvc_shape_mirrors_gateway_pvc() {
         "relay identity PVC is RWO (node-local, single writer)"
     );
     let req = s.resources.as_ref().unwrap().requests.as_ref().unwrap();
-    assert_eq!(req.get("storage").unwrap().0, "128Mi", "default relay PVC size is 128Mi");
-    assert!(s.storage_class_name.is_none(), "no storageClass unless the CR sets one");
+    assert_eq!(
+        req.get("storage").unwrap().0,
+        "128Mi",
+        "default relay PVC size is 128Mi"
+    );
+    assert!(
+        s.storage_class_name.is_none(),
+        "no storageClass unless the CR sets one"
+    );
     let labels = pvc.metadata.labels.as_ref().expect("labels");
     assert_eq!(
         labels.get("app.kubernetes.io/instance").map(String::as_str),
@@ -113,11 +126,26 @@ fn relay_pvc_shape_mirrors_gateway_pvc() {
     );
 
     // Overrides flow through from the CR.
-    let pvc2 = relay_pvc("relay-eu", &spec(Some("fast-ssd".into()), Some("256Mi".into())));
+    let pvc2 = relay_pvc(
+        "relay-eu",
+        &spec(Some("fast-ssd".into()), Some("256Mi".into())),
+    );
     let s2 = pvc2.spec.as_ref().unwrap();
-    assert_eq!(s2.storage_class_name.as_deref(), Some("fast-ssd"), "storageClass override honored");
     assert_eq!(
-        s2.resources.as_ref().unwrap().requests.as_ref().unwrap().get("storage").unwrap().0,
+        s2.storage_class_name.as_deref(),
+        Some("fast-ssd"),
+        "storageClass override honored"
+    );
+    assert_eq!(
+        s2.resources
+            .as_ref()
+            .unwrap()
+            .requests
+            .as_ref()
+            .unwrap()
+            .get("storage")
+            .unwrap()
+            .0,
         "256Mi",
         "storageSize override honored"
     );
@@ -132,8 +160,14 @@ fn relay_should_mint_token_keys_off_identity_persisted_not_needs_token_alone() {
     //   should_mint_token(identity_persisted, token_secret)
     //       == !identity_persisted || needs_token(token_secret)
     let mut data = BTreeMap::new();
-    data.insert("token".to_string(), ByteString(b"wiremesh://spent".to_vec()));
-    let populated = Secret { data: Some(data), ..Default::default() };
+    data.insert(
+        "token".to_string(),
+        ByteString(b"wiremesh://spent".to_vec()),
+    );
+    let populated = Secret {
+        data: Some(data),
+        ..Default::default()
+    };
 
     assert!(
         should_mint_token(false, Some(&populated)),
@@ -143,8 +177,17 @@ fn relay_should_mint_token_keys_off_identity_persisted_not_needs_token_alone() {
         !should_mint_token(true, Some(&populated)),
         "identity persisted + populated token → no re-mint (steady state; tokens stay single-mint)"
     );
-    assert!(should_mint_token(true, None), "no token secret → mint even if identity persisted");
-    assert!(should_mint_token(false, None), "no token secret + not persisted → mint");
+    assert!(
+        should_mint_token(true, None),
+        "no token secret → mint even if identity persisted"
+    );
+    assert!(
+        should_mint_token(false, None),
+        "no token secret + not persisted → mint"
+    );
     let empty = Secret::default();
-    assert!(should_mint_token(true, Some(&empty)), "token secret without token key → mint");
+    assert!(
+        should_mint_token(true, Some(&empty)),
+        "token secret without token key → mint"
+    );
 }

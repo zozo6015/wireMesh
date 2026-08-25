@@ -36,7 +36,9 @@ async fn revoke_pushes_serial_to_connected_gateways_and_audits() {
         .expect("Sync.Watch stream yielded an error instead of A's initial snapshot");
     match snap_msg.body {
         Some(sync_message::Body::Snapshot(_)) => {}
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 
     let victim_serial = victim

@@ -80,7 +80,10 @@ pub(crate) fn reuseport_udp(port: u16) -> anyhow::Result<UdpSocket> {
     unsafe {
         let fd = libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0);
         if fd < 0 {
-            return Err(anyhow::anyhow!("socket(): {}", std::io::Error::last_os_error()));
+            return Err(anyhow::anyhow!(
+                "socket(): {}",
+                std::io::Error::last_os_error()
+            ));
         }
         let one: libc::c_int = 1;
         for opt in [libc::SO_REUSEADDR, libc::SO_REUSEPORT] {
@@ -93,13 +96,18 @@ pub(crate) fn reuseport_udp(port: u16) -> anyhow::Result<UdpSocket> {
             ) != 0
             {
                 libc::close(fd);
-                return Err(anyhow::anyhow!("setsockopt: {}", std::io::Error::last_os_error()));
+                return Err(anyhow::anyhow!(
+                    "setsockopt: {}",
+                    std::io::Error::last_os_error()
+                ));
             }
         }
         let addr = libc::sockaddr_in {
             sin_family: libc::AF_INET as libc::sa_family_t,
             sin_port: port.to_be(),
-            sin_addr: libc::in_addr { s_addr: libc::INADDR_ANY.to_be() },
+            sin_addr: libc::in_addr {
+                s_addr: libc::INADDR_ANY.to_be(),
+            },
             sin_zero: [0; 8],
         };
         if libc::bind(
@@ -109,7 +117,10 @@ pub(crate) fn reuseport_udp(port: u16) -> anyhow::Result<UdpSocket> {
         ) != 0
         {
             libc::close(fd);
-            return Err(anyhow::anyhow!("bind(:{port}): {}", std::io::Error::last_os_error()));
+            return Err(anyhow::anyhow!(
+                "bind(:{port}): {}",
+                std::io::Error::last_os_error()
+            ));
         }
         Ok(UdpSocket::from_raw_fd(fd))
     }

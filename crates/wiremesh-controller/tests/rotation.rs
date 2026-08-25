@@ -68,16 +68,16 @@ async fn ack_driven_rotation_promotes_and_retires() {
         .expect("Sync.Watch stream yielded an error instead of B's initial snapshot");
     match _initial_snapshot.body {
         Some(sync_message::Body::Snapshot(_)) => {}
-        other => panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}"),
+        other => {
+            panic!("expected the first Sync.Watch message to be a StateSnapshot, got: {other:?}")
+        }
     }
 
     // Start the rotation: A gets a new pending epoch carrying the
     // "awaiting-submission" sentinel pubkey (Task 2 behavior).
     h.admin_client()
         .await
-        .rotate_key(RotateKeyRequest {
-            gateway_id: a.id(),
-        })
+        .rotate_key(RotateKeyRequest { gateway_id: a.id() })
         .await
         .expect("Admin.RotateKey(gateway_id = a.id()) must succeed");
 
@@ -139,9 +139,9 @@ async fn ack_driven_rotation_promotes_and_retires() {
          debug_key_states: {last_seen:?}"
     );
     assert!(
-        last_seen
-            .iter()
-            .any(|(epoch, pubkey, state)| *epoch == n1 && state == "active" && pubkey == "REALKEYA=="),
+        last_seen.iter().any(|(epoch, pubkey, state)| *epoch == n1
+            && state == "active"
+            && pubkey == "REALKEYA=="),
         "expected epoch {n1} to be 'active' with the real submitted pubkey REALKEYA==, \
          got: {last_seen:?}"
     );

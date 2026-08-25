@@ -35,7 +35,11 @@ pub fn token_secret_name(gateway_name: &str) -> String {
 pub fn needs_token(existing: Option<&Secret>) -> bool {
     match existing {
         None => true,
-        Some(s) => !s.data.as_ref().map(|d| d.contains_key("token")).unwrap_or(false),
+        Some(s) => !s
+            .data
+            .as_ref()
+            .map(|d| d.contains_key("token"))
+            .unwrap_or(false),
     }
 }
 
@@ -73,7 +77,9 @@ pub fn should_mint_token(identity_persisted: bool, token_secret: Option<&Secret>
 /// spent token (the mint-suppression deadlock). This selector is the single
 /// choke point every roster lookup routes through.
 pub fn active_in_segment<'a>(roster: &'a [GatewayRow], segment: &str) -> Option<&'a GatewayRow> {
-    roster.iter().find(|g| g.segment == segment && g.status == "active")
+    roster
+        .iter()
+        .find(|g| g.segment == segment && g.status == "active")
 }
 
 /// The rebind decision: compare the CIDRs the CURRENT token Secret was minted
@@ -286,7 +292,9 @@ async fn reconcile(gw: Arc<WiremeshGateway>, ctx: Arc<Context>) -> Result<Action
         }
     })
     .await
-    .map_err(|e: kube::runtime::finalizer::Error<Error>| Error::Admin(anyhow::anyhow!("finalizer: {e}")))
+    .map_err(|e: kube::runtime::finalizer::Error<Error>| {
+        Error::Admin(anyhow::anyhow!("finalizer: {e}"))
+    })
 }
 
 async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Error> {
@@ -317,7 +325,9 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     }
     if let Some(v) = gw.spec.metrics_bind.as_deref() {
         workloads::validate_bind_target(v).map_err(|e| {
-            Error::Admin(anyhow::anyhow!("WiremeshGateway {name}: spec.metricsBind: {e}"))
+            Error::Admin(anyhow::anyhow!(
+                "WiremeshGateway {name}: spec.metricsBind: {e}"
+            ))
         })?;
     }
 
@@ -408,7 +418,11 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
             .await
         {
             Ok(list) => {
-                list.items.iter().filter(|g| g.spec.segment_ref == gw.spec.segment_ref).count() == 1
+                list.items
+                    .iter()
+                    .filter(|g| g.spec.segment_ref == gw.spec.segment_ref)
+                    .count()
+                    == 1
             }
             Err(e) => {
                 tracing::warn!(
@@ -509,8 +523,10 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // Evaluated INDEPENDENTLY of the roster: whether the segment's CIDRs moved
     // since this Secret's token was minted is a fact about the Secret, not about
     // the controller's view of the gateway.
-    let rebind_pending =
-        needs_rebind(existing_secret.as_ref().and_then(bound_cidrs_of).as_deref(), &cidrs);
+    let rebind_pending = needs_rebind(
+        existing_secret.as_ref().and_then(bound_cidrs_of).as_deref(),
+        &cidrs,
+    );
 
     // The decision itself is pure and lives in ONE place (`mint_action`), so a
     // future edit cannot silently reorder the arms — in particular it cannot
@@ -538,7 +554,11 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
             );
         }
         MintAction::MintOrdinary => {
-            let token = ctx.admin.mint_gateway_token(&cidrs).await.map_err(Error::Admin)?;
+            let token = ctx
+                .admin
+                .mint_gateway_token(&cidrs)
+                .await
+                .map_err(Error::Admin)?;
             // `token_secret_body` also RECORDS the CIDRs the token was minted
             // against, so later reconciles can detect a segment-CIDR change and
             // issue a rebind (see the rebind arm below).
@@ -548,30 +568,30 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
             apply(&secrets, &sec).await?;
         }
         MintAction::MintRebind => {
-        // REBIND (segment-CIDR change on an enrolled gateway): the stored token
-        // was minted against the OLD CIDR set, so any future re-enroll (fresh
-        // PVC, adoption, node loss) would be rejected — on the CIDR set
-        // (`BoundCidrMismatch`) and, since the segment still has an active
-        // gateway, on the one-gateway-per-segment invariant
-        // (`SegmentAlreadyBound`). Mint a REBIND token instead: `kind =
-        // "rebind"` with EMPTY bound CIDRs and this segment's id as its scope
-        // (`mint_gateway_rebind_token` — the controller keys the rebind path
-        // off the KIND, and a rebind token's authorization IS the segment id).
-        // At redemption the controller replaces (revokes) the segment's active
-        // gateway rather than rejecting the enroll. Then force-apply the
-        // refreshed Secret (SSA replaces the stale token). The Secret still
-        // records the NEW segment CIDRs — that record is operator-side
-        // bookkeeping for the next `needs_rebind` decision, independent of the
-        // (empty) CIDRs on the wire.
-        //
-        // Pod recreation: NOT triggered separately — the segment CIDRs feed the
-        // enroll init-container argv (`--cidr`) via `gateway_deployment`, so
-        // the CIDR change itself alters the pod template and the Deployment's
-        // Recreate strategy replaces the pod on the apply below. The idempotent
-        // enroll init then redeems the rebind token if the persisted identity
-        // is absent, and skips otherwise (the live identity stays valid; the
-        // fabric apply already routes the new CIDRs, and the refreshed token
-        // covers every future re-enroll).
+            // REBIND (segment-CIDR change on an enrolled gateway): the stored token
+            // was minted against the OLD CIDR set, so any future re-enroll (fresh
+            // PVC, adoption, node loss) would be rejected — on the CIDR set
+            // (`BoundCidrMismatch`) and, since the segment still has an active
+            // gateway, on the one-gateway-per-segment invariant
+            // (`SegmentAlreadyBound`). Mint a REBIND token instead: `kind =
+            // "rebind"` with EMPTY bound CIDRs and this segment's id as its scope
+            // (`mint_gateway_rebind_token` — the controller keys the rebind path
+            // off the KIND, and a rebind token's authorization IS the segment id).
+            // At redemption the controller replaces (revokes) the segment's active
+            // gateway rather than rejecting the enroll. Then force-apply the
+            // refreshed Secret (SSA replaces the stale token). The Secret still
+            // records the NEW segment CIDRs — that record is operator-side
+            // bookkeeping for the next `needs_rebind` decision, independent of the
+            // (empty) CIDRs on the wire.
+            //
+            // Pod recreation: NOT triggered separately — the segment CIDRs feed the
+            // enroll init-container argv (`--cidr`) via `gateway_deployment`, so
+            // the CIDR change itself alters the pod template and the Deployment's
+            // Recreate strategy replaces the pod on the apply below. The idempotent
+            // enroll init then redeems the rebind token if the persisted identity
+            // is absent, and skips otherwise (the live identity stays valid; the
+            // fabric apply already routes the new CIDRs, and the refreshed token
+            // covers every future re-enroll).
             match ctx.admin.segment_id_by_name(&seg.spec.segment_name).await {
                 Ok(Some(segment_id)) => {
                     let token = ctx
@@ -623,7 +643,13 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // be passed through to the enroll init-container (--cidr).
     let addrs = super::controller_endpoints(ctx).await?;
     let mut dep = workloads::gateway_deployment(
-        gw, &addrs.sync, &addrs.enroll, &addrs.observe, crate::workloads::CONTROLLER_CA_SECRET, &token_secret, &cidrs,
+        gw,
+        &addrs.sync,
+        &addrs.enroll,
+        &addrs.observe,
+        crate::workloads::CONTROLLER_CA_SECRET,
+        &token_secret,
+        &cidrs,
     );
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![owner_ref(gw)?]);
@@ -653,7 +679,11 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // above would already have failed on them. The signal only ever fires on a
     // `spec.replicas` we actually read as 0.
     let scaled_down = matches!(
-        deployments.get_opt(&name).await?.as_ref().map(super::deployment_readiness),
+        deployments
+            .get_opt(&name)
+            .await?
+            .as_ref()
+            .map(super::deployment_readiness),
         Some(Readiness::ScaledDown)
     );
 
@@ -673,13 +703,27 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
             Condition {
                 type_: "Enrolled".into(),
                 status: if enrolled { "True" } else { "False" }.into(),
-                reason: if enrolled { "GatewayRegistered" } else { "AwaitingEnrollment" }.into(),
-                message: if enrolled { "gateway registered with the controller".into() } else { "gateway not yet enrolled".into() },
+                reason: if enrolled {
+                    "GatewayRegistered"
+                } else {
+                    "AwaitingEnrollment"
+                }
+                .into(),
+                message: if enrolled {
+                    "gateway registered with the controller".into()
+                } else {
+                    "gateway not yet enrolled".into()
+                },
             },
             Condition {
                 type_: "ScaledDown".into(),
                 status: if scaled_down { "True" } else { "False" }.into(),
-                reason: if scaled_down { "ReplicasZero" } else { "ReplicasNonZero" }.into(),
+                reason: if scaled_down {
+                    "ReplicasZero"
+                } else {
+                    "ReplicasNonZero"
+                }
+                .into(),
                 message: if scaled_down {
                     "gateway Deployment is scaled to 0 replicas — the enrollment is still valid, \
                      but no gateway pod is running and this segment carries no traffic"
@@ -695,11 +739,13 @@ async fn apply_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Er
     // no pod, enrollment can never progress, so the 15s retry would spin on
     // something that cannot happen. A scale back up arrives through the
     // Deployment watch (`.owns` in `run`), not by polling.
-    Ok(Action::requeue(Duration::from_secs(if enrolled || scaled_down {
-        super::SETTLED_REQUEUE_SECS
-    } else {
-        15
-    })))
+    Ok(Action::requeue(Duration::from_secs(
+        if enrolled || scaled_down {
+            super::SETTLED_REQUEUE_SECS
+        } else {
+            15
+        },
+    )))
 }
 
 async fn cleanup_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, Error> {
@@ -792,14 +838,21 @@ async fn cleanup_gateway(gw: &WiremeshGateway, ctx: &Context) -> Result<Action, 
     if let Some(id) = gateway_id {
         ctx.admin.drain(id).await.map_err(Error::Admin)?;
     } else {
-        tracing::warn!("gateway {} cleanup: no gateway_id to drain (never enrolled?)", gw.name_any());
+        tracing::warn!(
+            "gateway {} cleanup: no gateway_id to drain (never enrolled?)",
+            gw.name_any()
+        );
     }
     Ok(Action::await_change())
 }
 
 async fn api_status(ctx: &Context, name: &str, status: WiremeshGatewayStatus) -> Result<(), Error> {
     Api::<WiremeshGateway>::all(ctx.client.clone())
-        .patch_status(name, &PatchParams::default(), &Patch::Merge(serde_json::json!({ "status": status })))
+        .patch_status(
+            name,
+            &PatchParams::default(),
+            &Patch::Merge(serde_json::json!({ "status": status })),
+        )
         .await?;
     Ok(())
 }
@@ -811,16 +864,25 @@ fn error_policy(_gw: Arc<WiremeshGateway>, err: &Error, _ctx: Arc<Context>) -> A
 
 pub async fn run(ctx: Arc<Context>) {
     let client = ctx.client.clone();
-    Controller::new(Api::<WiremeshGateway>::all(client.clone()), watcher::Config::default())
-        .owns(Api::<Deployment>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
-        .owns(Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
-        .run(reconcile, error_policy, ctx)
-        .for_each(|res| async move {
-            if let Err(e) = res {
-                tracing::warn!("WiremeshGateway reconcile failed: {e}");
-            }
-        })
-        .await;
+    Controller::new(
+        Api::<WiremeshGateway>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .owns(
+        Api::<Deployment>::namespaced(client.clone(), &ctx.namespace),
+        watcher::Config::default(),
+    )
+    .owns(
+        Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ctx.namespace),
+        watcher::Config::default(),
+    )
+    .run(reconcile, error_policy, ctx)
+    .for_each(|res| async move {
+        if let Err(e) = res {
+            tracing::warn!("WiremeshGateway reconcile failed: {e}");
+        }
+    })
+    .await;
 }
 
 #[cfg(test)]
@@ -840,8 +902,14 @@ mod tests {
         assert!(needs_token(Some(&empty)), "secret without token key → mint");
         let mut data = BTreeMap::new();
         data.insert("token".to_string(), ByteString(b"wiremesh://...".to_vec()));
-        let populated = Secret { data: Some(data), ..Default::default() };
-        assert!(!needs_token(Some(&populated)), "populated token → skip mint");
+        let populated = Secret {
+            data: Some(data),
+            ..Default::default()
+        };
+        assert!(
+            !needs_token(Some(&populated)),
+            "populated token → skip mint"
+        );
     }
 
     #[test]
@@ -858,8 +926,14 @@ mod tests {
         //   should_mint_token(identity_persisted, token_secret)
         //       == !identity_persisted || needs_token(token_secret)
         let mut data = BTreeMap::new();
-        data.insert("token".to_string(), ByteString(b"wiremesh://spent".to_vec()));
-        let populated = Secret { data: Some(data), ..Default::default() };
+        data.insert(
+            "token".to_string(),
+            ByteString(b"wiremesh://spent".to_vec()),
+        );
+        let populated = Secret {
+            data: Some(data),
+            ..Default::default()
+        };
 
         // Not persisted (fresh/empty PVC OR failed-enroll) + stale populated token
         // → MUST re-mint (the volume needs an unspent token to enroll).
@@ -874,11 +948,20 @@ mod tests {
             "identity persisted + populated token → no re-mint"
         );
         // Token Secret absent → mint regardless of persistence.
-        assert!(should_mint_token(true, None), "no token secret → mint even if identity persisted");
-        assert!(should_mint_token(false, None), "no token secret + not persisted → mint");
+        assert!(
+            should_mint_token(true, None),
+            "no token secret → mint even if identity persisted"
+        );
+        assert!(
+            should_mint_token(false, None),
+            "no token secret + not persisted → mint"
+        );
         // Token Secret present but without the token key → mint.
         let empty = Secret::default();
-        assert!(should_mint_token(true, Some(&empty)), "token secret without token key → mint");
+        assert!(
+            should_mint_token(true, Some(&empty)),
+            "token secret without token key → mint"
+        );
     }
 
     #[test]
@@ -891,9 +974,18 @@ mod tests {
         //
         // Pure fn contract: identity_persisted(pvc_exists, gateway_active)
         //     == pvc_exists && gateway_active
-        assert!(identity_persisted(true, true), "PVC present AND active in roster → persisted");
-        assert!(!identity_persisted(true, false), "PVC present but NOT enrolled/active → NOT persisted (mint)");
-        assert!(!identity_persisted(false, true), "no PVC → NOT persisted even if a stale roster row exists");
+        assert!(
+            identity_persisted(true, true),
+            "PVC present AND active in roster → persisted"
+        );
+        assert!(
+            !identity_persisted(true, false),
+            "PVC present but NOT enrolled/active → NOT persisted (mint)"
+        );
+        assert!(
+            !identity_persisted(false, true),
+            "no PVC → NOT persisted even if a stale roster row exists"
+        );
         assert!(!identity_persisted(false, false), "neither → NOT persisted");
         // Implementer wiring: identity_persisted = pvc_exists && gateway_active,
         // where gateway_active comes from the controller roster (list_gateways for
@@ -1077,6 +1169,9 @@ mod tests {
         );
 
         // Both drifted → ABORT.
-        assert!(!drain_still_authorized(0, None, 8), "recount 0 and no active id → abort");
+        assert!(
+            !drain_still_authorized(0, None, 8),
+            "recount 0 and no active id → abort"
+        );
     }
 }

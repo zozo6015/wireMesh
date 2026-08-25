@@ -180,14 +180,20 @@ impl Drop for RootNetGuard {
 fn attach_underlay(ns: &Ns, ip: &str) {
     let hostend = "wmpah";
     let nsend = "wmpan";
-    run_root(&["ip", "link", "add", hostend, "type", "veth", "peer", "name", nsend]);
+    run_root(&[
+        "ip", "link", "add", hostend, "type", "veth", "peer", "name", nsend,
+    ]);
     run_root(&["ip", "link", "set", hostend, "master", BRIDGE]);
     run_root(&["ip", "link", "set", hostend, "up"]);
     run_root(&["ip", "link", "set", nsend, "netns", &ns.name]);
-    ns.exec(&["ip", "link", "set", nsend, "down"]).expect("down underlay end");
-    ns.exec(&["ip", "link", "set", nsend, "name", "und"]).expect("rename underlay end");
-    ns.exec(&["ip", "addr", "add", &format!("{ip}/24"), "dev", "und"]).expect("addr on underlay");
-    ns.exec(&["ip", "link", "set", "und", "up"]).expect("up underlay");
+    ns.exec(&["ip", "link", "set", nsend, "down"])
+        .expect("down underlay end");
+    ns.exec(&["ip", "link", "set", nsend, "name", "und"])
+        .expect("rename underlay end");
+    ns.exec(&["ip", "addr", "add", &format!("{ip}/24"), "dev", "und"])
+        .expect("addr on underlay");
+    ns.exec(&["ip", "link", "set", "und", "up"])
+        .expect("up underlay");
 }
 
 // --- gateway provisioning ---------------------------------------------------
@@ -264,12 +270,18 @@ fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path) 
     let statedir_s = statedir.to_str().unwrap();
     let args = [
         GW_BIN,
-        "--controller-sync", sync,
-        "--observe", observe,
-        "--tun", "wg0",
-        "--wg-port", "51820",
-        "--state-dir", statedir_s,
-        "--metrics", &metrics,
+        "--controller-sync",
+        sync,
+        "--observe",
+        observe,
+        "--tun",
+        "wg0",
+        "--wg-port",
+        "51820",
+        "--state-dir",
+        statedir_s,
+        "--metrics",
+        &metrics,
     ];
     let mut child = ns.spawn(&args).expect("spawn wiremesh-gateway");
     let mut drains = vec![];
@@ -290,7 +302,11 @@ fn spawn_gw(ns: &Ns, statedir: &Path, sync: &str, observe: &str, logdir: &Path) 
             }
         }));
     }
-    GwProc { child, err_log, drains }
+    GwProc {
+        child,
+        err_log,
+        drains,
+    }
 }
 
 // --- metrics probe ----------------------------------------------------------
@@ -304,7 +320,8 @@ fn scrape(addr: &str, budget: Duration) -> Result<(String, Duration), String> {
     let sa: std::net::SocketAddr = addr.parse().map_err(|e| format!("bad addr: {e}"))?;
     let mut s = std::net::TcpStream::connect_timeout(&sa, budget)
         .map_err(|e| format!("connect after {:?}: {e}", t0.elapsed()))?;
-    s.set_read_timeout(Some(budget)).map_err(|e| format!("set_read_timeout: {e}"))?;
+    s.set_read_timeout(Some(budget))
+        .map_err(|e| format!("set_read_timeout: {e}"))?;
     s.write_all(b"GET /metrics HTTP/1.0\r\n\r\n")
         .map_err(|e| format!("write after {:?}: {e}", t0.elapsed()))?;
     let mut buf = String::new();
@@ -343,7 +360,10 @@ async fn policy_apply_does_not_stall_the_gateway_and_bursts_collapse_to_one_grac
     // Fabric v1 BEFORE enrollment, so the gateway's very first snapshot
     // already carries a compiled policy and its first apply happens at boot.
     let diff = h.apply(&fabric(&[])).await;
-    assert!(diff.policy_updated, "fabric v1 must compile a real policy, got: {diff:?}");
+    assert!(
+        diff.policy_updated,
+        "fabric v1 must compile a real policy, got: {diff:?}"
+    );
     let v1 = latest_policy_version(&h).await;
 
     let (gw_priv, gw_pub) = wg_keypair();
@@ -353,8 +373,11 @@ async fn policy_apply_does_not_stall_the_gateway_and_bursts_collapse_to_one_grac
     let gwns = lab.ns("g").expect("gateway netns");
     let wlns = lab.ns("w").expect("workload netns");
     attach_underlay(&gwns, GW_IP);
-    lab.veth((&gwns, "seg0", "10.10.1.1/24"), (&wlns, "eth0", "10.10.1.2/24"))
-        .expect("seg-a veth");
+    lab.veth(
+        (&gwns, "seg0", "10.10.1.1/24"),
+        (&wlns, "eth0", "10.10.1.2/24"),
+    )
+    .expect("seg-a veth");
 
     let statedir = tempfile::tempdir().unwrap();
     write_identity(&gw, &gw_priv, statedir.path());
@@ -364,7 +387,13 @@ async fn policy_apply_does_not_stall_the_gateway_and_bursts_collapse_to_one_grac
     let observe_addr = h.observe_addr().to_string();
     let metrics_addr = format!("{GW_IP}:{METRICS_PORT}");
 
-    let mut proc = spawn_gw(&gwns, statedir.path(), &sync_addr, &observe_addr, logdir.path());
+    let mut proc = spawn_gw(
+        &gwns,
+        statedir.path(),
+        &sync_addr,
+        &observe_addr,
+        logdir.path(),
+    );
 
     // --- wait for the FIRST apply: it flips a generation and arms the 10s
     // --- reap deadline everything below is measured against.
@@ -390,11 +419,20 @@ async fn policy_apply_does_not_stall_the_gateway_and_bursts_collapse_to_one_grac
     // --- push TWO more policy versions back to back, both landing well
     // --- inside that deadline.
     let d2 = h.apply(&fabric(&[9090])).await;
-    assert!(d2.policy_updated, "fabric v2 must update policy, got: {d2:?}");
+    assert!(
+        d2.policy_updated,
+        "fabric v2 must update policy, got: {d2:?}"
+    );
     let d3 = h.apply(&fabric(&[9090, 9091])).await;
-    assert!(d3.policy_updated, "fabric v3 must update policy, got: {d3:?}");
+    assert!(
+        d3.policy_updated,
+        "fabric v3 must update policy, got: {d3:?}"
+    );
     let v3 = latest_policy_version(&h).await;
-    assert!(v3 > v1, "sanity: two applies must have advanced the policy version past {v1}");
+    assert!(
+        v3 > v1,
+        "sanity: two applies must have advanced the policy version past {v1}"
+    );
     assert!(
         t1.elapsed() < REAP_GRACE / 2,
         "both applies must be pushed well inside the gateway's 10s reap deadline for \
@@ -433,7 +471,10 @@ async fn policy_apply_does_not_stall_the_gateway_and_bursts_collapse_to_one_grac
         }
         std::thread::sleep(Duration::from_millis(250));
     }
-    assert!(scrapes >= 10, "sanity: expected many scrapes in {SCRAPE_WINDOW:?}, got {scrapes}");
+    assert!(
+        scrapes >= 10,
+        "sanity: expected many scrapes in {SCRAPE_WINDOW:?}, got {scrapes}"
+    );
     eprintln!(
         "ASSERTION 1 PASS: {scrapes} scrapes during the grace window, worst {worst:?} \
          (budget {SCRAPE_BUDGET:?})"

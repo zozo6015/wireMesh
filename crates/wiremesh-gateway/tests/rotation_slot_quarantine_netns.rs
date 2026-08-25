@@ -96,7 +96,10 @@ fn a_freed_slot_is_not_handed_straight_back() {
     let (mut set, priv_b64) = set_with_boot_tun(boot_id);
 
     // Peer 7 rotates to pending epoch 1: stand an overlap up.
-    let first_id = TunnelId::Overlap { gateway_id: 7, epoch: 1 };
+    let first_id = TunnelId::Overlap {
+        gateway_id: 7,
+        epoch: 1,
+    };
     let first = plan_tunnel(first_id, BASE_TUN, BASE_PORT, &set.plans()).expect("first overlap");
     set.bring_up(first_id, &first.ifname, &priv_b64, first.listen_port, 1280)
         .expect("the first overlap Device must come up");
@@ -104,7 +107,10 @@ fn a_freed_slot_is_not_handed_straight_back() {
     // Peer 7 re-rotates to pending epoch 2: retire the stale overlap and
     // immediately plan the replacement, with nothing in between.
     set.tear_down(first_id).expect("retiring the stale overlap");
-    assert!(set.get(first_id).is_none(), "the torn-down overlap must be out of the live set");
+    assert!(
+        set.get(first_id).is_none(),
+        "the torn-down overlap must be out of the live set"
+    );
 
     let reserved = set.plans();
     assert!(
@@ -121,7 +127,10 @@ fn a_freed_slot_is_not_handed_straight_back() {
         first.listen_port
     );
 
-    let second_id = TunnelId::Overlap { gateway_id: 7, epoch: 2 };
+    let second_id = TunnelId::Overlap {
+        gateway_id: 7,
+        epoch: 2,
+    };
     let second = plan_tunnel(second_id, BASE_TUN, BASE_PORT, &reserved)
         .expect("the restarted overlap must still be plannable");
     assert_ne!(
@@ -135,10 +144,23 @@ fn a_freed_slot_is_not_handed_straight_back() {
 
     // And the plan is realizable: the whole point is a Device that is actually
     // new, not merely differently named.
-    set.bring_up(second_id, &second.ifname, &priv_b64, second.listen_port, 1280)
-        .expect("the restarted overlap Device must come up on its fresh slot");
-    let out = Command::new("wg").args(["show", &second.ifname]).output().unwrap();
-    assert!(out.status.success(), "wg show {} must succeed", second.ifname);
+    set.bring_up(
+        second_id,
+        &second.ifname,
+        &priv_b64,
+        second.listen_port,
+        1280,
+    )
+    .expect("the restarted overlap Device must come up on its fresh slot");
+    let out = Command::new("wg")
+        .args(["show", &second.ifname])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "wg show {} must succeed",
+        second.ifname
+    );
     assert!(
         String::from_utf8_lossy(&out.stdout)
             .contains(&format!("listening port: {}", second.listen_port)),
@@ -164,9 +186,13 @@ fn quarantine_expires_and_the_slot_becomes_reusable() {
     let boot_id = TunnelId::Own { epoch: 1 };
     let (mut set, priv_b64) = set_with_boot_tun(boot_id);
 
-    let id = TunnelId::Overlap { gateway_id: 7, epoch: 1 };
+    let id = TunnelId::Overlap {
+        gateway_id: 7,
+        epoch: 1,
+    };
     let plan = plan_tunnel(id, BASE_TUN, BASE_PORT, &set.plans()).expect("overlap plan");
-    set.bring_up(id, &plan.ifname, &priv_b64, plan.listen_port, 1280).unwrap();
+    set.bring_up(id, &plan.ifname, &priv_b64, plan.listen_port, 1280)
+        .unwrap();
     set.tear_down(id).unwrap();
 
     assert!(
@@ -191,7 +217,10 @@ fn quarantine_expires_and_the_slot_becomes_reusable() {
     );
 
     let again = plan_tunnel(
-        TunnelId::Overlap { gateway_id: 8, epoch: 1 },
+        TunnelId::Overlap {
+            gateway_id: 8,
+            epoch: 1,
+        },
         BASE_TUN,
         BASE_PORT,
         &reserved,
@@ -206,7 +235,10 @@ fn quarantine_expires_and_the_slot_becomes_reusable() {
 
     // And it is genuinely usable again, not just nameable.
     set.bring_up(
-        TunnelId::Overlap { gateway_id: 8, epoch: 1 },
+        TunnelId::Overlap {
+            gateway_id: 8,
+            epoch: 1,
+        },
         &again.ifname,
         &priv_b64,
         again.listen_port,
@@ -234,15 +266,25 @@ fn bring_up_clears_a_matching_quarantine_entry() {
     let boot_id = TunnelId::Own { epoch: 1 };
     let (mut set, priv_b64) = set_with_boot_tun(boot_id);
 
-    let first_id = TunnelId::Overlap { gateway_id: 7, epoch: 1 };
+    let first_id = TunnelId::Overlap {
+        gateway_id: 7,
+        epoch: 1,
+    };
     let plan = plan_tunnel(first_id, BASE_TUN, BASE_PORT, &set.plans()).expect("overlap plan");
-    set.bring_up(first_id, &plan.ifname, &priv_b64, plan.listen_port, 1280).unwrap();
+    set.bring_up(first_id, &plan.ifname, &priv_b64, plan.listen_port, 1280)
+        .unwrap();
     set.tear_down(first_id).unwrap();
-    assert!(has_ifname(&set.plans(), &plan.ifname), "quarantined after tear_down");
+    assert!(
+        has_ifname(&set.plans(), &plan.ifname),
+        "quarantined after tear_down"
+    );
 
     // A different overlap deliberately re-takes the quarantined name+port
     // (what the boot path, or a caller holding an older plan, would do).
-    let second_id = TunnelId::Overlap { gateway_id: 99, epoch: 5 };
+    let second_id = TunnelId::Overlap {
+        gateway_id: 99,
+        epoch: 5,
+    };
     set.bring_up(second_id, &plan.ifname, &priv_b64, plan.listen_port, 1280)
         .expect("re-taking a quarantined slot explicitly must be allowed — it is not live");
 
@@ -254,7 +296,10 @@ fn bring_up_clears_a_matching_quarantine_entry() {
          entry). plans() = {reserved:?}"
     );
     assert_eq!(
-        reserved.iter().filter(|p| p.listen_port == plan.listen_port).count(),
+        reserved
+            .iter()
+            .filter(|p| p.listen_port == plan.listen_port)
+            .count(),
         1,
         "and the port exactly once. plans() = {reserved:?}"
     );
@@ -295,13 +340,21 @@ fn quarantine_is_capped_at_half_the_window_and_evicts_oldest_first() {
     let mut freed: Vec<TunnelPlan> = Vec::new();
     let started = Instant::now();
     for i in 0..churn {
-        let id = TunnelId::Overlap { gateway_id: 1000 + i as u64, epoch: 1 };
+        let id = TunnelId::Overlap {
+            gateway_id: 1000 + i as u64,
+            epoch: 1,
+        };
         let ifname = format!("{BASE_TUN}o{i}");
         let port = BASE_PORT + 1 + i as u16;
         set.bring_up(id, &ifname, &priv_b64, port, 1280)
             .unwrap_or_else(|e| panic!("churn {i}: bring_up {ifname}:{port}: {e:#}"));
-        set.tear_down(id).unwrap_or_else(|e| panic!("churn {i}: tear_down {ifname}: {e:#}"));
-        freed.push(TunnelPlan { id, ifname, listen_port: port });
+        set.tear_down(id)
+            .unwrap_or_else(|e| panic!("churn {i}: tear_down {ifname}: {e:#}"));
+        freed.push(TunnelPlan {
+            id,
+            ifname,
+            listen_port: port,
+        });
     }
     let elapsed = started.elapsed();
 
@@ -337,14 +390,20 @@ fn quarantine_is_capped_at_half_the_window_and_evicts_oldest_first() {
     // At least half the window is still allocatable, which is the whole reason
     // the cap exists.
     let next = plan_tunnel(
-        TunnelId::Overlap { gateway_id: 7, epoch: 9 },
+        TunnelId::Overlap {
+            gateway_id: 7,
+            epoch: 9,
+        },
         BASE_TUN,
         BASE_PORT,
         &reserved,
     )
     .expect("an overlap must still be plannable after saturating the quarantine");
     for p in &reserved {
-        assert_ne!(next.ifname, p.ifname, "the new plan must avoid every reserved ifname");
+        assert_ne!(
+            next.ifname, p.ifname,
+            "the new plan must avoid every reserved ifname"
+        );
         assert_ne!(next.listen_port, p.listen_port, "and every reserved port");
     }
 

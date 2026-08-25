@@ -88,7 +88,10 @@ fn lpm_capacity_constants_agree_across_policy_and_ebpf_common() {
          wiremesh_enforcer_common::LPM_MAX_ENTRIES — the compile-time guard \
          exists precisely to reject what the trie would reject at load time"
     );
-    assert_eq!(MAX_LPM_CIDRS_PER_SIDE, 1024, "the audited eBPF trie capacity");
+    assert_eq!(
+        MAX_LPM_CIDRS_PER_SIDE, 1024,
+        "the audited eBPF trie capacity"
+    );
 }
 
 /// Boundary: exactly `LPM_MAX_ENTRIES` distinct CIDRs on a side fills the

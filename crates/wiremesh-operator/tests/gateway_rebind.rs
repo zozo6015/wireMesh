@@ -151,8 +151,14 @@ fn legacy_secret_without_record_reads_as_unknown() {
     // A pre-fix Secret (only the token key) → None, which `needs_rebind` maps
     // to "no rebind" — legacy fabrics do not start churning after the upgrade.
     let mut data = BTreeMap::new();
-    data.insert("token".to_string(), ByteString(b"wiremesh://legacy".to_vec()));
-    let legacy = Secret { data: Some(data), ..Default::default() };
+    data.insert(
+        "token".to_string(),
+        ByteString(b"wiremesh://legacy".to_vec()),
+    );
+    let legacy = Secret {
+        data: Some(data),
+        ..Default::default()
+    };
     assert_eq!(
         bound_cidrs_of(&legacy),
         None,

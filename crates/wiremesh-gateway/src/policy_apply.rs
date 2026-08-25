@@ -258,10 +258,7 @@ enum Pause {
 /// change wins. Nothing can be lost either way — `watch` tracks changes with
 /// a version counter, not with the `changed()` future, so a `changed()`
 /// dropped by the timer arm leaves the flag set for the caller's next read.
-async fn pause_or_wake(
-    rx: &mut watch::Receiver<Option<DesiredState>>,
-    backoff: Duration,
-) -> Pause {
+async fn pause_or_wake(rx: &mut watch::Receiver<Option<DesiredState>>, backoff: Duration) -> Pause {
     tokio::select! {
         biased;
         r = rx.changed() => {
@@ -312,7 +309,10 @@ pub fn spawn_policy_apply_worker<T: PolicyApplyTarget>(
     // an operator actually wants can land.
     let (tx, mut rx) = watch::channel::<Option<DesiredState>>(None);
     let failures = Arc::new(AtomicU64::new(0));
-    let handle = PolicyApplyHandle { tx: Arc::new(tx), failures: failures.clone() };
+    let handle = PolicyApplyHandle {
+        tx: Arc::new(tx),
+        failures: failures.clone(),
+    };
 
     tokio::spawn(async move {
         loop {

@@ -44,8 +44,8 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
     svc.metadata.owner_references = Some(vec![oref.clone()]);
     apply(&Api::<Service>::namespaced(client.clone(), &ns), &svc).await?;
 
-    let operator_image =
-        std::env::var("OPERATOR_IMAGE").unwrap_or_else(|_| workloads::DEFAULT_OPERATOR_IMAGE.to_string());
+    let operator_image = std::env::var("OPERATOR_IMAGE")
+        .unwrap_or_else(|_| workloads::DEFAULT_OPERATOR_IMAGE.to_string());
     let mut dep = workloads::controller_deployment(&name, &cr.spec, &operator_image);
     dep.metadata.namespace = Some(ns.clone());
     dep.metadata.owner_references = Some(vec![oref.clone()]);
@@ -64,7 +64,9 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
     // like one that can never start. Calling that `WaitingForController`
     // forever — and requeuing every 10s to re-confirm it — would be a false
     // alarm with nothing behind it. See `super::workload_readiness`.
-    let live = Api::<Deployment>::namespaced(client.clone(), &ns).get(&name).await?;
+    let live = Api::<Deployment>::namespaced(client.clone(), &ns)
+        .get(&name)
+        .await?;
     let readiness = super::deployment_readiness(&live);
     let ready = readiness == Readiness::Available;
     let scaled_down = readiness == Readiness::ScaledDown;
@@ -72,18 +74,19 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
     // The advertised control-plane endpoint gateways/relays dial (sync-tcp).
     // (admin-tcp is loopback-only and never exposed — spec §0.)
     let sync_port = cr.spec.sync_tcp_port.unwrap_or(9500);
-    let status = WiremeshControllerStatus {
-        ready,
-        admin_endpoint: Some(service_dns(&name, &ns, sync_port)),
-        observed_version: None,
-        // `Ready` keeps its meaning (an available replica) and stays FALSE while
-        // scaled down — the control plane really is not serving. What changes is
-        // the reason it gives, and the second condition beside it: `ScaledDown`
-        // separates "deliberately off" from "trying and failing", so
-        // `kubectl describe` and any alerting rule can tell them apart. Both
-        // conditions are always emitted (True/False) rather than only-when-true,
-        // so a consumer never has to read absence as false.
-        conditions: vec![
+    let status =
+        WiremeshControllerStatus {
+            ready,
+            admin_endpoint: Some(service_dns(&name, &ns, sync_port)),
+            observed_version: None,
+            // `Ready` keeps its meaning (an available replica) and stays FALSE while
+            // scaled down — the control plane really is not serving. What changes is
+            // the reason it gives, and the second condition beside it: `ScaledDown`
+            // separates "deliberately off" from "trying and failing", so
+            // `kubectl describe` and any alerting rule can tell them apart. Both
+            // conditions are always emitted (True/False) rather than only-when-true,
+            // so a consumer never has to read absence as false.
+            conditions: vec![
             Condition {
                 type_: "Ready".into(),
                 status: if ready { "True" } else { "False" }.into(),
@@ -118,7 +121,7 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
                 },
             },
         ],
-    };
+        };
     Api::<WiremeshController>::all(client.clone())
         .patch_status(
             &name,
@@ -130,11 +133,13 @@ async fn reconcile(cr: Arc<WiremeshController>, ctx: Arc<Context>) -> Result<Act
     // A scale-down requeues on the settled cadence, not the 10s not-ready one:
     // nothing will change until a human scales back up, and that arrives through
     // the Deployment watch (`.owns` below) rather than by polling.
-    Ok(Action::requeue(Duration::from_secs(if ready || scaled_down {
-        super::SETTLED_REQUEUE_SECS
-    } else {
-        10
-    })))
+    Ok(Action::requeue(Duration::from_secs(
+        if ready || scaled_down {
+            super::SETTLED_REQUEUE_SECS
+        } else {
+            10
+        },
+    )))
 }
 
 fn error_policy(_cr: Arc<WiremeshController>, err: &Error, _ctx: Arc<Context>) -> Action {
@@ -145,20 +150,32 @@ fn error_policy(_cr: Arc<WiremeshController>, err: &Error, _ctx: Arc<Context>) -
 /// Run the `WiremeshController` controller loop until shutdown.
 pub async fn run(ctx: Arc<Context>) {
     let client = ctx.client.clone();
-    Controller::new(Api::<WiremeshController>::all(client.clone()), watcher::Config::default())
-        .owns(Api::<Deployment>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
-        .owns(Api::<Service>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
-        // Watch the data PVC too (parity with the gateway/relay reconcilers):
-        // a deleted or externally-edited PVC enqueues its owning CR at once
-        // rather than waiting out the 300s requeue. The apply itself stays
-        // CREATE-ONLY (`pvc_needs_create`) — this only affects when we look.
-        .owns(Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ctx.namespace), watcher::Config::default())
-        .run(reconcile, error_policy, ctx)
-        .for_each(|res| async move {
-            match res {
-                Ok((obj, _)) => tracing::info!("WiremeshController reconciled: {}", obj.name),
-                Err(e) => tracing::warn!("WiremeshController reconcile failed: {e}"),
-            }
-        })
-        .await;
+    Controller::new(
+        Api::<WiremeshController>::all(client.clone()),
+        watcher::Config::default(),
+    )
+    .owns(
+        Api::<Deployment>::namespaced(client.clone(), &ctx.namespace),
+        watcher::Config::default(),
+    )
+    .owns(
+        Api::<Service>::namespaced(client.clone(), &ctx.namespace),
+        watcher::Config::default(),
+    )
+    // Watch the data PVC too (parity with the gateway/relay reconcilers):
+    // a deleted or externally-edited PVC enqueues its owning CR at once
+    // rather than waiting out the 300s requeue. The apply itself stays
+    // CREATE-ONLY (`pvc_needs_create`) — this only affects when we look.
+    .owns(
+        Api::<PersistentVolumeClaim>::namespaced(client.clone(), &ctx.namespace),
+        watcher::Config::default(),
+    )
+    .run(reconcile, error_policy, ctx)
+    .for_each(|res| async move {
+        match res {
+            Ok((obj, _)) => tracing::info!("WiremeshController reconciled: {}", obj.name),
+            Err(e) => tracing::warn!("WiremeshController reconcile failed: {e}"),
+        }
+    })
+    .await;
 }

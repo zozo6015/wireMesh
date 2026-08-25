@@ -139,12 +139,18 @@ impl RelayTransport {
         // `wiremesh_relay::identity_from_client_cert`) and derives the 8-byte
         // registry key from the pair itself — a gateway can no longer register
         // under an id it doesn't own.
-        let client =
-            Client::connect_with_pems(relay_addr, cert_pem, key_pem, ca_pem, my_identity, peer_identity)
-                .await
-                .with_context(|| {
-                    format!("connect+register {my_identity:?}->{peer_identity:?} with relay {relay_addr}")
-                })?;
+        let client = Client::connect_with_pems(
+            relay_addr,
+            cert_pem,
+            key_pem,
+            ca_pem,
+            my_identity,
+            peer_identity,
+        )
+        .await
+        .with_context(|| {
+            format!("connect+register {my_identity:?}->{peer_identity:?} with relay {relay_addr}")
+        })?;
 
         let last_seen: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(local_peer_hint));
         let death_reason: Arc<OnceLock<RelayDeathReason>> = Arc::new(OnceLock::new());
@@ -179,14 +185,15 @@ impl RelayTransport {
                         // robustness against wiremesh-relay refactors.
                         // Non-connection send errors (e.g. datagram too
                         // large) record nothing — the connection is alive.
-                        let ce = e.downcast_ref::<quinn::ConnectionError>().cloned().or_else(
-                            || match e.downcast_ref::<quinn::SendDatagramError>() {
-                                Some(quinn::SendDatagramError::ConnectionLost(ce)) => {
-                                    Some(ce.clone())
-                                }
-                                _ => None,
-                            },
-                        );
+                        let ce =
+                            e.downcast_ref::<quinn::ConnectionError>()
+                                .cloned()
+                                .or_else(|| match e.downcast_ref::<quinn::SendDatagramError>() {
+                                    Some(quinn::SendDatagramError::ConnectionLost(ce)) => {
+                                        Some(ce.clone())
+                                    }
+                                    _ => None,
+                                });
                         if let Some(ce) = ce {
                             let _ = death.set(classify(&ce));
                         }
@@ -241,7 +248,14 @@ impl RelayTransport {
             })
         };
 
-        Ok(RelayTransport { local_addr, client, last_seen, uplink, downlink, death_reason })
+        Ok(RelayTransport {
+            local_addr,
+            client,
+            last_seen,
+            uplink,
+            downlink,
+            death_reason,
+        })
     }
 
     /// The bound local UDP address. WireGuard's peer endpoint gets pointed

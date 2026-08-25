@@ -40,7 +40,9 @@
 //! `relay_controller_endpoint_override.rs`; this file does not duplicate
 //! that.
 
-use wiremesh_operator::crd::{WiremeshGateway, WiremeshGatewaySpec, WiremeshRelay, WiremeshRelaySpec};
+use wiremesh_operator::crd::{
+    WiremeshGateway, WiremeshGatewaySpec, WiremeshRelay, WiremeshRelaySpec,
+};
 use wiremesh_operator::workloads::{gateway_deployment, relay_deployment};
 
 const CLUSTER_SYNC: &str = "10.43.0.10:9500";
@@ -119,7 +121,9 @@ fn relay_pod(s: WiremeshRelaySpec) -> k8s_openapi::api::core::v1::PodSpec {
     d.spec.unwrap().template.spec.unwrap()
 }
 
-fn relay_enroll(pod: &k8s_openapi::api::core::v1::PodSpec) -> &k8s_openapi::api::core::v1::Container {
+fn relay_enroll(
+    pod: &k8s_openapi::api::core::v1::PodSpec,
+) -> &k8s_openapi::api::core::v1::Container {
     pod.init_containers
         .as_ref()
         .expect("relay pod must have init containers")
