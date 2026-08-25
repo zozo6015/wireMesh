@@ -707,6 +707,24 @@ impl SyncSvc {
     }
 }
 
+/// One entry of [`seed_and_record_epoch_acks`]' unlocked pre-read: a rotating
+/// gateway's id paired with the seed a lazy tracker create needs.
+///
+/// **Both `Option` levels are load-bearing and mean different things.**
+///
+///  * The **outer** `Option` is `None` when that gateway has no `pending` row,
+///    or when the DB read failed — either way, "do not create a tracker for
+///    this one".
+///  * The **inner** `Option<u32>` is the prior active epoch, `None` when the
+///    key snapshot held no `active` row at all. It must STAY `None`: coercing
+///    it to `Some(0)` is BACKLOG item 5, the `Retire{0}` wedge — a promoted
+///    tracker would then ask `Db::retire_epoch` to retire epoch 0 forever, a
+///    CAS that matches nothing on every tick.
+///
+/// Named rather than written inline so the two levels can be told apart at the
+/// use site (and so `clippy::type_complexity` has nothing to complain about).
+type RotationSeed = (i64, Option<(u32, Option<u32>)>);
+
 /// (S3) Free-function core of [`SyncSvc::report`]'s ack-driven rotation
 /// pipeline -- the in-memory seed/record half only. Lifted out of `report`
 /// VERBATIM, the same move `drive_rotation_for` documents one function down,
@@ -745,7 +763,7 @@ impl SyncSvc {
 /// record pass itself is NOT split: both the create and the `live_acks.insert`
 /// still happen under one continuous hold. **Do not collapse these back
 /// together.**
-pub(crate) async fn seed_and_record_epoch_acks(
+async fn seed_and_record_epoch_acks(
     db: &DbHandle,
     rotations: &Arc<Mutex<HashMap<i64, RotationTracker>>>,
     reporting_gateway_id: i64,
@@ -766,8 +784,7 @@ pub(crate) async fn seed_and_record_epoch_acks(
     // tracker for this one", exactly as before. The INNER `Option<u32>` is the
     // prior active epoch, which is absent when the snapshot holds no `active`
     // row (S3, BACKLOG item 5) — NO `.unwrap_or(0)`.
-    let mut seeds: Vec<(i64, Option<(u32, Option<u32>)>)> =
-        Vec::with_capacity(touched_rotating_gateways.len());
+    let mut seeds: Vec<RotationSeed> = Vec::with_capacity(touched_rotating_gateways.len());
     for &rotating_id in &touched_rotating_gateways {
         let seed =
             match db.all_keys_for_gateway(rotating_id).await {
