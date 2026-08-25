@@ -17,9 +17,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     protobuf-compiler conntrack python3 \
     && rm -rf /var/lib/apt/lists/*
 
-# eBPF toolchain: nightly rustc (BPF codegen) + bpf-linker + cargo-generate
+# eBPF toolchain: nightly rustc (BPF codegen) + bpf-linker + cargo-generate.
+# bpf-linker is PINNED to the version this image already carries and the whole
+# suite is proven against. Unpinned, it broke the v0.10.0 release: 0.11.0 links
+# against system LLVM and its build script aborts without llvm-config. Existing
+# dev images are unaffected (the layer is cached); this stops a rebuild from
+# silently picking up a toolchain the suite has never run on. Keep in step with
+# deploy/docker/Dockerfile, which carries the same pin and the full reasoning.
 RUN rustup toolchain install nightly --component rust-src \
-    && cargo install bpf-linker cargo-generate
+    && cargo install bpf-linker --version 0.10.4 --locked \
+    && cargo install cargo-generate
 
 # bash -lc sources /etc/profile which resets PATH; keep cargo/rustup visible in login shells
 RUN echo 'export PATH=/usr/local/cargo/bin:/usr/local/rustup/bin:$PATH' > /etc/profile.d/cargo.sh
