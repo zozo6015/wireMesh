@@ -115,10 +115,17 @@ fn spawn_relay(bin: &str, bind: &str, certdir: &Path) -> Child {
 // A raw relay client: the crate's documented wire format, spoken directly.
 //
 // This duplicates the transport/TLS settings of `wiremesh_relay`'s private
-// `build_client_endpoint` (ALPN `wiremesh-relay/0`, 30s idle, DPLPMTUD on,
-// 1MiB datagram receive buffer). It must stay in sync with them — if the
-// crate ever changes ALPN or disables datagrams, this endpoint stops
-// connecting and the test fails loudly rather than silently passing.
+// `build_client_endpoint` (30s idle, DPLPMTUD on, 1MiB datagram receive
+// buffer). It must stay in sync with them — if the crate ever disables
+// datagrams, this endpoint stops connecting and the test fails loudly rather
+// than silently passing.
+//
+// (D2) The ALPN half no longer duplicates anything: it consumes the exported
+// `ALPN_SUPPORTED`, which is now the single definition both server builders
+// and `build_client_endpoint` read. So this replica cannot drift from the
+// crate on ALPN at all — the tripwire moved from "notice it broke" to "it
+// cannot break". `tests/alpn.rs` is what pins the LIST's contents; this file
+// only needs to speak whatever v1.0 speaks.
 // ---------------------------------------------------------------------------
 
 /// SNI the relay's leaf cert is stamped with (`test_certs` writes SAN
@@ -150,7 +157,10 @@ fn raw_client_endpoint(certdir: &Path, my_id: &str) -> quinn::Endpoint {
         .with_root_certificates(roots)
         .with_client_auth_cert(certs, key)
         .expect("build client TLS config");
-    tls.alpn_protocols = vec![b"wiremesh-relay/0".to_vec()];
+    tls.alpn_protocols = wiremesh_relay::ALPN_SUPPORTED
+        .iter()
+        .map(|p| p.to_vec())
+        .collect();
 
     let quic_crypto =
         quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client crypto");

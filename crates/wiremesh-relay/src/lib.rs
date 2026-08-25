@@ -2245,3 +2245,94 @@ mod datagram_drop_log_tests {
         assert_eq!(DATAGRAM_LOG_INTERVAL, Duration::from_secs(10));
     }
 }
+
+// ---------------------------------------------------------------------------
+// D2: connect-failure classification. The mapping from a QUIC transport error
+// code to the operator-facing reason.
+#[cfg(test)]
+mod classifier_tests {
+    use super::{classify_connection_error, classify_transport_code, RelayConnectFailure};
+
+    /// The transport code a peer's CONNECTION_CLOSE carries for TLS alert
+    /// `alert`. A one-liner, named so the two cases below read as "alert 120"
+    /// and "alert 116" rather than as quinn plumbing.
+    fn alert(code: u8) -> quinn::TransportErrorCode {
+        quinn::TransportErrorCode::crypto(code)
+    }
+
+    /// TLS alert 120 (`no_application_protocol`) is the ALPN mismatch, and the
+    /// ONLY alert that is.
+    #[test]
+    fn alert_120_classifies_as_an_alpn_mismatch() {
+        assert_eq!(
+            classify_transport_code(alert(120)),
+            RelayConnectFailure::AlpnMismatch,
+            "TLS alert 120 is `no_application_protocol` — the wire signal for \"no protocol \
+             in common\". It is what makes a version-skewed relay distinguishable from a \
+             revoked cert, a CA mismatch or a dead one, and §11 B' requires that \
+             distinction"
+        );
+    }
+
+    /// THE HAZARD THIS FILE EXISTS FOR — and it is a Rust footgun, not a
+    /// logic slip.
+    ///
+    /// If `ALERT_NO_APPLICATION_PROTOCOL` ever stops being a `const` and
+    /// becomes a plain binding — renamed to lowercase, moved into a `let`,
+    /// shadowed by a function parameter — then `match code { ALERT_... => }`
+    /// silently changes meaning. It stops being a comparison against 120 and
+    /// becomes an IRREFUTABLE BINDING that matches every value, so **every**
+    /// connect failure classifies as `AlpnMismatch`. The code still compiles,
+    /// the 120 test above still passes, and the classification silently
+    /// becomes a constant function.
+    ///
+    /// That is why this case is not redundant with the one above: 116 is the
+    /// probe that can tell a comparison from a binding, and only a non-120
+    /// input can.
+    #[test]
+    fn a_non_alpn_alert_does_not_classify_as_an_alpn_mismatch() {
+        let classified = classify_transport_code(alert(116));
+        assert_eq!(
+            classified,
+            RelayConnectFailure::PeerRejectedCredentials(116),
+            "TLS alert 116 (`certificate_required` — \"peer sent no certificates\", the alert \
+             `tests/bridge.rs` records for a certless client) must classify as \
+             `PeerRejectedCredentials(116)`, carrying the code through. Getting \
+             `AlpnMismatch` here is the const-pattern hazard: if \
+             `ALERT_NO_APPLICATION_PROTOCOL` degraded from a `const` to a binding, the match \
+             arm became irrefutable and EVERY alert now classifies as an ALPN mismatch — the \
+             120 case would still be green and every operator-facing reason would be a lie. \
+             Classified as {classified:?}"
+        );
+    }
+
+    /// The WRAPPER's own dispatch — the third case, and the only one that
+    /// exercises a `ConnectionError` variant carrying no transport code at
+    /// all.
+    ///
+    /// `TimedOut` never reaches `classify_transport_code`, so neither case
+    /// above can say anything about it. It guards a different degradation from
+    /// the const-pattern hazard: a wrapper that funnelled every variant through
+    /// a single "extract a code, or fall back" path would classify a silent
+    /// network as whatever that fallback is — and if the fallback were
+    /// `Other`, an operator chasing a dead relay would be told the failure is
+    /// unclassified rather than told it is unreachable.
+    ///
+    /// This matters more than it looks: `main.rs::ensure_relay_transport`'s
+    /// error arm retries indefinitely with no backoff, so "the relay is
+    /// unreachable" is precisely the case an operator most needs named.
+    #[test]
+    fn a_timeout_classifies_as_unreachable() {
+        let classified = classify_connection_error(&quinn::ConnectionError::TimedOut);
+        assert_eq!(
+            classified,
+            RelayConnectFailure::Unreachable,
+            "a QUIC handshake that times out means nothing answered — the relay is down, \
+             filtered, or the address is wrong. It must classify as `Unreachable`, not as \
+             `Other` and certainly not as `AlpnMismatch`. This is the one case that reaches \
+             the wrapper's own dispatch rather than the code→variant table, so it is the \
+             only guard against a wrapper that funnels every variant through a single \
+             extract-a-code path. Classified as {classified:?}"
+        );
+    }
+}
