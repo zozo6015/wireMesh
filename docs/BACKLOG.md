@@ -622,6 +622,57 @@ promote end; this is the retire end.
 **Phase C.** Ranked below (C-drop)/(E). Not R13, though R13 aggravates it &mdash; a re-armed
 rotation timer opens this window on a schedule rather than only when an operator rotates.
 
+### 36. A dropped `RotateDirective` recovers only on the next `KeyRotated`, with no upper bound
+
+`Broker::send_rotate_if_pending` is driven **only** by `ChangeEvent::KeyRotated`, and
+`projection::emit_key_rotated` has seven call sites: rotation-timer initiate,
+`Admin.RotateKey`, `Sync.SubmitEpochKey`, the promote / retire / abort arms of
+`drive_rotation_for`, and `sweep_rotations`' orphan-retire. Read that last one carefully &mdash;
+**the sweep does emit `KeyRotated`, but only after retiring an orphan `retiring` row, never
+for a still-sentinel `pending` row**, which is exactly what a dropped directive leaves behind.
+
+So the delivery is a single non-blocking `try_send` and **nothing retries it on purpose** —
+but it is **not** lost, and the distinction is the whole point of this item.
+`send_rotate_if_pending` runs on **every** `ChangeEvent::KeyRotated` for that gateway, and its
+predicate fires while the newest row is still a sentinel `pending` — *because* the row is
+still awaiting submission. A directive dropped by a full channel or an unconnected gateway is
+therefore re-issued by the **next `KeyRotated` emitted for that gateway**, from any of the
+seven sites above.
+
+What is missing is any emit aimed at recovery. Nothing emits `KeyRotated` *in order to* retry,
+so the delay is bounded below by whatever unrelated rotation activity happens to occur and
+above by the controller's `Abort` at `ABORT_AFTER` (300s, non-destructive) plus the next timer
+tick. **The defect is the absence of a bound, not the absence of a retry.**
+
+**Do not carry this over from the punch path.** `Broker::periodic_sweep` really does re-emit
+`PunchDirective`s, every 5s and bounded per pair by `MAX_PERIODIC_ATTEMPTS` &mdash; so *"the
+broker re-emits on its sweep"* is **true of punch and false of rotation**. That sentence has
+already been read off one path onto the other during review. Nothing re-punches a rotation.
+
+Consequence to weigh before the rotation timer is ever re-armed: a directive lost to a full
+channel is silent, and the gateway keeps serving its old key throughout, so nothing on the
+data plane reports it.
+
+### 37. `CutOver` has no abort edge, and the wedged-watch case only warns
+
+A gateway parked in `RotationPhase::CutOver` whose watch set drains to empty never fires its
+retire (`all_live` is false by construction on an empty set), so the phase never returns to
+`Idle` and `Rotation::on_directive` refuses every later directive. B2 closed route R1 &mdash;
+the synchronous unwind &mdash; and deliberately left this one open: it prints the
+`ROTATION WEDGED` block, and since v0.10.6/v0.10.7 it is also alertable via the rotation phase
+gauge and the abort counter.
+
+**Why no abort edge was added, so nobody adds one casually.** An abort out of `CutOver` tears
+the old epoch down *after* routes have flipped &mdash; a fifth route to collapsing
+`RETIRE_GRACE` to ~0, in a family where all four recorded routes look like simplifications.
+Accepting a directive from `CutOver` instead is sound for timer rotations
+(`initiate_due_rotations` skips `pending|retiring`) and **unsound** for `Admin.RotateKey`,
+which has no such guard.
+
+A safe unlock needs one of: a guard on admin-forced rotation, or a gateway-visible "your old
+epoch is gone" signal &mdash; and the second is blocked by the same capability gap as item 35
+(the `KeyRotated` delta self-skips the subject gateway). Phase C.
+
 ## Gateway / data plane
 
 ### 12. Fabric routes carry no `src`
@@ -664,6 +715,22 @@ least important of its family, and fixed for free by item 1's `PeerState::from_p
 
 ---
 
+### 45. `relay_matrix` case 4 is bimodally fragile, and a budget increase cannot fix it
+
+`case4_relay_leg_death_unwedges_direct_punch` is a **pre-existing** fragility, proven
+unattributable to the ALPN work (the only changed arm never executed). On a provably
+uncontended host it either goes green at ~66s with **0** defers, or exhausts its 125s budget
+with **3/3** defers and 11 `deferring direct punch` lines. **There is nothing in between**,
+which is why widening the budget cannot help. Roughly 1 in 3 in controlled repeats.
+
+Open question: why the relay-leg-death path sometimes never gets a clean punch window.
+Working hypothesis in the note: the two sides' recovery cycles fall out of phase.
+
+Actionable sub-item: the assertion's panic text blames the pre-fix `relay_pointed` mechanism
+and **misattributes on current code** &mdash; a wording fix, Phase C.
+
+Detail in `docs/research/relay-matrix-case4-bimodal-flake.md`. Phase C.
+
 ## Platform / design
 
 ### 17. `WIREMESH_INIT_CA` &mdash; explicit first-boot CA opt-in
@@ -697,7 +764,9 @@ What shipped (`wiremesh_relay::{ALPN_V0, ALPN_SUPPORTED}`):
   `tests/dest_pinning.rs::raw_client_endpoint` &mdash; now consume one exported list.
   `ALPN_SUPPORTED` has exactly one member in v1.0 but **stays a list**, so adding `/1`
   later is a one-line change at one site. (`relay-mux-design-verification.md` says the
-  ALPN literal lives in "three places"; it was **four** &mdash; the test replica counts.)
+  ALPN literal lives in "three places"; it was **four**, the test replica counting &mdash; and
+  since v0.10.3 it is **none**: the literals are one exported list,
+  `wiremesh_relay::{ALPN_V0, ALPN_SUPPORTED}`. Grep the symbols; do not count sites.)
 * **Negotiated-ALPN readback** via `quinn::Connection::handshake_data()` on both sides
   (`Client::negotiated_alpn`, and the relay's per-session read), previously called
   nowhere in the repo.
@@ -725,8 +794,11 @@ What shipped (`wiremesh_relay::{ALPN_V0, ALPN_SUPPORTED}`):
   **review-verified (PR5 CodeRabbit), not test-pinned**; pin it when a controller-side
   `RelayInfo` fixture exists that can feed a malformed `endpoint` through a real Sync
   stream.
-* A `RelaysChanged` delta that alters relay R's endpoint should **clear the `(gid, R)`
-  back-off entry** &mdash; the accumulated failure history is about a string that no
+* Any `RelaysChanged` delta that changes what `(gid, R)` addresses should **clear that
+  back-off entry** &mdash; not only an endpoint edit. **De-advertising R and re-advertising
+  it under the same relay id is routine maintenance** and must clear it too, so the trigger
+  cannot be "the endpoint field differs". The accumulated failure history is about a string
+  that no
   longer exists, and the key `(gid, relay_id)` survives the correction. Needs a decision
   on which `RelayInfo` fields count as "changed" for this purpose.
 
@@ -857,6 +929,126 @@ The specs have said `fabricctl key rotate` since the design was ratified
 never built, and the docs then described the design as if it had shipped.
 
 ---
+
+### 38. `RelayConnectFailure` classifies the relay's four rejections as `Other`
+
+The relay closes with an application-close naming one of four causes &mdash; no cert identity,
+identity mismatch, registration id in use, registration id collision. The gateway's
+`RelayConnectFailure` does not model them: they land in `Other`, with the raw reason carried
+in the error chain and logged. That is deliberate &mdash; D2's bar was four distinguishable
+*connect* causes and these are *post-handshake rejections* &mdash; but it means an operator
+grepping for why a relay refuses a specific gateway reads a generic class.
+
+Follow-up: a richer `RelayRejected { code, reason }` variant naming the four. Below the v1.0
+bar; the information is not lost today, only unclassified.
+
+### 39. Release artifacts record the toolchain that built them for no platform
+
+**Two legs, one cause: a compiler on an artifact path that nothing pins and nothing records.**
+
+**Leg 1 &mdash; the eBPF classifier (Linux).** `deploy/docker/Dockerfile`'s digest freezes
+*stable*, but the `rustup toolchain install nightly` beneath it is **undated** and resolves at
+the last cold build. The classifier that nightly compiles is baked into the shipped gateway by
+`wiremesh-enforcer`'s `include_bytes_aligned!` on `OUT_DIR`, with no prebuilt-artifact escape
+hatch &mdash; so **the compiler of the component implementing default-deny is unrecorded**, and
+divergence from the tested one grows with the interval between cold builds. The float is
+knowingly accepted (pinning a dated nightly needs its own `aya_build` verification pass); being
+*unrecorded* is the defect.
+
+**Leg 2 &mdash; the mac and Windows binaries.** `release.yml`'s `macos` and `windows-binaries`
+jobs use `dtolnay/rust-toolchain@stable`, which floats. **Windows builds `fabricctl` only.**
+**macOS builds three crates &mdash; `fabricctl`, `wiremesh-controller`, `wiremesh-relay` &mdash;
+producing four binaries** (the relay crate also ships `mkcerts`, i.e. `wiremesh-mkcerts`) **for
+two targets, combined by `lipo`.** No release records which stable produced them.
+
+**Why the existing checks cover neither.** `toolchain-parity` compares the dev image against
+the release builder &mdash; both Linux, both stable. Leg 1 is a different toolchain on the same
+platform; leg 2 is a different platform entirely. And PR3's test jobs are Linux-only, so the
+mac/Windows compilers still build artifacts nothing exercises.
+
+**Consequence.** *"Tested with X, shipped with X"* holds only for **stable userspace on
+Linux**. Not a regression from any single change &mdash; PR0 made it visible; it did not create
+it.
+
+**Remedy (one, covering both legs).** Record the compiler into the release artifacts through
+the existing version-stamping machinery, and have `cold-build` / `toolchain-parity` **PRINT**
+each image's nightly and stable versions. **Print, do not assert** &mdash; these toolchains
+float by design, so an equality assertion would red constantly and be disabled inside a week,
+leaving *less* visibility than printing. The property wanted is **attributability after the
+fact**, not enforcement.
+
+### 40. `graphify-out/manifest.json` cannot be reviewed by reading its diff
+
+Measured across six regenerations during Phase B: **the content signal is ~0.3&ndash;1% of
+entries and is always exactly the touched files**; everything else is `mtime` churn.
+
+* **The first `graphify update .` in a fresh worktree renews every entry's `mtime`** &mdash;
+  measured 367/371 and 373/374 on first runs, and **0** on a second run in the same worktree
+  with only one real change. The trigger is the worktree's own first run, not the change.
+* **A stale manifest on `main` makes the next regeneration look like it picked up foreign
+  files.** When `main`'s manifest was last written on a branch whose base predated several
+  merges, the next regeneration legitimately adds entries for files that merged in between.
+  That appearance is correct behaviour, not contamination.
+* **A dirty root manifest after a branch switch is the repo's graphify hook, not uncommitted
+  work.** `git checkout main` fires a background rebuild that can regenerate from a
+  pre-merge snapshot, producing a working copy **older** than `HEAD`'s. **Discard or
+  regenerate it; never commit it** &mdash; it reads as pure `mtime` noise (`hash-changed 0`)
+  while silently **removing** entries for merged files. **Classify by added/removed before
+  deciding, not by hash-change count**, which is exactly the metric that misses it.
+
+Operationally: **regenerate on conflict, never hand-merge**, and expect a whole-file diff after
+any fresh worktree or rebase.
+
+### 41. LOW &mdash; `drive_rotation_for` is `pub(crate)` with in-file callers only
+
+Same caller profile as `seed_and_record_epoch_acks`, which review narrowed to a plain private
+`fn` in v0.10.4. Narrow both when a cleanup PR next touches the file, or leave both with a
+comment recording that **`sweep_rotations` is the one that genuinely needs crate visibility**
+&mdash; `lib.rs` drives it, and that also pins `RotationTracker` at `pub(crate)`. Cosmetic;
+noted so the asymmetry is not read as an oversight.
+
+### 42. B10's consulting half &mdash; the fields are stored and never read
+
+**The wire and storage half closed in v0.11.0**: `client_version` / `max_ir_schema` /
+`controller_version` / `min_supported_version` are on the wire, persisted, and additive. What
+was deliberately deferred is every consumer of them:
+
+* **X-6 skew enforcement** &mdash; the Watch-open `FailedPrecondition` gate;
+* **apply-time laggard gating** &mdash; refusing to apply an IR schema a gateway cannot parse;
+* **`fabricctl gateway list` flagging** &mdash; surfacing version skew to an operator;
+* **skew CI** &mdash; old-gateway/new-controller and the reverse, run on every PR.
+
+Until these land, a version-skewed fabric behaves exactly as it did before v0.11.0: the data
+is collected and nothing acts on it. Phase C. **Write it as "the v1.0 half of B10 is closed",
+never as version negotiation &mdash; nothing negotiates and nothing is enforced.**
+
+### 43. A pre-2.0 floor gate, before any 2.0 is planned
+
+`min_supported_version` maps `2.0.x` to `2.0.0` and stays total and pure. That **fails
+closed**, which is the right default: a too-narrow floor is recoverable in the field through
+the lower-only `--min-supported-version` override, while a too-wide one publishes an untested
+compatibility claim to every peer and nothing recovers that.
+
+**Land the gate early in Phase C:** a test that fails when a major &ge; 2 version is stamped,
+so attempting a 2.0 release breaks the build until the floor decision is made deliberately. A
+CI-only test is correct **when it IS a release gate** &mdash; release time is the only moment
+the guarded event occurs &mdash; and a defect only when it purports to verify a property.
+
+**The recorded criterion for that decision: does the 2.0 break the Sync wire?** Yes &rarr; the
+suspension is honest; ship it and state the gateway-first requirement in the release notes.
+No &rarr; the compatibility window must continue, and its mechanism is the stamped last-1.x
+minor (`release_version_stamping.rs` precedent) &mdash; with the hazard that a 1.x maintenance
+release *after* 2.0 makes such a stamp retroactively wrong, since only **"last 1.x at build
+time"** is knowable.
+
+Gate worth landing before any 2.0 is planned.
+
+### 44. BELOW BAR &mdash; the CI test sweep does not guard against an empty `$TESTS`
+
+Noted during PR3's review: if the `-p` sweep's variable is ever emptied by an editing
+mistake, the step degenerates to a bare `cargo test` and reports success while running the
+wrong set. A one-line non-empty guard would close it. Below the bar for its own PR; fold into
+the next change that touches those workflows.
 
 ## Ingress validation &mdash; item 1's siblings
 

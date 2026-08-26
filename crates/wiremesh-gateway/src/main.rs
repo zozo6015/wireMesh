@@ -3161,12 +3161,13 @@ async fn run_path_ticks(ctx: PathCtx) {
         // one `RelayConnectBackoff`. It is therefore bounded, but by a
         // HIGH-WATER MARK, not by the live advertisement.
         //
-        // The principled cleanup is filed, not done here (`docs/BACKLOG.md`,
-        // beside item 19): "a `RelaysChanged` delta that alters relay R's
-        // endpoint should clear the `(gid, R)` back-off entry — the
-        // accumulated failure history is about a string that no longer
-        // exists". That is the right trigger; peer departure is merely the
-        // one this loop already has in hand.
+        // The principled cleanup is filed, not done here: see the back-off
+        // follow-up under `docs/BACKLOG.md` item 19, which owns the trigger's
+        // definition. Deliberately a REFERENCE rather than a quotation — the
+        // wording there has since been widened (any `RelaysChanged` delta that
+        // changes what `(gid, R)` addresses, not only an endpoint edit), and a
+        // copy here would have silently gone stale. Peer departure is merely
+        // the trigger this loop already has in hand.
         ctx.relay_connect_backoff
             .lock()
             .unwrap()

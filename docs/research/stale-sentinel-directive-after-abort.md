@@ -63,6 +63,21 @@ claim has **four** sites, not the two design finding C1 recorded (all verified p
 | `proto/wiremesh/v1/sync.proto`, `SubmitEpochKeyRequest` | "the controller re-issues a `RotateDirective` for the still-sentinel…" |
 | `crates/wiremesh-controller/tests/epoch_key_submit.rs` rationale | "broker therefore re-issues the `RotateDirective`; the new process mints a…" |
 
+**Disposition (v0.10.4 and PR6).** The first was corrected in v0.10.4. The other three were
+re-checked against the code and **their mechanism names were already right** — each credits
+`Broker::send_rotate_if_pending`, and repo-wide no text credits the *sweep* with re-issuing a
+rotate directive. What was actually imprecise in all three was **causation**: they read as if
+the gateway restart caused the re-issue. It does not. `send_rotate_if_pending` runs only from
+`ChangeEvent::KeyRotated`, and reconnecting emits none (Watch registration goes to
+`on_gateway_connected`, the punch path) — so the race needs a `KeyRotated` for that gateway
+while the sentinel still stands. **The restart is the setup, not the trigger.** All three now
+say so.
+
+A rewrite claiming the re-issue does not happen at all was proposed during PR6 and
+**withdrawn**: an independent premise check found `send_rotate_if_pending` fires on *every*
+`KeyRotated` and re-issues *precisely because* the row is still the sentinel. The two-key race
+this note describes is real.
+
 The fourth is the one that matters most: it is a **test's stated rationale**, so the false
 claim is not merely documented, it is load-bearing for why that test is believed to prove
 what it proves.

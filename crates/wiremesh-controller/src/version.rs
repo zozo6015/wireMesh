@@ -59,8 +59,14 @@
 /// **At a major boundary the one-minor window is deliberately SUSPENDED, not
 /// satisfied** — so a reader who knows the vN/vN−1 contract does not read this
 /// as a bug. It fails CLOSED: a narrow floor rejects peers that might have
-/// worked, never admits peers that do not. **Needs a ruling before any 2.0
-/// release.**
+/// worked, never admits peers that do not. **Ruled: keep this behaviour.** A
+/// too-narrow floor is recoverable in the field through the lower-only
+/// `--min-supported-version` override; a too-wide one publishes an untested
+/// compatibility claim to every peer and nothing recovers that. What is owed
+/// before any 2.0 is a release gate that fails when a major `>= 2` is stamped,
+/// so the floor decision is made deliberately rather than by default — see
+/// `docs/BACKLOG.md` item 43 for the gate and for the recorded criterion
+/// (does the 2.0 break the Sync wire?).
 ///
 /// A version that is not **exactly `MAJOR.MINOR.PATCH`** — three components,
 /// each a `u64`, after any `-pre`/`+build` suffix is stripped — advertises

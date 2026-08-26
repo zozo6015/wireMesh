@@ -169,8 +169,11 @@ tracks *gateway* versions at the **controller**, while the entity that must deci
 **relay**, which has no Sync-borne knowledge of gateway versions, and a version does not
 say which ALPN was negotiated.
 
-Dual-offer itself needs nothing: `tls.alpn_protocols` is set in three places, all
-single-valued (`lib.rs:200`, `:224`, `:1015`). Only the horizon was tied to X-6.
+Dual-offer itself needs nothing. **(Superseded by v0.10.3: the duplicated literals are gone.)**
+`tls.alpn_protocols` now reads from one exported list, `wiremesh_relay::{ALPN_V0,
+ALPN_SUPPORTED}` — **grep those symbols for the referents rather than counting sites**, since
+every site count and line citation this note carried has since rotted. The list keeps its
+shape so `/1` is a one-line addition. Only the horizon was tied to X-6.
 
 **Defensible replacement:** a per-ALPN session counter logged at registration
 (`lib.rs:616-620` already logs every registration; the relay has zero metrics today —

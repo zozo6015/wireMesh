@@ -480,7 +480,17 @@ impl Broker {
     /// like every other broker emit). A no-op if the gateway isn't currently
     /// connected (nothing registered) or the channel is full.
     ///
-    /// **A dropped directive is NOT retried.** `projection::emit_key_rotated`
+    /// **Delivery is one non-blocking `try_send`, and nothing retries it *on
+    /// purpose* — but it is not lost either, and the difference matters.**
+    /// This function runs on **every** `ChangeEvent::KeyRotated` for the
+    /// gateway (the arm in `Broker::run`), and its predicate re-issues while
+    /// the newest row is still a sentinel `pending` — that is, *because* the
+    /// row is still awaiting submission. So a directive dropped by a full
+    /// channel or an unconnected gateway is re-issued by the **next
+    /// `KeyRotated` emitted for that gateway**, whenever one happens to occur.
+    /// What is absent is any event emitted *for the purpose of* retrying: a
+    /// gateway with no other rotation activity waits for the controller's own
+    /// `Abort` at `ABORT_AFTER` and the next timer tick. `projection::emit_key_rotated`
     /// has seven call sites: rotation-timer initiate, `Admin.RotateKey`,
     /// `Sync.SubmitEpochKey`, the promote / retire / abort arms of
     /// `drive_rotation_for`, and `sweep_rotations`' orphan-retire. Read that
@@ -488,7 +498,8 @@ impl Broker {
     /// retiring an orphan `retiring` row, never for a still-sentinel `pending`
     /// row**, which is precisely what a dropped directive leaves behind. So a
     /// `try_send` that finds the channel full, or a gateway not connected at
-    /// that instant, drops the whole rotation until the controller's own
+    /// that instant, therefore delays the rotation — bounded below by the next
+    /// `KeyRotated` for this gateway and above by the controller's own
     /// `Abort` (`ABORT_AFTER`) and the next timer tick.
     ///
     /// **Do not carry this over from the punch path.** `Broker::periodic_sweep`

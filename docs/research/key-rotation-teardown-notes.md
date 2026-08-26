@@ -163,9 +163,11 @@ component reporting an error.
 
 How the controller could come to advertise such a key (the shape that led here, now closed
 on the Sync side): `Db::set_epoch_pubkey` (db.rs:1903-1908) is a compare-and-swap onto the
-sentinel, first writer wins. With a submission in flight across a gateway restart,
-`Broker::send_rotate_if_pending` (broker.rs:482-502) re-issues a `RotateDirective` for the
-still-sentinel epoch; the new process mints a *different* key (`EpochKeys::generate_next`
+sentinel, first writer wins. With a submission in flight across a gateway restart, the
+next `ChangeEvent::KeyRotated` for that gateway drives
+`Broker::send_rotate_if_pending` to re-issue a `RotateDirective` while the newest row is
+still the sentinel — the restart is the setup, not the trigger, since reconnecting emits no
+`KeyRotated`; the new process mints a *different* key (`EpochKeys::generate_next`
 allocates `max(epoch)+1`, epochkeys.rs:79) but submits it under the *directive* epoch —
 there is even a WARNING log for that mismatch at main.rs:3680-3686 — so two different
 pubkeys race for one epoch and the pre-restart one usually lands first. Session generation

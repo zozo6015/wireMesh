@@ -2286,9 +2286,13 @@ impl Sync for SyncSvc {
         // `Db::set_epoch_pubkey` is a compare-and-swap that only ever
         // overwrites the `awaiting-submission` sentinel, so a stale
         // submission cannot clobber a real key; but it CAN WIN that swap.
-        // With a submission in flight across a gateway restart,
-        // `Broker::send_rotate_if_pending` re-issues a `RotateDirective` for
-        // the still-sentinel epoch, the new process mints a DIFFERENT key
+        // With a submission in flight across a gateway restart, the next
+        // `ChangeEvent::KeyRotated` for this gateway drives
+        // `Broker::send_rotate_if_pending`, which re-issues a `RotateDirective`
+        // while the newest row is still the sentinel. The restart is the SETUP,
+        // not the trigger: nothing about (re)connecting emits `KeyRotated` —
+        // Watch registration goes to `on_gateway_connected`, which is the punch
+        // path. The new process then mints a DIFFERENT key
         // and submits it under the same epoch, and whichever lands first
         // wins — the pre-restart one usually, since it was sent first. The
         // controller would then advertise a pubkey the restarted gateway is
@@ -4164,7 +4168,8 @@ mod tests {
              path filters `state == \"retiring\"`, and `drive_rotation_for` returns before \
              deciding when there is no tracker. The row then keeps the gateway inside \
              `Db::gateways_with_rotation_state`, which `initiate_due_rotations` skips — so \
-             automatic rotation is disabled for that gateway PERMANENTLY (the v0.7.2 class)"
+             automatic rotation is disabled for that gateway PERMANENTLY — the same \
+             self-disable v0.7.3 fixed, arriving by a new route"
         );
 
         // Before `ABORT_AFTER`: nothing happens. `decide` rule 2 returns for a
@@ -4337,7 +4342,8 @@ mod tests {
              `drive_rotation_for` returns before deciding when no tracker exists. The \
              stranded row keeps the gateway inside `Db::gateways_with_rotation_state`, \
              which `initiate_due_rotations` skips — so AUTOMATIC ROTATION IS DISABLED FOR \
-             THAT GATEWAY PERMANENTLY, the v0.7.2 class of defect. Do not unify this \
+             THAT GATEWAY PERMANENTLY — the same self-disable v0.7.3 fixed, arriving by \
+             a new route. Do not unify this \
              selector with the broker's"
         );
     }
