@@ -30,8 +30,8 @@
     "semantic_hash": "a83bf1e9b578225bf9538d4bc8ab85b0"
   },
   "crates/wiremesh-controller/src/broker.rs": {
-    "mtime": 1787709550.6091287,
-    "ast_hash": "3e263bf0f8a1da28b7a9b9654c4ecbe6",
+    "mtime": 1787711227.5751758,
+    "ast_hash": "b19ae17878b67450e4fe434981edaaef",
     "semantic_hash": ""
   },
   "crates/wiremesh-controller/src/cli.rs": {
