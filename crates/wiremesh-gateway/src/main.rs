@@ -6537,4 +6537,71 @@ mod tests {
              'unwinding the wrong one would tear down a live tun'."
         );
     }
+
+    /// PR4: the `ROTATION STALLED` diagnostic must derive its epoch from the
+    /// PHASE, never from `old_epoch + 1`.
+    ///
+    /// The two agree only while directive epochs are contiguous. After a B2
+    /// abort they are not: the controller allocates `MAX(epoch) + 1` over its
+    /// own rows and the aborted epoch's row survives (there is no
+    /// gateway->controller cancel RPC), so the sequence goes 0 active,
+    /// 1 aborted, 2 directed — and `old_epoch + 1` names **1**, an epoch this
+    /// gateway aborted and does not hold, in the one diagnostic an operator
+    /// reads when a rotation is stuck.
+    ///
+    /// See `docs/research/stale-sentinel-directive-after-abort.md` for why the
+    /// skip is normal rather than exotic.
+    ///
+    /// CROSS-REFERENCE: the emitted line's token is pinned separately, as an
+    /// ABSENCE check, by `tests/rotation_wedge.rs::STALL_WARN_MARKER` — that
+    /// test asserts a healthy rotation emits NO stall warning. The two are
+    /// complementary and neither substitutes for the other: this one says the
+    /// warning names the right epoch, that one says it does not fire when
+    /// nothing is wrong. Changing the `ROTATION STALLED` string means updating
+    /// that test in the same change.
+    #[test]
+    fn stalled_target_epoch_comes_from_the_phase_not_from_old_plus_one() {
+        // The post-abort shape: the gateway's active epoch is 0, and the
+        // directive it is currently Overlapping on is 2 — epoch 1 having been
+        // aborted and scrubbed locally.
+        let old_epoch: u32 = 0;
+        let phase = RotationPhase::Overlapping { new_epoch: 2 };
+
+        assert_eq!(
+            stalled_target_epoch(&phase),
+            Some(2),
+            "the ROTATION STALLED diagnostic must derive the epoch from the PHASE, never from \
+             `old_epoch + 1` — after a B2 abort directive epochs SKIP (0 active, 1 aborted, \
+             2 directed), so `old_epoch + 1` = {} names an epoch this gateway aborted and does \
+             not hold. That is the one line an operator reads when a rotation is stuck, and \
+             naming the wrong epoch there sends them to the wrong row in the controller's key \
+             table.",
+            old_epoch + 1
+        );
+
+        // Guard the contrast is real: if these ever coincide the test is
+        // asserting nothing, which is how this class of pin rots.
+        assert_ne!(
+            Some(old_epoch + 1),
+            stalled_target_epoch(&phase),
+            "harness precondition: the phase epoch and `old_epoch + 1` must DIFFER here, or this \
+             test cannot distinguish the two derivations"
+        );
+    }
+
+    /// The warning is an `Overlapping`-only diagnostic, so no other phase may
+    /// yield a target epoch. A `Some` from `CutOver` would let the stall line
+    /// name an epoch in a phase where the rotation has already cut over and
+    /// nothing is stalled.
+    #[test]
+    fn stalled_target_epoch_is_none_outside_overlapping() {
+        assert_eq!(stalled_target_epoch(&RotationPhase::Idle), None);
+        assert_eq!(
+            stalled_target_epoch(&RotationPhase::CutOver { new_epoch: 2 }),
+            None,
+            "`CutOver` means routes have already flipped onto the new epoch — there is no stall \
+             to warn about, and a target epoch here would be a warning about a rotation that \
+             succeeded"
+        );
+    }
 }
