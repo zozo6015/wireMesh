@@ -633,6 +633,13 @@ impl SyncSvc {
     /// `wiremesh_gateway::sync::session_generation`).
     ///
     /// `rpc` names the calling RPC for the log/status line only.
+    // `tonic::Status` is the error type of EVERY gRPC handler in this service,
+    // and it is ~176 bytes. Boxing it to satisfy the lint would change the
+    // service signature for a lint, so the size is accepted and recorded here.
+    #[expect(
+        clippy::result_large_err,
+        reason = "`tonic::Status` is the error type of every gRPC handler; boxing it would change the service signature for a lint"
+    )]
     fn check_session_generation(
         &self,
         gateway_id: i64,
@@ -998,6 +1005,15 @@ async fn seed_and_record_epoch_acks(
 /// [`DropPendingOutcome`] carries that distinction because in-memory state
 /// cannot: the promoter commits before it re-takes the guard. `remove*` is
 /// conditional even then — see [`TrackerEffect::FinishedIfUnpromoted`].
+// Rev 1.42a: the `contains_key`-then-`insert` here is left AS IS. These two
+// functions took three load-bearing edits this phase (S3's `Option<u32>`,
+// PR1b's selector, PR1c's `select_live_pending`); a zero-behaviour lint
+// transform landing fourth would dilute the property that every hunk here
+// is deliberate. Revisit when the file is quiet.
+#[expect(
+    clippy::map_entry,
+    reason = "Rev 1.42a: left as-is deliberately — these two functions took three load-bearing edits this phase and a zero-behaviour lint transform landing fourth would dilute the property that every hunk here is deliberate"
+)]
 pub(crate) async fn drive_rotation_for(
     db: &DbHandle,
     change_tx: &broadcast::Sender<ChangeEvent>,
@@ -1370,7 +1386,7 @@ pub(crate) async fn drive_rotation_for(
 ///      rebuild its `RotationTracker` (fresh `started_at`) if none is
 ///      currently held — the same check-and-evict plus crash-recovery
 ///      rebuild `drive_rotation_for` itself does.
-///   2b. Then call `drive_rotation_for` for EVERY gateway in the step-1 set,
+///      2b. Then call `drive_rotation_for` for EVERY gateway in the step-1 set,
 ///      `pending` row or not, which fires grace-promote/abort/retire via
 ///      `rotation::decide` exactly as an ack-triggered call would.
 ///
@@ -1415,6 +1431,15 @@ pub(crate) async fn drive_rotation_for(
 /// tracker to `Retire { epoch: 1 }` and removes it; the re-read then sees
 /// epoch 0 still `retiring` with NO tracker held, so step 3's orphan path
 /// takes it in the very same iteration.
+// Rev 1.42a: the `contains_key`-then-`insert` here is left AS IS. These two
+// functions took three load-bearing edits this phase (S3's `Option<u32>`,
+// PR1b's selector, PR1c's `select_live_pending`); a zero-behaviour lint
+// transform landing fourth would dilute the property that every hunk here
+// is deliberate. Revisit when the file is quiet.
+#[expect(
+    clippy::map_entry,
+    reason = "Rev 1.42a: left as-is deliberately — these two functions took three load-bearing edits this phase and a zero-behaviour lint transform landing fourth would dilute the property that every hunk here is deliberate"
+)]
 pub(crate) async fn sweep_rotations(
     db: &DbHandle,
     change_tx: &broadcast::Sender<ChangeEvent>,
@@ -2268,6 +2293,13 @@ impl Sync for SyncSvc {
 /// never `None` by the time a request reaches here. It's still handled as a
 /// hard authentication failure rather than `.expect()`-ing, in case a
 /// future refactor of the TLS config ever loosens that guarantee.
+// `tonic::Status` is the error type of EVERY gRPC handler in this service,
+// and it is ~176 bytes. Boxing it to satisfy the lint would change the
+// service signature for a lint, so the size is accepted and recorded here.
+#[expect(
+    clippy::result_large_err,
+    reason = "`tonic::Status` is the error type of every gRPC handler; boxing it would change the service signature for a lint"
+)]
 fn peer_identity<T>(request: &Request<T>) -> Result<(String, String), Status> {
     let certs = request.peer_certs().ok_or_else(|| {
         Status::unauthenticated(

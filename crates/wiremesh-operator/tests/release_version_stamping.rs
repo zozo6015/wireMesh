@@ -270,7 +270,7 @@ fn every_job_that_compiles_a_shipped_binary_stamps_the_version_first() {
                 .iter()
                 .enumerate()
                 .find_map(|(i, s)| build_reason(s).map(|r| (i, r)));
-            let first_stamp = steps.iter().position(|s| is_stamp_step(s));
+            let first_stamp = steps.iter().position(is_stamp_step);
 
             let (build_idx, why) = match first_build {
                 Some(v) => v,

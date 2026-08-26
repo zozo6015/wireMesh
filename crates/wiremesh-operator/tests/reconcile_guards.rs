@@ -80,5 +80,11 @@ fn fabric_apply_lock_is_compile_pinned() {
     // `apply_fabric`'s list happens INSIDE the locked section and that both
     // finalizer arms acquire the lock. A unit test cannot exercise the race
     // without fabricating a kube mock layer this crate deliberately lacks.
-    assert!(true);
+    //
+    // The body references the compile-pin instead of asserting a constant:
+    // `assert!(true)` trips `clippy::assertions_on_constants` under CI's
+    // `-D warnings`, and silencing it with an `#[allow]` would hide the lint
+    // for any future real assertion added here. Naming `_pin_fabric_apply_lock`
+    // is also the more honest body -- the pin IS what this test guards.
+    let _ = _pin_fabric_apply_lock;
 }

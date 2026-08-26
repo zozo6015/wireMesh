@@ -179,7 +179,7 @@ async fn authorize(db: &DbHandle, headers: &HeaderMap, method: &str) -> Result<P
     // enrollment tokens.
     let secret_bytes = hex_decode(&token)
         .ok_or_else(|| Status::unauthenticated("invalid, expired, or revoked API token"))?;
-    let secret_hash = hex_encode(&Sha256::digest(secret_bytes));
+    let secret_hash = hex_encode(Sha256::digest(secret_bytes));
     let now = OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .map_err(|e| Status::internal(format!("formatting current time: {e}")))?;
@@ -219,7 +219,7 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
 /// input (odd length or a non-hex-digit byte) — mirrors
 /// `services::enrollment::hex_decode`'s contract exactly.
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return None;
     }
     let bytes = s.as_bytes();

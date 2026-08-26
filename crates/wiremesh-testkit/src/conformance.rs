@@ -473,6 +473,11 @@ fn check_tcp(from_ns: &Ns, to_ns: &Ns, to_addr: &str, dst_port: u16) -> bool {
     std::thread::sleep(Duration::from_millis(200));
     let ok = tcp_connect(from_ns, to_addr, dst_port, 2);
     let _ = listener.kill();
+    // Reap it. `Ns::spawn` runs `nsenter -- ip netns exec <ns> <cmd>`, and
+    // both `nsenter` (no PID namespace here) and `ip netns exec` EXEC rather
+    // than fork, so the direct child IS the helper: after SIGKILL this
+    // returns immediately and cannot block.
+    let _ = listener.wait();
     ok
 }
 
@@ -716,6 +721,17 @@ fn check_raw_ip_proto(from_ns: &Ns, to_ns: &Ns, to_addr: &str, proto_num: u8) ->
 /// against BOTH backends from the same call site rather than being
 /// duplicated per-backend. Callers (this crate's `tests/conformance.rs`)
 /// call this once per `BackendKind`, alongside the `SCENARIOS` table.
+// Both children ARE reaped, by `wait_with_output()` below. The lint fires on
+// the EARLY-RETURN paths: this function is `-> anyhow::Result<_>` and several
+// `?`/`with_context` arms return before those calls, leaving the children
+// unreaped on a failure path. Reaping them there would mean restructuring the
+// whole body around a guard type purely to satisfy a lint, on a path that only
+// runs when the test is already failing and whose namespace `Lab`'s `Drop`
+// tears down regardless.
+#[expect(
+    clippy::zombie_processes,
+    reason = "children are reaped by `wait_with_output()` on the success path; the lint is about `?` early-return arms, where `Lab`'s Drop destroys the namespace anyway"
+)]
 pub fn flip_under_traffic_zero_loss(kind: BackendKind) -> anyhow::Result<()> {
     let (lab, a, b) = wg_lab("aeth13");
     join_netns(&b.name).context("join b's netns before probing wg0 in-process")?;

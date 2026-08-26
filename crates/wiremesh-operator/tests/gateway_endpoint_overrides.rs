@@ -24,6 +24,7 @@
 //! carry the override when present:
 //!   * `--observe <spec.observe_endpoint | controller_observe>`
 //!   * `--controller-sync <spec.sync_endpoint | controller_sync>`
+//!
 //! Values are `host:port` — the gateway binary accepts DNS hostnames on both
 //! flags (re-resolved per reconnect/tick), so overrides pass through VERBATIM
 //! as single argv elements (no shell, no validation-mangling; the builder's

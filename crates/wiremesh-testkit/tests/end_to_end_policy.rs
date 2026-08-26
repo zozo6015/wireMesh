@@ -328,6 +328,11 @@ fn check_tcp(from_ns: &Ns, to_ns: &Ns, to_addr: &str, dst_port: u16) -> bool {
     std::thread::sleep(Duration::from_millis(200));
     let ok = tcp_connect(from_ns, to_addr, dst_port, 2);
     let _ = listener.kill();
+    // Reap it. `Ns::spawn` runs `nsenter -- ip netns exec <ns> <cmd>`, and
+    // both `nsenter` (no PID namespace here) and `ip netns exec` EXEC rather
+    // than fork, so the direct child IS the helper: after SIGKILL this
+    // returns immediately and cannot block.
+    let _ = listener.wait();
     ok
 }
 

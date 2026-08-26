@@ -1498,71 +1498,6 @@ fn normalize_serial_to_16_bytes(raw: &[u8]) -> anyhow::Result<[u8; 16]> {
     Ok(buf)
 }
 
-#[cfg(test)]
-mod serial_normalization_tests {
-    use super::normalize_serial_to_16_bytes;
-
-    /// Exact 16 bytes: no stripping, no padding — passed through unchanged.
-    #[test]
-    fn exact_16_bytes_passes_through() {
-        let raw: [u8; 16] = [0x7f; 16];
-        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), raw);
-    }
-
-    /// OVER-length (17 bytes, `0x00` sign-pad prefix): the real 16-byte
-    /// serial had its top byte `>= 0x80` (e.g. starting `0xff, 0x01, ..`),
-    /// so minimal-DER `raw_serial()` prepends a pad byte to keep the ASN.1
-    /// INTEGER non-negative. Must be stripped back to exactly the original
-    /// 16 bytes.
-    #[test]
-    fn over_length_sign_pad_is_stripped() {
-        let inner: [u8; 16] = [
-            0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e, 0x0f,
-        ];
-        let mut raw = vec![0x00u8];
-        raw.extend_from_slice(&inner);
-        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), inner);
-    }
-
-    /// UNDER-length (15 bytes): the real serial's leading byte was itself
-    /// `0x00`, which minimal-DER drops entirely (no pad needed — a leading
-    /// zero followed by a byte `< 0x80` is still non-negative without one).
-    /// Must be restored to 16 bytes via a single left-padding `0x00`.
-    #[test]
-    fn under_length_by_one_is_left_padded() {
-        let raw: [u8; 15] = [
-            0x7f, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-            0x0e,
-        ];
-        let mut expected = [0u8; 16];
-        expected[1..].copy_from_slice(&raw);
-        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), expected);
-    }
-
-    /// UNDER-length by two (14 bytes): two genuine leading zero bytes were
-    /// dropped by minimal DER — must be restored with two left-padding
-    /// `0x00` bytes.
-    #[test]
-    fn under_length_by_two_is_left_padded() {
-        let raw: [u8; 14] = [
-            0x03, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
-        ];
-        let mut expected = [0u8; 16];
-        expected[2..].copy_from_slice(&raw);
-        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), expected);
-    }
-
-    /// Over-length that is NOT exactly a 16-byte sign-pad (e.g. 18 bytes, or
-    /// 17 bytes whose pad byte isn't `0x00`) must be rejected as an
-    /// internal inconsistency rather than silently truncated/misread.
-    #[test]
-    fn implausible_over_length_is_rejected() {
-        let raw = [0xAAu8; 18];
-        assert!(normalize_serial_to_16_bytes(&raw).is_err());
-    }
-}
-
 /// Convenience wrapper mirroring the pattern already exercised by
 /// `tests/enroll.rs`: creates a fresh segment named `segment_name` bound to
 /// `cidr`, mints a single-use `gateway` token scoped to that same `cidr`,
@@ -1750,4 +1685,69 @@ pub fn gen_csr(cn: &str) -> (String, rcgen::KeyPair) {
         .pem()
         .expect("PEM-encoding CSR");
     (csr_pem, key_pair)
+}
+
+#[cfg(test)]
+mod serial_normalization_tests {
+    use super::normalize_serial_to_16_bytes;
+
+    /// Exact 16 bytes: no stripping, no padding — passed through unchanged.
+    #[test]
+    fn exact_16_bytes_passes_through() {
+        let raw: [u8; 16] = [0x7f; 16];
+        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), raw);
+    }
+
+    /// OVER-length (17 bytes, `0x00` sign-pad prefix): the real 16-byte
+    /// serial had its top byte `>= 0x80` (e.g. starting `0xff, 0x01, ..`),
+    /// so minimal-DER `raw_serial()` prepends a pad byte to keep the ASN.1
+    /// INTEGER non-negative. Must be stripped back to exactly the original
+    /// 16 bytes.
+    #[test]
+    fn over_length_sign_pad_is_stripped() {
+        let inner: [u8; 16] = [
+            0xff, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f,
+        ];
+        let mut raw = vec![0x00u8];
+        raw.extend_from_slice(&inner);
+        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), inner);
+    }
+
+    /// UNDER-length (15 bytes): the real serial's leading byte was itself
+    /// `0x00`, which minimal-DER drops entirely (no pad needed — a leading
+    /// zero followed by a byte `< 0x80` is still non-negative without one).
+    /// Must be restored to 16 bytes via a single left-padding `0x00`.
+    #[test]
+    fn under_length_by_one_is_left_padded() {
+        let raw: [u8; 15] = [
+            0x7f, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e,
+        ];
+        let mut expected = [0u8; 16];
+        expected[1..].copy_from_slice(&raw);
+        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), expected);
+    }
+
+    /// UNDER-length by two (14 bytes): two genuine leading zero bytes were
+    /// dropped by minimal DER — must be restored with two left-padding
+    /// `0x00` bytes.
+    #[test]
+    fn under_length_by_two_is_left_padded() {
+        let raw: [u8; 14] = [
+            0x03, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+        ];
+        let mut expected = [0u8; 16];
+        expected[2..].copy_from_slice(&raw);
+        assert_eq!(normalize_serial_to_16_bytes(&raw).unwrap(), expected);
+    }
+
+    /// Over-length that is NOT exactly a 16-byte sign-pad (e.g. 18 bytes, or
+    /// 17 bytes whose pad byte isn't `0x00`) must be rejected as an
+    /// internal inconsistency rather than silently truncated/misread.
+    #[test]
+    fn implausible_over_length_is_rejected() {
+        let raw = [0xAAu8; 18];
+        assert!(normalize_serial_to_16_bytes(&raw).is_err());
+    }
 }

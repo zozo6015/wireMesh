@@ -170,6 +170,7 @@ pub enum MintAction {
 ///     so [`needs_rebind`] reads false from then on and the required rebind is
 ///     PERMANENTLY LOST — nothing re-derives it. The gateway then sits on an
 ///     unusable plain token and wedges at the next re-enroll.
+///
 /// Deferring costs nothing: the not-enrolled requeue is 15s and the pending
 /// rebind stays derivable from the untouched Secret.
 ///
@@ -275,6 +276,7 @@ pub fn adoption_needs_stale_drain(
 ///   * the segment's currently-active roster id is STILL present AND STILL exactly the
 ///     `stale_id` we snapshotted (`active_id_now == Some(stale_id)`); and
 ///   * this CR is STILL the sole gateway CR for the segment (`recount_now == 1`).
+///
 /// Any drift — a DIFFERENT active id, NO active id, or a peer CR now sharing the
 /// segment — returns `false`, aborting the drain. (A fresh-read FAILURE is handled at
 /// the call site by likewise aborting; a missed drain is a manual cleanup, a wrong

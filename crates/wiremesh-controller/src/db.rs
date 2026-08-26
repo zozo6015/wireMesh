@@ -1690,6 +1690,20 @@ impl Db {
     /// persisted revision must advance in this same transaction, and an
     /// early `InvalidToken` return above must NOT reach here (it rolls back
     /// instead).
+    // The parameters are the inputs of ONE enrollment transaction, not one
+    // table's columns -- an earlier version of this reason said the latter and
+    // was wrong. This function redeems the enrollment token (`secret_hash`,
+    // matched on `used_at IS NULL AND expires_at > now`), inserts the `relay`
+    // row (`relay_name`, `endpoint`), records the issued `certificate`
+    // (`cert_serial`, `issuer_handle`, `cert_not_after`), stamps
+    // `enrollment_token.used_at` and the `audit_log` entry (`now`), and bumps
+    // the persisted revision -- five tables, atomically. Grouping them behind
+    // a struct would add an indirection whose only purpose is the lint, in the
+    // crate whose history says cleanups are where regressions enter.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "these are the inputs of one atomic enrollment transaction -- token redemption, relay row, certificate record, audit stamp and revision bump across five tables -- not the columns of a single table"
+    )]
     pub fn enroll_relay(
         &self,
         secret_hash: &str,
@@ -2179,8 +2193,8 @@ impl Db {
         Ok(DropPendingOutcome::Dropped)
     }
 
-    /// (Key-rotation Task 3) Atomic combination of [`Db::all_keys_for_gateway`]
-    /// + [`Db::current_revision`]: acquires the connection `Mutex` guard
+    /// (Key-rotation Task 3) Atomic combination of [`Db::all_keys_for_gateway`] +
+    /// [`Db::current_revision`]: acquires the connection `Mutex` guard
     /// exactly ONCE and reads both the gateway's full key set AND the
     /// persisted revision while holding it, so the pair is a single
     /// consistent snapshot — mirrors [`Db::relays_snapshot`]'s doc comment
@@ -2612,8 +2626,8 @@ impl Db {
         Ok(rows)
     }
 
-    /// (CodeRabbit round 3, Major) Atomic combination of [`Db::active_relays`]
-    /// + [`Db::current_revision`]: acquires the connection `Mutex` guard
+    /// (CodeRabbit round 3, Major) Atomic combination of [`Db::active_relays`] +
+    /// [`Db::current_revision`]: acquires the connection `Mutex` guard
     /// exactly ONCE and reads both the active-relay set AND the persisted
     /// revision while holding it, so the pair is a single consistent
     /// snapshot. Every `RelaysChanged`-emitting call site
@@ -2817,6 +2831,13 @@ impl Db {
     /// match is unambiguous and lets a caller filter precisely (e.g.
     /// `action = "revoke"` — see `tests/revoke_audit.rs`) without a wildcard
     /// character convention this cycle doesn't otherwise need.
+    // The tuple mirrors the SELECT's column list one-for-one. A `type` alias
+    // would name the shape but hide which column is which, which is the thing
+    // a reader of this function actually needs.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the tuple mirrors the SELECT's column list; a type alias would hide which column is which"
+    )]
     pub fn audit_query(
         &self,
         limit: i64,
@@ -2871,6 +2892,13 @@ impl Db {
     /// `Admin.ListGateways`, making T8's `Sync.Report` bookkeeping
     /// (`Db::set_applied_version`) observable from the Admin surface for the
     /// first time. Ordered by id.
+    // The tuple mirrors the SELECT's column list one-for-one. A `type` alias
+    // would name the shape but hide which column is which, which is the thing
+    // a reader of this function actually needs.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the tuple mirrors the SELECT's column list; a type alias would hide which column is which"
+    )]
     pub fn list_gateways(&self) -> Result<Vec<(i64, String, String, String, Option<i64>)>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(

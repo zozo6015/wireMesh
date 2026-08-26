@@ -61,8 +61,7 @@ async fn create_segment_with_empty_cidrs_is_invalid_argument() {
             cidrs: vec![],
         })
         .await
-        .err()
-        .expect(
+        .expect_err(
             "CreateSegment with an empty cidrs list must be rejected with \
              invalid_argument, not stored as a zero-CIDR segment",
         );

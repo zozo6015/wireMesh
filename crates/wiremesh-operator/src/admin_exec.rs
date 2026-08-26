@@ -345,7 +345,7 @@ impl AdminExec {
                 .collect());
         }
         let v = self.exec_json(&["list-gateways"], None).await?;
-        Ok(serde_json::from_value(v).context("parsing gateway roster")?)
+        serde_json::from_value(v).context("parsing gateway roster")
     }
 
     /// The controller's relay roster.
@@ -363,7 +363,7 @@ impl AdminExec {
                 .collect());
         }
         let v = self.exec_json(&["list-relays"], None).await?;
-        Ok(serde_json::from_value(v).context("parsing relay roster")?)
+        serde_json::from_value(v).context("parsing relay roster")
     }
 
     /// Drain a gateway by id (driven by the Gateway finalizer).

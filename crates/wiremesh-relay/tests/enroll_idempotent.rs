@@ -39,6 +39,15 @@
 //! which is exactly how the gateway's `tests/enroll_idempotent.rs` proves it and
 //! how these tests do too.
 
+// The doc comment above column-aligns its continuation lines under the list
+// item they belong to. Clippy wants them at the minimum indent, which
+// ragged-edges a table a human laid out on purpose, so the disagreement is
+// recorded here rather than resolved against the reader.
+#![expect(
+    clippy::doc_overindented_list_items,
+    reason = "the doc comment aligns its continuation lines on purpose; the lint's fix ragged-edges a hand-aligned table"
+)]
+
 use std::os::unix::fs::PermissionsExt;
 use wiremesh_proto::v1::MintTokenRequest;
 use wiremesh_relay::enroll::{run_enroll, EnrollArgs};

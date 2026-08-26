@@ -229,8 +229,8 @@ const STORM_WINDOW: Duration = Duration::from_secs(75);
 const STORM_BOUND: usize = 6;
 
 /// ASSERTION 4: the workload-idle length (plan: 90s) and the per-C-pair-side
-/// punch-attempt bound across idle + post-idle probes (back-off windows are
-/// >=30s and typically >=60s by this point; 4 = ceiling + margin). The A-B
+/// punch-attempt bound across idle + post-idle probes (back-off windows
+/// are >=30s and typically >=60s by this point; 4 = ceiling + margin). The A-B
 /// pair's bound is 1: an established direct pair has no reason to punch at
 /// all during idle (no state ever leaves `direct`, and the broker only
 /// re-punches on candidate change), but a single stray benign re-confirm is
@@ -714,8 +714,8 @@ fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut f: F) -> bool {
 // --- the scenario ------------------------------------------------------------
 
 /// The full three-gateway incident topology. A and B run from build; C's
-/// netns/NAT/workload are wired from build but its gateway is only enrolled
-/// + spawned by [`Scenario::enroll_and_spawn_c`] — ASSERTION 3 *is* the act
+/// netns/NAT/workload are wired from build but its gateway is only enrolled +
+/// spawned by [`Scenario::enroll_and_spawn_c`] — ASSERTION 3 *is* the act
 /// of C joining an already-converged mesh.
 ///
 /// Field order = drop order: gateway processes die first, then the
@@ -1072,7 +1072,7 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
         tcp_connect(&sc.wla, "10.10.22.2", WORKLOAD_PORT)
     });
     if !crossed {
-        dump_diag("assertion1 workload-cross", &sc);
+        dump_diag("assertion1 workload-cross", sc);
         panic!(
             "ASSERTION 1 (A<->B direct): workload wlA->wlB tcp/{WORKLOAD_PORT} never crossed \
              the tunnel within {AB_CROSS_BUDGET:?}"
@@ -1086,7 +1086,7 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
             && latest_handshake_with(&sc.gwb, &sc.a_pub) > 0
     });
     if !direct {
-        dump_diag("assertion1 reach-direct", &sc);
+        dump_diag("assertion1 reach-direct", sc);
         panic!(
             "ASSERTION 1 (A<->B direct): workload crossed but both sides did not reach \
              path_state=direct with a real WG handshake \
@@ -1134,7 +1134,7 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
                 enroll_at.elapsed()
             );
             if consecutive_failures >= 2 {
-                dump_diag("assertion3 continuity-break", &sc);
+                dump_diag("assertion3 continuity-break", sc);
                 panic!(
                     "ASSERTION 3 (make-before-break): A<->B workload flow BROKE across C's \
                      peer-set update — {consecutive_failures} consecutive probe failures at \
@@ -1150,7 +1150,7 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
         ] {
             let st = path_state_for(ns, peer);
             if matches!(st.as_deref(), Some("connecting") | Some("disconnected")) {
-                dump_diag("assertion3 state-reversion", &sc);
+                dump_diag("assertion3 state-reversion", sc);
                 panic!(
                     "ASSERTION 3 (make-before-break): {side} reverted to {st:?} at t+{:?} \
                      after C's enrollment — the established pair's path state must never \
@@ -1166,7 +1166,7 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
     if path_state_for(&sc.gwa, id_b).as_deref() != Some("direct")
         || path_state_for(&sc.gwb, id_a).as_deref() != Some("direct")
     {
-        dump_diag("assertion3 post-pump", &sc);
+        dump_diag("assertion3 post-pump", sc);
         panic!(
             "ASSERTION 3 (make-before-break): A<->B did not remain direct through C's join \
              (gwA[peer B]={:?}, gwB[peer A]={:?})",
@@ -1213,7 +1213,7 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
             .all(|(_, ns, gid)| settled_ok(&path_state_for(ns, *gid)))
     });
     if !settled {
-        dump_diag("assertion2 settle", &sc);
+        dump_diag("assertion2 settle", sc);
         panic!(
             "ASSERTION 2 (C settles): C's pairs did not all settle (direct|relayed on both \
              sides) within {C_SETTLE_BUDGET:?} of C's enrollment: {:?}",
@@ -1229,7 +1229,7 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
     for (name, ns, gid) in &pair_sides {
         let st = path_state_for(ns, *gid);
         if !settled_ok(&st) {
-            dump_diag("assertion2 settle-flap", &sc);
+            dump_diag("assertion2 settle-flap", sc);
             panic!(
                 "ASSERTION 2 (C settles): {name} flapped out of settled state to {st:?} \
                  within 10s of settling — that is the sawtooth, not convergence"
@@ -1240,7 +1240,7 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
         // the finding-§4 false-liveness bug (handshake-time advance with no
         // rx corroboration). Fail loud; investigate, don't weaken (CLAUDE.md).
         if st.as_deref() == Some("direct") {
-            dump_diag("assertion2 impossible-direct", &sc);
+            dump_diag("assertion2 impossible-direct", sc);
             panic!(
                 "ASSERTION 2 / T2 rx-liveness: {name} reports path_state=direct, but rc's \
                  inbound-DROP makes a direct path to C physically impossible — this is the \
@@ -1261,7 +1261,7 @@ async fn converge_incident_mesh(sc: &mut Scenario) -> u64 {
         tcp_connect(&sc.wla, "10.10.23.2", WORKLOAD_PORT)
     });
     if !c_crossed {
-        dump_diag("assertion2 c-flow", &sc);
+        dump_diag("assertion2 c-flow", sc);
         panic!(
             "ASSERTION 2 (C settles): wlA->wlC tcp/{WORKLOAD_PORT} never crossed the relayed \
              tunnel within 30s of settle — a settled state label without flowing traffic is \

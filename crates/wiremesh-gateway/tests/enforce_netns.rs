@@ -18,20 +18,14 @@ fn apply_if_changed_applies_once_per_version() {
         policy_ir: br#"{"schema":1,"version":1,"blocks":[]}"#.to_vec(),
         ..Default::default()
     };
+    assert!(enf.apply_if_changed(&ds).unwrap(), "first apply happens");
     assert!(
-        enf.apply_if_changed(&mut ds).unwrap(),
-        "first apply happens"
-    );
-    assert!(
-        !enf.apply_if_changed(&mut ds).unwrap(),
+        !enf.apply_if_changed(&ds).unwrap(),
         "same version is a no-op"
     );
 
     // Bump version -> applies again.
     ds.policy_version = 2;
-    assert!(
-        enf.apply_if_changed(&mut ds).unwrap(),
-        "new version re-applies"
-    );
+    assert!(enf.apply_if_changed(&ds).unwrap(), "new version re-applies");
     drop(lab);
 }

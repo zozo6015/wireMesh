@@ -76,7 +76,7 @@
 //! construction — see its doc comment.)
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use tokio::net::UdpSocket;
@@ -114,7 +114,7 @@ fn provision(dir: &PathBuf) -> Pems {
 /// `enroll_and_spawn_killable_relay` documents: `spawn_server`'s returned
 /// handle covers only the accept loop, so only `Endpoint::close` delivers
 /// the genuine CONNECTION_CLOSE severance an eviction consists of.
-async fn spawn_killable_relay(dir: &PathBuf) -> (SocketAddr, quinn::Endpoint) {
+async fn spawn_killable_relay(dir: &Path) -> (SocketAddr, quinn::Endpoint) {
     let cfg = wiremesh_relay::server_config(dir).expect("relay server_config");
     let endpoint = quinn::Endpoint::server(cfg, "127.0.0.1:0".parse().unwrap())
         .expect("bind in-process relay endpoint");

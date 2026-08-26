@@ -167,8 +167,9 @@ fn describe_mismatch(generated: &str, on_disk: &str, display: &str) -> String {
     // which CRD and which block they are looking at.
     if let Some(i) = (0..want.len().max(got.len())).find(|&i| want.get(i) != got.get(i)) {
         out.push_str(&format!("first difference at line {}:\n", i + 1));
-        for c in i.saturating_sub(3)..i {
-            out.push_str(&format!("   {:>4} | {}\n", c + 1, want[c]));
+        let ctx_start = i.saturating_sub(3);
+        for (offset, line) in want[ctx_start..i].iter().enumerate() {
+            out.push_str(&format!("   {:>4} | {}\n", ctx_start + offset + 1, line));
         }
         out.push_str(&format!(
             "  generated {:>4} | {}\n",

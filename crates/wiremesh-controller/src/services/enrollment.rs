@@ -66,6 +66,13 @@ impl EnrollmentSvc {
 
 #[tonic::async_trait]
 impl Enrollment for EnrollmentSvc {
+    // `tonic::Status` is the error type of EVERY gRPC handler in this service,
+    // and it is ~176 bytes. Boxing it to satisfy the lint would change the
+    // service signature for a lint, so the size is accepted and recorded here.
+    #[expect(
+        clippy::result_large_err,
+        reason = "`tonic::Status` is the error type of every gRPC handler; boxing it would change the service signature for a lint"
+    )]
     async fn enroll(
         &self,
         request: Request<EnrollRequest>,
@@ -86,7 +93,7 @@ impl Enrollment for EnrollmentSvc {
             .ok_or_else(|| Status::permission_denied("invalid enrollment token"))?;
         let secret_bytes = hex_decode(&secret_hex)
             .map_err(|_| Status::permission_denied("invalid enrollment token"))?;
-        let secret_hash_hex = hex_encode(&Sha256::digest(&secret_bytes));
+        let secret_hash_hex = hex_encode(Sha256::digest(&secret_bytes));
 
         let cidrs: Vec<Ipv4Net> = req
             .cidrs
@@ -317,7 +324,7 @@ impl Enrollment for EnrollmentSvc {
         // `EmbeddedTrust::sign`); a future non-embedded issuer with opaque
         // post-sign handles would need to revisit this ordering.
         let serial = wiremesh_trust::random_serial();
-        let serial_hex = hex_encode(&serial);
+        let serial_hex = hex_encode(serial);
 
         // not_after is computed here (at reserve time) rather than read back
         // from the signed leaf, since we sign after this transaction. The
@@ -495,7 +502,7 @@ fn hex_encode(bytes: impl AsRef<[u8]>) -> String {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>, ()> {
-    if s.len() % 2 != 0 {
+    if !s.len().is_multiple_of(2) {
         return Err(());
     }
     let bytes = s.as_bytes();

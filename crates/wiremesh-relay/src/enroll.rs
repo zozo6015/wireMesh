@@ -249,7 +249,7 @@ pub fn cli_action(args: impl Iterator<Item = String>) -> CliAction {
 fn enroll_manual() -> String {
     format!(
         "\
-{version}
+{ENROLL_BIN} {version}
 Relay identity bootstrap: redeem a kind=relay enrollment token and write the
 ca.pem / relay.pem / relay.key layout the relay server loads from its certdir.
 Run once (the operator's enroll init-container, or a bare-metal sudo step)
@@ -293,7 +293,7 @@ EXAMPLE:
                          --ca /etc/wiremesh/ca.pem --certdir /var/lib/wiremesh \\
                          --endpoint 203.0.113.7:4443
 ",
-        version = format!("{ENROLL_BIN} {}", env!("CARGO_PKG_VERSION"))
+        version = env!("CARGO_PKG_VERSION")
     )
 }
 

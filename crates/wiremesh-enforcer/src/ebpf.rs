@@ -1,8 +1,8 @@
 //! The real eBPF [`crate::Enforcer`] backend — graduated from
 //! `spike/enforcer/enforcer/src/main.rs`'s `run()`/`apply_rules()` (Task 7
 //! brief), then upgraded in Task 8
-//! (`.superpowers/sdd/task-8-brief.md`) to LPM-bitset first-match matching
-//! + map-in-map atomic generations, then in Task 9
+//! (`.superpowers/sdd/task-8-brief.md`) to LPM-bitset first-match matching +
+//! map-in-map atomic generations, then in Task 9
 //! (`.superpowers/sdd/task-9-brief.md`) with a real flow-table idle timeout/
 //! per-source rate cap, and in Task 10
 //! (`.superpowers/sdd/task-10-brief.md`) with real, sampled
@@ -550,7 +550,7 @@ enum Side {
     Dst,
 }
 
-fn side_cidrs<'a>(f: &'a FlatRule, side: Side) -> &'a [Ipv4Net] {
+fn side_cidrs(f: &FlatRule, side: Side) -> &[Ipv4Net] {
     match side {
         Side::Src => &f.src_cidrs,
         Side::Dst => &f.dst_cidrs,

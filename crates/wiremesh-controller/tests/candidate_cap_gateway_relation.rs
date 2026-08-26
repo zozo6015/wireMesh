@@ -141,6 +141,14 @@ fn max_local_candidates_is_pinned_pending_a_conscious_gateway_cap_check() {
 /// is correct), THIS assertion is the one that still catches a value that
 /// went too far.
 #[test]
+// The assertion IS constant on purpose: it pins the RELATION
+// `1 + MAX_LOCAL_CANDIDATES < GATEWAY_MAX_PEER_CANDIDATES_MIRROR` at
+// compile time so that moving either constant forces a human to re-check
+// it. A constant value is the guarantee here, not a defect.
+#[expect(
+    clippy::assertions_on_constants,
+    reason = "pins the relation `1 + MAX_LOCAL_CANDIDATES < GATEWAY_MAX_PEER_CANDIDATES_MIRROR` at compile time; constant IS the guarantee"
+)]
 fn the_cap_relation_holds_against_the_mirrored_gateway_value() {
     assert!(
         1 + MAX_LOCAL_CANDIDATES < GATEWAY_MAX_PEER_CANDIDATES_MIRROR,

@@ -13,6 +13,7 @@
 //!     `needs_rebind` reads false from then on and the required rebind is
 //!     PERMANENTLY LOST — nothing re-derives it. The gateway then sits on an
 //!     unusable plain token and wedges at the next re-enroll.
+//!
 //! Deferring costs nothing: the not-enrolled requeue is 15s and the pending
 //! rebind stays derivable from the untouched Secret.
 //!

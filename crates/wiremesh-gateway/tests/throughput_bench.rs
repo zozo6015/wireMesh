@@ -146,7 +146,7 @@ fn parse_receiver_mbps(json: &str) -> Option<f64> {
     let kidx = tail.find(key)? + key.len();
     let rest = tail[kidx..].trim_start();
     let rest = rest.strip_prefix(':')?.trim_start();
-    let end = rest.find(|c: char| c == ',' || c == '}')?;
+    let end = rest.find([',', '}'])?;
     rest[..end]
         .trim()
         .parse::<f64>()

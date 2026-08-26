@@ -12,6 +12,7 @@
 //!   - a relay is UNHEALTHY iff it has >=1 report AND NO gateway currently
 //!     reports it healthy.
 //!   - a relay is HEALTHY iff >=1 gateway currently reports it healthy.
+//!
 //! When a relay's aggregate flips to unhealthy the controller must set its
 //! `relay.status = 'inactive'` and emit a `ChangeEvent::RelaysChanged` (the
 //! SAME event Cycle-4c Task 5 already wired — see `tests/sync_relays.rs`)
