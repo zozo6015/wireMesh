@@ -661,15 +661,6 @@ policy:
 /// counter) -- so `by_rule[id]` is an EXACT count of connections made, not
 /// just "> 0".
 #[test]
-// A long-lived netns helper (traffic generator / listener). `wait()`ing on
-// it here would block the suite forever, which is exactly what clippy's fix
-// does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
-// `ip netns del`, which takes every process in the namespace with it -- so
-// there is no orphan to reap and nothing for a `wait()` to accomplish.
-#[expect(
-    clippy::zombie_processes,
-    reason = "long-lived netns harness process; teardown is `ip netns del` in `Lab`'s Drop, and `wait()`ing here would block the suite"
-)]
 fn counters_survive_a_policy_reapply_via_the_offset_accumulator() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
@@ -736,6 +727,11 @@ policy:
     );
 
     let _ = listener.kill();
+    // Reap it. `Ns::spawn` runs `nsenter -- ip netns exec <ns> <cmd>`, and
+    // both `nsenter` (no PID namespace here) and `ip netns exec` EXEC rather
+    // than fork, so the direct child IS the helper: after SIGKILL this
+    // returns immediately and cannot block.
+    let _ = listener.wait();
     drop(lab);
 }
 
@@ -763,15 +759,6 @@ policy:
 /// `src/lib.rs` doc comment on `probe_with`) is implementer-verified by
 /// code inspection/the task report, not by an automated test here.
 #[test]
-// A long-lived netns helper (traffic generator / listener). `wait()`ing on
-// it here would block the suite forever, which is exactly what clippy's fix
-// does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
-// `ip netns del`, which takes every process in the namespace with it -- so
-// there is no orphan to reap and nothing for a `wait()` to accomplish.
-#[expect(
-    clippy::zombie_processes,
-    reason = "long-lived netns harness process; teardown is `ip netns del` in `Lab`'s Drop, and `wait()`ing here would block the suite"
-)]
 fn probe_with_nftables_returns_a_functional_nftables_backend() {
     let (lab, a, b) = wg_lab("aeth12");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
@@ -798,5 +785,10 @@ fn probe_with_nftables_returns_a_functional_nftables_backend() {
     );
 
     let _ = listener.kill();
+    // Reap it. `Ns::spawn` runs `nsenter -- ip netns exec <ns> <cmd>`, and
+    // both `nsenter` (no PID namespace here) and `ip netns exec` EXEC rather
+    // than fork, so the direct child IS the helper: after SIGKILL this
+    // returns immediately and cannot block.
+    let _ = listener.wait();
     drop(lab);
 }

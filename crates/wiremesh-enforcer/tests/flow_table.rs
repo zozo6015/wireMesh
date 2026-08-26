@@ -587,15 +587,6 @@ for s in socks:
 /// brief's explicit list and as this task's TCP/security-group-framed
 /// regression guard alongside (c)'s UDP variant.
 #[test]
-// A long-lived netns helper (traffic generator / listener). `wait()`ing on
-// it here would block the suite forever, which is exactly what clippy's fix
-// does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
-// `ip netns del`, which takes every process in the namespace with it -- so
-// there is no orphan to reap and nothing for a `wait()` to accomplish.
-#[expect(
-    clippy::zombie_processes,
-    reason = "long-lived netns harness process; teardown is `ip netns del` in `Lab`'s Drop, and `wait()`ing here would block the suite"
-)]
 fn live_tcp_flow_survives_apply_removing_its_rule_but_not_a_subsequent_flush() {
     let (lab, a, b) = wg_lab("aeth9");
     join_netns(&b.name).expect("join b's netns before probing wg0 in-process");
@@ -676,6 +667,11 @@ policy:
     );
 
     let _ = listener.kill();
+    // Reap it. `Ns::spawn` runs `nsenter -- ip netns exec <ns> <cmd>`, and
+    // both `nsenter` (no PID namespace here) and `ip netns exec` EXEC rather
+    // than fork, so the direct child IS the helper: after SIGKILL this
+    // returns immediately and cannot block.
+    let _ = listener.wait();
     drop(lab);
 }
 

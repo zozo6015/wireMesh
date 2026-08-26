@@ -323,20 +323,16 @@ except Exception:
 /// `true` iff a TCP SYN from `from_ns` to `to_ns:dst_port` is actually
 /// delivered (the listener accepts the connection) — `false` means the
 /// enforcer dropped it before it ever reached the listener.
-// A long-lived netns helper (traffic generator / listener). `wait()`ing on
-// it here would block the suite forever, which is exactly what clippy's fix
-// does. Teardown is by NAMESPACE DESTRUCTION -- `Lab`'s `Drop` runs
-// `ip netns del`, which takes every process in the namespace with it -- so
-// there is no orphan to reap and nothing for a `wait()` to accomplish.
-#[expect(
-    clippy::zombie_processes,
-    reason = "long-lived netns harness process; teardown is `ip netns del` in `Lab`'s Drop, and `wait()`ing here would block the suite"
-)]
 fn check_tcp(from_ns: &Ns, to_ns: &Ns, to_addr: &str, dst_port: u16) -> bool {
     let mut listener = spawn_accept_only_listener(to_ns, dst_port);
     std::thread::sleep(Duration::from_millis(200));
     let ok = tcp_connect(from_ns, to_addr, dst_port, 2);
     let _ = listener.kill();
+    // Reap it. `Ns::spawn` runs `nsenter -- ip netns exec <ns> <cmd>`, and
+    // both `nsenter` (no PID namespace here) and `ip netns exec` EXEC rather
+    // than fork, so the direct child IS the helper: after SIGKILL this
+    // returns immediately and cannot block.
+    let _ = listener.wait();
     ok
 }
 
