@@ -21,6 +21,9 @@ use wiremesh_gateway::path::{
 use wiremesh_gateway::policy_apply::needs_policy_write;
 use wiremesh_gateway::punch_backoff::{PunchBackoff, PunchDecision};
 use wiremesh_gateway::relay::{RelayDeathReason, RelayTransport};
+use wiremesh_gateway::relay_connect_backoff::{
+    LogDecision, RelayConnectBackoff, RelayConnectDecision,
+};
 use wiremesh_gateway::rotation::{
     role_b_decisions, EpochWatch, OverlapClaim, OverlapIdentity, RoleBDecision, Rotation,
     RotationAction, RotationPhase, RouteOwner, WriteBack,
@@ -31,6 +34,7 @@ use wiremesh_gateway::uapi::{pubkey_b64_to_hex, DeviceConfig};
 use wiremesh_gateway::{netif, observe, punch, reconcile, rotation, routes, sync, uapi};
 use wiremesh_proto::v1::sync_client::SyncClient;
 use wiremesh_proto::v1::{EpochAck, PeerPath, RelayHealth};
+use wiremesh_relay::RelayConnectFailure;
 
 const TUN_MTU: u32 = 1280;
 const MSS: u16 = 1240;
@@ -698,6 +702,7 @@ async fn run(cfg: GatewayConfig) -> anyhow::Result<()> {
         peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
         live_endpoints: live_endpoints.clone(),
         punch_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        relay_connect_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
     };
 
     // Metrics endpoint (Prometheus scrape) on an ephemeral loopback port,
@@ -1429,6 +1434,18 @@ struct PathCtx {
     /// by [`PathCtx::record_punch_outcome`] from `punch_and_apply`. Note
     /// `try_start_punch` bounds concurrency; this bounds RATE.
     punch_backoff: Arc<std::sync::Mutex<HashMap<u64, PunchBackoff>>>,
+    /// Per-(peer, relay) relay-connect back-off (Phase B, D2 / BACKLOG item
+    /// 19) — the relay analogue of `punch_backoff`, and for the same reason
+    /// one level down: `ensure_relay_transport`'s error arm used to be a bare
+    /// `eprintln!` + `return`, re-spawned from two `MarkRelayNeeded`-driven
+    /// sites, so an unusable relay produced a silent, indefinitely repeating,
+    /// indistinguishable per-tick retry. Keyed by `(peer gateway_id,
+    /// relay_id)` — NOT by peer alone: a peer is offered several relays and
+    /// one being unusable says nothing about the next, which is exactly what
+    /// `relay_next_idx`'s round-robin exists to exploit. Consulted via
+    /// [`PathCtx::relay_connect_allowed`]; fed by
+    /// [`PathCtx::record_relay_connect_outcome`].
+    relay_connect_backoff: Arc<std::sync::Mutex<HashMap<(u64, u64), RelayConnectBackoff>>>,
     /// Prompt-report signal (relay-wedge fix round 4): `run_path_ticks`
     /// fires `notify_one` whenever any peer's recorded transition CROSSES
     /// the settled boundary (`path::transition_crosses_settled_boundary` —
@@ -1534,6 +1551,75 @@ impl PathCtx {
                         until.saturating_duration_since(now)
                     );
                 }
+            }
+        }
+    }
+
+    /// Whether a relay-connect attempt to `relay_id` for peer `gid` may run
+    /// now (Phase B, D2). `false` = this (peer, relay) is inside an open
+    /// back-off window. Deliberately SILENT on skip, exactly like
+    /// [`PathCtx::punch_allowed`]: the whole point is to stop a per-tick
+    /// line, so the logging happens when the STATE changes, in
+    /// [`PathCtx::record_relay_connect_outcome`].
+    fn relay_connect_allowed(&self, gid: u64, relay_id: u64) -> bool {
+        let now = Instant::now();
+        let mut map = self.relay_connect_backoff.lock().unwrap();
+        let backoff = map.entry((gid, relay_id)).or_insert_with(|| {
+            RelayConnectBackoff::new(relay_backoff_seed(self.identity.gateway_id, gid, relay_id))
+        });
+        matches!(backoff.decide(now), RelayConnectDecision::Allow)
+    }
+
+    /// Feed a finished relay-connect attempt's outcome into this
+    /// (peer, relay)'s back-off. `outcome` is `Ok(())` on success, or the
+    /// classified [`RelayConnectFailure`] on failure.
+    ///
+    /// Returns `true` if the caller should LOG this failure. The rule (see
+    /// [`LogDecision`]) is first failure, any change of cause, or a newly
+    /// opened window — so an operator sees the cause and then sees it stop
+    /// repeating, rather than one indistinguishable line per tick forever.
+    fn record_relay_connect_outcome(
+        &self,
+        gid: u64,
+        relay_id: u64,
+        outcome: Result<(), RelayConnectFailure>,
+    ) -> bool {
+        let mut map = self.relay_connect_backoff.lock().unwrap();
+        let Some(backoff) = map.get_mut(&(gid, relay_id)) else {
+            // No decide ever ran for this (peer, relay) — the caller
+            // consults `relay_connect_allowed` first, so this shouldn't
+            // happen; nothing to feed, but a failure still deserves its line.
+            return outcome.is_err();
+        };
+        match outcome {
+            Ok(()) => {
+                let was_backed_off = backoff.backoff_until().is_some();
+                backoff.record_success();
+                if was_backed_off {
+                    eprintln!(
+                        "wiremesh-gateway: peer={gid} relay={relay_id} connect back-off cleared \
+                         (connect succeeded)"
+                    );
+                }
+                false
+            }
+            Err(cause) => {
+                let now = Instant::now();
+                let before = backoff.backoff_until();
+                let decision = backoff.record_failure(now, cause);
+                let after = backoff.backoff_until();
+                if after != before {
+                    if let Some(until) = after {
+                        eprintln!(
+                            "wiremesh-gateway: peer={gid} relay={relay_id} connect back-off \
+                             engaged for {:?} (cause: {cause}; further attempts to THIS relay \
+                             are skipped until it expires — other advertised relays are \
+                             unaffected)",
+                            until.saturating_duration_since(now)
+                        );
+                    }
+                }
+                matches!(decision, LogDecision::Log)
             }
         }
     }
@@ -1767,6 +1853,17 @@ fn punch_jitter_seed(own_gateway_id: u64, peer_gateway_id: u64) -> u64 {
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
         .rotate_left(32)
         ^ peer_gateway_id.wrapping_mul(0xBF58_476D_1CE4_E5B9)
+}
+
+/// Jitter seed for one (peer, relay) relay-connect back-off. Same shape and
+/// same rationale as [`punch_jitter_seed`]: deterministic per triple, so
+/// retry timing is reproducible when replaying an incident from logs, and
+/// decorrelated across pairs so backed-off retries don't re-synchronize.
+/// The relay id is folded in so two relays for the same peer draw different
+/// windows.
+fn relay_backoff_seed(own_gateway_id: u64, peer_gateway_id: u64, relay_id: u64) -> u64 {
+    punch_jitter_seed(own_gateway_id, peer_gateway_id)
+        ^ relay_id.wrapping_mul(0x94D0_49BB_1331_11EB).rotate_left(17)
 }
 
 /// Production [`punch::NudgeSink`]: sends ONE datagram from a fresh EPHEMERAL
@@ -2549,13 +2646,46 @@ async fn ensure_relay_transport(
     };
     let relay_info = &relays[idx];
 
+    // Phase B (D2): has THIS (peer, relay) earned a back-off? Silent on skip
+    // by design — the point is to stop the per-tick line, so the logging
+    // happens when the back-off state changes, not when it is honoured.
+    // Checked after the round-robin pick so a backed-off relay costs this
+    // peer only the tick that selected it; the cursor has already advanced,
+    // so the next tick tries the NEXT advertised relay.
+    if !ctx.relay_connect_allowed(gid, relay_info.relay_id) {
+        return;
+    }
+
     let addr: SocketAddr = match relay_info.endpoint.parse() {
         Ok(a) => a,
         Err(e) => {
-            eprintln!(
-                "wiremesh-gateway: relay={} endpoint {:?} unparseable for peer={gid}: {e}",
-                relay_info.relay_id, relay_info.endpoint
-            );
+            // TRANSIENT (`Other`, threshold 3), not permanent — and the
+            // reason is sharper than "it is data, not a peer rejection":
+            // this is the one failure cause whose INPUT can change while the
+            // back-off key cannot. The controller can correct a malformed
+            // advertisement via a `RelaysChanged` delta, but the key stays
+            // `(gid, relay_id)`, so the accumulated history follows the
+            // relay id across the correction. Threshold 3 is what lets a
+            // corrected advertisement land promptly; threshold 1 would open
+            // a window on the first bad string and push an already-fixed
+            // relay toward the 300s cap for a fault that no longer exists.
+            //
+            // But it MUST be recorded. This arm sits AFTER
+            // `relay_connect_allowed` has consumed a `decide()`, and
+            // returning without an outcome is a WIRING GAP, not merely a
+            // slow path: the counter never increments, `window_until` stays
+            // `None`, and `decide()` therefore returns `Allow` on every
+            // subsequent tick. The back-off is INERT here — not lenient.
+            if ctx.record_relay_connect_outcome(
+                gid,
+                relay_info.relay_id,
+                Err(RelayConnectFailure::Other),
+            ) {
+                eprintln!(
+                    "wiremesh-gateway: relay={} endpoint {:?} unparseable for peer={gid}: {e}",
+                    relay_info.relay_id, relay_info.endpoint
+                );
+            }
             return;
         }
     };
@@ -2593,13 +2723,37 @@ async fn ensure_relay_transport(
     {
         Ok(t) => t,
         Err(e) => {
-            eprintln!(
-                "wiremesh-gateway: connecting relay={} for peer={gid} failed: {e}",
-                relay_info.relay_id
-            );
+            // Phase B (D2). Two things changed here, and both matter:
+            //
+            // 1. The cause is CLASSIFIED. `wiremesh_relay` attaches a
+            //    `RelayConnectFailure` as the error-chain ROOT, so an ALPN
+            //    mismatch (version skew), a rejected cert (revoked / wrong
+            //    CA), and a dead relay are no longer one indistinguishable
+            //    line.
+            // 2. The retry is RATE-LIMITED. This arm is re-spawned from two
+            //    `MarkRelayNeeded`-driven sites, so it used to repeat every
+            //    tick forever with no back-off and no signal.
+            //
+            // `{e:#}` (anyhow's alternate form) is REQUIRED, not cosmetic:
+            // it prints the whole chain, which is what keeps an
+            // unclassified `Other` from being an empty bucket — the relay's
+            // own application-level rejections ("identity mismatch (code
+            // 2)") arrive that way.
+            let cause = e
+                .downcast_ref::<wiremesh_relay::RelayConnectFailure>()
+                .copied()
+                .unwrap_or(wiremesh_relay::RelayConnectFailure::Other);
+            if ctx.record_relay_connect_outcome(gid, relay_info.relay_id, Err(cause)) {
+                eprintln!(
+                    "wiremesh-gateway: connecting relay={} for peer={gid} failed \
+                     (cause: {cause}): {e:#}",
+                    relay_info.relay_id
+                );
+            }
             return;
         }
     };
+    ctx.record_relay_connect_outcome(gid, relay_info.relay_id, Ok(()));
     let local_addr = transport.local_addr();
     let relay_id = relay_info.relay_id;
 
@@ -2882,6 +3036,32 @@ async fn run_path_ticks(ctx: PathCtx) {
             .lock()
             .unwrap()
             .retain(|gid, _| desired_gids.contains(gid));
+        // Same again for the relay-connect back-off, whose key is
+        // `(gid, relay_id)` — so the retain matches on the tuple's first
+        // element. A relay dropped from the advertised set keeps its entry
+        // until the PEER goes away; that is deliberate (the relay may be
+        // re-advertised, and the back-off it earned is still the truth about
+        // it).
+        //
+        // The bound, stated exactly, because the loose version invites
+        // skipping a cleanup that matters: this is bounded by LIVE peers ×
+        // the relays ever advertised to them WHILE THEY LIVE — not by the
+        // currently-advertised set. Relay ids are controller-assigned
+        // enrollment ids, so that second factor is a small, bounded set
+        // rather than anything attacker- or churn-driven, and an entry costs
+        // one `RelayConnectBackoff`. It is therefore bounded, but by a
+        // HIGH-WATER MARK, not by the live advertisement.
+        //
+        // The principled cleanup is filed, not done here (`docs/BACKLOG.md`,
+        // beside item 19): "a `RelaysChanged` delta that alters relay R's
+        // endpoint should clear the `(gid, R)` back-off entry — the
+        // accumulated failure history is about a string that no longer
+        // exists". That is the right trigger; peer departure is merely the
+        // one this loop already has in hand.
+        ctx.relay_connect_backoff
+            .lock()
+            .unwrap()
+            .retain(|(gid, _), _| desired_gids.contains(gid));
         // Same rationale again for the path map (directive-storm fix
         // review): a peer dropped from the fabric otherwise kept its `Path`
         // entry forever — unbounded growth, AND the sync loop's Report would
@@ -5840,6 +6020,7 @@ mod tests {
             peer_stats: Arc::new(std::sync::Mutex::new(HashMap::new())),
             live_endpoints: Arc::new(std::sync::Mutex::new(HashMap::new())),
             punch_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            relay_connect_backoff: Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 

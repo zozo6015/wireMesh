@@ -187,10 +187,29 @@ collapsing to ~0 has been reachable by three independent routes**, each of which
 looks like a simplification; `evict_decision`'s `None`-means-keep is pinned by
 unit tests whose failure messages say so.
 
+**Relay ALPN (Phase B, D2 — owner ruling 2026-08-25).** v1.0 speaks
+`wiremesh-relay/0` **only, on both sides**: the shipped client offers `/0`
+only and the relay accepts `/0` only, because a client that offers a protocol
+must be able to speak it and a v1.0 client cannot speak `/1` (whose framing is
+still undefined — mux decisions F and G are open). The four duplicated ALPN
+literals are now one exported list (`wiremesh_relay::{ALPN_V0,
+ALPN_SUPPORTED}`) that keeps its list shape so `/1` is a one-line addition
+later; both sides read the negotiated protocol back off the handshake; and the
+relay counts sessions per ALPN in its registration line
+(`alpn_sessions=N`) — decision H's `/0` deprecation anchor, which had to exist
+in the shipped 1.0 relay or fleet-wide "zero `/0` sessions" could not start
+being measured until 1.1. Relay connect failures are now classified
+(`RelayConnectFailure`) at every fallible step of `Client::finish_connect` and
+rate-limited per (peer, relay) — `ensure_relay_transport` previously retried an
+unusable relay every tick forever with one indistinguishable line per attempt.
+See `docs/BACKLOG.md` item 19.
+
 Next action: the Cycle-4c fast-follows (make-before-break direct cutover;
-`relay_pair_id` width + per-relay connection multiplexing). Also pending:
-Cycle 2b fast-follow (OpenBao provider driver). Update this section as phases
-complete.
+per-relay connection multiplexing). **`relay_pair_id` width is NOT a pending
+item** — no such symbol exists; the concept is
+`wiremesh_relay::registration_key`, which has returned the full 64 bits since
+v0.6.0 (`94e8b98`). Also pending: Cycle 2b fast-follow (OpenBao provider
+driver). Update this section as phases complete.
 
 ## Agent workflow rules
 

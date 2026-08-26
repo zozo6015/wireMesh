@@ -14,6 +14,7 @@ pub mod punch;
 pub mod punch_backoff;
 pub mod reconcile;
 pub mod relay;
+pub mod relay_connect_backoff;
 pub mod rotation;
 pub mod routes;
 pub mod state;
