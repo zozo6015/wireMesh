@@ -85,17 +85,38 @@ const ALLOWED: &[(&str, &str)] = &[
     // -- schema -----------------------------------------------------------
     ("crates/wiremesh-controller/src/db.rs", "SCHEMA_V4"),
     // -- storage: the write path and its normalisation ---------------------
-    ("crates/wiremesh-controller/src/db.rs", "set_gateway_reported_version"),
-    ("crates/wiremesh-controller/src/db_async.rs", "set_gateway_reported_version"),
+    (
+        "crates/wiremesh-controller/src/db.rs",
+        "set_gateway_reported_version",
+    ),
+    (
+        "crates/wiremesh-controller/src/db_async.rs",
+        "set_gateway_reported_version",
+    ),
     ("crates/wiremesh-controller/src/services/sync.rs", "watch"),
-    ("crates/wiremesh-controller/src/services/enrollment.rs", "enroll"),
+    (
+        "crates/wiremesh-controller/src/services/enrollment.rs",
+        "enroll",
+    ),
     // -- read-and-surface: no flagging, no filtering, no colouring ---------
     ("crates/wiremesh-controller/src/db.rs", "list_gateways"),
-    ("crates/wiremesh-controller/src/services/admin.rs", "list_gateways"),
+    (
+        "crates/wiremesh-controller/src/services/admin.rs",
+        "list_gateways",
+    ),
     // -- the controller's own pair, stamped onto both snapshot builders ----
-    ("crates/wiremesh-controller/src/projection.rs", "build_snapshot"),
-    ("crates/wiremesh-controller/src/projection.rs", "build_relay_revocation_snapshot"),
-    ("crates/wiremesh-controller/src/version.rs", "min_supported_version"),
+    (
+        "crates/wiremesh-controller/src/projection.rs",
+        "build_snapshot",
+    ),
+    (
+        "crates/wiremesh-controller/src/projection.rs",
+        "build_relay_revocation_snapshot",
+    ),
+    (
+        "crates/wiremesh-controller/src/version.rs",
+        "min_supported_version",
+    ),
     ("crates/wiremesh-controller/src/main.rs", "main"),
     // -- clients populating their own values --------------------------------
     ("crates/wiremesh-gateway/src/sync.rs", "watch"),
@@ -159,8 +180,7 @@ fn occurrences(root: &Path) -> Vec<(String, String, String)> {
                 // ABOVE — those two land on `audit_query` and `revoke_cert`,
                 // which touch neither field. An allowlist entry naming them
                 // would be a lie a later reader could not audit.
-                if attr_depth == 0 && (trimmed.starts_with("#[") || trimmed.starts_with("#!["))
-                {
+                if attr_depth == 0 && (trimmed.starts_with("#[") || trimmed.starts_with("#![")) {
                     attr_depth = 1;
                 }
                 if attr_depth > 0 {
