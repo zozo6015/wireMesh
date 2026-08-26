@@ -201,6 +201,6 @@ that grew a pushing entry would still be missed.
 ## Verification
 
 Per the project's agent workflow rules the runs belong to the qa agent, not the test
-author: `cargo test -p wiremesh-operator --test release_version_stamping`. To see the
+author: `./dev.sh run 'cargo test -p wiremesh-operator --test release_version_stamping'` (from the repo root — all cargo runs go through the dev container). To see the
 RED directly, revert only the `build_reason()` hunk and run the negative test alone —
 it fails with `Some("runs a docker build of deploy/docker/Dockerfile")` against `None`.
