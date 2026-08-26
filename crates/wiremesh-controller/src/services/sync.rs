@@ -41,7 +41,8 @@ use wiremesh_proto::v1::{
 
 use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
 use crate::db::{
-    is_usable_candidate_endpoint, CasOutcome, DropPendingOutcome, GatewayIdentity, GatewayKeyRow,
+    self, is_usable_candidate_endpoint, CasOutcome, DropPendingOutcome, GatewayIdentity,
+    GatewayKeyRow,
 };
 use crate::db_async::DbHandle;
 use crate::projection::{self, ChangeEvent};
@@ -1703,6 +1704,8 @@ impl SyncSvc {
         gw: GatewayIdentity,
         self_cert_pem: String,
         session_generation: u64,
+        reported_version: Option<String>,
+        reported_schema: Option<u32>,
     ) -> Result<Response<WatchStream>, Status> {
         // (Sync session generation) FIRST statement, and the ordering is
         // LOAD-BEARING — before `change_tx.subscribe()`, before
@@ -1714,6 +1717,23 @@ impl SyncSvc {
         // and re-install the very state the clear just removed — the race
         // would survive verbatim.
         self.record_session_generation(gw.id, session_generation);
+
+        // (B10) Record what this gateway reports about itself. Already
+        // normalised at the entry point, so `None` means "never reported".
+        // Best-effort and NON-FATAL: this is observability, and failing a
+        // Watch — the gateway's whole control plane — because a bookkeeping
+        // UPDATE failed would trade a real outage for a missing datum.
+        if let Err(e) = self
+            .db
+            .set_gateway_reported_version(gw.id, reported_version, reported_schema)
+            .await
+        {
+            eprintln!(
+                "wiremesh-controller: recording gateway={} reported version failed \
+                 (continuing, this is observability only): {e}",
+                gw.id
+            );
+        }
 
         // Subscribe BEFORE building the snapshot. `build_snapshot` has
         // internal `await` points (each `DbHandle` call hops onto
@@ -1862,7 +1882,24 @@ impl SyncSvc {
         &self,
         relay_id: i64,
         self_cert_pem: String,
+        reported_version: Option<String>,
     ) -> Result<Response<WatchStream>, Status> {
+        // (B10) Record what this relay reports. `version` only — the `relay`
+        // table has no `max_ir_schema` column (a relay has no policy IR), and
+        // that omission is what keeps "0 = not applicable" from ever being
+        // read as B10's "0 = assume schema 1". Same best-effort, non-fatal
+        // treatment as the gateway path.
+        if let Err(e) = self
+            .db
+            .set_relay_reported_version(relay_id, reported_version)
+            .await
+        {
+            eprintln!(
+                "wiremesh-controller: recording relay={relay_id} reported version failed \
+                 (continuing, this is observability only): {e}"
+            );
+        }
+
         // Subscribe BEFORE snapshotting for the same reason the gateway path
         // does (see `watch_gateway`): a revocation published in the window
         // between the snapshot's DB read and here must be buffered in `rx`,
@@ -1946,6 +1983,18 @@ impl Sync for SyncSvc {
         // gateway row ids (see `watch_relay`'s doc comment), so recording one
         // under a relay id would corrupt a real gateway's entry.
         let session_generation = request.get_ref().session_generation;
+        // (B10) Read here, at the one entry point, and thread to whichever
+        // path claims this client. NORMALISED IMMEDIATELY via the two pure
+        // helpers, so `None` is the only "never reported" that travels on:
+        // proto3 cannot distinguish an absent field from an explicit ""/0, so
+        // an old client arrives with ""/0 and must not gain a second spelling
+        // of unknown in the column.
+        //
+        // The normalisation is the ONLY branch on these fields anywhere, and
+        // it lives inside the helpers by design — Phase B stores them and
+        // NEVER consults them (no gate, no filter, no flag, no log).
+        let reported_version = db::store_version(&request.get_ref().client_version);
+        let reported_schema = db::store_schema(request.get_ref().max_ir_schema);
 
         if let Some(gw) = self
             .db
@@ -1954,7 +2003,13 @@ impl Sync for SyncSvc {
             .map_err(|e| Status::internal(format!("looking up gateway by cert CN: {e}")))?
         {
             return self
-                .watch_gateway(gw, self_cert_pem, session_generation)
+                .watch_gateway(
+                    gw,
+                    self_cert_pem,
+                    session_generation,
+                    reported_version,
+                    reported_schema,
+                )
                 .await;
         }
 
@@ -1964,7 +2019,13 @@ impl Sync for SyncSvc {
             .await
             .map_err(|e| Status::internal(format!("looking up relay by cert CN: {e}")))?
         {
-            return self.watch_relay(relay_id, self_cert_pem).await;
+            // A relay gets only `version`: the `relay` table has no
+            // `max_ir_schema` column, because a relay has no policy IR. The
+            // schema value it sent (0 = not applicable) is dropped here, on
+            // purpose — see SCHEMA_V4's tripwire in `db.rs`.
+            return self
+                .watch_relay(relay_id, self_cert_pem, reported_version)
+                .await;
         }
 
         Err(Status::permission_denied(

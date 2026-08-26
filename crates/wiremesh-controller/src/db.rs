@@ -316,6 +316,71 @@ CREATE TABLE gateway_candidate (
 );
 "#;
 
+/// Schema migration to `user_version = 4` (Phase B, B10 / X-6): records what
+/// version each client last reported, so a skew window is *observable* before
+/// v1.0 tags.
+///
+/// **Nullable, no DEFAULT — deliberately.** This table's existing
+/// "unknown until reported" columns (`applied_version`, `observe_key`,
+/// `candidate_endpoint`) are nullable for the same reason: `''`/`0` would be
+/// indistinguishable from a genuine legacy client that reports nothing. The
+/// write sites map `""` -> NULL and `0` -> NULL BEFORE the upsert, so NULL is
+/// the ONLY spelling of "never reported" that is ever stored.
+///
+/// **`relay` gains `version` but NOT `max_ir_schema` — and that asymmetry is
+/// a TRIPWIRE, not an oversight.** A relay has no policy IR, so it sends
+/// `max_ir_schema = 0` meaning "not applicable". B10's legacy read-mapping
+/// treats a `0` from a GATEWAY as "assume schema 1". Those two readings of
+/// `0` are only safe to coexist because there is no relay column for the
+/// mapping to ever be applied to. **Adding `max_ir_schema` to `relay` will
+/// look like a harmless symmetry fix and will silently make every relay
+/// report as schema 1.** If you need it, change the wire encoding first so
+/// "not applicable" is distinguishable from "schema 1".
+///
+/// In Phase B these columns are WRITTEN AND NEVER READ for a decision: no
+/// Watch-open gate, no apply-time laggard gate, no `fabricctl` flagging.
+/// That is X-6/Phase C.
+const SCHEMA_V4: &str = r#"
+ALTER TABLE gateway ADD COLUMN version TEXT;
+ALTER TABLE gateway ADD COLUMN max_ir_schema INTEGER;
+ALTER TABLE relay ADD COLUMN version TEXT;
+"#;
+
+/// Normalises a reported client version for STORAGE: `""` becomes `None`.
+///
+/// proto3 cannot distinguish an absent `client_version` from an explicit
+/// `""`, so an old client's request arrives with `""`. Writing that through
+/// would give the column a SECOND spelling of "unknown" (`''` beside `NULL`)
+/// — exactly the ambiguity the nullable choice exists to remove. `NULL` is
+/// the only "never reported" that is ever stored.
+///
+/// # Why this is a function and not an inline `if`
+///
+/// Phase B's scope rule is that these fields are STORED AND NEVER CONSULTED:
+/// no gate, no filter, no flag, no log branches on them. That rule is checked
+/// by grepping the diff's call sites for a branch on the field names — so the
+/// one branch B10 legitimately needs lives HERE, in a pure function, and the
+/// call sites stay branch-free. These two helpers are the complete allowlist:
+/// a branch on any of the four fields anywhere else is out of scope by
+/// construction.
+///
+/// Normalising for storage is not consulting: it decides only what is
+/// WRITTEN, never control flow, what is served, or what is logged.
+pub(crate) fn store_version(reported: &str) -> Option<String> {
+    (!reported.is_empty()).then(|| reported.to_string())
+}
+
+/// Normalises a reported max IR schema for STORAGE: `0` becomes `None`.
+/// See [`store_version`] for why this is a function; the same rule governs it.
+///
+/// `0` is the proto3 default, so it means "never reported" from a gateway —
+/// and "not applicable" from a relay, which has no policy IR. Both map to
+/// `NULL`, and the two readings never collide because the `relay` table has
+/// no `max_ir_schema` column at all (see [`SCHEMA_V4`]'s tripwire).
+pub(crate) fn store_schema(reported: u32) -> Option<u32> {
+    (reported != 0).then_some(reported)
+}
+
 /// Returned (wrapped in [`anyhow::Error`]) when [`Db::insert_segment`]'s CIDR
 /// overlap check finds a conflicting, already-registered CIDR. Names the
 /// existing segment so callers/operators can resolve it (master-spec §4.1,
@@ -774,6 +839,14 @@ impl Db {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA_V3)?;
             tx.execute_batch("PRAGMA user_version = 3")?;
+            tx.commit()?;
+        }
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 4 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V4)?;
+            tx.execute_batch("PRAGMA user_version = 4")?;
             tx.commit()?;
         }
 
@@ -2477,6 +2550,68 @@ impl Db {
         Ok(())
     }
 
+    /// (B10) Records what a gateway reported about itself when it opened its
+    /// Watch: its build version and the highest policy-IR schema it can
+    /// apply. Both are already NORMALISED by the caller via
+    /// [`store_version`]/[`store_schema`], so `None` here means "never
+    /// reported" and is the only spelling of unknown that reaches the column.
+    ///
+    /// WRITE-ONLY in Phase B: nothing reads these to make a decision. See
+    /// [`SCHEMA_V4`].
+    pub fn set_gateway_reported_version(
+        &self,
+        gateway_id: i64,
+        version: Option<String>,
+        max_ir_schema: Option<u32>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE gateway SET version = ?1, max_ir_schema = ?2 WHERE id = ?3",
+            params![version, max_ir_schema, gateway_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("Watch: no gateway row with id {gateway_id} to record version on");
+        }
+        Ok(())
+    }
+
+    /// (B10) Records ONLY a gateway's reported version, leaving
+    /// `max_ir_schema` untouched — the enrollment path, where the client
+    /// sends `EnrollRequest.client_version` but no schema (that is learned
+    /// when it first opens a Watch).
+    ///
+    /// Separate from [`Db::set_gateway_reported_version`] on purpose: writing
+    /// `NULL` for the schema here would CLOBBER a value learned from an
+    /// earlier Watch if a gateway ever re-enrolls against an existing row.
+    pub fn set_gateway_version(&self, gateway_id: i64, version: Option<String>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE gateway SET version = ?1 WHERE id = ?2",
+            params![version, gateway_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("Enroll: no gateway row with id {gateway_id} to record version on");
+        }
+        Ok(())
+    }
+
+    /// (B10) The relay counterpart of [`Db::set_gateway_reported_version`].
+    ///
+    /// There is no `max_ir_schema` parameter, and that is deliberate: the
+    /// `relay` table has no such column, because a relay has no policy IR.
+    /// See [`SCHEMA_V4`]'s tripwire before adding one.
+    pub fn set_relay_reported_version(&self, relay_id: i64, version: Option<String>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE relay SET version = ?1 WHERE id = ?2",
+            params![version, relay_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("Watch: no relay row with id {relay_id} to record version on");
+        }
+        Ok(())
+    }
+
     /// (Task 13) Every registered segment with its CIDRs, ordered by id —
     /// backs `Admin.ListSegments` / `fabricctl segment list`.
     pub fn list_segments(&self) -> Result<Vec<(i64, String, Vec<String>)>> {
@@ -2893,16 +3028,37 @@ impl Db {
     /// (`Db::set_applied_version`) observable from the Admin surface for the
     /// first time. Ordered by id.
     // The tuple mirrors the SELECT's column list one-for-one. A `type` alias
-    // would name the shape but hide which column is which, which is the thing
-    // a reader of this function actually needs.
+    // would name the shape but hide WHICH column is which, which is the thing
+    // a reader of this function actually needs — so the eventual fix is a row
+    // STRUCT with named fields, not an alias. (PR0b's rationale kept; B10
+    // widened the tuple 5 -> 7 and the argument is unchanged by the width.)
     #[expect(
         clippy::type_complexity,
-        reason = "the tuple mirrors the SELECT's column list; a type alias would hide which column is which"
+        reason = "the 7-tuple mirrors the SELECT's column list one-for-one (id, name, \
+                  segment, status, applied_version, version, max_ir_schema); a type \
+                  alias would hide which column is which, and a named row struct is \
+                  the eventual fix that `expect` will error on the day it lands"
     )]
-    pub fn list_gateways(&self) -> Result<Vec<(i64, String, String, String, Option<i64>)>> {
+    pub fn list_gateways(
+        &self,
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        )>,
+    > {
         let conn = self.conn.lock().unwrap();
+        // (B10) `version`/`max_ir_schema` come along so `Admin.ListGateways`
+        // can EXPOSE them. Exposing is not consulting: `fabricctl` prints
+        // nothing derived from them and gains no out-of-window flagging in
+        // Phase B — that is X-6/Phase C.
         let mut stmt = conn.prepare(
-            "SELECT g.id, g.name, s.name, g.status, g.applied_version \
+            "SELECT g.id, g.name, s.name, g.status, g.applied_version, g.version, g.max_ir_schema \
              FROM gateway g JOIN segment s ON s.id = g.segment_id \
              ORDER BY g.id",
         )?;
@@ -2914,6 +3070,8 @@ impl Db {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -3953,6 +4111,264 @@ mod cas_tests {
             before, after,
             "reading the row's state to explain the failed CAS must not turn a rolled-back \
              transaction into a committed one: the revision must not move"
+        );
+    }
+
+    /// Builds a database at exactly `user_version = 3`, from the REAL schema
+    /// constants, and returns it with its temp dir.
+    ///
+    /// The DDL is replayed by hand because there is no supported way to STOP
+    /// at 3: `Db::open` does not migrate at all (it opens, enables
+    /// `foreign_keys`, sets a busy timeout), and the only thing that does —
+    /// `run_migrations` — always runs the ladder to the top, which is 4 once
+    /// this PR lands. So the fixture applies V1 → V2 → V3 and stamps the
+    /// version itself.
+    ///
+    /// It replays the ACTUAL consts rather than a copy: a hand-written V3
+    /// would silently stop matching the real one, which is the reason this
+    /// test is in-module at all.
+    fn v3_database() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("controller.db");
+        let conn = rusqlite::Connection::open(&path).expect("create the V3 database");
+        conn.pragma_update(None, "foreign_keys", true)
+            .expect("enable foreign keys");
+        for (ddl, v) in [(SCHEMA_V1, 1), (SCHEMA_V2, 2), (SCHEMA_V3, 3)] {
+            conn.execute_batch(ddl)
+                .unwrap_or_else(|e| panic!("applying SCHEMA_V{v}: {e}"));
+        }
+        conn.execute_batch("PRAGMA user_version = 3")
+            .expect("stamp user_version = 3");
+
+        let v: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("reading back user_version");
+        assert_eq!(
+            v, 3,
+            "the fixture must start at user_version = 3 — the whole point is migrating an \
+             EXISTING V3 database. Starting anywhere else silently tests a different upgrade \
+             path than the one operators will run"
+        );
+        (dir, path)
+    }
+
+    /// `(column_name, ...)` for a table, straight from SQLite.
+    fn columns_of(conn: &rusqlite::Connection, table: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .expect("preparing table_info");
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .expect("querying table_info")
+            .collect::<Result<_, _>>()
+            .expect("reading column names");
+        assert!(
+            !cols.is_empty(),
+            "table `{table}` has no columns — it does not exist, so any assertion about its \
+             shape below would pass or fail for the wrong reason"
+        );
+        cols
+    }
+
+    /// (3) `SCHEMA_V4` upgrades a real V3 database in place, preserving its data.
+    ///
+    /// The data half is the part that matters operationally: `ALTER TABLE …
+    /// ADD COLUMN` is non-destructive by construction, but the migration also
+    /// stamps `user_version` inside the same transaction, and a mistake there
+    /// (a bump without the DDL, or DDL outside the transaction) leaves a
+    /// database that claims a schema it does not have. That is unrecoverable
+    /// for an operator, because `run_migrations` is version-driven and will
+    /// never revisit the block.
+    #[test]
+    fn schema_v4_migrates_an_existing_v3_database_and_preserves_its_data() {
+        let (dir, path) = v3_database();
+
+        // Rows in BOTH tables the migration touches, so "preserved" is checked
+        // where it could actually be lost rather than only where it is easy.
+        {
+            let conn = rusqlite::Connection::open(&path).expect("seeding connection");
+            conn.execute(
+                "INSERT INTO segment (id, name, description) VALUES (1, 'seg-a', NULL)",
+                [],
+            )
+            .expect("seeding a segment");
+            conn.execute(
+                "INSERT INTO gateway (id, segment_id, name, status, backend) \
+                 VALUES (7, 1, 'gw-a', 'active', 'nftables')",
+                [],
+            )
+            .expect("seeding a gateway");
+            conn.execute(
+                "INSERT INTO relay (id, name, endpoint, status) \
+                 VALUES (3, 'relay-a', '10.0.0.9:7777', 'active')",
+                [],
+            )
+            .expect("seeding a relay");
+        }
+
+        // `Db::open` does NOT migrate — it opens, sets `foreign_keys` and a busy
+        // timeout, and returns. `run_migrations` is the explicit step, and it is
+        // what this test drives.
+        let db = Db::open(&path).expect("opening the V3 database");
+        db.run_migrations().expect("running migrations to V4");
+
+        let conn = rusqlite::Connection::open(&path).expect("assertion connection");
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("reading user_version");
+        assert_eq!(
+            version, 4,
+            "an existing V3 database must end at user_version = 4. `run_migrations` is \
+             version-driven, so a database left below 4 will never receive the columns and \
+             one stamped 4 without them will never be revisited"
+        );
+
+        let gw_name: String = conn
+            .query_row("SELECT name FROM gateway WHERE id = 7", [], |r| r.get(0))
+            .expect("the seeded gateway row must survive the migration");
+        assert_eq!(gw_name, "gw-a", "gateway data must survive the migration");
+        let relay_name: String = conn
+            .query_row("SELECT name FROM relay WHERE id = 3", [], |r| r.get(0))
+            .expect("the seeded relay row must survive the migration");
+        assert_eq!(
+            relay_name, "relay-a",
+            "relay data must survive the migration"
+        );
+
+        // The new columns exist and are NULL for a row that predates them —
+        // the "never reported" state, which is the whole reason they are
+        // nullable with no DEFAULT.
+        let gw_version: Option<String> = conn
+            .query_row("SELECT version FROM gateway WHERE id = 7", [], |r| r.get(0))
+            .expect("gateway.version must exist after the migration");
+        let gw_schema: Option<i64> = conn
+            .query_row("SELECT max_ir_schema FROM gateway WHERE id = 7", [], |r| {
+                r.get(0)
+            })
+            .expect("gateway.max_ir_schema must exist after the migration");
+        let relay_version: Option<String> = conn
+            .query_row("SELECT version FROM relay WHERE id = 3", [], |r| r.get(0))
+            .expect("relay.version must exist after the migration");
+        assert_eq!(
+            (gw_version, gw_schema, relay_version),
+            (None, None, None),
+            "a row that predates the migration has never reported a version, and NULL is the \
+             single spelling of that. A DEFAULT — `''` or `0` — would make a pre-existing row \
+             indistinguishable from one whose client genuinely reported an empty version, \
+             which is the ambiguity the nullable choice exists to remove (§5.1 N7)"
+        );
+
+        drop(dir);
+    }
+
+    /// (8) The relay table gains `version` and DELIBERATELY NOT `max_ir_schema`.
+    ///
+    /// A schema-shape assertion rather than a value convention, so it reds on
+    /// the realistic regression: someone adding `relay.max_ir_schema` "for
+    /// symmetry" with the gateway table. The relay has no IR to gate on — its
+    /// wire `max_ir_schema` is 0 meaning "not applicable" — and 0 is also
+    /// proto3's default for an absent field, so a stored column could never
+    /// distinguish "n/a" from "never reported". Not storing it is what keeps
+    /// that ambiguity off the schema entirely.
+    #[test]
+    fn the_relay_table_gains_version_but_not_max_ir_schema() {
+        let (dir, path) = v3_database();
+        let db = Db::open(&path).expect("opening the V3 database");
+        db.run_migrations().expect("running migrations to V4");
+        let conn = rusqlite::Connection::open(&path).expect("assertion connection");
+
+        let relay_cols = columns_of(&conn, "relay");
+        assert!(
+            relay_cols.iter().any(|c| c == "version"),
+            "`relay.version` must exist after SCHEMA_V4 — the relay reports a real crate \
+             version and it is stored. Columns present: {relay_cols:?}"
+        );
+        assert!(
+            !relay_cols.iter().any(|c| c == "max_ir_schema"),
+            "`relay.max_ir_schema` must NOT exist. The relay has no policy IR to gate on, so \
+             its wire value is 0 meaning \"not applicable\" — and 0 is ALSO proto3's default \
+             for an absent field, so the column could never tell \"n/a\" apart from \"never \
+             reported\". Adding it for symmetry with the gateway table puts exactly the \
+             ambiguity the nullable-column decision was made to avoid back into the schema. \
+             Columns present: {relay_cols:?}"
+        );
+
+        // The counterweight: the gateway table DOES get both, so this test
+        // cannot pass by the migration simply not running.
+        let gw_cols = columns_of(&conn, "gateway");
+        assert!(
+            gw_cols.iter().any(|c| c == "version") && gw_cols.iter().any(|c| c == "max_ir_schema"),
+            "the gateway table must gain BOTH columns — without this, `relay.max_ir_schema` \
+             being absent would also be satisfied by SCHEMA_V4 never having run at all, and \
+             the assertion above would pass vacuously. Gateway columns: {gw_cols:?}"
+        );
+
+        drop(dir);
+    }
+
+    // ---- (4a) the storage-normalisation helpers, at their single definition ----
+
+    /// `store_version` maps ONLY the empty string to `None`.
+    ///
+    /// This is §5.1's N7 write-site rule at the one place it is decided. proto3
+    /// cannot distinguish an absent `client_version` from an explicit `""`, so
+    /// an old client's request arrives indistinguishable from a new client
+    /// reporting nothing — and both mean "never reported". Storing `''` would
+    /// give the column a SECOND spelling of unknown beside NULL, which is
+    /// exactly the ambiguity the nullable choice removes.
+    #[test]
+    fn store_version_maps_only_the_empty_string_to_null() {
+        assert_eq!(
+            store_version(""),
+            None,
+            "an empty reported version means \"never reported\" and must store as NULL. \
+             Returning `Some(\"\")` puts a second spelling of unknown in the column, and \
+             every later read has to know which one it is looking at"
+        );
+        assert_eq!(
+            store_version("0.11.0"),
+            Some("0.11.0".to_string()),
+            "a real reported version must be stored verbatim — no trimming, no defaulting"
+        );
+        assert_eq!(
+            store_version("0.1.0"),
+            Some("0.1.0".to_string()),
+            "`0.1.0` is a REAL value here, not a sentinel: every crate carries it in git and \
+             `scripts/set-version.sh` rewrites it only inside a release job. Treating it as \
+             \"unknown\" would silently discard every locally-built gateway's honest report"
+        );
+    }
+
+    /// `store_schema` maps ONLY zero to `None`.
+    ///
+    /// Zero is proto3's default, so it means "never reported" from a gateway —
+    /// and "not applicable" from a relay, which has no policy IR. Both map to
+    /// NULL, and that collapse is safe ONLY because the `relay` table has no
+    /// `max_ir_schema` column at all (pinned by
+    /// [`the_relay_table_gains_version_but_not_max_ir_schema`]). The two facts
+    /// are load-bearing on each other: add that column and this collapse
+    /// silently starts meaning two different things in one place.
+    #[test]
+    fn store_schema_maps_only_zero_to_null() {
+        assert_eq!(
+            store_schema(0),
+            None,
+            "0 is proto3's default and means \"never reported\" — it must store as NULL, not \
+             as a schema numbered zero, which no `wiremesh_policy` IR has ever been"
+        );
+        assert_eq!(
+            store_schema(1),
+            Some(1),
+            "1 is the only schema `wiremesh_policy::compile` emits and the only one \
+             `PolicyIR::from_json` accepts, so it is the value every current gateway sends \
+             and it must round-trip"
+        );
+        assert_eq!(
+            store_schema(2),
+            Some(2),
+            "a future schema must store verbatim. Clamping or rejecting an unknown-but- \
+             non-zero value here would make a newer gateway indistinguishable from one that \
+             never reported, which is the distinction this column exists for"
         );
     }
 }

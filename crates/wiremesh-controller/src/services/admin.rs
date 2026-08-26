@@ -291,13 +291,28 @@ impl Admin for AdminSvc {
         Ok(Response::new(ListGatewaysResponse {
             gateways: rows
                 .into_iter()
-                .map(|(id, name, segment, status, applied_version)| GatewayInfo {
-                    id: id as u64,
-                    name,
-                    segment,
-                    status,
-                    applied_version: applied_version.unwrap_or(0) as u64,
-                })
+                .map(
+                    |(id, name, segment, status, applied_version, version, max_ir_schema)| {
+                        GatewayInfo {
+                            id: id as u64,
+                            name,
+                            segment,
+                            status,
+                            applied_version: applied_version.unwrap_or(0) as u64,
+                            // (B10) NULL (never reported) surfaces as the
+                            // proto3 default, which is what a legacy client
+                            // would have sent anyway — the wire cannot carry
+                            // the distinction and Phase B does not need it.
+                            //
+                            // EXPOSED, NOT CONSULTED: `fabricctl gateway
+                            // list` prints nothing derived from these and
+                            // gains no out-of-window flagging. That is
+                            // X-6/Phase C.
+                            version: version.unwrap_or_default(),
+                            max_ir_schema: max_ir_schema.unwrap_or(0) as u32,
+                        }
+                    },
+                )
                 .collect(),
         }))
     }

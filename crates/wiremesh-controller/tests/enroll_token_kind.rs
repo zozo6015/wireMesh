@@ -280,6 +280,7 @@ async fn relay_token_rejected_at_gateway_enrollment_boundary() {
             cidrs: vec!["10.0.0.0/16".into()],
             wg_pubkey: String::new(),
             endpoint: String::new(),
+            client_version: String::new(),
         })
         .await
         .expect_err("a relay-kind token must not be redeemable as a gateway");
@@ -294,6 +295,7 @@ async fn relay_token_rejected_at_gateway_enrollment_boundary() {
             cidrs: vec!["10.0.0.0/16".into()],
             wg_pubkey: String::new(),
             endpoint: String::new(),
+            client_version: String::new(),
         })
         .await
         .expect_err("an unknown token secret must be refused");
@@ -346,6 +348,7 @@ async fn gateway_token_rejected_at_relay_enrollment_boundary() {
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: "203.0.113.9:51820".into(),
+            client_version: String::new(),
         })
         .await
         .expect_err("a gateway-kind token must not be redeemable as a relay");
@@ -358,6 +361,7 @@ async fn gateway_token_rejected_at_relay_enrollment_boundary() {
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: "203.0.113.9:51820".into(),
+            client_version: String::new(),
         })
         .await
         .expect_err("an unknown token secret must be refused");
@@ -420,6 +424,7 @@ async fn rebind_token_rejected_at_relay_enrollment_boundary() {
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: "203.0.113.9:51820".into(),
+            client_version: String::new(),
         })
         .await
         .expect_err("a rebind-kind token must not be redeemable as a relay");
@@ -432,6 +437,7 @@ async fn rebind_token_rejected_at_relay_enrollment_boundary() {
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: "203.0.113.9:51820".into(),
+            client_version: String::new(),
         })
         .await
         .expect_err("an unknown token secret must be refused");

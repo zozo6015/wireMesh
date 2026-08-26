@@ -10,7 +10,14 @@ service Enrollment { rpc Enroll(EnrollRequest) returns (EnrollResponse); }
 // that don't set this field are unaffected.
 // `endpoint` (Task 1, 4c): relay-only public endpoint; empty for gateways
 // (additive, 4c).
-message EnrollRequest { string token = 1; string csr_pem = 2; repeated string cidrs = 3; string wg_pubkey = 4; string endpoint = 5; }
+// (B10 / X-6) `client_version` is the enrolling client's own build version.
+// It is supplied by the CALLER, never read inside `wiremesh-enroll`:
+// `env!("CARGO_PKG_VERSION")` expands at its DEFINITION site, so reading it in
+// the shared enroll crate would stamp every gateway AND relay with
+// `wiremesh-enroll`'s version — a crate `scripts/set-version.sh` does not even
+// stamp, so it would ship as a permanent "0.1.0". Each caller passes its own.
+// Empty means "never reported" and is stored as NULL.
+message EnrollRequest { string token = 1; string csr_pem = 2; repeated string cidrs = 3; string wg_pubkey = 4; string endpoint = 5; string client_version = 6; }
 // (Task 11) `gateway_id` is the DB row id the controller assigned this
 // enrollment — lets a caller (e.g. `wiremesh-testkit::StubGateway::id`)
 // address itself in later Admin ops (e.g. `RotateKey`) without a dedicated

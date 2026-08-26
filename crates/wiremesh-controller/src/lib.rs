@@ -19,6 +19,7 @@ pub mod projection;
 pub mod rotation;
 pub mod routes;
 pub mod services;
+pub mod version;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

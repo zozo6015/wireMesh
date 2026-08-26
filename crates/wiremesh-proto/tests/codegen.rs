@@ -24,6 +24,10 @@ fn snapshot_message_roundtrips() {
         policy_ir: vec![],
         policy_version: 0,
         revoked_serials: vec![],
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        controller_version: String::new(),
+        min_supported_version: String::new(),
     };
     let msg = SyncMessage {
         body: Some(Body::Snapshot(snap.clone())),
@@ -137,6 +141,10 @@ fn state_snapshot_relay_infos_roundtrips_multiple_relay_infos() {
         policy_ir: vec![],
         policy_version: 0,
         revoked_serials: vec![],
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        controller_version: String::new(),
+        min_supported_version: String::new(),
     };
 
     let bytes = snap.encode_to_vec();
@@ -255,6 +263,9 @@ fn enroll_request_endpoint_roundtrips() {
         cidrs: vec!["10.1.0.0/24".into()],
         wg_pubkey: "wgpubkey==".into(),
         endpoint: "203.0.113.9:51820".into(),
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        client_version: String::new(),
     };
     let bytes = with_endpoint.encode_to_vec();
     let decoded =
@@ -274,6 +285,9 @@ fn enroll_request_endpoint_roundtrips() {
         cidrs: vec![],
         wg_pubkey: "wgpubkey==".into(),
         endpoint: String::new(),
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        client_version: String::new(),
     };
     let bytes = no_endpoint.encode_to_vec();
     let decoded =
@@ -484,6 +498,10 @@ fn session_generation_roundtrips_on_watch_report_and_submit_epoch_key() {
 
     let watch = WatchRequest {
         session_generation: nonce,
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        client_version: String::new(),
+        max_ir_schema: 0,
     };
     let decoded = WatchRequest::decode(watch.encode_to_vec().as_slice())
         .expect("decoding the encoded WatchRequest");
@@ -554,5 +572,123 @@ fn session_generation_roundtrips_on_watch_report_and_submit_epoch_key() {
         "an absent SubmitEpochKeyRequest.session_generation must decode as the 0 \
          legacy/unknown sentinel — a legacy gateway must still be able to complete a \
          rotation it was directed into"
+    );
+}
+
+// ===========================================================================
+// (B10 / X-6) The version fields are ADDITIVE: an old peer that never sets
+// them, and a new peer that clears them, must both decode without error.
+//
+// proto3 already guarantees this — the point of the tests below is that they
+// go RED the day someone adds validation that rejects the defaults, which is
+// how "additive" quietly stops being true. The fields are advisory in Phase B
+// (stored and never consulted), so a decoder that refuses `""`/`0` would break
+// every pre-1.0 client for a value nothing reads.
+// ===========================================================================
+
+/// `WatchRequest{2,3}` cleared: an old gateway's Watch decodes cleanly and
+/// lands on the proto3 defaults, which ARE the legacy contract.
+#[test]
+fn watch_request_decodes_with_the_version_fields_cleared() {
+    let full = WatchRequest {
+        session_generation: 7,
+        client_version: "0.11.0".to_string(),
+        max_ir_schema: 1,
+    };
+    let mut buf = Vec::new();
+    full.encode(&mut buf).expect("encoding a full WatchRequest");
+    assert!(
+        WatchRequest::decode(&buf[..]).is_ok(),
+        "a WatchRequest carrying the version fields must decode"
+    );
+
+    // What an old gateway actually puts on the wire: the fields are simply
+    // absent, which prost encodes as nothing at all for scalar defaults.
+    let legacy = WatchRequest {
+        session_generation: 7,
+        client_version: String::new(),
+        max_ir_schema: 0,
+    };
+    let mut legacy_buf = Vec::new();
+    legacy
+        .encode(&mut legacy_buf)
+        .expect("encoding a legacy WatchRequest");
+    let decoded = WatchRequest::decode(&legacy_buf[..]).expect(
+        "a WatchRequest with the version fields absent MUST decode — proto3 defaults \
+                 are the legacy contract, and rejecting them breaks every pre-1.0 gateway",
+    );
+    assert_eq!(
+        (decoded.client_version.as_str(), decoded.max_ir_schema),
+        ("", 0),
+        "absent version fields must arrive as the proto3 defaults `\"\"` and 0 — those are \
+         what the controller maps to NULL at the write site (`store_version`/`store_schema`), \
+         so any other value here changes what gets stored for a legacy client"
+    );
+    assert_eq!(
+        decoded.session_generation, 7,
+        "the pre-existing field must be unaffected by the additions — this is what makes \
+         the change additive rather than merely compatible-looking"
+    );
+}
+
+/// `StateSnapshot{9,10}` cleared: a new gateway talking to an OLD controller
+/// gets a snapshot with no version pair, and must not gate on it.
+#[test]
+fn state_snapshot_decodes_with_the_version_fields_cleared() {
+    let legacy = StateSnapshot {
+        revision: 3,
+        self_cert_pem: "PEM".to_string(),
+        peers: vec![],
+        deprecated_relays: vec![],
+        policy_ir: Vec::new(),
+        policy_version: 0,
+        revoked_serials: vec![],
+        relay_infos: vec![],
+        controller_version: String::new(),
+        min_supported_version: String::new(),
+    };
+    let mut buf = Vec::new();
+    legacy
+        .encode(&mut buf)
+        .expect("encoding a legacy StateSnapshot");
+    let decoded = StateSnapshot::decode(&buf[..]).expect(
+        "a StateSnapshot with 9/10 absent MUST decode — that is exactly what a new gateway \
+         receives from a controller that predates B10",
+    );
+    assert_eq!(
+        (
+            decoded.controller_version.as_str(),
+            decoded.min_supported_version.as_str()
+        ),
+        ("", ""),
+        "an old controller's snapshot carries no version pair, and the gateway must see `\"\"` \
+         rather than an error. In Phase B nothing reads these at all; a gateway that gated on \
+         them would refuse to run against every pre-1.0 controller"
+    );
+    assert_eq!(
+        decoded.revision, 3,
+        "the pre-existing fields must survive alongside the additions"
+    );
+}
+
+/// `GatewayInfo{6,7}` and `EnrollRequest{6}` default to the legacy values.
+#[test]
+fn gateway_info_and_enroll_request_version_fields_are_proto3_defaults() {
+    let gi = wiremesh_proto::v1::GatewayInfo::default();
+    assert_eq!(
+        (gi.version.as_str(), gi.max_ir_schema),
+        ("", 0),
+        "`GatewayInfo`'s version pair must default to `\"\"`/0 — these surface a NULL column \
+         (never reported), so the default and the never-reported case have to agree or \
+         `fabricctl gateway list` would show two different spellings of the same fact"
+    );
+
+    let er = EnrollRequest::default();
+    assert_eq!(
+        er.client_version.as_str(),
+        "",
+        "`EnrollRequest::client_version` must default to `\"\"` — a client that does not \
+         supply it (or supplies it empty, which `wiremesh-enroll` documents as \"not \
+         reported\") stores NULL, never `''`"
     );
 }

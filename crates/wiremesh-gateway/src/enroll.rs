@@ -77,6 +77,10 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
         &wg_pubkey,
         "", // gateways declare no endpoint at enroll (see EnrollArgs note)
         "gateway",
+        // (B10) THIS crate's version. `env!` must expand here, in a crate
+        // `scripts/set-version.sh` stamps — never inside the shared
+        // `wiremesh-enroll`, which is not stamped and would ship "0.1.0".
+        env!("CARGO_PKG_VERSION"),
     )
     .await
     .context("enrolling gateway with the controller")?;

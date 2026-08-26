@@ -781,6 +781,13 @@ impl StubGateway {
                 cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
                 wg_pubkey: wg_pubkey.to_string(),
                 endpoint: String::new(),
+                // B10: harness default — and LOAD-BEARING. Empty here makes
+                // `StubGateway` a genuine pre-B10 client on the wire, which is
+                // exactly what
+                // `wiremesh-controller/tests/b10_version_fields.rs::an_old_client_with_absent_version_fields_enrolls_and_syncs`
+                // relies on. Populating it "for realism" would leave that test
+                // still named for a legacy client while testing a new one.
+                client_version: String::new(),
             })
             .await
             .map_err(|status| anyhow::anyhow!("Enrollment.Enroll failed: {status}"))?
@@ -953,7 +960,14 @@ impl StubGateway {
 
         let mut client = SyncClient::new(channel);
         let stream = client
-            .watch(WatchRequest { session_generation })
+            .watch(WatchRequest {
+                session_generation,
+                // B10: harness defaults — see the note at the enroll site.
+                // Empty/0 IS the pre-B10 wire shape; keep them that way so the
+                // legacy-client tests stay legacy.
+                client_version: String::new(),
+                max_ir_schema: 0,
+            })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Watch failed: {status}"))?
             .into_inner();
@@ -1613,6 +1627,8 @@ pub async fn enroll_relay(h: &TestController, endpoint: &str) -> (String, String
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: endpoint.to_string(),
+            // B10: harness default — see the note at the gateway enroll site.
+            client_version: String::new(),
         })
         .await
         .expect("Enrollment.Enroll (relay path) failed in enroll_relay")

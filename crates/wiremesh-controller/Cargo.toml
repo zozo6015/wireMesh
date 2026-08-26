@@ -72,3 +72,8 @@ wiremesh-testkit = { path = "../wiremesh-testkit" }
 tokio-stream = "0.1"
 # Real on-disk DB file path for the persisted-revision reopen test.
 tempfile = "3"
+# (B10) Reading the raw `version`/`max_ir_schema` columns back. It must be the
+# RAW value: the point of the nullable columns is that "never reported" is
+# NULL and nothing else, and every read path maps NULL to "" — so an
+# assertion made through the API could not tell the two apart.
+rusqlite = { workspace = true }

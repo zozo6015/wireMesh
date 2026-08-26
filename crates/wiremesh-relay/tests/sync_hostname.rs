@@ -239,6 +239,7 @@ async fn enroll_relay_with_key(h: &TestController, endpoint: &str) -> RelayIdent
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: endpoint.to_string(),
+            client_version: String::new(),
         })
         .await
         .expect("Enrollment.Enroll (relay path) failed")

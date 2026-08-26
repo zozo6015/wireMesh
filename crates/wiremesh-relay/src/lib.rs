@@ -1767,6 +1767,15 @@ pub async fn run_sync(
     let mut stream = client
         .watch(WatchRequest {
             session_generation: 0,
+            // (B10) This crate's OWN version — `env!` expands here, in
+            // `wiremesh-relay`, which `scripts/set-version.sh` stamps.
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            // 0 = NOT APPLICABLE. A relay has no policy IR at all, so it is
+            // not claiming schema 0 — it is declining to claim one. Safe only
+            // because the `relay` table has no `max_ir_schema` column for
+            // B10's "0 -> assume schema 1" mapping to be applied to; see
+            // SCHEMA_V4's tripwire in the controller's `db.rs`.
+            max_ir_schema: 0,
         })
         .await
         .map_err(|s| anyhow::anyhow!("Sync.Watch failed: {s}"))?

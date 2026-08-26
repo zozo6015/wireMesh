@@ -128,6 +128,7 @@ async fn relay_enrollment_issues_ca_signed_cert_and_creates_active_relay_row() {
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: endpoint.to_string(),
+            client_version: String::new(),
         })
         .await
         .expect("a relay-kind token with a non-empty endpoint must enroll successfully")
@@ -218,6 +219,7 @@ async fn gateway_token_cannot_enroll_a_relay() {
         cidrs: vec![],
         wg_pubkey: String::new(),
         endpoint: "203.0.113.9:51820".to_string(),
+        client_version: String::new(),
     })
     .await
     .expect_err(
@@ -272,6 +274,7 @@ async fn gateway_enrollment_unaffected() {
             cidrs: vec!["10.0.0.0/16".into()],
             wg_pubkey: String::new(),
             endpoint: String::new(),
+            client_version: String::new(),
         })
         .await
         .expect("a plain gateway enrollment (empty endpoint) must be unaffected by the relay path")
