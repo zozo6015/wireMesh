@@ -62,10 +62,15 @@
 /// worked, never admits peers that do not. **Needs a ruling before any 2.0
 /// release.**
 ///
-/// An unparseable version advertises itself unchanged. Reaching this branch
-/// implies the stamping was bypassed — `scripts/set-version.sh` validates the
-/// shape before writing it — so it signals a BUILD-PROCESS failure, not a
-/// runtime one. Degrading to the narrowest claim beats a panic or an empty
+/// A version that is not **exactly `MAJOR.MINOR.PATCH`** — three components,
+/// each a `u64`, after any `-pre`/`+build` suffix is stripped — advertises
+/// itself unchanged. `1.2` (too few), `1.2.x` (non-numeric patch) and
+/// `1.2.3.4` (too many) are all rejected; naming the accepted shape rather
+/// than saying "unparseable" is deliberate, because the vaguer word is what
+/// once let this function accept all three. Reaching this branch implies the
+/// stamping was bypassed — `scripts/set-version.sh` validates the shape
+/// before writing it — so it signals a BUILD-PROCESS failure, not a runtime
+/// one. Degrading to the narrowest claim beats a panic or an empty
 /// field, consistent with the rule that a value nothing reads must never be
 /// able to fail a connection.
 pub fn min_supported_version(controller_version: &str) -> String {
@@ -73,11 +78,29 @@ pub fn min_supported_version(controller_version: &str) -> String {
         .split(['-', '+'])
         .next()
         .unwrap_or(controller_version);
+    // EXACTLY three components, each numeric. Validating the patch matters even
+    // though the derivation never uses it: "the patch does not move the floor"
+    // and "the patch may be anything" are different claims, and reading only
+    // the two components this function consumes silently accepted `1.2`,
+    // `1.2.x` and `1.2.3.4` as well-formed.
     let mut parts = core.split('.');
-    let (Some(major), Some(minor)) = (parts.next(), parts.next()) else {
+    // The trailing `None` is what makes this EXACTLY three: without it,
+    // `1.2.3.4` would match on its first three components and the rest would
+    // be silently dropped.
+    let (Some(major), Some(minor), Some(patch), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
         return controller_version.to_string();
     };
-    let (Ok(major), Ok(minor)) = (major.parse::<u64>(), minor.parse::<u64>()) else {
+    let (Ok(major), Ok(minor), Ok(_patch)) = (
+        major.parse::<u64>(),
+        minor.parse::<u64>(),
+        // Bound and named, not discarded: the patch is parsed for SHAPE and
+        // deliberately never read, which is what keeps
+        // `the_patch_component_does_not_move_the_floor` a real assertion
+        // rather than one satisfied by accident.
+        patch.parse::<u64>(),
+    ) else {
         return controller_version.to_string();
     };
 
