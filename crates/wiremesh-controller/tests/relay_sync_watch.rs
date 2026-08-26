@@ -667,3 +667,50 @@ async fn relay_watch_receives_rebind_revocation_without_peer_state() {
         }
     }
 }
+
+/// (B10 / X-6) The RELAY's snapshot carries the controller's version pair too.
+///
+/// There are two `StateSnapshot` builders — `projection::build_snapshot` for
+/// gateways and `build_relay_revocation_snapshot` for relays — and they are a
+/// genuine fork, not a shared helper with a flag. A test that only covered the
+/// gateway path would leave the relay's fields unasserted, which is why this
+/// case lives here rather than being a parameter of the gateway one.
+///
+/// It lives in THIS file specifically because the relay-watch recipe
+/// (`enroll_relay_with_key` + `open_relay_watch`, and the header's note that
+/// `wiremesh_testkit::enroll_relay` does not return the key a relay needs to
+/// dial Sync) already exists here. Re-spelling that recipe in a new file would
+/// be a second representation of the dial plumbing.
+///
+/// Advisory in Phase B: the relay stores nothing and gates on nothing. Note
+/// the asymmetry with what the relay SENDS — a relay reports
+/// `max_ir_schema = 0` meaning "not applicable" and has no `max_ir_schema`
+/// column at all (see `db.rs`'s `the_relay_table_gains_version_but_not_max_ir_schema`),
+/// but it still RECEIVES the controller's pair like any other client.
+#[tokio::test]
+async fn relay_watch_snapshot_carries_the_controller_version_pair() {
+    let h = TestController::start().await;
+    let relay = enroll_relay_with_key(&h, "203.0.113.9:7777").await;
+    let mut stream = open_relay_watch(&h, &relay)
+        .await
+        .expect("an enrolled relay must be able to open Sync.Watch");
+
+    let snapshot = match next_msg(&mut stream).await.body {
+        Some(sync_message::Body::Snapshot(s)) => s,
+        other => panic!("a relay's Watch must open with a Snapshot; got {other:?}"),
+    };
+
+    assert!(
+        !snapshot.controller_version.is_empty(),
+        "the RELAY snapshot's `controller_version` is empty. `build_relay_revocation_snapshot` \
+         is a separate builder from `build_snapshot`, so stamping the pair in the gateway \
+         path does not stamp it here — and a relay that cannot see the controller's version \
+         is exactly the blind spot B10 exists to close"
+    );
+    assert!(
+        !snapshot.min_supported_version.is_empty(),
+        "the RELAY snapshot's `min_supported_version` is empty. Same fork: the two builders \
+         must both carry the pair, or a relay is left unable to tell a supporting controller \
+         from one that predates the field"
+    );
+}

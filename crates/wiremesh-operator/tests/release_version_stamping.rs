@@ -996,3 +996,88 @@ fn joined(set: &BTreeSet<String>) -> String {
         set.iter().cloned().collect::<Vec<_>>().join(", ")
     }
 }
+
+/// (B10) Every crate under `crates/` that reads its own `CARGO_PKG_VERSION`
+/// must be one `scripts/set-version.sh` stamps.
+///
+/// # The defect this generalises from
+///
+/// `wiremesh-enroll` builds the `EnrollRequest` for BOTH the gateway and the
+/// relay. `env!` expands at its DEFINITION site, so an `env!("CARGO_PKG_VERSION")`
+/// there would stamp every gateway and every relay with `wiremesh-enroll`'s
+/// own version — a crate the script does not stamp, so it would ship as a
+/// permanent `"0.1.0"`. That is worse than reporting nothing: being non-empty
+/// it stores as a real value instead of the honest NULL, in the one field
+/// whose entire purpose is detecting version skew. B10's fix makes
+/// `client_version` a caller-supplied parameter; this asserts the macro has
+/// not crept back in beside it.
+///
+/// # Why the CLASS and not the instance
+///
+/// Stated narrowly ("`wiremesh-enroll/src` contains no `CARGO_PKG_VERSION`")
+/// it would pass while the identical defect appeared in the next shared crate.
+/// The invariant is **readers ⊆ stamped**, and it is ONE-DIRECTIONAL on
+/// purpose: `fabricctl` is stamped and contains no literal read (clap's
+/// `#[command(version)]` reads the macro implicitly), so an equality would red
+/// on a correct tree.
+///
+/// The stamped set is obtained by RUNNING the script, never by parsing its
+/// `for crate in …` line — see this file's header for the three reasons.
+///
+/// Comment lines are stripped. `wiremesh-relay/src/enroll.rs`'s `ENROLL_BIN`
+/// doc comment already contains the literal `env!("CARGO_PKG_VERSION")` while
+/// reasoning about this very hazard, and the natural thing to add to
+/// `wiremesh-enroll` after B10 is a comment saying it deliberately does NOT
+/// read it. Without stripping, prose reinforcing the invariant would break it.
+#[test]
+fn every_crate_that_reads_its_own_version_is_stamped() {
+    let run = run_set_version();
+    let root = std::path::Path::new(REPO_ROOT);
+
+    let mut readers: BTreeSet<String> = BTreeSet::new();
+    let mut stack = vec![root.join("crates")];
+    while let Some(d) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                // `tests/` is out of scope: a test naming the macro is not a
+                // binary reporting a version.
+                if p.file_name().is_some_and(|n| n == "tests" || n == "target") {
+                    continue;
+                }
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "rs") {
+                let text = std::fs::read_to_string(&p).expect("reading a source file");
+                let reads = text
+                    .lines()
+                    .filter(|l| !l.trim_start().starts_with("//"))
+                    .any(|l| l.contains("CARGO_PKG_VERSION"));
+                if reads {
+                    let rel = p
+                        .strip_prefix(root.join("crates"))
+                        .expect("scanned file is under crates/");
+                    if let Some(krate) = rel.components().next() {
+                        readers.insert(krate.as_os_str().to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    let unstamped: Vec<&String> = readers.iter().filter(|c| !run.stamped.contains(*c)).collect();
+    assert!(
+        unstamped.is_empty(),
+        "these crates read their own `CARGO_PKG_VERSION` but are NOT stamped by \
+         scripts/set-version.sh: {unstamped:?}. Such a crate reports a version it can never \
+         receive — it ships the `0.1.0` placeholder forever, and any value derived from it \
+         (an enrolled client's `client_version`, a `--version` line) is a confident wrong \
+         answer. Either add the crate to the script, or — if it ships nothing, as \
+         `wiremesh-enroll` does with no `[[bin]]` at all — have its CALLER pass the value in \
+         as a parameter. Stamped set (obtained by RUNNING the script): {:?}",
+        run.stamped
+    );
+}
+
