@@ -32,6 +32,25 @@
 //! failure message below distinguishes the two cases rather than accusing the
 //! author of adding a gate.
 //!
+//! # In-module tests are OUT OF SCOPE, by construction
+//!
+//! The scan stops at each `src/` file's first `#[cfg(test)]` marker — the same
+//! N4 marker that divides implementer-owned code from test-writer-owned code
+//! everywhere else in this repo.
+//!
+//! This is not a convenience. The property is *"no production code branches on
+//! these fields"*, and a test that names one is not production code: it is
+//! usually a struct literal that MUST name every field, because the proto
+//! additions are additive and Rust has no partial initialisation. Those fills
+//! are mechanical and unavoidable, they arrive with every future field, and
+//! allowlisting them would mean an entry per test fixture — a list that grows
+//! without bound, that nobody can audit, and that would eventually be deleted
+//! wholesale for being noise. Excluding the block keeps the allowlist small
+//! enough to read, which is the only property that makes it a tripwire.
+//!
+//! What this gives up: a GATE written inside an in-module test would not be
+//! caught. That is acceptable — a gate in a `#[cfg(test)]` block does not ship.
+//!
 //! # Known limits, stated so nobody mistakes this for proof
 //!
 //! It is a source-text scan. It catches the realistic regression (someone
@@ -161,6 +180,14 @@ fn occurrences(root: &Path) -> Vec<(String, String, String)> {
             let mut attr_depth = 0i32;
             for line in text.lines() {
                 let trimmed = line.trim_start();
+                // STOP at the file's first `#[cfg(test)]`. Everything below it
+                // is the in-module test block, which is out of scope BY
+                // CONSTRUCTION — see the header. Not `continue`: a marker means
+                // the rest of the file is tests, so there is nothing further to
+                // scan.
+                if trimmed.starts_with("#[cfg(test)]") {
+                    break;
+                }
                 // Comment-stripped: documenting the rule must not trip it, and
                 // the proto/enroll sources document it at length.
                 if trimmed.starts_with("//") {
@@ -247,7 +274,7 @@ fn no_code_outside_the_allowlist_touches_the_version_fields() {
         .map(|(f, i)| ((*f).to_string(), (*i).to_string()))
         .collect();
 
-    let unexpected: Vec<_> = occurrences(&root)
+    let unexpected: Vec<_> = occurrences(root)
         .into_iter()
         .filter(|(f, i, _)| !allowed.contains(&(f.clone(), i.clone())))
         .collect();
@@ -282,7 +309,7 @@ fn no_code_outside_the_allowlist_touches_the_version_fields() {
 #[test]
 fn every_allowlist_entry_still_names_a_real_occurrence() {
     let root = Path::new(REPO_ROOT);
-    let seen: BTreeSet<(String, String)> = occurrences(&root)
+    let seen: BTreeSet<(String, String)> = occurrences(root)
         .into_iter()
         .map(|(f, i, _)| (f, i))
         .collect();

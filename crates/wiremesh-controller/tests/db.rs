@@ -6,13 +6,23 @@ use wiremesh_controller::db::{Db, OverlapError};
 fn migration_is_idempotent_and_sets_user_version() {
     let db = Db::open_memory().unwrap();
     // Cycle-3 Task 4 adds migration v2 (`policy_version.fingerprint`);
-    // cycle-4b Task 3 adds migration v3 (`gateway_candidate`) — both via the
-    // same `PRAGMA user_version` mechanism as v1. `Db::open`/`open_memory`
-    // already runs every migration up to the latest, so a fresh DB lands on
-    // 3, not 1.
-    assert_eq!(db.user_version().unwrap(), 3);
+    // cycle-4b Task 3 adds migration v3 (`gateway_candidate`); Phase-B B10
+    // adds migration v4 (`gateway.version`, `gateway.max_ir_schema`,
+    // `relay.version`) — each via the same `PRAGMA user_version` mechanism as
+    // v1. `open_memory` runs every migration up to the latest, so a fresh DB
+    // lands on 4, not 1.
+    //
+    // THIS NUMBER TRACKS THE SCHEMA. Bumping it here is what the test is for:
+    // the assertion pins that a fresh DB reaches the CURRENT top and that a
+    // second `run_migrations` is a no-op, so it must move with every added
+    // migration. It is not a tolerance being widened.
+    //
+    // (`Db::open` does NOT migrate — only `open_memory` does. The asymmetry is
+    // real; see `tests/migration` coverage in `db.rs`'s in-module block, whose
+    // V3 fixture calls `run_migrations` explicitly for exactly that reason.)
+    assert_eq!(db.user_version().unwrap(), 4);
     db.run_migrations().unwrap(); // second run is a no-op
-    assert_eq!(db.user_version().unwrap(), 3);
+    assert_eq!(db.user_version().unwrap(), 4);
 }
 
 #[test]
