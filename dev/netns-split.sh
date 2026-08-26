@@ -74,6 +74,33 @@ case "${1:-}" in
         fail=1
       }
     done
+    # SECOND GUARD (added after `rotation_wedge.rs` landed in the gateway
+    # bucket silently). The catch-all guarantees a new gated file runs
+    # SOMEWHERE; it does not guarantee it runs in the RIGHT job. The criterion
+    # that matters is "is this a rotation done-bar", because those are the
+    # suites `direct_rotation_is_zero_drop`'s ~42%-under-load flake lives in
+    # and the reason `netns-rotation` gets a runner to itself.
+    #
+    # This checks a PROXY for that criterion -- the file name mentioning
+    # `rotation` -- because the real property (topology: two real gateway
+    # processes plus a controller) does not discriminate: `mesh_milestone.rs`
+    # has the same shape and belongs in the gateway job. So it is NECESSARY,
+    # NOT SUFFICIENT: it catches the case that actually happened (a rotation
+    # PR adding a `rotation_*` done-bar), and it CANNOT catch a rotation
+    # done-bar under some other name. If you add one, add it to ROTATION by
+    # hand -- this guard will not remind you.
+    for t in "${all[@]}"; do
+      case "$t" in
+        *rotation*)
+          in_list "$t" "${ROTATION[@]}" || {
+            echo "netns-split: '$t' looks like a rotation done-bar but is not in ROTATION." >&2
+            echo "netns-split: rotation suites run alone on their own runner (design 6.3);" >&2
+            echo "netns-split: the catch-all would put it in the CONTENDED gateway job." >&2
+            fail=1
+          } ;;
+      esac
+    done
+
     printf 'netns-split: %d gated test files\n' "${#all[@]}"
     printf '  rotation : %s\n' "${ROTATION[*]}"
     printf '  excluded : %s\n' "${EXCLUDED[*]}"
