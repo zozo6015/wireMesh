@@ -1024,11 +1024,26 @@ fn joined(set: &BTreeSet<String>) -> String {
 /// The stamped set is obtained by RUNNING the script, never by parsing its
 /// `for crate in …` line — see this file's header for the three reasons.
 ///
-/// Comment lines are stripped. `wiremesh-relay/src/enroll.rs`'s `ENROLL_BIN`
-/// doc comment already contains the literal `env!("CARGO_PKG_VERSION")` while
-/// reasoning about this very hazard, and the natural thing to add to
-/// `wiremesh-enroll` after B10 is a comment saying it deliberately does NOT
-/// read it. Without stripping, prose reinforcing the invariant would break it.
+/// # Comments COUNT, and that is deliberate
+///
+/// This scans raw text — a mention inside a `//` comment is a read as far as
+/// this guard is concerned. That sounds too strict and is exactly right,
+/// because the strictness lands only where it should:
+///
+///   * in a STAMPED crate a comment is harmless and tolerated —
+///     `wiremesh-relay/src/enroll.rs`'s `ENROLL_BIN` doc comment names the
+///     macro while reasoning about this very hazard, and its crate is stamped,
+///     so it never trips;
+///   * in an UNSTAMPED crate any mention at all reds — which is the property
+///     wanted for `wiremesh-enroll`, a crate that ships no `[[bin]]`, can
+///     never be stamped, and must not so much as name the macro it is
+///     forbidden to use.
+///
+/// The case that settled it: `wiremesh-enroll/src/lib.rs` briefly carried a
+/// doc comment asserting *"the string `CARGO_PKG_VERSION` appears nowhere
+/// under `crates/wiremesh-enroll/src/`"* — a sentence that falsified itself by
+/// containing the key. A comment-aware guard would have let that stand; this
+/// one forces the comment to describe the macro without spelling it.
 #[test]
 fn every_crate_that_reads_its_own_version_is_stamped() {
     let run = run_set_version();
@@ -1051,10 +1066,8 @@ fn every_crate_that_reads_its_own_version_is_stamped() {
                 stack.push(p);
             } else if p.extension().is_some_and(|x| x == "rs") {
                 let text = std::fs::read_to_string(&p).expect("reading a source file");
-                let reads = text
-                    .lines()
-                    .filter(|l| !l.trim_start().starts_with("//"))
-                    .any(|l| l.contains("CARGO_PKG_VERSION"));
+                // Raw text, comments included — see the doc comment above.
+                let reads = text.contains("CARGO_PKG_VERSION");
                 if reads {
                     let rel = p
                         .strip_prefix(root.join("crates"))
