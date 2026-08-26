@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# dev/doctest-counts.sh — pin the per-crate doctest inventory.
+#
+# WHY THIS EXISTS. `cargo test --doc` exiting 0 proves the doctests that exist
+# COMPILE AND PASS. It does not prove the same doctests exist. Both directions
+# of drift are silent and both matter:
+#
+#   * ONE APPEARED. PR0b did this. A blank `///` inserted to satisfy
+#     `doc_lazy_continuation` closed a Markdown list, which turned a
+#     six-space-indented paragraph NINE LINES FURTHER DOWN -- untouched by the
+#     edit -- into an indented code block. rustdoc compiles those, so a
+#     paragraph of English became a doctest with 34 syntax errors. Five clippy
+#     invocations and two `fmt --check`s were green over it, and a token-level
+#     comparison of the doc text could not see it either: every token was
+#     identical, only Markdown's INTERPRETATION moved.
+#   * ONE VANISHED. A doctest deleted or accidentally fenced out is a LOST
+#     TEST. Nothing else in CI notices; `--doc` still exits 0.
+#
+# WHAT THIS DELIBERATELY DOES NOT DETECT. The table records per-crate COUNTS,
+# not per-doctest identity, so a change that is count-neutral is invisible to
+# it: delete one ```ignore``` doctest and add another in the same crate and the
+# row still reads `ignored=2`. Recording each doctest's path and line instead
+# would catch that -- and would also red on every unrelated edit that shifts a
+# line number, which is most edits, in a file whose whole purpose is to be
+# boring enough that a red MEANS something. The tripwire is aimed at APPEARANCE
+# and DISAPPEARANCE, which is where the observed bug lived (a doc edit turning
+# prose into a compiled code block) and where the silent loss lives (a deleted
+# doctest). Swapping one ignored doctest for another is a deliberate act by
+# someone editing that doc comment, and it is visible in their diff.
+#
+# Why a committed table rather than an A/B against the merge base: it costs no
+# second workspace compile, it catches the case an A/B cannot (a doctest
+# deleted upstream, where base and head agree and are both wrong), and changing
+# the inventory becomes a DELIBERATE edit to a reviewed file instead of a
+# number that drifts unobserved.
+#
+# The values in `dev/doctest-counts.txt` are MEASURED, never hand-written:
+#   ./dev.sh run "cd /work && cargo test -j 1 --workspace --doc"            > /tmp/root.log
+#   ./dev.sh run "cd /work/crates/wiremesh-enforcer-ebpf && cargo test -j 1 --doc" > /tmp/ebpf.log
+#   dev/doctest-counts.sh generate /tmp/root.log /tmp/ebpf.log > dev/doctest-counts.txt
+# DESIGN INVARIANT -- `check` compares against the COMPLETE expected table and
+# never iterates the log. That is what makes it a backstop for a BROKEN run,
+# not just a changed one: a truncated log, an empty log, or a `failed=N` row
+# all produce a table that differs from the committed one, so all three red.
+# Measured: full log exit 0; truncated after four crates exit 1 with 8 rows
+# missing; crashed before any output exit 1 with 12 missing.
+#
+# Simplifying this to "walk the log and check each row we find" would look
+# equivalent and would SILENTLY REMOVE that backstop -- a truncated log would
+# then match on every row it still contained. Do not.
+#
+# (It is a backstop, not the primary gate: the CI steps that produce these logs
+# set `pipefail` so a failed run fails THERE, with the right message. This one
+# would red too, but saying "a doctest appeared or vanished" for what is really
+# "the doc run died".)
+set -euo pipefail
+
+TABLE="$(dirname "$0")/doctest-counts.txt"
+
+usage() { echo "usage: dev/doctest-counts.sh {generate|check} <root-doc-log> <ebpf-doc-log>" >&2; exit 2; }
+[ $# -eq 3 ] || usage
+mode=$1; root_log=$2; ebpf_log=$3
+[ -r "$root_log" ] || { echo "doctest-counts: cannot read $root_log" >&2; exit 2; }
+[ -r "$ebpf_log" ] || { echo "doctest-counts: cannot read $ebpf_log" >&2; exit 2; }
+
+# `Doc-tests <crate>` then, some lines later, `test result: ok. N passed; N
+# failed; N ignored; ...`. Emit `<crate> passed=<n> failed=<n> ignored=<n>`,
+# sorted, so the table is order-independent and diffs cleanly.
+parse() {
+  awk '
+    /^[[:space:]]*Doc-tests /      { crate=$2; next }
+    /^test result:/ && crate != "" {
+      p=f=i=0
+      for (k = 1; k <= NF; k++) {
+        if ($(k+1) ~ /^passed/)  p=$k
+        if ($(k+1) ~ /^failed/)  f=$k
+        if ($(k+1) ~ /^ignored/) i=$k
+      }
+      printf "%s passed=%d failed=%d ignored=%d\n", crate, p, f, i
+      crate=""
+    }
+  ' "$1"
+}
+
+emit() { { parse "$root_log"; parse "$ebpf_log"; } | sort; }
+
+case "$mode" in
+  generate)
+    # REFUSE TO WRITE AN EMPTY TABLE. A parse that finds no crate is never a
+    # workspace with no doctests -- it is a log captured without stderr, where
+    # cargo's `Doc-tests <crate>` banners went missing and only libtest's
+    # `test result:` lines survived. Writing that out would replace the
+    # inventory with a header and silently disarm this tripwire for good,
+    # which is exactly the kind of quiet-loss failure it exists to catch.
+    if [ -z "$(emit)" ]; then
+      echo "doctest-counts: parsed ZERO crates from the given logs — capture them with \`2>&1\`; cargo prints the \`Doc-tests <crate>\` banner on stderr. Refusing to write an empty table." >&2
+      exit 3
+    fi
+    echo "# GENERATED by dev/doctest-counts.sh — do not hand-edit."
+    echo "# The per-crate doctest inventory. A difference here means a doctest"
+    echo "# APPEARED or VANISHED; see that script's header for why both are bugs."
+    echo "# Regenerate deliberately, from a real run, when the change is intended."
+    emit
+    ;;
+  check)
+    [ -r "$TABLE" ] || { echo "doctest-counts: $TABLE is missing — generate it from a real run" >&2; exit 1; }
+    if diff -u <(grep -v '^#' "$TABLE" | sed '/^$/d') <(emit); then
+      echo "doctest inventory unchanged"
+    else
+      echo "::error::the doctest inventory changed. A doctest APPEARED or VANISHED." >&2
+      echo "::error::An appearance is usually prose that rustdoc started compiling (a" >&2
+      echo "::error::closed Markdown list turns an indented paragraph into a code block)." >&2
+      echo "::error::A disappearance is a LOST TEST. Fix the cause; if the change is" >&2
+      echo "::error::intended, regenerate dev/doctest-counts.txt from a real run." >&2
+      exit 1
+    fi
+    ;;
+  *) usage ;;
+esac

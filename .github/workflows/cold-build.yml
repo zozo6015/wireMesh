@@ -1,0 +1,209 @@
+# Scheduled COLD build of both Dockerfiles. This is not a nicety — it covers a
+# regression class nothing else in this repo can see (design §6.1 c8).
+#
+# THE v0.10.0 LESSON. `container-images.yml` restores a cached BuildKit layer,
+# so its build never re-executes the `cargo install bpf-linker` line. When
+# bpf-linker 0.11.0 shipped — it links against system LLVM and its build script
+# aborts without `llvm-config` — every warm build stayed green and the RELEASE
+# broke. `dev/Dockerfile` and `deploy/docker/Dockerfile` now both carry a
+# `--version 0.10.4 --locked` pin, and this workflow is what proves the pin
+# still resolves and still builds, on a schedule, from nothing.
+#
+# `--no-cache` is the load-bearing flag: it re-executes every RUN line, which
+# is the only way the `cargo install bpf-linker` line is reached at all.
+# `--pull` re-resolves base images; it matters for `dev/Dockerfile`, whose
+# `FROM rust:1-bookworm` is a floating tag, so a base bump surfaces here rather
+# than at tag time. It is a deliberate no-op for `deploy/docker/Dockerfile`,
+# which pins every base by digest.
+name: Cold build
+
+on:
+  schedule:
+    # 04:17 UTC daily. Off the hour on purpose — the top of the hour is the
+    # busiest slot on GitHub's shared scheduler and gets delayed the most.
+    - cron: '17 4 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cold-build
+  cancel-in-progress: false
+
+jobs:
+  cold:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      # Both images build even if one fails — a red `dev` image and a red
+      # release image are different problems and both want reporting.
+      fail-fast: false
+      matrix:
+        include:
+          - name: dev image
+            context: dev
+            file: dev/Dockerfile
+            target: ''
+          - name: release image
+            context: .
+            file: deploy/docker/Dockerfile
+            target: export
+    name: cold build (${{ matrix.name }})
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      # STAMP BEFORE THE BUILD. `release_version_stamping.rs`'s
+      # `every_job_that_compiles_a_shipped_binary_stamps_the_version_first`
+      # states the rule this obeys: stamping is per-JOB, because each job gets
+      # its own runner and its own checkout, so an unstamped compile bakes the
+      # `0.1.0` placeholder into whatever it produces.
+      #
+      # THIS JOB GENUINELY NEEDS IT, and the guard does NOT currently catch it.
+      # The release matrix entry builds `deploy/docker/Dockerfile` target
+      # `export`, whose `builder` stage runs `cargo build --release
+      # --workspace` -- every shipped binary. The guard's classifier compares
+      # `with.file` against the literal path, and this step passes
+      # `${{ matrix.file }}`, so the expression never matches and the job is a
+      # FALSE NEGATIVE: a job that really does compile shipped binaries and
+      # that the invariant cannot see. Do not remove this step on the grounds
+      # that the test is green without it.
+      #
+      # The version is a deliberately non-colliding prerelease: these images
+      # are never published (`push: false`), so stamping a real release number
+      # would be a lie in the other direction.
+      - name: stamp a non-colliding version before compiling
+        run: bash scripts/set-version.sh "0.0.0-cold-$(git rev-parse --short HEAD)"
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          push: false
+          load: false
+          # No `cache-from`, no `cache-to`. That is the entire point.
+          no-cache: true
+          pull: true
+
+
+  # A SEPARATE, CHEAP job on purpose: it must report even when a cold build
+  # reds, because "dev and release disagree about the compiler" is a different
+  # problem from "a Dockerfile stopped building".
+  #
+  # Two independent pins claim the same compiler and nothing checks that they
+  # still agree: `dev/Dockerfile` pins the TAG `rust:1.97.1-bookworm`, and
+  # `deploy/docker/Dockerfile`'s builder pins the DIGEST
+  # `rust:1-bookworm@sha256:77fac8b9...`. Today both resolve to
+  # `rustc 1.97.1 (8bab26f4f 2026-07-14)` -- by coincidence of two hand-made
+  # pins, not by construction. If either moves alone, the compiler that TESTS
+  # the code and the compiler that SHIPS it drift apart silently, and every
+  # done-bar becomes evidence about a binary nobody ships. Fail closed.
+  toolchain-parity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # Stamped to satisfy `release_version_stamping.rs`'s per-job rule, and
+      # recorded plainly: THIS JOB COMPILES NOTHING. It greps two `FROM` lines
+      # and `docker run`s the two prebuilt BASE images to print
+      # `rustc --version`; there is no `cargo build`, no `docker build` and no
+      # build-push-action anywhere in it, so no artifact exists to carry a
+      # version. The guard's classifier matches any `run:` block naming the
+      # release Dockerfile alongside the word "build", and this one does so
+      # incidentally -- via the grep pattern `'^FROM .* AS builder'` and two
+      # comments. That is a FALSE POSITIVE, the mirror of the false negative
+      # noted on the `cold` job above.
+      #
+      # Kept rather than argued away: the step costs milliseconds, it keeps the
+      # invariant's job scan free of exceptions, and an invariant with no
+      # exception list is worth more than one carrying a special case for a job
+      # that would need stamping the moment it ever did compile something. The
+      # precision fix belongs to the guard, not here.
+      - name: stamp a non-colliding version (see note above)
+        run: bash scripts/set-version.sh "0.0.0-parity-$(git rev-parse --short HEAD)"
+      - name: dev-image rustc == release-builder rustc
+        run: |
+          set -euo pipefail
+          dev_base="$(grep -m1 '^FROM ' dev/Dockerfile | awk '{print $2}')"
+          rel_base="$(grep -m1 '^FROM .* AS builder' deploy/docker/Dockerfile | awk '{print $2}')"
+          echo "dev base:     $dev_base"
+          echo "release base: $rel_base"
+          dev_rustc="$(docker run --rm "$dev_base" rustc --version)"
+          rel_rustc="$(docker run --rm "$rel_base" rustc --version)"
+          echo "dev rustc:     $dev_rustc"
+          echo "release rustc: $rel_rustc"
+          if [ "$dev_rustc" != "$rel_rustc" ]; then
+            echo "::error::dev/Dockerfile and deploy/docker/Dockerfile no longer agree on the compiler."
+            echo "::error::The suite would be proven on one rustc and the release built with another."
+            echo "::error::Move both pins together: dev/Dockerfile's FROM tag and the release builder digest."
+            exit 1
+          fi
+          echo "OK -- both bases carry $dev_rustc"
+
+          # PRINTED, never asserted. Both Dockerfiles ALSO install an UNDATED
+          # nightly, and the eBPF object that nightly produces is baked into
+          # the shipped gateway via `include_bytes_aligned!`. The two nightlies
+          # float independently and resolve at each image's last COLD build --
+          # that is deliberate (design 6.2 keeps nightly floating), so a
+          # mismatch here is information, not a failure. It is logged so that
+          # when an eBPF-shaped regression appears, the question "which nightly
+          # built the shipped object" has an answer in the run history.
+          echo "--- undated nightly, informational only ---"
+          docker run --rm "$dev_base" bash -lc \
+            'rustup toolchain install nightly -q --profile minimal --no-self-update >/dev/null 2>&1; rustup run nightly rustc --version' \
+            || echo "(dev base: nightly version unavailable)"
+          docker run --rm "$rel_base" bash -lc \
+            'rustup toolchain install nightly -q --profile minimal --no-self-update >/dev/null 2>&1; rustup run nightly rustc --version' \
+            || echo "(release base: nightly version unavailable)"
+
+  # Keeps the root workspace's declared `rust-version` TRUE as dependencies
+  # move. The floor is dependency-derived and `Cargo.lock`-pinned, so it only
+  # changes on a deliberate `cargo update` or a dependency-bump PR -- including
+  # Dependabot security bumps, which need no config file to land. This is
+  # DETECTION LATENCY, not a gate: it rides the nightly schedule and is
+  # deliberately NOT in the per-PR matrix (that table is locked).
+  #
+  # If this reds, a dependency raised the floor. Bump `rust-version` in the
+  # root `Cargo.toml`; do not go hunting for a code change.
+  #
+  # Runs in the dev image because `cargo check` alone is not enough:
+  # `wiremesh-enforcer/build.rs` drives `aya_build`, which needs nightly +
+  # rust-src + bpf-linker. That also scopes what this proves -- "the userspace
+  # crates build on $MSRV, given a nightly present for the eBPF build step",
+  # not "the whole tree builds on $MSRV".
+  msrv:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: dev
+          push: false
+          load: true
+          tags: wiremesh-dev:ci
+          cache-from: type=gha,scope=dev-image
+      - name: cargo +$(rust-version) check --workspace --all-targets
+        run: |
+          set -euo pipefail
+          # Read the floor from the manifest rather than restating it here, so
+          # the workflow cannot drift from the number it is meant to defend.
+          MSRV="$(sed -n 's/^rust-version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ -z "$MSRV" ]; then
+            echo "::error::no rust-version found in the root Cargo.toml [workspace.package]"
+            exit 1
+          fi
+          echo "declared MSRV: $MSRV"
+          docker run --rm -v "$PWD":/work wiremesh-dev:ci bash -lc "
+            set -euo pipefail
+            cd /work
+            rustup toolchain install '$MSRV' --profile minimal --no-self-update
+            cargo +'$MSRV' check --workspace --all-targets -j 1
+          "

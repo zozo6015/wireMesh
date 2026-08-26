@@ -23,6 +23,19 @@ name: "CodeQL Advanced"
 on:
   workflow_dispatch:
 
+# Least privilege at the workflow level; jobs that need more (packages:write,
+# security-events:write, contents:write) still ask for it explicitly, and a
+# job-level block overrides this one. Added by B4 so every workflow in the
+# repo starts from the same floor.
+permissions:
+  contents: read
+
+# Duplicate runs on the same ref were unguarded before B4. `cancel-in-progress`
+# is FALSE here on purpose: a dispatch-only analysis is cheap and cancelling one loses its result for no gain.
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
@@ -61,8 +74,14 @@ jobs:
         # your codebase is analyzed, see https://docs.github.com/en/code-security/code-scanning/creating-an-advanced-setup-for-code-scanning/codeql-code-scanning-for-compiled-languages
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v4
-
+      uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        # No git credential persisted into `.git/config`: nothing in this job
+        # runs an authenticated git operation, and a persisted token is
+        # reachable by any later step or action in the job. Same hardening as
+        # the other workflows (B4 §6.2). `git describe`-style local reads are
+        # unaffected.
+        persist-credentials: false
     # Add any setup steps before running the `github/codeql-action/init` action.
     # This includes steps like installing compilers or runtimes (`actions/setup-node`
     # or others). This is typically only required for manual builds.
@@ -71,7 +90,7 @@ jobs:
 
     # Initializes the CodeQL tools for scanning.
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v4
+      uses: github/codeql-action/init@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
       with:
         languages: ${{ matrix.language }}
         build-mode: ${{ matrix.build-mode }}
@@ -100,6 +119,6 @@ jobs:
         exit 1
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v4
+      uses: github/codeql-action/analyze@db488ddef3bf6cb639b32c2e9a7c0a7ea8271d28 # v4
       with:
         category: "/language:${{matrix.language}}"
