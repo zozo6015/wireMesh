@@ -143,12 +143,34 @@ field by field (item 1 `candidates`, item 23 `active_pubkey_b64`, item 24 `allow
 again be a fixture correction rather than a change to the filter. Anyone landing that
 filter should expect them and reach for realistic serials, not for the assertions.
 
-**Coverage gap left open (not filled here):** no test in this file pins the *filter's*
-own behaviour on the fail-static path — i.e. that a hand-written `state.json` carrying
-an undecodable `active_pubkey_b64` loads as `None` rather than reaching the UAPI at
-boot. `state.rs`'s unit tests cover the shim in isolation; the boot-path round trip is
-uncovered. Adding it would be a new test, not a fixture change, so it is called out
-rather than smuggled into this correction.
+**Where the filter's own boot-path behaviour is pinned (corrected 2026-08-26).** An
+earlier revision of this paragraph claimed the fail-static path was uncovered — that
+"no test pins the filter's own behaviour on the boot path". **That was wrong.** The
+items-23/24 suite, `crates/wiremesh-gateway/tests/peer_key_and_allowedips_validation.rs`,
+has a whole "Door C (`state.json`)" section that has covered it since `f4a9c87` itself:
+`a_persisted_peer_with_an_undecodable_pubkey_does_not_block_the_fail_static_boot` and
+`a_persisted_state_where_every_peers_pubkey_is_bad_still_boots_with_an_empty_device`
+hand-write a `state.json`, load it through `DesiredState::load`, and assert the
+boot-time encode succeeds with the peer dropped.
+
+What was actually missing is narrower. Both Door-C tests persist a **single** peer, so
+each asserts only that something is *absent* from the encoding — assertions a load that
+returned a peerless `DesiredState` would satisfy just as well. The sibling-survival
+case existed only for the Sync-ingest door
+(`one_peers_bad_active_pubkey_does_not_cost_a_sibling_peer_its_configuration`) and had
+no disk-door twin, so nothing pinned the blast radius on the door where a poisoned row
+decides whether the *other* peers get a data plane at all, with the controller not in
+the loop. That twin now exists —
+`a_persisted_bad_pubkey_does_not_cost_a_sibling_peer_its_boot_configuration`, on
+`test/fail-static-shim-boot-roundtrip` — and its healthy peer doubles as the vacuity
+guard the two single-peer tests lack.
+
+The error is worth recording next to the finding, because it is the same class the
+finding itself is about: **an absence asserted from having read one file.** The claim
+"nothing covers this" was made after reading `state.rs` and `fail_static_policy_ir.rs`,
+without listing `crates/wiremesh-gateway/tests/`, where the covering suite sits under a
+name that says so. A coverage claim is a claim about a whole directory and needs to be
+checked against one.
 
 ## Verification
 
