@@ -1281,7 +1281,8 @@ pub(crate) async fn drive_rotation_for(
                 // rotation, which loses its first — and, per Role-B cutover,
                 // only — ack to `report`'s `ack.epoch ==
                 // tracker.pending_epoch` check and silently falls back to the
-                // 90s grace promote.
+                // 90s grace promote. ("Silently" = the FALLBACK is unannounced;
+                // the precipitating mismatch is logged — `ignoring EpochAck(...)`.)
                 //
                 // Safe to remove because an aborting tracker has `promoted_at
                 // == None` (`decide`'s rule 2), so it owns no live `retiring`

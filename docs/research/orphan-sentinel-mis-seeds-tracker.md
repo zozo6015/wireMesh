@@ -237,3 +237,62 @@ grace-free orphan path.
   can drop it.
 * The gateway's retire clock and the controller's promote clock are independent. Anything that
   delays promotion widens the window in which the roster advertises a destroyed key.
+
+
+---
+
+## What the falsification runs measured
+
+Four sabotages against the fix, each one site (or, for the fourth, one *part* of one site),
+each applied on a throwaway commit, run by the test-runner, reverted after.
+
+| # | sabotage | SHA | RED |
+|---|---|---|---|
+| 1 | `drive_rotation_for`'s whole site → `.find()` (both consumers) | `cae7570` | `drive_seeds`, `sweep_step2`, `one_tick` |
+| 2 | `sweep_rotations` step 2's whole site → `.find()` (both consumers) | `5c192f7` | `one_tick` |
+| 3 | `seed_and_record_epoch_acks`' site → `.find()` (one consumer) | `7ef2689` | the ack test, on its seed assertion |
+| 4 | **half-refactor**: seed on the selector, `drive`'s evict input on `.find()` | `7e73533` | `one_tick` |
+
+### The three sites are not equally self-guarding
+
+| site | reds its own test when reverted? | what actually guards it |
+|---|---|---|
+| `drive_rotation_for` | **yes** | its own seed test |
+| `seed_and_record_epoch_acks` | **yes** | its own seed test |
+| `sweep_rotations` step 2 | **NO** | `one_tick_…`'s identity stamps, alone |
+
+The sweep site's own test stayed **green** under a full revert of that site (sabotage 2),
+because step 2b calls `drive_rotation_for` for every gateway in step 1's set — after step 2,
+off a fresher read — so the still-correct drive selector evicted the wrong seed and rebuilt it
+on the right epoch inside the same iteration. The epoch is repaired; the identity stamps are
+not.
+
+The coupling is **asymmetric**, and neither run shows that alone: sabotage 1 propagated *into*
+the sweep test (a defect that site does not own), while sabotage 2 was *masked* by drive (a
+defect it does own). **`sweep_rotations` step 2's seed is therefore not independently
+observable through a sweep pass** — anything that drives a sweep drives `drive_rotation_for`
+after it, so a test that does not read the tracker between them is measuring the composition
+of two sites.
+
+### Two measurements about `one_tick_…` specifically
+
+1. **A `pending_epoch`-only comparison would have produced ZERO reds under both sabotage 2 and
+   sabotage 4.** In each, the tracker ends the tick holding the correct epoch. The identity
+   stamps (`started_at` / `installed_at`) are the only thing standing between those two
+   defects and complete silence.
+2. **The sweep site's guarantee rests on `one_tick_…` alone**, and the full-sweep test is
+   actively misleading about it: it reds for a defect it does not own (sabotage 1) and stays
+   green for one it does (sabotage 2).
+
+**So `one_tick_…` is the sole detector for two independent defects** — the sweep site's full
+revert and the drive site's half-refactor. It is not redundant with the three per-site seed
+tests; it is the only thing covering the cases they cannot see. Weakening it to compare epochs
+rather than stamps silently removes both guards at once.
+
+### Why the half-refactor is the shape worth remembering
+
+Sabotage 4 is what a careful refactor lands in: the selection is moved to the shared function
+at every seed site, and one consumer of that selection — the staleness input — is left behind.
+Every per-site seed test passes, because every site really does seed the newest pending row.
+The tracker is then evicted and rebuilt **on the same epoch** every tick, so only its clock
+moves, and no grace can ever elapse. Three of the four tests are blind to it.
