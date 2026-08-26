@@ -951,7 +951,9 @@ async fn a_failed_rotation_does_not_wedge_the_gateway() {
         // `saturating_sub`: `stderr_grep` yields an empty Vec on a read
         // failure, so `after` could read LOWER than `before`. A bare `-` would
         // then underflow and panic INSIDE the failure message, replacing a
-        // clear diagnosis with an arithmetic backtrace.
+        // clear diagnosis with an arithmetic backtrace. Same premise as the
+        // stall-warning delta above, and the same strict-comparison choice —
+        // keep the two in step.
         stale_mints_after.saturating_sub(stale_mints_before),
         pa.stderr_tail()
     );
@@ -1012,6 +1014,16 @@ async fn a_failed_rotation_does_not_wedge_the_gateway() {
         "rotation 2 completed in {:?}; stall-warning lines before={stall_before} after={stall_after}",
         rot2_elapsed
     );
+    // STRICT `==`, deliberately — not `<=`. Both this delta and the stale-mint
+    // delta below rest on the same premise: `stderr_grep` yields an EMPTY Vec
+    // on a read failure, so `after` can read LOWER than `before`. Relaxing the
+    // comparison to `<=` would make that case PASS, and an absence check that
+    // passes on a read failure is indistinguishable from "the harness stopped
+    // looking" — which is precisely the confusion this assertion exists to
+    // resolve, since the bug it catches also presents as "no warning appeared".
+    // So the comparison stays strict and the MESSAGE names the read-failure
+    // case; `saturating_sub` is there only to stop the diagnostic itself from
+    // underflowing. Keep the two deltas the same shape.
     assert!(
         stall_after == stall_before || rot2_elapsed >= STALL_WARN_AFTER,
         "gwA emitted {} new stall warning(s) during a rotation that completed in {:?} — inside \
@@ -1020,10 +1032,17 @@ async fn a_failed_rotation_does_not_wedge_the_gateway() {
          set and steps 1-8 of `handle_rotate` all fail with `role_a` still `None`, so a clock \
          tracked inside the tick's `if let Some(a) = role_a` guard never sees the reset and the \
          next rotation inherits a stale `Instant`. Track the spell unconditionally, above the \
-         guard. New lines:\n{:?}",
-        stall_after - stall_before,
+         guard.\n\n\
+         (If that count reads 0 and `after` is BELOW `before` — {} < {} — then the stderr \
+         capture became unreadable mid-run rather than the property failing: `stderr_grep` \
+         yields an empty Vec on a read error. Check the log file before diagnosing the \
+         gateway.)\n\n\
+         New lines:\n{:?}",
+        stall_after.saturating_sub(stall_before),
         rot2_elapsed,
         STALL_WARN_AFTER.as_secs(),
+        stall_after,
+        stall_before,
         pa.stderr_grep(STALL_WARN_MARKER)
     );
 
