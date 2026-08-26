@@ -846,6 +846,16 @@ async fn a_failed_rotation_does_not_wedge_the_gateway() {
     let stall_before = pa.stderr_grep(STALL_WARN_MARKER).len();
     let rot2_start = Instant::now();
 
+    // Same device for the mechanism pin below: a DELTA snapshotted here, so the
+    // assertion is about what the SECOND directive caused and nothing else.
+    // A file-wide count would happen to work today only because
+    // `Role A minted epoch … on` is logged AFTER `submit_epoch_key`, which the
+    // injected fault precedes — i.e. it would silently stop being
+    // anchor-relative the moment the fault point moved later than submit.
+    let stale_mints_before = pa
+        .stderr_grep(&format!("Role A minted epoch {} on", r1.epoch))
+        .len();
+
     let r2 = h
         .admin_client()
         .await
@@ -893,6 +903,58 @@ async fn a_failed_rotation_does_not_wedge_the_gateway() {
         );
     }
     eprintln!("SECOND ROTATION COMPLETE: {states2:?}");
+
+    // MECHANISM PIN (architect ruling Rev 1.39/1.40).
+    //
+    // The headline above says the epoch advanced. This says WHY, so a future
+    // regression in the controller's sentinel SELECTION goes red HERE — at the
+    // mechanism — instead of three layers downstream as "the second rotation
+    // never happened".
+    //
+    // Asserted on gwA's captured stderr rather than the controller's, because
+    // `wiremesh_testkit::TestController` runs IN-PROCESS: its `eprintln!` goes
+    // to this test binary's own stderr, and `GwProc::stderr_grep` reads a FILE
+    // that a gateway SUBPROCESS's stderr was drained into. There is no
+    // equivalent handle for an in-process controller, and redirecting this
+    // process's fd 2 would swallow the `--nocapture` diagnostics every other
+    // assertion here depends on. The gateway side carries the same
+    // discriminating signal and is the stronger pin anyway: it evidences what
+    // the gateway DID, not merely what the controller said.
+    //
+    //   post-fix : abort for r1, then a mint at r2 and none at r1
+    //   pre-fix  : abort for r1, then a mint at R1 AGAIN — the stale sentinel
+    //              re-directed — and never one at r2
+    //
+    // The trailing `" on"` is load-bearing: without it "minted epoch 1" also
+    // matches "minted epoch 12".
+    let aborted_for = format!("ROTATION ABORTED — rotation to epoch {} failed", r1.epoch);
+    let minted_target = format!("Role A minted epoch {} on", r2.epoch);
+    let minted_stale = format!("Role A minted epoch {} on", r1.epoch);
+
+    assert!(
+        !pa.stderr_grep(&aborted_for).is_empty(),
+        "gwA never logged an abort for epoch {} — step (ii)'s injected fault did not fire for          the epoch the FIRST RotateKey created, so nothing below is interpretable.          stderr tail:\n{}",
+        r1.epoch,
+        pa.stderr_tail()
+    );
+    assert!(
+        !pa.stderr_grep(&minted_target).is_empty(),
+        "gwA never minted epoch {} — the epoch the SECOND RotateKey created. The rotation that          completed was for some OTHER epoch, so the headline assertion above passed for the          wrong reason.\n\n         THE MECHANISM THIS PINS: `broker.rs::send_rotate_if_pending` selects the epoch to          direct from the gateway's full row set. An aborted rotation leaves its OWN sentinel          `pending` row behind — there is no gateway->controller cancel RPC — so a selection          that does not prefer the NEWEST row re-directs the ABORTED epoch instead of the one          just created. The gateway then rotates to the stale epoch, and the correctly-targeted          directives that follow arrive while it is mid-rotation and are refused as re-entrant          (design C1: nothing retries them). Full derivation, evidence and the (A′) ruling:          docs/research/stale-sentinel-directive-after-abort.md.\n         stderr tail:\n{}",
+        r2.epoch,
+        pa.stderr_tail()
+    );
+    let stale_mints_after = pa.stderr_grep(&minted_stale).len();
+    assert_eq!(
+        stale_mints_after, stale_mints_before,
+        "gwA re-minted epoch {} — the epoch whose rotation was deliberately ABORTED — {} more          time(s) after the abort. That is the stale-sentinel defect in its exact signature: the          controller re-directed the orphan instead of the epoch the second RotateKey created.          The pair can look perfectly healthy on the data plane while this happens, which is why          it is asserted on the log and not on traffic. See          docs/research/stale-sentinel-directive-after-abort.md.\n         stderr tail:\n{}",
+        r1.epoch,
+        // `saturating_sub`: `stderr_grep` yields an empty Vec on a read
+        // failure, so `after` could read LOWER than `before`. A bare `-` would
+        // then underflow and panic INSIDE the failure message, replacing a
+        // clear diagnosis with an arithmetic backtrace.
+        stale_mints_after.saturating_sub(stale_mints_before),
+        pa.stderr_tail()
+    );
 
     // The epoch advanced on the fabric; now prove the gateway actually moved
     // its data plane onto it rather than merely acknowledging the roster.
