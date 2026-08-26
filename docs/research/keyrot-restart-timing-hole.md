@@ -19,7 +19,9 @@ that happens *before* the scrub it asserts, and a loaded runner can land its
 
 ## The retire is a four-step sequence
 
-`crates/wiremesh-gateway/src/main.rs:4305-4340`:
+`service_retire`'s four steps, in `crates/wiremesh-gateway/src/main.rs`
+(the range was `:4305-4340` at `1f70ef6` and `:4306-4346` at `b30969e` — the
+symbol is the citation, the numbers only orient):
 
 ```
   1  tunnels.tear_down(id)                    ← wg0 DISAPPEARS HERE
@@ -53,9 +55,10 @@ source is explicit that the two are decoupled —
 > retire.
 
 **What actually bounds the window.** Step 3 is not merely slow-under-load: it
-takes `ctx.endpoint_commit.lock().await` (`main.rs:4199`). So the interval
-between `wg0` disappearing and the scrub landing is bounded by whoever else
-holds that mutex — the observe/punch commit path — not by CPU scheduling alone.
+takes the `ctx.endpoint_commit` lock inside `renormalize_active_listen_port`.
+So the interval between `wg0` disappearing and the scrub landing is bounded by
+whoever else holds that mutex — the observe/punch commit path — not by CPU
+scheduling alone.
 That matters two ways. It explains why a busy runner widens the window far more
 than a proportional slowdown would suggest; and it means the window can open on
 an otherwise idle host if a punch/observe commit happens to be in flight. The

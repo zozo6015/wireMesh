@@ -1722,16 +1722,17 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     // the new tun) proves the DATA-PLANE retire happened and
     // `service_retire` was entered. It does NOT prove the scrub ran — an
     // earlier revision of this comment claimed it did, and the ordering
-    // above contradicts it. Step 3 awaits `ctx.endpoint_commit`
-    // (`main.rs`:4199), a mutex shared with the observe/punch commit path,
-    // so the gap between `wg0` disappearing and the key leaving disk is
-    // bounded by lock contention, not by CPU. A `pkill -KILL` inside that
-    // gap crashes a gateway whose epoch-0 row is still present in state
-    // `"retiring"`, and the durable-retire assertion (b) then fails for a
-    // reason that has nothing to do with durability. Observed on a loaded CI
-    // runner: epoch 0 present, and ZERO `CRITICAL: … retire …` lines — which
-    // is what "never ran" looks like, since a scrub that runs and fails logs
-    // one. The scrub therefore gets its own gate, immediately below.
+    // above contradicts it. Step 3 awaits the `ctx.endpoint_commit` lock
+    // inside `renormalize_active_listen_port` — a mutex shared with the
+    // observe/punch commit path — so the gap between `wg0` disappearing and
+    // the key leaving disk is bounded by lock contention, not by CPU. A
+    // `pkill -KILL` inside that gap crashes a gateway whose epoch-0 row is
+    // still present in state `"retiring"`, and the durable-retire assertion
+    // (b) then fails for a reason that has nothing to do with durability.
+    // Observed on a loaded CI runner: epoch 0 present, and ZERO
+    // `CRITICAL: … retire …` lines — which is what "never ran" looks like,
+    // since a scrub that runs and fails logs one. The scrub therefore gets
+    // its own gate, immediately below.
     let teardown_deadline = Instant::now() + Duration::from_secs(30);
     let mut torn_down = false;
     loop {
