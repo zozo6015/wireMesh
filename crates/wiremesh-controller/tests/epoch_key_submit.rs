@@ -244,7 +244,9 @@ async fn a_cas_bail_on_submit_stays_failed_precondition_not_internal() {
 // submission can never CLOBBER a real key. What it can do is WIN that swap.
 // A gateway process that mints its epoch key, persists it, and dies with the
 // submission still in flight leaves the pending row holding the sentinel; the
-// broker therefore re-issues the `RotateDirective`; the new process mints a
+// next `KeyRotated` for that gateway therefore drives the broker to re-issue
+// the `RotateDirective` (the restart is the setup, not the trigger — nothing
+// about reconnecting emits `KeyRotated`); the new process mints a
 // DIFFERENT key and submits it for the same epoch; and whichever lands first
 // takes the row — usually the pre-restart one, because it was sent first.
 //

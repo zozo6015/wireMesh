@@ -89,8 +89,10 @@ message SubmitEpochKeyRequest {
   // compare-and-swap that only ever overwrites the `awaiting-submission`
   // sentinel, so a stale submission cannot clobber a real key — but it CAN
   // WIN that swap. When a submission is in flight across a gateway restart,
-  // the controller re-issues a `RotateDirective` for the still-sentinel
-  // epoch, the new process mints a DIFFERENT key and submits it for the same
+  // the next `KeyRotated` for that gateway re-issues a `RotateDirective` while
+  // the newest row is still the sentinel -- the restart is the setup, not the
+  // trigger, since reconnecting emits no `KeyRotated` of its own. The new
+  // process then mints a DIFFERENT key and submits it for the same
   // epoch, and whichever lands first wins. If the pre-restart key wins, the
   // controller advertises a pubkey the restarted gateway is not serving on
   // that epoch's tun, no peer can ever ack it, and the rotation promotes it

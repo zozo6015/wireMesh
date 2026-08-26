@@ -2286,9 +2286,13 @@ impl Sync for SyncSvc {
         // `Db::set_epoch_pubkey` is a compare-and-swap that only ever
         // overwrites the `awaiting-submission` sentinel, so a stale
         // submission cannot clobber a real key; but it CAN WIN that swap.
-        // With a submission in flight across a gateway restart,
-        // `Broker::send_rotate_if_pending` re-issues a `RotateDirective` for
-        // the still-sentinel epoch, the new process mints a DIFFERENT key
+        // With a submission in flight across a gateway restart, the next
+        // `ChangeEvent::KeyRotated` for this gateway drives
+        // `Broker::send_rotate_if_pending`, which re-issues a `RotateDirective`
+        // while the newest row is still the sentinel. The restart is the SETUP,
+        // not the trigger: nothing about (re)connecting emits `KeyRotated` —
+        // Watch registration goes to `on_gateway_connected`, which is the punch
+        // path. The new process then mints a DIFFERENT key
         // and submits it under the same epoch, and whichever lands first
         // wins — the pre-restart one usually, since it was sent first. The
         // controller would then advertise a pubkey the restarted gateway is
