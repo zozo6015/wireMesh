@@ -903,6 +903,47 @@ impl Drop for RegistrationGuard {
 
 #[cfg(test)]
 mod tests {
+    //! Six cases pinning [`Broker::send_rotate_if_pending`]'s selector: direct a
+    //! rotation only when the NEWEST key row is itself a sentinel.
+    //!
+    //! # Why no case here is redundant, and what pruning one would cost
+    //!
+    //! Two regressions are in scope, and their falsification sets are NESTED —
+    //! which is exactly why the overlap reads as redundancy and is not:
+    //!
+    //! * restoring `.find()` (the original defect: the LOWEST sentinel, since
+    //!   `Db::all_keys_for_gateway` returns `ORDER BY epoch` ascending) reds
+    //!   **(a), (d) and (f)**;
+    //! * filter-then-max (the highest SENTINEL rather than the highest ROW —
+    //!   the clause order this selector's comment forbids) reds **(d) and (f)**.
+    //!
+    //! So **no case reds ONLY under filter-then-max.** (d) and (f) are the sole
+    //! witnesses to the clause-order defect. Pruning them as "already covered by
+    //! (a)" would leave a filter-then-max regression with **zero** failing tests
+    //! while this module still looked healthy — the worst available outcome,
+    //! because the suite would be reporting confidence it no longer has.
+    //!
+    //! And **(a) is the only DISCRIMINATOR** — the one case whose verdict differs
+    //! between the two regressions (red under `.find()`, green under
+    //! filter-then-max). Pruning it does not hide a regression, but it destroys
+    //! the diagnosis: a red run could no longer say WHICH defect it found, and
+    //! the two have different fixes.
+    //!
+    //! (d) and (f) are themselves not duplicates. They are the same predicate
+    //! reached through two different reachable states — a real-keyed `pending`
+    //! row above the orphan, and an `active` row above it — and a fix that
+    //! special-cased one state while ignoring the other would red only one of
+    //! them.
+    //!
+    //! # Why these are plain `#[test]`
+    //!
+    //! [`Broker::send_rotate_if_pending`] and [`Broker::new`] are synchronous,
+    //! and `tokio::sync::mpsc` is runtime-agnostic — `try_send`/`try_recv` need
+    //! no reactor. That is the assumption; if any case here ever panics with a
+    //! missing-reactor message rather than an assertion failure, THAT is what
+    //! changed, and the fix is `#[tokio::test]` on all six, never a change to an
+    //! assertion.
+
     use super::*;
     use crate::db::Db;
 
