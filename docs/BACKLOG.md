@@ -631,9 +631,18 @@ rotation timer opens this window on a schedule rather than only when an operator
 **the sweep does emit `KeyRotated`, but only after retiring an orphan `retiring` row, never
 for a still-sentinel `pending` row**, which is exactly what a dropped directive leaves behind.
 
-So the delivery is a single non-blocking `try_send`: if the registry channel is full, or the
-gateway is not connected at that instant, **the whole rotation is lost** until the
-controller's own `Abort` at `ABORT_AFTER` (300s, non-destructive) and the next timer tick.
+So the delivery is a single non-blocking `try_send` and **nothing retries it on purpose** —
+but it is **not** lost, and the distinction is the whole point of this item.
+`send_rotate_if_pending` runs on **every** `ChangeEvent::KeyRotated` for that gateway, and its
+predicate fires while the newest row is still a sentinel `pending` — *because* the row is
+still awaiting submission. A directive dropped by a full channel or an unconnected gateway is
+therefore re-issued by the **next `KeyRotated` emitted for that gateway**, from any of the
+seven sites above.
+
+What is missing is any emit aimed at recovery. Nothing emits `KeyRotated` *in order to* retry,
+so the delay is bounded below by whatever unrelated rotation activity happens to occur and
+above by the controller's `Abort` at `ABORT_AFTER` (300s, non-destructive) plus the next timer
+tick. **The defect is the absence of a bound, not the absence of a retry.**
 
 **Do not carry this over from the punch path.** `Broker::periodic_sweep` really does re-emit
 `PunchDirective`s, every 5s and bounded per pair by `MAX_PERIODIC_ATTEMPTS` &mdash; so *"the
