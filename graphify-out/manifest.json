@@ -350,8 +350,8 @@
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/flow_table.rs": {
-    "mtime": 1787734764.6635807,
-    "ast_hash": "acc437ee99d96148cce52742955980b4",
+    "mtime": 1787745989.4320953,
+    "ast_hash": "4ce2915bbdc8c6a1a7e51b7dfda261a6",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/generations.rs": {
@@ -375,8 +375,8 @@
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/nft_backend.rs": {
-    "mtime": 1787734764.6645854,
-    "ast_hash": "8209ee629bf2d9821fa35f9f99e32792",
+    "mtime": 1787746030.3453305,
+    "ast_hash": "0ba1b10bfed913a11a053385e43ec9e3",
     "semantic_hash": ""
   },
   "crates/wiremesh-enforcer/tests/nft_codegen.rs": {
@@ -1025,8 +1025,8 @@
     "semantic_hash": "c1e5135080dcd2e3688b4338fbaa91fc"
   },
   "crates/wiremesh-testkit/src/conformance.rs": {
-    "mtime": 1787734764.686357,
-    "ast_hash": "73be046a238b1b3c03e5e814363eb744",
+    "mtime": 1787746030.3457832,
+    "ast_hash": "3a0d4a7009ef0addf00cdeb3f9efc34c",
     "semantic_hash": ""
   },
   "crates/wiremesh-testkit/src/lib.rs": {
@@ -1045,8 +1045,8 @@
     "semantic_hash": ""
   },
   "crates/wiremesh-testkit/tests/end_to_end_policy.rs": {
-    "mtime": 1787734764.6868534,
-    "ast_hash": "fcb307a31ecb375970d13b9b27225f56",
+    "mtime": 1787745989.4344664,
+    "ast_hash": "2d3820bfa3296806cca3511fc5e00bb7",
     "semantic_hash": ""
   },
   "crates/wiremesh-testkit/tests/netem.rs": {
