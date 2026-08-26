@@ -408,6 +408,102 @@ fn a_persisted_state_where_every_peers_pubkey_is_bad_still_boots_with_an_empty_d
     );
 }
 
+/// Like [`write_state_json_with_pubkey`], but persists a SECOND, healthy
+/// peer beside the one under test. Kept separate rather than parameterizing
+/// the single-peer writer so the two tests above keep the exact fixture they
+/// were written against.
+fn write_state_json_with_bad_and_healthy_peer(dir: &std::path::Path, bad_pubkey_b64: &str) {
+    let doc = serde_json::json!({
+        "revision": 7,
+        "peers": [
+            {
+                "gateway_id": 2,
+                "segment_name": "s2",
+                "active_pubkey_b64": bad_pubkey_b64,
+                "keys": [{ "epoch": 0, "pubkey_b64": bad_pubkey_b64, "state": "active" }],
+                "candidates": [VALID_EP],
+                "allowed_ips": [VALID_CIDR_A],
+            },
+            {
+                "gateway_id": 3,
+                "segment_name": "s3",
+                "active_pubkey_b64": PEER_B_PUB_B64,
+                "keys": [{ "epoch": 0, "pubkey_b64": PEER_B_PUB_B64, "state": "active" }],
+                "candidates": [VALID_EP_9],
+                "allowed_ips": [VALID_CIDR_B],
+            },
+        ],
+        "policy_ir": [],
+        "policy_version": 0,
+        "relays": [],
+        "revoked_serials": [],
+    });
+    std::fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec_pretty(&doc).unwrap(),
+    )
+    .expect("writing the test state.json");
+}
+
+/// Door C's blast-radius case: the disk-door twin of
+/// [`one_peers_bad_active_pubkey_does_not_cost_a_sibling_peer_its_configuration`].
+/// The two Door-C tests above persist a SINGLE peer, so each asserts only
+/// that something is absent from the encoding — which a load that yielded a
+/// peerless `DesiredState` would satisfy just as well. This one persists a
+/// healthy peer beside the poisoned one, so the healthy peer's key, endpoint
+/// and route are a vacuity guard: they can only appear if `load` really did
+/// read the file and really did keep everything it was not supposed to drop.
+///
+/// It also pins the blast radius where it matters most. `encode_set` is
+/// all-or-nothing across all peers and the boot-time `apply_state(None, ds,
+/// ..)?` is the caller, so on this door one poisoned row in a file — written
+/// by an older binary, or hand-edited — decides whether the OTHER peers get
+/// a data plane at all, with the controller not in the loop to correct it.
+///
+/// `BOGUS_KEY_WRONG_LEN` rather than `BOGUS_KEY_NOT_B64`: it is the failure
+/// mode a "does this look like base64" guard would wave through, so it
+/// discriminates the real `key_b64_to_hex` length check from a cheaper
+/// lookalike.
+#[test]
+fn a_persisted_bad_pubkey_does_not_cost_a_sibling_peer_its_boot_configuration() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_state_json_with_bad_and_healthy_peer(dir.path(), BOGUS_KEY_WRONG_LEN);
+
+    let ds = DesiredState::load(dir.path())
+        .expect("loading state.json must not error")
+        .expect("state.json exists, so load must yield Some");
+
+    let encoded = encode(&ds).expect(
+        "one persisted peer's unusable key must not fail the whole-device encode for its \
+         siblings — this encode IS the boot-time apply, and its `Err` unwinds to `main` \
+         and ends the process before the controller can send a correction",
+    );
+    assert!(
+        encoded.contains(&format!("public_key={PEER_B_PUB_HEX}\n")),
+        "the healthy persisted peer must keep its key, got:\n{encoded}"
+    );
+    assert!(
+        encoded.contains(&format!("endpoint={VALID_EP_9}\n")),
+        "and its endpoint, got:\n{encoded}"
+    );
+    assert!(
+        encoded.contains(VALID_CIDR_B),
+        "and its route, got:\n{encoded}"
+    );
+    assert!(
+        !encoded.contains(VALID_CIDR_A),
+        "while the peer whose persisted key is undecodable contributes nothing — dropped \
+         wholesale, exactly as the Sync-ingest door drops it. Got:\n{encoded}"
+    );
+    assert_eq!(
+        encoded.matches("public_key=").count(),
+        1,
+        "exactly ONE peer block may survive: the healthy one. A second would mean the bad \
+         key reached the encoder; zero would mean the assertions above passed vacuously on \
+         an empty device. Got:\n{encoded}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Item 24, Door B (Sync ingest) — allowed_ips, filter-per-entry semantics
 // ---------------------------------------------------------------------------
