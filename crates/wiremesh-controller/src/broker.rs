@@ -478,13 +478,54 @@ impl Broker {
     /// submitted its real key — deliver a [`RotateDirective`] for that epoch
     /// to `gateway_id`'s registered Watch channel (a non-blocking `try_send`,
     /// like every other broker emit). A no-op if the gateway isn't currently
-    /// connected (nothing registered) or the channel is full — the rotation
-    /// sweep/timer re-emits KeyRotated on subsequent ticks, and an unconnected
-    /// gateway can't be rotating a live session anyway.
+    /// connected (nothing registered) or the channel is full.
+    ///
+    /// **A dropped directive is NOT retried.** Nothing re-emits `KeyRotated`
+    /// for a still-sentinel `pending` row: `sweep_rotations` does not, and
+    /// `projection::emit_key_rotated` fires only on rotation initiate,
+    /// `Admin.RotateKey`, `Sync.SubmitEpochKey`, and the promote / retire /
+    /// abort arms of `drive_rotation_for`. So a `try_send` that finds the
+    /// channel full, or a gateway not connected at that instant, drops the
+    /// whole rotation until the controller's own `Abort` (`ABORT_AFTER`) and
+    /// the next timer tick. (An earlier version of this comment claimed the
+    /// sweep/timer re-emits on subsequent ticks. It does not.)
     pub fn send_rotate_if_pending(&self, gateway_id: i64, keys: &[(i64, String, String)]) {
-        let Some((epoch, _, _)) = keys.iter().find(|(_, pubkey, state)| {
-            state == "pending" && pubkey == AWAITING_SUBMISSION_SENTINEL
-        }) else {
+        // Take the NEWEST row of any state, then direct it only if it is itself
+        // a sentinel. "The newest row is a sentinel" is the invariant; a
+        // sentinel that is not the newest row is stale by construction.
+        //
+        // Why that is a fact and not a heuristic: `Db::rotate_key` allocates
+        // `MAX(epoch) + 1` over ALL of a gateway's rows and is the only insert
+        // path above the epoch-0 enrollment baseline. So a sentinel with any row
+        // above it — in any state — was allocated before a later rotation
+        // existed, and cannot be the current one. Nothing legitimate is ever
+        // suppressed: a genuinely in-flight rotation IS the top row until its
+        // key is submitted.
+        //
+        // THE CLAUSE ORDER IS LOAD-BEARING. Filter-then-max (pick the highest
+        // SENTINEL) looks equivalent and is not: it directs a stale sentinel the
+        // moment the newer row stops being one. Concretely — a gateway-side
+        // abort leaves an orphan sentinel at epoch 1 until `ABORT_AFTER`; a
+        // rotation to epoch 2 then submits its real key; the next `KeyRotated`
+        // re-runs this selector; the only remaining SENTINEL is the orphan at 1,
+        // so the gateway is told to rotate to 1, mints beneath its own active
+        // epoch 2, and `Db::promote_epoch` — whose demote is
+        // `WHERE state = 'active'` with no epoch predicate — demotes 2 to
+        // `retiring`, after which `Db::retire_epoch` DELETES it. The fabric ends
+        // up on the older key and the newer one is destroyed. Max-then-filter
+        // cannot reach that state, because epoch 2 is the top row and is not a
+        // sentinel, so no directive is emitted at all.
+        //
+        // Do not reorder these two clauses, and do not restore `.find()` (which
+        // took the LOWEST sentinel — `keys` arrives `ORDER BY epoch` ASC from
+        // `Db::all_keys_for_gateway` — and so directed the orphan directly).
+        let Some((epoch, _, _)) =
+            keys.iter()
+                .max_by_key(|(epoch, _, _)| *epoch)
+                .filter(|(_, pubkey, state)| {
+                    state == "pending" && pubkey == AWAITING_SUBMISSION_SENTINEL
+                })
+        else {
             return;
         };
         let msg = SyncMessage {
@@ -568,6 +609,16 @@ impl Broker {
                         // sentinel row, so `send_rotate_if_pending` is a no-op
                         // — the directive fires exactly once, at rotation
                         // start.
+                        //
+                        // That "exactly once" holds only while at most ONE
+                        // sentinel row exists. After a clean gateway-side abort
+                        // an orphan sentinel survives until `ABORT_AFTER`, so a
+                        // rotation started inside that window leaves two;
+                        // `send_rotate_if_pending` then directs the NEWEST and
+                        // the orphan is never directed at all (it is dropped by
+                        // the abort deadline, not by a directive). Making the
+                        // orphan impossible rather than merely undirected is
+                        // Phase C.
                         Ok(ChangeEvent::KeyRotated { gateway_id, keys, .. }) => {
                             self.send_rotate_if_pending(gateway_id, &keys);
                         }
