@@ -24,6 +24,19 @@
 #     `crates/wiremesh-enforcer-ebpf` is `exclude`d from the root workspace and
 #     has its own `Cargo.lock` and `edition = "2024"`, so `fmt` and `clippy`
 #     must each run TWICE.
+#  4. EVERY MULTI-TARGET `cargo test` PASSES `--no-fail-fast`. Cargo's default
+#     is to stop at the first test TARGET that fails, so a job that names
+#     several suites reports only as far as the first red one. Measured on
+#     this workflow's own first run (32994354342): `netns-rotation` requests
+#     four suites, `key_rotation` failed 5/7, and `rotation_wedge`,
+#     `rotation_stall_epoch` and `rotation_slot_quarantine_netns` NEVER RAN --
+#     the log carries exactly one `Running tests/...` line. A CI job whose
+#     coverage silently shrinks to "up to the first failure" is worse than one
+#     that is simply red: it reports a subset while looking complete, and the
+#     suites it skips are the ones a rotation PR most needs judged. This is
+#     not the flake-tolerance knob -- the verdict is still the exit code, and
+#     no step retries, widens a tolerance, or sets `continue-on-error` on a
+#     GATING step.
 #
 # The image is built in-job with a buildx `type=gha` cache rather than pulled
 # from GHCR, so fork PRs work without credentials (§6.1 c5). The checkout is
@@ -248,7 +261,7 @@ jobs:
       - name: cargo test (fast sweep, privileged)
         run: |
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
-            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 \
+            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 --no-fail-fast \
               -p wiremesh-proto -p wiremesh-trust -p wiremesh-policy -p wiremesh-enroll \
               -p wiremesh-controller -p fabricctl -p wiremesh-operator -p wiremesh-relay \
               -p wiremesh-gateway \
@@ -280,9 +293,25 @@ jobs:
           # "the doc run died". Verified: `check` does red on a truncated log
           # (8 rows missing) and on an empty one (12), so it is a backstop --
           # but the right step must fail, with the right message.
+          #
+          # `2>&1`: see the root `--doc` step above -- cargo's `Doc-tests`
+          # banner is on stderr, and without it this log parses to nothing.
+          #
+          # `2>&1` IS EQUALLY LOAD-BEARING, and its absence cost a full red run
+          # before anyone noticed. Cargo prints the `Doc-tests <crate>` banner
+          # (like `Running` and `Compiling`) on STDERR, while libtest prints
+          # `test result:` on STDOUT. Piping stdout alone therefore produced a
+          # log full of `test result:` lines with no crate context, and
+          # `doctest-counts.sh`'s parser -- which emits a row only once a
+          # banner has named a crate -- yielded NOTHING. The inventory step
+          # then reported all twelve rows as vanished on a workspace where no
+          # doctest had changed. Same class as the pipefail bug above: the gate
+          # observed an empty world and named the wrong cause. Keep both, and
+          # keep the local regeneration command in `README.md` on `2>&1` too,
+          # so the log this parses has one shape everywhere.
           set -o pipefail
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
-            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 --workspace --doc' | tee doc-root.log
+            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 --workspace --doc' 2>&1 | tee doc-root.log
       # The sub-workspace has its own `Cargo.lock` and is invisible to the
       # root, so its doctests need their own invocation like fmt and clippy do.
       - name: cargo test --doc (crates/wiremesh-enforcer-ebpf)
@@ -297,7 +326,7 @@ jobs:
           # but the right step must fail, with the right message.
           set -o pipefail
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
-            "$DEV_IMAGE" bash -lc 'cd /work/crates/wiremesh-enforcer-ebpf && cargo test -j 1 --doc' | tee doc-ebpf.log
+            "$DEV_IMAGE" bash -lc 'cd /work/crates/wiremesh-enforcer-ebpf && cargo test -j 1 --doc' 2>&1 | tee doc-ebpf.log
       # WHAT THESE THREE STEPS DO AND DO NOT PROVE -- measured, so nobody reads
       # them as coverage. The workspace has three doctests today (controller 1,
       # testkit 2) and ALL THREE are ```ignore``` fences, which rustdoc neither
@@ -352,12 +381,12 @@ jobs:
       - name: cargo test -p wiremesh-enforcer (eBPF + nftables backends)
         run: |
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
-            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 -p wiremesh-enforcer -- --test-threads=1 --nocapture'
+            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 --no-fail-fast -p wiremesh-enforcer -- --test-threads=1 --nocapture'
       # The Cycle-3 22/22 backend-equivalence conformance packet-suite.
       - name: cargo test -p wiremesh-testkit --features netns (Cycle-3 conformance)
         run: |
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
-            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 -p wiremesh-testkit --features netns -- --test-threads=1 --nocapture'
+            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 --no-fail-fast -p wiremesh-testkit --features netns -- --test-threads=1 --nocapture'
       - name: chown the cache back to the runner user
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" .ci-cargo-registry || true
@@ -402,7 +431,7 @@ jobs:
           TESTS="$(bash dev/netns-split.sh gateway)"
           echo "targets: $TESTS"
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
-            "$DEV_IMAGE" bash -lc "cd /work && cargo test -j 1 -p wiremesh-gateway --features netns-tests $TESTS -- --test-threads=1 --nocapture"
+            "$DEV_IMAGE" bash -lc "cd /work && cargo test -j 1 --no-fail-fast -p wiremesh-gateway --features netns-tests $TESTS -- --test-threads=1 --nocapture"
       - name: chown the cache back to the runner user
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" .ci-cargo-registry || true
@@ -447,7 +476,7 @@ jobs:
           TESTS="$(bash dev/netns-split.sh rotation)"
           echo "targets: $TESTS"
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
-            "$DEV_IMAGE" bash -lc "cd /work && cargo test -j 1 -p wiremesh-gateway --features netns-tests $TESTS -- --test-threads=1 --nocapture"
+            "$DEV_IMAGE" bash -lc "cd /work && cargo test -j 1 --no-fail-fast -p wiremesh-gateway --features netns-tests $TESTS -- --test-threads=1 --nocapture"
 
       # DIAGNOSTIC ONLY — it cannot turn this job green. The step above has
       # already failed by the time this runs, and nothing here changes that.
@@ -461,35 +490,79 @@ jobs:
       # cause. Do NOT respond by widening a tolerance or deleting a case.
       - name: 'FAILURE DIAGNOSTIC: re-run the same suite at the merge-base'
         if: failure() && steps.rotation.outcome == 'failure'
+        # `continue-on-error` ON THE DIAGNOSTIC STEP ONLY, and this is not a
+        # softening of the done-bar. The bar forbids `continue-on-error` on a
+        # GATING step, because that is how a red suite gets reported green. This
+        # step gates nothing: the job's verdict was already fixed by the step
+        # above, which has failed. Its exit status carries NO verdict -- it
+        # prints evidence. Left fatal, a diagnostic that itself breaks (a fetch
+        # failure, a base tree that will not build) replaces "here is your
+        # control run" with "the diagnostic crashed", which is strictly worse
+        # than a missing control. That is not hypothetical: on this workflow's
+        # own first run the step died at exit 127 before reaching the control.
+        continue-on-error: true
         run: |
-          set -x
-          BASE_REF="${{ github.base_ref || 'main' }}"
-          # `actions/checkout` only fetches the checked-out ref, so the base
-          # branch has to be fetched explicitly even at fetch-depth 0.
-          #
-          # This fetch is UNAUTHENTICATED, and that is a design precondition
-          # rather than a property of git: the checkout above sets
-          # `persist-credentials: false`, so it works only because this repo is
-          # PUBLIC. If wireMesh ever goes private, this line starts failing and
-          # the symptom is a dead A/B control on rotation PRs -- which reads
-          # like a CI bug and is not one. The fix then is a scoped token on
-          # this step, not reverting the credential hardening.
-          git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
-          BASE="$(git merge-base "origin/$BASE_REF" HEAD)"
-          echo "merge-base: $BASE"
-          # `--detach`: a branchless working tree is all cargo needs, and
-          # nothing in the build or test path shells out to git.
-          git worktree add --detach /tmp/mergebase "$BASE"
-          # The target list MUST come from the merge-base tree, not this one.
-          # `--test <name>` fails outright if the target does not exist, so a
-          # rotation done-bar ADDED by this PR would be requested from a tree
-          # that has never had it -- turning the control run into a build error
-          # and destroying exactly the evidence this step exists to produce.
-          TESTS="$(cd /tmp/mergebase && bash dev/netns-split.sh rotation)"
-          docker run --rm --privileged -v /tmp/mergebase:/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
-            "$DEV_IMAGE" bash -lc "cd /work && cargo test -j 1 -p wiremesh-gateway --features netns-tests $TESTS -- --test-threads=1 --nocapture" \
-            && echo "MERGE-BASE RESULT: GREEN — the PR head is red and its control is green, so investigate the PR." \
-            || echo "MERGE-BASE RESULT: RED — the control is red too, so this is the documented ~42% flake, NOT a regression introduced by this PR."
+          # The whole body is one `bash -c '...' || true` so that NO command in
+          # it can abort the step through the default `-e`. The first version
+          # used `set -x` under `-e`, and a failing command substitution killed
+          # the step before its `|| echo` could classify anything.
+          bash -c '
+            set -x
+            # NOTE the plain quotes around main below: that is a GitHub
+            # expression, substituted to bare text BEFORE bash ever sees this
+            # script, so those quotes belong to the expression parser and never
+            # reach the shell. Do NOT rewrite them with the shell single-quote
+            # escaping this block uses elsewhere -- inside an expression it is
+            # a parse error, and a bare expression delimiter written anywhere in
+            # a run block (even in a comment) is evaluated too.
+            BASE_REF="${{ github.base_ref || 'main' }}"
+            # `actions/checkout` only fetches the checked-out ref, so the base
+            # branch has to be fetched explicitly even at fetch-depth 0.
+            #
+            # This fetch is UNAUTHENTICATED, and that is a design precondition
+            # rather than a property of git: the checkout above sets
+            # `persist-credentials: false`, so it works only because this repo
+            # is PUBLIC. If wireMesh ever goes private, this line starts
+            # failing and the symptom is a dead A/B control on rotation PRs --
+            # which reads like a CI bug and is not one. The fix then is a
+            # scoped token on this step, not reverting the credential
+            # hardening.
+            git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
+            BASE="$(git merge-base "origin/$BASE_REF" HEAD)"
+            echo "merge-base: $BASE"
+            # `--detach`: a branchless working tree is all cargo needs, and
+            # nothing in the build or test path shells out to git.
+            git worktree add --detach /tmp/mergebase "$BASE"
+
+            # CLASSIFIER FROM THE PR TREE, FILE SET FROM THE MERGE-BASE TREE.
+            # Both halves are load-bearing and the first version got the split
+            # wrong in each direction in turn:
+            #
+            #   * the file set must be the BASE tree'"'"'s, because `--test <name>`
+            #     fails outright if the target does not exist -- so a rotation
+            #     done-bar added by this PR would be requested from a tree that
+            #     never had it, turning the control into a build error;
+            #   * the classifier must be the PR tree'"'"'s, because the base tree is
+            #     not guaranteed to contain `dev/netns-split.sh` at all. On the
+            #     PR that INTRODUCED that script the base had no copy, and
+            #     `cd /tmp/mergebase && bash dev/netns-split.sh rotation` exited
+            #     127 with `No such file or directory`.
+            #
+            # `rotation-present` (not `rotation`) intersects the authoritative
+            # list with what is actually gated in `NETNS_SPLIT_ROOT`, which is
+            # the filtering the base tree needs and the gating step must never
+            # have. See that script'"'"'s comment on the two modes.
+            TESTS="$(NETNS_SPLIT_ROOT=/tmp/mergebase bash "$GITHUB_WORKSPACE/dev/netns-split.sh" rotation-present)"
+            echo "merge-base targets: ${TESTS:-<none>}"
+            if [ -z "$TESTS" ]; then
+              echo "MERGE-BASE RESULT: N/A — the merge-base tree carries no gated rotation done-bar, so there is no control to run. This is expected on a PR that introduces the first one."
+              exit 0
+            fi
+            docker run --rm --privileged -v /tmp/mergebase:/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
+              "$DEV_IMAGE" bash -lc "cd /work && cargo test -j 1 --no-fail-fast -p wiremesh-gateway --features netns-tests $TESTS -- --test-threads=1 --nocapture" \
+              && echo "MERGE-BASE RESULT: GREEN — the PR head is red and its control is green, so investigate the PR." \
+              || echo "MERGE-BASE RESULT: RED — the control is red too, so this is the documented ~42% flake, NOT a regression introduced by this PR."
+          ' || true
       - name: chown the cache back to the runner user
         if: always()
         run: sudo chown -R "$(id -u):$(id -g)" .ci-cargo-registry || true

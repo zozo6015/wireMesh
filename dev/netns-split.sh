@@ -34,7 +34,20 @@
 # gated and is wrong. That miscount is already recorded in the shipped docs.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
+# The tree this script CLASSIFIES is not necessarily the tree it lives in.
+# `NETNS_SPLIT_ROOT` lets a caller point the classifier at another checkout
+# while still running THIS copy of the script; it defaults to the repo this
+# file belongs to, so every ordinary invocation is unchanged.
+#
+# It exists for `ci.yml`'s merge-base A/B diagnostic, and that step is the
+# reason the distinction matters. It re-runs the rotation suite at the PR's
+# merge-base to produce a control. The first version ran
+# `cd /tmp/mergebase && bash dev/netns-split.sh rotation`, which died with
+# `No such file or directory` (exit 127) on the very PR that introduced this
+# script -- the merge-base predates it. The file SET must come from the
+# merge-base tree, but the CLASSIFIER must come from the PR tree, because the
+# base tree is not guaranteed to have one at all.
+cd "${NETNS_SPLIT_ROOT:-$(dirname "$0")/..}"
 TESTS_DIR="crates/wiremesh-gateway/tests"
 
 # Rotation done-bars: their own runner (see above).
@@ -52,6 +65,31 @@ in_list() { local n="$1"; shift; local e; for e in "$@"; do [ "$e" = "$n" ] && r
 case "${1:-}" in
   rotation)
     for t in "${ROTATION[@]}"; do printf -- '--test %s ' "$t"; done; echo
+    ;;
+  # ROTATION intersected with what is actually gated in the configured root.
+  #
+  # SEPARATE FROM `rotation` ON PURPOSE, and it must stay separate. `rotation`
+  # is the AUTHORITATIVE list and prints all four names unconditionally, so
+  # the gating job fails loudly if one has been renamed or un-gated -- exactly
+  # what `check` guards. Filtering that list would convert "a rotation done-bar
+  # vanished" from a hard error into a silently shorter test run, which is the
+  # failure mode this whole script exists to prevent.
+  #
+  # This mode is for the merge-base control ONLY, where the opposite property
+  # is wanted: `--test <name>` fails outright if the target does not exist, so
+  # requesting a done-bar the PR ADDED from a tree that never had it turns the
+  # control into a build error and destroys the evidence the diagnostic exists
+  # to produce. Here a missing file means "the base predates it", which is
+  # information, not a fault.
+  rotation-present)
+    # `gated` once, not once per name: a base tree may have no gateway tests
+    # directory at all, and re-globbing a missing path four times just prints
+    # four identical grep errors. Absent directory -> empty list -> no targets,
+    # which the caller reads as "no control to run".
+    present="$(gated 2>/dev/null || true)"
+    for t in "${ROTATION[@]}"; do
+      in_list "$t" $present && printf -- '--test %s ' "$t"
+    done; echo
     ;;
   gateway)
     while read -r t; do
@@ -108,5 +146,5 @@ case "${1:-}" in
     [ "$fail" -eq 0 ]
     ;;
   *)
-    echo "usage: dev/netns-split.sh {gateway|rotation|check}" >&2; exit 1 ;;
+    echo "usage: dev/netns-split.sh {gateway|rotation|rotation-present|check}" >&2; exit 1 ;;
 esac
