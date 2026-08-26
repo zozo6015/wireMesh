@@ -478,13 +478,64 @@ impl Broker {
     /// submitted its real key — deliver a [`RotateDirective`] for that epoch
     /// to `gateway_id`'s registered Watch channel (a non-blocking `try_send`,
     /// like every other broker emit). A no-op if the gateway isn't currently
-    /// connected (nothing registered) or the channel is full — the rotation
-    /// sweep/timer re-emits KeyRotated on subsequent ticks, and an unconnected
-    /// gateway can't be rotating a live session anyway.
+    /// connected (nothing registered) or the channel is full.
+    ///
+    /// **A dropped directive is NOT retried.** `projection::emit_key_rotated`
+    /// has seven call sites: rotation-timer initiate, `Admin.RotateKey`,
+    /// `Sync.SubmitEpochKey`, the promote / retire / abort arms of
+    /// `drive_rotation_for`, and `sweep_rotations`' orphan-retire. Read that
+    /// last one carefully — **the sweep DOES emit `KeyRotated`, but only after
+    /// retiring an orphan `retiring` row, never for a still-sentinel `pending`
+    /// row**, which is precisely what a dropped directive leaves behind. So a
+    /// `try_send` that finds the channel full, or a gateway not connected at
+    /// that instant, drops the whole rotation until the controller's own
+    /// `Abort` (`ABORT_AFTER`) and the next timer tick.
+    ///
+    /// **Do not carry this over from the punch path.** `Broker::periodic_sweep`
+    /// really does re-emit `PunchDirective`s — every 5s, bounded per pair by
+    /// `MAX_PERIODIC_ATTEMPTS` — so "the broker re-emits on its sweep" is TRUE
+    /// of punch and FALSE of rotation. That sentence has already been read off
+    /// one path onto the other. Nothing re-punches a rotation.
+    ///
+    /// (An earlier version of this comment claimed the rotation sweep/timer
+    /// re-emits `KeyRotated` on subsequent ticks. It does not.)
     pub fn send_rotate_if_pending(&self, gateway_id: i64, keys: &[(i64, String, String)]) {
-        let Some((epoch, _, _)) = keys.iter().find(|(_, pubkey, state)| {
-            state == "pending" && pubkey == AWAITING_SUBMISSION_SENTINEL
-        }) else {
+        // Take the NEWEST row of any state, then direct it only if it is itself
+        // a sentinel. "The newest row is a sentinel" is the invariant; a
+        // sentinel that is not the newest row is stale by construction.
+        //
+        // Why that is a fact and not a heuristic: `Db::rotate_key` allocates
+        // `MAX(epoch) + 1` over ALL of a gateway's rows and is the only insert
+        // path above the epoch-0 enrollment baseline. So a sentinel with any row
+        // above it — in any state — was allocated before a later rotation
+        // existed, and cannot be the current one. Nothing legitimate is ever
+        // suppressed: a genuinely in-flight rotation IS the top row until its
+        // key is submitted.
+        //
+        // THE CLAUSE ORDER IS LOAD-BEARING. Filter-then-max (pick the highest
+        // SENTINEL) looks equivalent and is not: it directs a stale sentinel the
+        // moment the newer row stops being one. Concretely — a gateway-side
+        // abort leaves an orphan sentinel at epoch 1 until `ABORT_AFTER`; a
+        // rotation to epoch 2 then submits its real key; the next `KeyRotated`
+        // re-runs this selector; the only remaining SENTINEL is the orphan at 1,
+        // so the gateway is told to rotate to 1, mints beneath its own active
+        // epoch 2, and `Db::promote_epoch` — whose demote is
+        // `WHERE state = 'active'` with no epoch predicate — demotes 2 to
+        // `retiring`, after which `Db::retire_epoch` DELETES it. The fabric ends
+        // up on the older key and the newer one is destroyed. Max-then-filter
+        // cannot reach that state, because epoch 2 is the top row and is not a
+        // sentinel, so no directive is emitted at all.
+        //
+        // Do not reorder these two clauses, and do not restore `.find()` (which
+        // took the LOWEST sentinel — `keys` arrives `ORDER BY epoch` ASC from
+        // `Db::all_keys_for_gateway` — and so directed the orphan directly).
+        let Some((epoch, _, _)) =
+            keys.iter()
+                .max_by_key(|(epoch, _, _)| *epoch)
+                .filter(|(_, pubkey, state)| {
+                    state == "pending" && pubkey == AWAITING_SUBMISSION_SENTINEL
+                })
+        else {
             return;
         };
         let msg = SyncMessage {
@@ -568,6 +619,16 @@ impl Broker {
                         // sentinel row, so `send_rotate_if_pending` is a no-op
                         // — the directive fires exactly once, at rotation
                         // start.
+                        //
+                        // That "exactly once" holds only while at most ONE
+                        // sentinel row exists. After a clean gateway-side abort
+                        // an orphan sentinel survives until `ABORT_AFTER`, so a
+                        // rotation started inside that window leaves two;
+                        // `send_rotate_if_pending` then directs the NEWEST and
+                        // the orphan is never directed at all (it is dropped by
+                        // the abort deadline, not by a directive). Making the
+                        // orphan impossible rather than merely undirected is
+                        // Phase C.
                         Ok(ChangeEvent::KeyRotated { gateway_id, keys, .. }) => {
                             self.send_rotate_if_pending(gateway_id, &keys);
                         }
@@ -837,5 +898,248 @@ impl Drop for RegistrationGuard {
                 reg.remove(&self.gateway_id);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Six cases pinning [`Broker::send_rotate_if_pending`]'s selector: direct a
+    //! rotation only when the NEWEST key row is itself a sentinel.
+    //!
+    //! # Why no case here is redundant, and what pruning one would cost
+    //!
+    //! Two regressions are in scope, and their falsification sets are NESTED —
+    //! which is exactly why the overlap reads as redundancy and is not:
+    //!
+    //! * restoring `.find()` (the original defect: the LOWEST sentinel, since
+    //!   `Db::all_keys_for_gateway` returns `ORDER BY epoch` ascending) reds
+    //!   **(a), (d) and (f)**;
+    //! * filter-then-max (the highest SENTINEL rather than the highest ROW —
+    //!   the clause order this selector's comment forbids) reds **(d) and (f)**.
+    //!
+    //! So **no case reds ONLY under filter-then-max.** (d) and (f) are the sole
+    //! witnesses to the clause-order defect. Pruning them as "already covered by
+    //! (a)" would leave a filter-then-max regression with **zero** failing tests
+    //! while this module still looked healthy — the worst available outcome,
+    //! because the suite would be reporting confidence it no longer has.
+    //!
+    //! And **(a) is the only DISCRIMINATOR** — the one case whose verdict differs
+    //! between the two regressions (red under `.find()`, green under
+    //! filter-then-max). Pruning it does not hide a regression, but it destroys
+    //! the diagnosis: a red run could no longer say WHICH defect it found, and
+    //! the two have different fixes.
+    //!
+    //! (d) and (f) are themselves not duplicates. They are the same predicate
+    //! reached through two different reachable states — a real-keyed `pending`
+    //! row above the orphan, and an `active` row above it — and a fix that
+    //! special-cased one state while ignoring the other would red only one of
+    //! them.
+    //!
+    //! # Why these are plain `#[test]`
+    //!
+    //! [`Broker::send_rotate_if_pending`] and [`Broker::new`] are synchronous,
+    //! and `tokio::sync::mpsc` is runtime-agnostic — `try_send`/`try_recv` need
+    //! no reactor. That is the assumption; if any case here ever panics with a
+    //! missing-reactor message rather than an assertion failure, THAT is what
+    //! changed, and the fix is `#[tokio::test]` on all six, never a change to an
+    //! assertion.
+
+    use super::*;
+    use crate::db::Db;
+
+    /// The gateway every case below is about.
+    const GW: i64 = 7;
+
+    // -- fixture builders -------------------------------------------------
+    //
+    // `send_rotate_if_pending` takes the key snapshot as a PARAMETER and never
+    // touches `self.db`, so these cases need no rows, no RPCs and no timing —
+    // just the slice `Db::all_keys_for_gateway` would have returned.
+
+    fn sentinel(epoch: i64) -> (i64, String, String) {
+        (
+            epoch,
+            AWAITING_SUBMISSION_SENTINEL.to_string(),
+            "pending".to_string(),
+        )
+    }
+
+    fn real_pending(epoch: i64) -> (i64, String, String) {
+        (epoch, format!("REALKEY{epoch}=="), "pending".to_string())
+    }
+
+    fn active(epoch: i64) -> (i64, String, String) {
+        (epoch, format!("REALKEY{epoch}=="), "active".to_string())
+    }
+
+    /// Drives the real `send_rotate_if_pending` against `keys` and returns the
+    /// epoch of the `RotateDirective` that reached the gateway's channel, or
+    /// `None` if no directive was sent.
+    ///
+    /// # The fixture order is load-bearing
+    ///
+    /// `Db::all_keys_for_gateway` is `ORDER BY epoch` — ASCENDING — and the
+    /// whole defect is that `.find()` therefore answers "the OLDEST
+    /// un-submitted epoch" when the caller means "the epoch this event is
+    /// about". A fixture handed to this helper in descending order would make
+    /// `.find()` accidentally correct and every case below would pass under
+    /// sabotage. So the ascending order is ASSERTED here rather than left to
+    /// each call site to remember.
+    fn directed_epoch(keys: &[(i64, String, String)]) -> Option<u32> {
+        assert!(
+            keys.windows(2).all(|w| w[0].0 < w[1].0),
+            "fixture must be in ASCENDING epoch order, as `Db::all_keys_for_gateway` \
+             (`ORDER BY epoch`) returns it. A descending fixture makes the buggy `.find()` \
+             pick the newest row by accident, and every case in this module would then pass \
+             under sabotage. Got: {:?}",
+            keys.iter()
+                .map(|(e, _, s)| (*e, s.as_str()))
+                .collect::<Vec<_>>()
+        );
+
+        let db = DbHandle::new(Db::open_memory().expect("in-memory controller DB"));
+        let registry = new_registry();
+        let (tx, mut rx) = mpsc::channel(8);
+        registry.lock().expect("registry mutex").insert(GW, tx);
+        let broker = Broker::new(db, registry);
+
+        broker.send_rotate_if_pending(GW, keys);
+
+        match rx.try_recv() {
+            Ok(SyncMessage {
+                body: Some(Body::Rotate(d)),
+            }) => Some(d.epoch),
+            Ok(other) => panic!(
+                "expected a RotateDirective or nothing on the gateway's channel; got a \
+                 different SyncMessage body: {other:?}"
+            ),
+            Err(_) => None,
+        }
+    }
+
+    // -- the cases --------------------------------------------------------
+    //
+    // The predicate under test (ruling A′): direct a sentinel `pending` row
+    // ONLY IF its epoch is the highest of ALL the gateway's rows.
+    //
+    // (A) alone — "the highest SENTINEL" — was withdrawn as unsafe. Cases (d)
+    // and (f) are what distinguish A′ from A, and both are about the same
+    // harm: `Db::promote_epoch`'s demotion step is
+    // `UPDATE gateway_key SET state = 'retiring' WHERE gateway_id = ?1 AND
+    // state = 'active'` — NO epoch predicate. So promoting a lower epoch
+    // demotes whatever is currently active REGARDLESS of whether it is newer,
+    // and the retire that follows deletes it. A directive for a sentinel that
+    // sits beneath a newer row is therefore not a wasted round trip; it is a
+    // route to destroying the key the fabric is actually using.
+
+    /// (a) Two sentinels: the NEWEST is directed.
+    ///
+    /// The regression this pins is `.find()` over an ascending snapshot, which
+    /// answers "oldest un-submitted" — so the assertion is on the epoch the
+    /// directive CARRIES, never on the fact that one arrived. Both the fixed
+    /// and the broken code send a directive here; only the epoch differs.
+    #[test]
+    fn two_sentinels_direct_the_newest() {
+        assert_eq!(
+            directed_epoch(&[sentinel(1), sentinel(2)]),
+            Some(2),
+            "with sentinels at BOTH epoch 1 and epoch 2 the directive must name 2, the \
+             newest. Getting `Some(1)` is the defect: `Db::all_keys_for_gateway` is \
+             `ORDER BY epoch` ascending and `.find()` takes the first match, which answers \
+             \"the oldest un-submitted epoch\" rather than \"the epoch this KeyRotated event \
+             is about\". This state is reached when a B2 clean abort leaves an orphan \
+             sentinel at 1 and the next Admin.RotateKey inserts 2 — the gateway would build \
+             1 and orphan 2. NOTE: a directive is sent either way, so an assertion that one \
+             merely ARRIVED would pass under sabotage"
+        );
+    }
+
+    /// (b) A single sentinel that IS the newest row: directed, as before.
+    ///
+    /// The fixture is pinned deliberately. Under A′ the behaviour of "one
+    /// sentinel" is NOT uniform any more — see (f), where a single sentinel
+    /// sitting beneath an active row must be directed NOTHING. Labelling this
+    /// case "unchanged behaviour" without pinning the shape would invite
+    /// someone to rewrite it as `{sentinel(1), active(2)}` and read a correct
+    /// `None` as a regression.
+    #[test]
+    fn a_single_sentinel_that_is_the_newest_row_is_directed() {
+        assert_eq!(
+            directed_epoch(&[active(0), sentinel(1)]),
+            Some(1),
+            "the ordinary post-rotate snapshot — `Db::rotate_key` inserts the sentinel at \
+             MAX(epoch)+1, so it is the newest row — must still be directed. This is the \
+             case that must NOT regress while (d) and (f) are being fixed"
+        );
+    }
+
+    /// (c) No sentinel at all: no directive. (C1's no-op.)
+    #[test]
+    fn no_sentinel_sends_no_directive() {
+        assert_eq!(
+            directed_epoch(&[active(0), real_pending(1)]),
+            None,
+            "every `pending` row already holds a real key, so there is nothing for the \
+             gateway to submit and no directive may be sent. `send_rotate_if_pending` is \
+             driven by `ChangeEvent::KeyRotated`, which carries no epoch — the row set is \
+             the only evidence of what to do, and here it says \"nothing\""
+        );
+    }
+
+    /// (d) A sentinel BENEATH a real-keyed pending row: nothing. **The
+    /// backwards-rotation guard, and the case qa actually hit.**
+    #[test]
+    fn a_sentinel_beneath_a_real_keyed_row_is_not_directed() {
+        assert_eq!(
+            directed_epoch(&[sentinel(1), real_pending(2)]),
+            None,
+            "epoch 2 already holds a real key, so epoch 1's orphan sentinel must NOT be \
+             directed: doing so rotates the fabric BACKWARDS. `Db::promote_epoch`'s \
+             demotion step is `UPDATE gateway_key SET state = 'retiring' WHERE gateway_id \
+             = ?1 AND state = 'active'` with NO epoch predicate, so promoting the lower \
+             epoch demotes whatever is active regardless of age and the following \
+             `retire_epoch` DELETES it. This is not a wasted round trip — it is a route to \
+             destroying the key the fabric is using. Selecting the highest SENTINEL (ruling \
+             A, withdrawn) returns `Some(1)` here and is exactly the unsafe answer"
+        );
+    }
+
+    /// (e) The normal post-rotation snapshot: history below, sentinel newest.
+    ///
+    /// (d) and (e) together pin "the newest row is a sentinel" from both
+    /// sides: (e) proves older real-keyed rows do not suppress a legitimate
+    /// directive, (d) proves a newer one does.
+    #[test]
+    fn older_real_keyed_rows_do_not_suppress_a_newest_sentinel() {
+        assert_eq!(
+            directed_epoch(&[real_pending(0), active(1), sentinel(2)]),
+            Some(2),
+            "the sentinel at 2 is the newest row, so it must be directed even though older \
+             real-keyed rows exist. A predicate that suppressed a directive whenever ANY \
+             real-keyed row was present would break every rotation after the first — this \
+             is the counterweight to (d), which must not be over-corrected into silence"
+        );
+    }
+
+    /// (f) A sentinel beneath an ACTIVE row: nothing. The
+    /// orphan-behind-a-promote route.
+    ///
+    /// Same predicate as (d), a different reachable state: the abort leaves an
+    /// orphan sentinel at 1, a later rotation completes and PROMOTES to 2, and
+    /// the orphan is still sitting there. Pinned in its own right because the
+    /// route differs and a fix could plausibly special-case `pending` rows
+    /// while ignoring `active` ones.
+    #[test]
+    fn a_sentinel_beneath_an_active_row_is_not_directed() {
+        assert_eq!(
+            directed_epoch(&[sentinel(1), active(2)]),
+            None,
+            "epoch 2 is ACTIVE — the fabric is using it — so epoch 1's orphan sentinel must \
+             not be directed. A gateway back in `Idle` would honour the directive and \
+             rotate backwards onto 1, and `promote_epoch` would then demote the active \
+             epoch 2 (its UPDATE matches on `state = 'active'` with no epoch predicate) and \
+             the retire would delete it. Note this is a SINGLE-sentinel snapshot: it is why \
+             (b) pins its fixture rather than claiming \"one sentinel is always directed\""
+        );
     }
 }
