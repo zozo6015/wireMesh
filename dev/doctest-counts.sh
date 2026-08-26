@@ -16,6 +16,18 @@
 #   * ONE VANISHED. A doctest deleted or accidentally fenced out is a LOST
 #     TEST. Nothing else in CI notices; `--doc` still exits 0.
 #
+# WHAT THIS DELIBERATELY DOES NOT DETECT. The table records per-crate COUNTS,
+# not per-doctest identity, so a change that is count-neutral is invisible to
+# it: delete one ```ignore``` doctest and add another in the same crate and the
+# row still reads `ignored=2`. Recording each doctest's path and line instead
+# would catch that -- and would also red on every unrelated edit that shifts a
+# line number, which is most edits, in a file whose whole purpose is to be
+# boring enough that a red MEANS something. The tripwire is aimed at APPEARANCE
+# and DISAPPEARANCE, which is where the observed bug lived (a doc edit turning
+# prose into a compiled code block) and where the silent loss lives (a deleted
+# doctest). Swapping one ignored doctest for another is a deliberate act by
+# someone editing that doc comment, and it is visible in their diff.
+#
 # Why a committed table rather than an A/B against the merge base: it costs no
 # second workspace compile, it catches the case an A/B cannot (a doctest
 # deleted upstream, where base and head agree and are both wrong), and changing

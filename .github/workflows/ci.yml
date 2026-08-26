@@ -72,6 +72,8 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -92,6 +94,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -121,6 +125,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -213,6 +219,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -244,7 +252,7 @@ jobs:
               -p wiremesh-proto -p wiremesh-trust -p wiremesh-policy -p wiremesh-enroll \
               -p wiremesh-controller -p fabricctl -p wiremesh-operator -p wiremesh-relay \
               -p wiremesh-gateway \
-              -- --test-threads=1'
+              -- --test-threads=1 --nocapture'
       # Its own step, because NOTHING ELSE IN THIS FILE CAN SEE IT.
       #
       # `-D warnings` green says nothing about whether the doctests compile --
@@ -306,6 +314,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -342,6 +352,8 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
@@ -391,6 +403,8 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
+          # Public repo: the merge-base `git fetch` below needs no credential.
+          persist-credentials: false
           # The A/B step below needs the merge-base, so the shallow default
           # clone is not enough.
           fetch-depth: 0
@@ -442,7 +456,12 @@ jobs:
           # `--detach`: a branchless working tree is all cargo needs, and
           # nothing in the build or test path shells out to git.
           git worktree add --detach /tmp/mergebase "$BASE"
-          TESTS="$(bash dev/netns-split.sh rotation)"
+          # The target list MUST come from the merge-base tree, not this one.
+          # `--test <name>` fails outright if the target does not exist, so a
+          # rotation done-bar ADDED by this PR would be requested from a tree
+          # that has never had it -- turning the control run into a build error
+          # and destroying exactly the evidence this step exists to produce.
+          TESTS="$(cd /tmp/mergebase && bash dev/netns-split.sh rotation)"
           docker run --rm --privileged -v /tmp/mergebase:/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
             "$DEV_IMAGE" bash -lc "cd /work && cargo test -j 1 -p wiremesh-gateway --features netns-tests $TESTS -- --test-threads=1 --nocapture" \
             && echo "MERGE-BASE RESULT: GREEN — the PR head is red and its control is green, so investigate the PR." \
