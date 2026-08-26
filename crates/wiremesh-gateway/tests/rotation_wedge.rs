@@ -108,6 +108,19 @@ const TUNNEL_QUARANTINE: Duration = Duration::from_secs(5);
 /// stall-clock assertion in step (iv).
 const STALL_WARN_AFTER: Duration = Duration::from_secs(90);
 
+/// The controller's "no real key submitted yet" placeholder pubkey, mirrored
+/// from `wiremesh-controller`'s private `db.rs::AWAITING_SUBMISSION_SENTINEL`
+/// exactly as `key_rotation.rs` already mirrors it — it is not exported, and a
+/// `tests/*` target cannot reach it.
+///
+/// HAZARD, stated because it is the same shape as this file's log anchors: the
+/// only use below is an ABSENCE-shaped comparison (`pubkey != SENTINEL` meaning
+/// "a real key was submitted"). If the production string ever drifts, this does
+/// not fail — it silently MIS-CLASSIFIES, reporting a never-submitted epoch as
+/// submitted. It feeds printed diagnosis only, never an assertion, so the blast
+/// radius is a misleading message rather than a wrong verdict; keep it that way.
+const AWAITING_SUBMISSION: &str = "awaiting-submission";
+
 /// Substring identifying the R2 stall warning `run_rotation_ticks` emits once
 /// a phase has been `Overlapping` longer than `OVERLAP_STALL_WARN` (emitted at
 /// most once per spell, via that function's `warned_overlap_stall` latch).
@@ -875,6 +888,70 @@ async fn a_failed_rotation_does_not_wedge_the_gateway() {
         poll_rotation_to_epoch(&h, ga.id(), r2.epoch, Duration::from_secs(120)).await;
     if !done2 {
         let phase = scrape_rotation_phase(&metrics_a);
+
+        // FAILURE-TIME KEY-STATE DUMP + CLASSIFICATION (design Rev 1.42).
+        //
+        // Printed diagnosis ONLY — deliberately not an assertion. The headline
+        // poll above is and stays the single red condition for step (iv); a
+        // second assertion here would give the step two independent ways to
+        // fail and reinstate the "which one fired?" ambiguity that the rest of
+        // this file is built to avoid. What was missing was never a check — it
+        // was that a red did not say WHICH mechanism produced it, so a
+        // diagnosis took a second run.
+        //
+        // `states2` is `poll_rotation_to_epoch`'s last-observed snapshot, so
+        // this costs no extra RPC.
+        //
+        // NOT asserted, and each for its own reason:
+        //  - the row SET is never compared for equality: epoch 0 may be
+        //    `active`, `retiring`, or already gone depending on retire timing,
+        //    so an equality check would red on benign variation;
+        //  - the epoch-1 orphan's ABSENCE is never asserted: that sentinel row
+        //    legitimately survives until the controller's `ABORT_AFTER` (300s),
+        //    which is longer than this 120s poll, so requiring it to be gone
+        //    would red a CORRECT system.
+        // The regression pin for the tracker-seed defect lives in the
+        // controller's own unit tests at the seed sites, not here.
+        eprintln!("\n===== CONTROLLER KEY STATE AT FAILURE (gwA) =====");
+        for (epoch, pubkey, state) in &states2 {
+            let key_desc = if pubkey == AWAITING_SUBMISSION {
+                "sentinel (no real key submitted)"
+            } else {
+                "REAL key submitted"
+            };
+            eprintln!("  epoch {epoch}: state={state}, pubkey={key_desc}");
+        }
+        let target = states2.iter().find(|(e, _, _)| *e == r2.epoch);
+        let gw_minted_target = !pa
+            .stderr_grep(&format!("Role A minted epoch {} on", r2.epoch))
+            .is_empty();
+        match target {
+            None => eprintln!(
+                "  CLASSIFICATION: the controller has NO row for epoch {} at all — neither \
+                 mechanism below fits; suspect the RotateKey RPC itself.",
+                r2.epoch
+            ),
+            Some((_, pubkey, _)) if pubkey == AWAITING_SUBMISSION => eprintln!(
+                "  CLASSIFICATION: epoch {} is still the SENTINEL and gwA {} mint it — the \
+                 gateway was never told to rotate to it. This is the DIRECTIVE-SELECTION \
+                 class: an aborted rotation's orphan sentinel outranks the new epoch in the \
+                 controller's selection. See docs/research/\
+                 stale-sentinel-directive-after-abort.md.",
+                r2.epoch,
+                if gw_minted_target { "DID" } else { "did not" }
+            ),
+            Some(_) => {
+                eprintln!(
+                "  CLASSIFICATION: epoch {} carries a REAL key and gwA {} mint it — the gateway \
+                 did its part and the CONTROLLER did not promote. This is the PROMOTION class \
+                 (tracker seed / dropped ack), NOT directive selection.",
+                r2.epoch,
+                if gw_minted_target { "DID" } else { "did NOT (unexpected — investigate)" }
+            )
+            }
+        }
+        eprintln!("=================================================\n");
+
         dump_diag(
             "second-rotation-never-happened",
             &[("gwA", &gwa), ("gwB", &gwb)],
