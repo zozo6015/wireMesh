@@ -85,7 +85,8 @@
 //! can be perfect and still never be called. So
 //! `every_job_that_compiles_a_shipped_binary_stamps_the_version_first` walks
 //! every workflow's jobs and requires that a job which compiles workspace
-//! source (a `cargo build`, or any build of `deploy/docker/Dockerfile`) runs
+//! source (a `cargo build`, or a `docker build`/`docker buildx build` of
+//! `deploy/docker/Dockerfile`) runs
 //! `scripts/set-version.sh` at an EARLIER step index. Same job, not merely the
 //! same workflow: stamping edits the checkout, and each job gets its own
 //! runner and its own checkout, so a stamp in job A does nothing for job B.
@@ -107,6 +108,19 @@
 //! composite action (`uses: ./.github/actions/…`) or a Makefile target would
 //! not be recognised. Nothing in this repo does that today; if something starts
 //! to, extend `build_reason()`.
+//!
+//! The opposite error has already happened once, and it is the reason the
+//! `run:` arm requires a build VERB rather than the token `build`. PR3's
+//! `cold-build.yml` job `toolchain-parity` runs zero builds — it greps two
+//! `FROM` lines and `docker run`s prebuilt base images to compare
+//! `rustc --version` — and the old `contains(DOCKERFILE) && contains("build")`
+//! predicate flagged it on the word `builder` inside a grep PATTERN and two
+//! comments, demanding a version stamp from a job that compiles nothing.
+//! A substring proxy for a property fires on PROSE ABOUT the property; when
+//! the proxy is a common English word and the file it reads is deliberately
+//! well-commented, prose about the property is exactly what it will find.
+//! Pinned by `a_run_block_that_only_mentions_the_dockerfile_in_a_grep_is_not_a_build`
+//! and its twin; see `docs/research/stamping-guard-proxy-vs-property.md`.
 //!
 //! # The Helm chart is deliberately NOT in scope
 //!
@@ -318,6 +332,107 @@ fn every_job_that_compiles_a_shipped_binary_stamps_the_version_first() {
          Note this covers the `builder` job too: `cargo build --release --workspace` runs \
          inside the builder stage, and the runtime stages only COPY from it.",
         offenders.join("\n\n"),
+    );
+}
+
+/// PR3's `cold-build.yml` job `toolchain-parity`, its one step, text
+/// unchanged — only the YAML indentation is re-rooted so the fixture is a
+/// standalone step mapping. This job runs ZERO builds: it greps two `FROM`
+/// lines out of the two Dockerfiles and `docker run`s the already-built base
+/// images to print `rustc --version`.
+///
+/// Three occurrences of the token `build` live in it, and not one of them is
+/// a build: `builder` inside a grep PATTERN, `the release builder digest`
+/// inside an error message, and `last COLD build` inside a comment.
+const TOOLCHAIN_PARITY_STEP: &str = r#"
+name: dev-image rustc == release-builder rustc
+run: |
+  set -euo pipefail
+  dev_base="$(grep -m1 '^FROM ' dev/Dockerfile | awk '{print $2}')"
+  rel_base="$(grep -m1 '^FROM .* AS builder' deploy/docker/Dockerfile | awk '{print $2}')"
+  echo "dev base:     $dev_base"
+  echo "release base: $rel_base"
+  dev_rustc="$(docker run --rm "$dev_base" rustc --version)"
+  rel_rustc="$(docker run --rm "$rel_base" rustc --version)"
+  echo "dev rustc:     $dev_rustc"
+  echo "release rustc: $rel_rustc"
+  if [ "$dev_rustc" != "$rel_rustc" ]; then
+    echo "::error::dev/Dockerfile and deploy/docker/Dockerfile no longer agree on the compiler."
+    echo "::error::The suite would be proven on one rustc and the release built with another."
+    echo "::error::Move both pins together: dev/Dockerfile's FROM tag and the release builder digest."
+    exit 1
+  fi
+  echo "OK -- both bases carry $dev_rustc"
+
+  # PRINTED, never asserted. Both Dockerfiles ALSO install an UNDATED
+  # nightly, and the eBPF object that nightly produces is baked into
+  # the shipped gateway via `include_bytes_aligned!`. The two nightlies
+  # float independently and resolve at each image's last COLD build --
+  # that is deliberate (design 6.2 keeps nightly floating), so a
+  # mismatch here is information, not a failure.
+  echo "--- undated nightly, informational only ---"
+"#;
+
+/// `release.yml`'s `linux-binaries` build step, same treatment. This one IS a
+/// build. `"docker build"` alone would classify it correctly — `docker build`
+/// IS a substring of `docker buildx build` — so what the buildx entry buys is
+/// the MESSAGE: the reason names the command actually present instead of a
+/// vaguer one, in a failure a release engineer reads under time pressure.
+const LINUX_BINARIES_BUILD_STEP: &str = r#"
+name: Build release binaries (Dockerfile export stage)
+run: |
+  set -euo pipefail
+  docker buildx build \
+    -f deploy/docker/Dockerfile --target export \
+    --platform "linux/$ARCH" \
+    --output "type=local,dest=dist/linux-$ARCH" .
+  ls -l "dist/linux-$ARCH"
+"#;
+
+fn step_fixture(yaml: &str) -> serde_yaml::Value {
+    serde_yaml::from_str(yaml).unwrap_or_else(|e| panic!("fixture is not parseable YAML: {e}"))
+}
+
+/// The classifier must key on what a step DOES, not on what it talks about.
+///
+/// RED before the `build_reason()` change this commit makes, by construction:
+/// the old predicate was `run.contains(DOCKERFILE) && run.contains("build")`,
+/// and this fixture satisfies both halves without building anything. It is the
+/// real job PR3 added, and the real misclassification it produced — the guard
+/// demanded that a job which compiles nothing stamp a version first.
+#[test]
+fn a_run_block_that_only_mentions_the_dockerfile_in_a_grep_is_not_a_build() {
+    let step = step_fixture(TOOLCHAIN_PARITY_STEP);
+    assert_eq!(
+        build_reason(&step),
+        None,
+        "`toolchain-parity` greps the Dockerfile and `docker run`s prebuilt base images; it \
+         compiles nothing, so it ships nothing and has nothing to stamp. Classifying it as a \
+         build makes {SET_VERSION_SH} a requirement for a job that produces no artifact — and \
+         the next such job is a false failure, or a stamp added to silence one. A substring \
+         proxy for a property fires on PROSE about the property: the hits here are `builder` \
+         in a grep pattern, `the release builder digest` in an error message, and `last COLD \
+         build` in a comment."
+    );
+}
+
+/// The twin that keeps the one above honest. A `build_reason()` that returned
+/// `None` for everything would satisfy the negative case perfectly and disarm
+/// the whole guard; `builds_seen >= 3` catches that across the real workflow
+/// set, and this catches it on the exact shape the tightening touched.
+#[test]
+fn a_run_block_that_really_buildx_builds_the_dockerfile_is_still_a_build() {
+    let step = step_fixture(LINUX_BINARIES_BUILD_STEP);
+    let reason = build_reason(&step).unwrap_or_else(|| {
+        panic!(
+            "`release.yml`'s linux-binaries step runs `docker buildx build -f {DOCKERFILE}` and \
+             produces every packaged Linux binary. If tightening the predicate stopped \
+             recognising it, the guard no longer covers the job it exists for."
+        )
+    });
+    assert!(
+        reason.contains("docker buildx build"),
+        "the reported reason must name the verb actually present, got: {reason}"
     );
 }
 
@@ -754,15 +869,41 @@ fn workflow_files() -> Vec<String> {
     out
 }
 
+/// The build VERBS a `run:` block can invoke on the Dockerfile, most specific
+/// first so the reported reason names the command that is actually there.
+/// Order matters only for the reported reason, not for coverage:
+/// `docker build` IS a substring of `docker buildx build`, so either entry
+/// alone would match `release.yml`'s `linux-binaries` step. Listing the
+/// longer form first makes `.iter().find` report `runs \`docker buildx build\``
+/// rather than the vaguer `runs \`docker build\``.
+const DOCKER_BUILD_VERBS: [&str; 2] = ["docker buildx build", "docker build"];
+
 /// Does this step compile workspace source into a shipped binary? Returns the
 /// human-readable reason, which goes straight into the failure message.
+///
+/// The `run:` arm requires an actual build VERB, never the bare token
+/// `build`. It used to ask `run.contains(DOCKERFILE) && run.contains("build")`,
+/// and that is a proxy for the property rather than the property: a block
+/// fires on PROSE ABOUT building just as readily as on building. PR3's
+/// `cold-build.yml` job `toolchain-parity` runs zero builds — it greps two
+/// `FROM` lines out of the Dockerfiles and `docker run`s the prebuilt base
+/// images to print `rustc --version` — and was classified as a build anyway,
+/// on the word `builder` inside the grep PATTERN
+/// (`grep -m1 '^FROM .* AS builder' deploy/docker/Dockerfile`) plus two
+/// comments ("the release builder digest", "last COLD build"). It was then
+/// required to stamp a version into a job that compiles nothing.
+/// `a_run_block_that_only_mentions_the_dockerfile_in_a_grep_is_not_a_build`
+/// pins that it no longer is; see
+/// `docs/research/stamping-guard-proxy-vs-property.md`.
 fn build_reason(step: &serde_yaml::Value) -> Option<String> {
     if let Some(run) = step["run"].as_str() {
         if run.contains("cargo build") {
             return Some("runs `cargo build`".to_string());
         }
-        if run.contains(DOCKERFILE) && run.contains("build") {
-            return Some(format!("runs a docker build of {DOCKERFILE}"));
+        if run.contains(DOCKERFILE) {
+            if let Some(verb) = DOCKER_BUILD_VERBS.iter().find(|v| run.contains(**v)) {
+                return Some(format!("runs `{verb}` of {DOCKERFILE}"));
+            }
         }
     }
     if let Some(uses) = step["uses"].as_str() {
