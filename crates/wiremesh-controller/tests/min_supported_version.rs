@@ -138,6 +138,24 @@ fn a_major_bump_floors_at_itself_pending_a_ruling() {
 
 /// An unparseable version returns itself unchanged.
 ///
+/// **Parseable means EXACTLY THREE NUMERIC COMPONENTS** after pre-release and
+/// build metadata are stripped. Not "at least three", and not "the first two
+/// parse": `"1.2"`, `"1.2.x"` and `"1.2.3.4"` are all unparseable, and each
+/// must come back unchanged rather than have a floor derived from whatever
+/// prefix happened to be numeric.
+///
+/// That strictness is the point rather than pedantry. A derivation that reads
+/// the first two components and ignores the rest cannot tell `"1.2"` — which
+/// is not a version this project ever produces — from `"1.2.3"`, so it answers
+/// confidently for an input it did not understand. The whole value of this
+/// field is telling an operator what a controller IS; a confident wrong answer
+/// there is worse than the honest echo, which is visibly odd and prompts a
+/// look.
+///
+/// The patch component is VALIDATED for shape here but still never used in the
+/// derivation — patch-invariance is unaffected, and
+/// [`the_patch_component_does_not_move_the_floor`] pins it separately.
+///
 /// The controller's version comes from `CARGO_PKG_VERSION`, so in practice it
 /// always parses. Returning the input rather than panicking or emptying is the
 /// fail-soft choice: `min_supported_version` is advisory in Phase B (stored,
@@ -145,7 +163,20 @@ fn a_major_bump_floors_at_itself_pending_a_ruling() {
 /// string would be a far worse failure than reporting an odd one.
 #[test]
 fn an_unparseable_version_is_returned_unchanged() {
-    for v in ["not-a-version", "", "1", "1.x.0"] {
+    for v in [
+        "not-a-version",
+        "",
+        "1",
+        "1.x.0",
+        // Too few components: two numbers are not a version, and deriving
+        // `"1.1.0"` from `"1.2"` is the confident wrong answer above.
+        "1.2",
+        // Three components, but the third is not numeric — the shape must be
+        // validated even though the value is never used.
+        "1.2.x",
+        // Too many components.
+        "1.2.3.4",
+    ] {
         assert_eq!(
             min_supported_version(v),
             v,
