@@ -500,12 +500,6 @@ impl DbHandle {
     }
 
     /// See [`Db::list_gateways`].
-    #[expect(
-        clippy::type_complexity,
-        reason = "the 7-tuple row (id, name, segment, status, applied_version, \
-                  version, max_ir_schema) is what Admin.ListGateways needs; a named \
-                  row struct is the eventual fix, and `expect` errors the day it lands"
-    )]
     pub async fn list_gateways(
         &self,
     ) -> Result<

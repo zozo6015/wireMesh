@@ -208,6 +208,17 @@ pub struct EnrollOutcome {
 /// instead of the honest NULL.
 ///
 /// Pass `""` to mean "not reported" — it is stored as NULL, never as `''`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the eight are the enrollment's own shape, not accumulation: TWO dial the \
+              controller (`controller_addr`, `ca_pem`), ONE names the CSR subject \
+              (`common_name`, which also selects gateway-vs-relay), and FIVE are \
+              `EnrollRequest` fields passed straight through (`token`, `cidrs`, \
+              `wg_pubkey`, `endpoint`, `client_version`). A params struct would just \
+              re-spell `EnrollRequest`, which a caller cannot build itself because \
+              `csr_pem` — its sixth field — is generated inside this function from a \
+              keypair that must never leave it."
+)]
 pub async fn enroll(
     controller_addr: &str,
     ca_pem: &str,
