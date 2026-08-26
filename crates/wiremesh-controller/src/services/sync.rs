@@ -4164,7 +4164,8 @@ mod tests {
              path filters `state == \"retiring\"`, and `drive_rotation_for` returns before \
              deciding when there is no tracker. The row then keeps the gateway inside \
              `Db::gateways_with_rotation_state`, which `initiate_due_rotations` skips — so \
-             automatic rotation is disabled for that gateway PERMANENTLY (the v0.7.2 class)"
+             automatic rotation is disabled for that gateway PERMANENTLY — the same \
+             self-disable v0.7.3 fixed, arriving by a new route"
         );
 
         // Before `ABORT_AFTER`: nothing happens. `decide` rule 2 returns for a
@@ -4337,7 +4338,8 @@ mod tests {
              `drive_rotation_for` returns before deciding when no tracker exists. The \
              stranded row keeps the gateway inside `Db::gateways_with_rotation_state`, \
              which `initiate_due_rotations` skips — so AUTOMATIC ROTATION IS DISABLED FOR \
-             THAT GATEWAY PERMANENTLY, the v0.7.2 class of defect. Do not unify this \
+             THAT GATEWAY PERMANENTLY — the same self-disable v0.7.3 fixed, arriving by \
+             a new route. Do not unify this \
              selector with the broker's"
         );
     }

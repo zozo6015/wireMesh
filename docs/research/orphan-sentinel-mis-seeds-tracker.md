@@ -145,7 +145,9 @@ In the second state the orphan is still there. Under max-over-all **no tracker i
 for it**, so `decide` is never asked, so `ABORT_AFTER` never fires, so `drop_pending_epoch` is
 never called: **the row becomes permanent.** And `initiate_due_rotations` skips any gateway with
 a `pending` or `retiring` row, so that gateway is **excluded from automatic rotation for good** —
-the v0.7.2 class of silent self-disable, reintroduced.
+the same self-disable **v0.7.3** fixed, arriving by a new route. (Not v0.7.2 — that release
+is the port authority and the stranded-tracker work; the driven retire that ended the
+self-disable is `9d67b69`, first tagged v0.7.3.)
 
 The unfixed code is *slow but self-healing*. That shape would be *fast but leaky*: it turns a
 latency bug into a durability bug, and the done-bar cannot tell the difference.
