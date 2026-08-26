@@ -3013,7 +3013,9 @@ mod tests {
              hand it the same unsatisfiable Abort on every tick. The cost lands on the NEXT \
              rotation, which loses its first (and, per Role-B cutover, only) ack to the \
              `ack.epoch == tracker.pending_epoch` check in report() and silently falls back \
-             to the 90s grace promote"
+             to the 90s grace promote. (\"Silently\" = the FALLBACK is \
+             unannounced; the precipitating mismatch is logged — \
+             `ignoring EpochAck(...)`.)"
         );
         assert_eq!(
             key_states(&db).await,
@@ -3921,7 +3923,7 @@ mod tests {
 
     /// Site 2 — `sweep_rotations` step 2.
     #[tokio::test]
-    async fn sweep_rotations_step2_seeds_the_newest_pending_row() {
+    async fn a_full_sweep_leaves_the_tracker_on_the_newest_pending_row() {
         let (_dir, db) = seeded_db(&orphan_then_live());
         let (change_tx, _rx) = broadcast::channel(16);
         let broker = broker_for(&db);
@@ -3933,10 +3935,14 @@ mod tests {
         assert_eq!(
             tracker_identity(&rotations).await.map(|(e, _, _)| e),
             Some(2),
-            "`sweep_rotations` step 2 seeded from the oldest pending row (the orphan \
-             sentinel at 1) rather than the newest (2). Step 2 seeds under its own guard \
-             BEFORE step 2b's `drive_rotation_for` runs, so fixing only the other sites \
-             leaves this one reachable on every sweep tick"
+            "after a full sweep the tracker holds the OLDEST pending row. `sweep_rotations` \
+             runs step 2's seed and THEN step 2b's `drive_rotation_for`, which re-arbitrates \
+             with its own `evict_decision` and can evict and reseed what step 2 installed — \
+             so this failure attributes to that COMPOSITE, not to step 2 alone. A \
+             step-2-only regression is in fact MASKED here (2b corrects it), so a red \
+             implicates `drive_rotation_for`'s selector or its evict input; \
+             `one_tick_does_not_evict_and_rebuild_the_newest_pending_tracker` reds on the \
+             identity stamps for either site and is what discriminates"
         );
     }
 
@@ -3975,7 +3981,9 @@ mod tests {
              pass installed a tracker on the orphan epoch 1, so the record pass's \
              `ack.epoch == tracker.pending_epoch` is false and the ack is discarded \
              SILENTLY. A gateway acks exactly once per Role-B cutover, so nothing retries \
-             it and the rotation falls back to the 90s zero-ack grace promote"
+             it and the rotation falls back to the 90s zero-ack grace promote. \
+             (\"Silently\" = the FALLBACK is unannounced; the precipitating \
+             mismatch is logged — `ignoring EpochAck(...)`.)"
         );
     }
 
