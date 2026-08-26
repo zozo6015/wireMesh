@@ -66,31 +66,39 @@ const SCOPE: &[&str] = &[
 /// Every `(path, enclosing item)` where one of [`FIELDS`] may legitimately
 /// appear: the sites that POPULATE, THREAD or STORE the values.
 ///
+/// MEASURED at 13 sites / 28 occurrences after wire-dev's population commit,
+/// by running this file's own scanner over the tree — not copied from a
+/// prediction (the estimate beforehand was 11, and the difference is real:
+/// `main`'s boot log, `version.rs` itself, and the split of the writer across
+/// `db.rs`/`db_async.rs` were not in it).
+///
+/// Note what is NOT here: the two `run_enroll` call sites. They pass the
+/// value POSITIONALLY into `wiremesh_enroll::enroll`, so they never name the
+/// identifier and this scan cannot see them. That is a known limit, not an
+/// omission — a site that BRANCHES on one of these fields has to name it.
+///
 /// **To whoever a red run sends here:** adding an entry is correct if your site
 /// populates, threads or stores. It is NOT correct if your site READS one to
 /// decide something — that is the Phase-C gate this guard exists to catch, and
 /// the answer is to defer it, not to widen the list.
 const ALLOWED: &[(&str, &str)] = &[
-    // The schema DDL naming the column.
+    // -- schema -----------------------------------------------------------
     ("crates/wiremesh-controller/src/db.rs", "SCHEMA_V4"),
-    // The two snapshot builders stamping the controller's own pair.
-    (
-        "crates/wiremesh-controller/src/projection.rs",
-        "build_snapshot",
-    ),
-    (
-        "crates/wiremesh-controller/src/projection.rs",
-        "build_relay_revocation_snapshot",
-    ),
-    // Surfacing the stored pair on the admin API (no flagging, no filtering).
-    (
-        "crates/wiremesh-controller/src/services/admin.rs",
-        "list_gateways",
-    ),
-    // The clients populating their own values.
-    ("crates/wiremesh-gateway/src/enroll.rs", "run_enroll"),
+    // -- storage: the write path and its normalisation ---------------------
+    ("crates/wiremesh-controller/src/db.rs", "set_gateway_reported_version"),
+    ("crates/wiremesh-controller/src/db_async.rs", "set_gateway_reported_version"),
+    ("crates/wiremesh-controller/src/services/sync.rs", "watch"),
+    ("crates/wiremesh-controller/src/services/enrollment.rs", "enroll"),
+    // -- read-and-surface: no flagging, no filtering, no colouring ---------
+    ("crates/wiremesh-controller/src/db.rs", "list_gateways"),
+    ("crates/wiremesh-controller/src/services/admin.rs", "list_gateways"),
+    // -- the controller's own pair, stamped onto both snapshot builders ----
+    ("crates/wiremesh-controller/src/projection.rs", "build_snapshot"),
+    ("crates/wiremesh-controller/src/projection.rs", "build_relay_revocation_snapshot"),
+    ("crates/wiremesh-controller/src/version.rs", "min_supported_version"),
+    ("crates/wiremesh-controller/src/main.rs", "main"),
+    // -- clients populating their own values --------------------------------
     ("crates/wiremesh-gateway/src/sync.rs", "watch"),
-    ("crates/wiremesh-relay/src/enroll.rs", "run_enroll"),
     ("crates/wiremesh-relay/src/lib.rs", "run_sync"),
 ];
 
@@ -129,11 +137,43 @@ fn occurrences(root: &Path) -> Vec<(String, String, String)> {
                 .replace('\\', "/");
             let text = std::fs::read_to_string(&f).expect("reading a source file");
             let mut item = "<module scope>".to_string();
+            let mut attr_depth = 0i32;
             for line in text.lines() {
                 let trimmed = line.trim_start();
                 // Comment-stripped: documenting the rule must not trip it, and
                 // the proto/enroll sources document it at length.
                 if trimmed.starts_with("//") {
+                    continue;
+                }
+                // Attribute bodies are skipped for the SAME reason, and it is
+                // not a convenience: a `reason = "..."` string inside an
+                // `#[expect(...)]` is prose that cannot branch on anything, so
+                // it is documentation in every sense that matters here. Two
+                // such strings exist today — `db.rs`'s and `db_async.rs`'s
+                // `#[expect(clippy::type_complexity)]` both spell out the
+                // 7-tuple row including `max_ir_schema`.
+                //
+                // Skipping them also avoids MIS-ATTRIBUTION, which is the
+                // sharper reason. Attributes precede the item they annotate,
+                // so a nearest-preceding-`fn` scan credits them to the item
+                // ABOVE — those two land on `audit_query` and `revoke_cert`,
+                // which touch neither field. An allowlist entry naming them
+                // would be a lie a later reader could not audit.
+                if attr_depth == 0 && (trimmed.starts_with("#[") || trimmed.starts_with("#!["))
+                {
+                    attr_depth = 1;
+                }
+                if attr_depth > 0 {
+                    attr_depth += line.matches('[').count() as i32
+                        - line.matches(']').count() as i32
+                        - if trimmed.starts_with("#[") || trimmed.starts_with("#![") {
+                            1
+                        } else {
+                            0
+                        };
+                    if attr_depth <= 0 {
+                        attr_depth = 0;
+                    }
                     continue;
                 }
                 if let Some(name) = item_name(trimmed) {
