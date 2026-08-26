@@ -216,8 +216,8 @@ pub struct EnrollOutcome {
               `EnrollRequest` fields passed straight through (`token`, `cidrs`, \
               `wg_pubkey`, `endpoint`, `client_version`). A params struct would just \
               re-spell `EnrollRequest`, which a caller cannot build itself because \
-              `csr_pem` — its sixth field — is generated inside this function from a \
-              keypair that must never leave it."
+              the one field it does NOT list — `csr_pem` — is generated inside this \
+              function from a keypair that must never leave it."
 )]
 pub async fn enroll(
     controller_addr: &str,
