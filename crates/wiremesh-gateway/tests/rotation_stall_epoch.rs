@@ -52,7 +52,6 @@
 //! sufficient and no measurement of a healthy window is needed.
 #![cfg(feature = "netns-tests")]
 
-use std::collections::BTreeSet;
 use std::path::Path;
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -346,16 +345,6 @@ fn wait_until<F: FnMut() -> bool>(timeout: Duration, mut f: F) -> bool {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-}
-
-fn link_names(ns: &Ns) -> BTreeSet<String> {
-    let Ok(out) = ns.exec(&["ip", "-br", "link"]) else {
-        return BTreeSet::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| Some(l.split_whitespace().next()?.split('@').next()?.to_string()))
-        .collect()
 }
 
 // --- local additions (NOT part of the block duplicated above) ---------------
