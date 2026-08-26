@@ -466,6 +466,14 @@ jobs:
           BASE_REF="${{ github.base_ref || 'main' }}"
           # `actions/checkout` only fetches the checked-out ref, so the base
           # branch has to be fetched explicitly even at fetch-depth 0.
+          #
+          # This fetch is UNAUTHENTICATED, and that is a design precondition
+          # rather than a property of git: the checkout above sets
+          # `persist-credentials: false`, so it works only because this repo is
+          # PUBLIC. If wireMesh ever goes private, this line starts failing and
+          # the symptom is a dead A/B control on rotation PRs -- which reads
+          # like a CI bug and is not one. The fix then is a scoped token on
+          # this step, not reverting the credential hardening.
           git fetch --no-tags origin "+refs/heads/$BASE_REF:refs/remotes/origin/$BASE_REF"
           BASE="$(git merge-base "origin/$BASE_REF" HEAD)"
           echo "merge-base: $BASE"

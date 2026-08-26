@@ -38,6 +38,21 @@
 #   ./dev.sh run "cd /work && cargo test -j 1 --workspace --doc"            > /tmp/root.log
 #   ./dev.sh run "cd /work/crates/wiremesh-enforcer-ebpf && cargo test -j 1 --doc" > /tmp/ebpf.log
 #   dev/doctest-counts.sh generate /tmp/root.log /tmp/ebpf.log > dev/doctest-counts.txt
+# DESIGN INVARIANT -- `check` compares against the COMPLETE expected table and
+# never iterates the log. That is what makes it a backstop for a BROKEN run,
+# not just a changed one: a truncated log, an empty log, or a `failed=N` row
+# all produce a table that differs from the committed one, so all three red.
+# Measured: full log exit 0; truncated after four crates exit 1 with 8 rows
+# missing; crashed before any output exit 1 with 12 missing.
+#
+# Simplifying this to "walk the log and check each row we find" would look
+# equivalent and would SILENTLY REMOVE that backstop -- a truncated log would
+# then match on every row it still contained. Do not.
+#
+# (It is a backstop, not the primary gate: the CI steps that produce these logs
+# set `pipefail` so a failed run fails THERE, with the right message. This one
+# would red too, but saying "a doctest appeared or vanished" for what is really
+# "the doc run died".)
 set -euo pipefail
 
 TABLE="$(dirname "$0")/doctest-counts.txt"
