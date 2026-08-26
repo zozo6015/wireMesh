@@ -23,6 +23,7 @@ use tonic::Status;
 use wiremesh_proto::v1::{Delta, Peer, PeerKey, RelayInfo, StateSnapshot};
 
 use crate::db::AWAITING_SUBMISSION_SENTINEL;
+
 use crate::db_async::DbHandle;
 use crate::routes;
 
@@ -504,10 +505,12 @@ pub async fn build_snapshot(
         policy_ir,
         policy_version,
         revoked_serials,
-        // B10: populated in the next commit (population step). BOTH
-        // builders must carry them — see the field docs in sync.proto.
-        controller_version: String::new(),
-        min_supported_version: String::new(),
+        // (B10) Facts about THIS controller. Both builders carry them: a
+        // relay receiving "" here would permanently read a v1.0 controller
+        // as legacy. The floor is DERIVED from the stamped version, never
+        // written down — see `crate::version::min_supported_version`.
+        controller_version: env!("CARGO_PKG_VERSION").to_string(),
+        min_supported_version: crate::version::min_supported_version(env!("CARGO_PKG_VERSION")),
     })
 }
 
@@ -551,10 +554,12 @@ pub async fn build_relay_revocation_snapshot(
         policy_ir: Vec::new(),
         policy_version: 0,
         revoked_serials,
-        // B10: populated in the next commit (population step). BOTH
-        // builders must carry them — see the field docs in sync.proto.
-        controller_version: String::new(),
-        min_supported_version: String::new(),
+        // (B10) Facts about THIS controller. Both builders carry them: a
+        // relay receiving "" here would permanently read a v1.0 controller
+        // as legacy. The floor is DERIVED from the stamped version, never
+        // written down — see `crate::version::min_supported_version`.
+        controller_version: env!("CARGO_PKG_VERSION").to_string(),
+        min_supported_version: crate::version::min_supported_version(env!("CARGO_PKG_VERSION")),
     })
 }
 

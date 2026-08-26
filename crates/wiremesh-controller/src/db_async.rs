@@ -298,6 +298,41 @@ impl DbHandle {
             .await?
     }
 
+    /// See [`Db::set_gateway_reported_version`].
+    pub async fn set_gateway_reported_version(
+        &self,
+        gateway_id: i64,
+        version: Option<String>,
+        max_ir_schema: Option<u32>,
+    ) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            db.set_gateway_reported_version(gateway_id, version, max_ir_schema)
+        })
+        .await?
+    }
+
+    /// See [`Db::set_gateway_version`].
+    pub async fn set_gateway_version(
+        &self,
+        gateway_id: i64,
+        version: Option<String>,
+    ) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.set_gateway_version(gateway_id, version)).await?
+    }
+
+    /// See [`Db::set_relay_reported_version`].
+    pub async fn set_relay_reported_version(
+        &self,
+        relay_id: i64,
+        version: Option<String>,
+    ) -> Result<()> {
+        let db = self.inner.clone();
+        tokio::task::spawn_blocking(move || db.set_relay_reported_version(relay_id, version))
+            .await?
+    }
+
     /// See [`Db::find_gateway_by_name`].
     pub async fn find_gateway_by_name(&self, name: String) -> Result<Option<GatewayIdentity>> {
         let db = self.inner.clone();
@@ -465,7 +500,25 @@ impl DbHandle {
     }
 
     /// See [`Db::list_gateways`].
-    pub async fn list_gateways(&self) -> Result<Vec<(i64, String, String, String, Option<i64>)>> {
+    #[expect(
+        clippy::type_complexity,
+        reason = "the 7-tuple row (id, name, segment, status, applied_version, \
+                  version, max_ir_schema) is what Admin.ListGateways needs; a named \
+                  row struct is the eventual fix, and `expect` errors the day it lands"
+    )]
+    pub async fn list_gateways(
+        &self,
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        )>,
+    > {
         let db = self.inner.clone();
         tokio::task::spawn_blocking(move || db.list_gateways()).await?
     }

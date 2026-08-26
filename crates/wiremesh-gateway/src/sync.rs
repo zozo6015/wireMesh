@@ -166,9 +166,12 @@ pub async fn watch(
     Ok(client
         .watch(WatchRequest {
             session_generation: session_generation(),
-            // B10: populated in the next commit (population step).
-            client_version: String::new(),
-            max_ir_schema: 0,
+            // (B10) This crate's OWN version — `env!` expands here, in
+            // `wiremesh-gateway`, which `scripts/set-version.sh` stamps.
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+            // The only policy-IR schema `wiremesh_policy::compile` emits and
+            // the only one `PolicyIR::from_json` accepts.
+            max_ir_schema: 1,
         })
         .await
         .map_err(|s| anyhow!("Sync.Watch failed: {s}"))?

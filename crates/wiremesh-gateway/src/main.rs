@@ -2426,7 +2426,8 @@ async fn directive_punch_handoff(ctx: PathCtx, gid: u64, candidates: Vec<String>
         if Instant::now() >= deadline {
             eprintln!(
                 "wiremesh-gateway: peer={gid} directive handoff timed out waiting for the \
-                 punch slot; dropping directive (broker re-emits on its sweep)"
+                 punch slot; dropping directive (broker re-punches on its ~5s sweep, \
+                 up to a bounded retry budget)"
             );
             return;
         }

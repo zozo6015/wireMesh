@@ -26,6 +26,7 @@ use wiremesh_proto::v1::enrollment_server::Enrollment;
 use wiremesh_proto::v1::{EnrollRequest, EnrollResponse};
 use wiremesh_trust::{CertProfile, CertificateIssuer};
 
+use crate::db;
 use crate::db_async::{DbHandle, EnrollError};
 use crate::projection::ChangeEvent;
 
@@ -207,6 +208,22 @@ impl Enrollment for EnrollmentSvc {
                 }
             };
 
+            // (B10) Record what this relay reported about itself at
+            // enrollment. Normalised through the shared helper, so `""`
+            // becomes NULL and never a second spelling of unknown.
+            // Best-effort: the relay row and cert are already durably
+            // committed, so a bookkeeping failure must not fail the enroll.
+            if let Err(e) = self
+                .db
+                .set_relay_reported_version(relay_id, db::store_version(&req.client_version))
+                .await
+            {
+                eprintln!(
+                    "wiremesh-controller: recording relay={relay_id} enroll version failed \
+                     (continuing, this is observability only): {e}"
+                );
+            }
+
             // Projection-affecting mutation succeeded (and its transaction
             // already bumped the persisted revision — see
             // `Db::enroll_relay`'s doc comment) and the single-use token is
@@ -387,6 +404,24 @@ impl Enrollment for EnrollmentSvc {
                 });
             }
         };
+
+        // (B10) Record the gateway's reported version. `set_gateway_version`
+        // rather than the two-column writer: `EnrollRequest` carries no
+        // schema (that is learned at the first Watch), and writing NULL for
+        // it here would clobber a value a re-enrolling gateway had already
+        // reported. Best-effort, same discipline as everything else past the
+        // durable commit.
+        if let Err(e) = self
+            .db
+            .set_gateway_version(outcome.gateway_id, db::store_version(&req.client_version))
+            .await
+        {
+            eprintln!(
+                "wiremesh-controller: recording gateway={} enroll version failed \
+                 (continuing, this is observability only): {e}",
+                outcome.gateway_id
+            );
+        }
 
         // The token is now spent and the certificate row is durably
         // committed (with `serial_hex`). Sign the leaf NOW that we know the

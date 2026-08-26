@@ -190,9 +190,12 @@ pub struct EnrollOutcome {
 ///
 /// # `client_version` is a PARAMETER, and that is the whole point (B10)
 ///
-/// The caller passes its OWN `env!("CARGO_PKG_VERSION")`. This crate must
-/// never read that macro itself, and there is a test asserting the string
-/// `CARGO_PKG_VERSION` appears nowhere under `crates/wiremesh-enroll/src/`.
+/// The caller passes its OWN compile-time crate version (the `env!` of the
+/// standard Cargo version key). This crate must never expand that macro
+/// itself, and a source guard asserts the macro key appears nowhere under
+/// `crates/wiremesh-enroll/src/` — which is why this comment describes it
+/// rather than spelling it, so the guard can stay a plain literal grep with
+/// no comment-stripping and no risk of matching its own explanation.
 ///
 /// `env!` expands at its DEFINITION site, not its call site. Both the gateway
 /// and the relay enroll through this one shared function, so an `env!` here

@@ -58,6 +58,15 @@ async fn main() -> Result<()> {
         running.observe_addr()
     );
 
+    // (B10) State the version window this build advertises, so an operator
+    // reading the log knows what every `StateSnapshot` is carrying. Phase B
+    // ADVERTISES ONLY — nothing is rejected for falling outside it.
+    eprintln!(
+        "wiremesh-controller: version={} min_supported_version={} (advertised, not enforced)",
+        env!("CARGO_PKG_VERSION"),
+        wiremesh_controller::version::min_supported_version(env!("CARGO_PKG_VERSION"))
+    );
+
     tokio::signal::ctrl_c().await?;
     eprintln!("wiremesh-controller: shutting down");
     running.shutdown().await;

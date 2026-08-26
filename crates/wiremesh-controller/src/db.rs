@@ -2550,6 +2550,68 @@ impl Db {
         Ok(())
     }
 
+    /// (B10) Records what a gateway reported about itself when it opened its
+    /// Watch: its build version and the highest policy-IR schema it can
+    /// apply. Both are already NORMALISED by the caller via
+    /// [`store_version`]/[`store_schema`], so `None` here means "never
+    /// reported" and is the only spelling of unknown that reaches the column.
+    ///
+    /// WRITE-ONLY in Phase B: nothing reads these to make a decision. See
+    /// [`SCHEMA_V4`].
+    pub fn set_gateway_reported_version(
+        &self,
+        gateway_id: i64,
+        version: Option<String>,
+        max_ir_schema: Option<u32>,
+    ) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE gateway SET version = ?1, max_ir_schema = ?2 WHERE id = ?3",
+            params![version, max_ir_schema, gateway_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("Watch: no gateway row with id {gateway_id} to record version on");
+        }
+        Ok(())
+    }
+
+    /// (B10) Records ONLY a gateway's reported version, leaving
+    /// `max_ir_schema` untouched — the enrollment path, where the client
+    /// sends `EnrollRequest.client_version` but no schema (that is learned
+    /// when it first opens a Watch).
+    ///
+    /// Separate from [`Db::set_gateway_reported_version`] on purpose: writing
+    /// `NULL` for the schema here would CLOBBER a value learned from an
+    /// earlier Watch if a gateway ever re-enrolls against an existing row.
+    pub fn set_gateway_version(&self, gateway_id: i64, version: Option<String>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE gateway SET version = ?1 WHERE id = ?2",
+            params![version, gateway_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("Enroll: no gateway row with id {gateway_id} to record version on");
+        }
+        Ok(())
+    }
+
+    /// (B10) The relay counterpart of [`Db::set_gateway_reported_version`].
+    ///
+    /// There is no `max_ir_schema` parameter, and that is deliberate: the
+    /// `relay` table has no such column, because a relay has no policy IR.
+    /// See [`SCHEMA_V4`]'s tripwire before adding one.
+    pub fn set_relay_reported_version(&self, relay_id: i64, version: Option<String>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let updated = conn.execute(
+            "UPDATE relay SET version = ?1 WHERE id = ?2",
+            params![version, relay_id],
+        )?;
+        if updated != 1 {
+            anyhow::bail!("Watch: no relay row with id {relay_id} to record version on");
+        }
+        Ok(())
+    }
+
     /// (Task 13) Every registered segment with its CIDRs, ordered by id —
     /// backs `Admin.ListSegments` / `fabricctl segment list`.
     pub fn list_segments(&self) -> Result<Vec<(i64, String, Vec<String>)>> {
@@ -2966,16 +3028,37 @@ impl Db {
     /// (`Db::set_applied_version`) observable from the Admin surface for the
     /// first time. Ordered by id.
     // The tuple mirrors the SELECT's column list one-for-one. A `type` alias
-    // would name the shape but hide which column is which, which is the thing
-    // a reader of this function actually needs.
+    // would name the shape but hide WHICH column is which, which is the thing
+    // a reader of this function actually needs — so the eventual fix is a row
+    // STRUCT with named fields, not an alias. (PR0b's rationale kept; B10
+    // widened the tuple 5 -> 7 and the argument is unchanged by the width.)
     #[expect(
         clippy::type_complexity,
-        reason = "the tuple mirrors the SELECT's column list; a type alias would hide which column is which"
+        reason = "the 7-tuple mirrors the SELECT's column list one-for-one (id, name, \
+                  segment, status, applied_version, version, max_ir_schema); a type \
+                  alias would hide which column is which, and a named row struct is \
+                  the eventual fix that `expect` will error on the day it lands"
     )]
-    pub fn list_gateways(&self) -> Result<Vec<(i64, String, String, String, Option<i64>)>> {
+    pub fn list_gateways(
+        &self,
+    ) -> Result<
+        Vec<(
+            i64,
+            String,
+            String,
+            String,
+            Option<i64>,
+            Option<String>,
+            Option<i64>,
+        )>,
+    > {
         let conn = self.conn.lock().unwrap();
+        // (B10) `version`/`max_ir_schema` come along so `Admin.ListGateways`
+        // can EXPOSE them. Exposing is not consulting: `fabricctl` prints
+        // nothing derived from them and gains no out-of-window flagging in
+        // Phase B — that is X-6/Phase C.
         let mut stmt = conn.prepare(
-            "SELECT g.id, g.name, s.name, g.status, g.applied_version \
+            "SELECT g.id, g.name, s.name, g.status, g.applied_version, g.version, g.max_ir_schema \
              FROM gateway g JOIN segment s ON s.id = g.segment_id \
              ORDER BY g.id",
         )?;
@@ -2987,6 +3070,8 @@ impl Db {
                     row.get(2)?,
                     row.get(3)?,
                     row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
                 ))
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
