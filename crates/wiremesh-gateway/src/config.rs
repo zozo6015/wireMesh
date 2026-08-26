@@ -117,6 +117,7 @@ pub mod fault {
     use anyhow::{anyhow, Context};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::OnceLock;
+    use std::time::Duration;
 
     /// The environment variable that arms the hook.
     /// Format: `<point>` or `<point>:<count>`, e.g.
@@ -243,6 +244,61 @@ pub mod fault {
                 })
                 .is_ok()
         }
+    }
+
+    /// Overrides `main.rs`'s `OVERLAP_STALL_WARN` (90s) — **test-only**.
+    ///
+    /// The R2 stall warning fires only after the rotation has sat in
+    /// `Overlapping` for the full 90s, which mirrors the controller's
+    /// `GRACE_PROMOTE`. A netns test cannot wait that long, and it cannot reach
+    /// the warning any faster: the emission lives inside
+    /// `run_rotation_ticks`'s `if let Some(a) = role_a` guard, so it is
+    /// reachable ONLY from a genuine R2 — a rotation that got past
+    /// `role_a = Some` and submitted, whose new tun no peer ever corroborates
+    /// live. (Every fault point in `RotationFailPoint` precedes that
+    /// assignment, so an injected abort can never produce a stall.)
+    ///
+    /// This knob lowers the threshold so that scenario is observable in
+    /// seconds. It does NOT change what the constant means: `OVERLAP_STALL_WARN`
+    /// stays 90s and stays the production source of truth — this is consulted
+    /// only under `netns-tests`, and only as an override.
+    pub const OVERLAP_STALL_WARN_ENV: &str = "WIREMESH_TEST_OVERLAP_STALL_WARN_SECS";
+
+    /// Parse an override spec. **Pure** — takes the value rather than reading
+    /// the environment, so its unit tests need no env mutation.
+    ///
+    /// * `None`, empty, or whitespace-only → `None` (no override; production
+    ///   threshold applies). Absent must arm nothing: every netns suite builds
+    ///   with `netns-tests` ON and runs with this variable unset.
+    /// * a non-negative integer number of seconds → `Some(Duration)`. `0` is
+    ///   valid and means "warn on the first tick of the spell".
+    /// * anything else → `Err`. A malformed spec is a HARD ERROR, never a
+    ///   silent fallback to 90s: falling back would make the test either wait
+    ///   the full 90s or time out, and the likely "fix" for that is widening a
+    ///   tolerance on an assertion — which is how a typo becomes a weakened
+    ///   test.
+    pub fn parse_overlap_stall_warn(spec: Option<&str>) -> anyhow::Result<Option<Duration>> {
+        let Some(raw) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let secs: u64 = raw.parse().with_context(|| {
+            format!("{OVERLAP_STALL_WARN_ENV}={raw:?}: expected a number of seconds")
+        })?;
+        Ok(Some(Duration::from_secs(secs)))
+    }
+
+    /// The process-wide stall-threshold override, read from the environment
+    /// once. `None` means "use the production constant".
+    ///
+    /// A malformed spec panics here rather than being ignored — see
+    /// [`parse_overlap_stall_warn`]. This is test-only code; failing loudly at
+    /// the first tick is the correct posture.
+    pub fn overlap_stall_warn_override() -> Option<Duration> {
+        static OVERRIDE: OnceLock<Option<Duration>> = OnceLock::new();
+        *OVERRIDE.get_or_init(|| {
+            parse_overlap_stall_warn(std::env::var(OVERLAP_STALL_WARN_ENV).ok().as_deref())
+                .expect("parsing the overlap-stall-warning override")
+        })
     }
 
     /// The process-wide armed fault set, read from the environment once.

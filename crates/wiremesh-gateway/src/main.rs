@@ -390,6 +390,25 @@ const RETIRE_GRACE: Duration = Duration::from_secs(2 * ROTATION_KEEPALIVE as u64
 /// assert rather than fail — silently weaker, not red.
 const OVERLAP_STALL_WARN: Duration = Duration::from_secs(90);
 
+/// The stall threshold this tick actually compares against.
+///
+/// In a release build this is `OVERLAP_STALL_WARN`, unconditionally — the
+/// override below is compiled out entirely, so there is no environment read in
+/// a shipped binary (same posture as `config::fault`'s rotation fault hook).
+///
+/// Under `netns-tests` only, a test may lower it via
+/// `WIREMESH_TEST_OVERLAP_STALL_WARN_SECS`, because the warning is otherwise
+/// reachable only after 90s of real wall clock. `OVERLAP_STALL_WARN` remains
+/// the production source of truth and its 90s value is unchanged and still
+/// pinned; this is an override, not a redefinition.
+fn overlap_stall_warn() -> Duration {
+    #[cfg(feature = "netns-tests")]
+    if let Some(overridden) = wiremesh_gateway::config::fault::overlap_stall_warn_override() {
+        return overridden;
+    }
+    OVERLAP_STALL_WARN
+}
+
 /// How often the run task wakes to service a pending old-epoch retire even when
 /// the controller is quiet (no Sync traffic). The teardown happens in the run
 /// task because it owns the non-`Send` `TunnelSet`; the rotation tick only
@@ -5782,7 +5801,7 @@ async fn run_rotation_ticks(rot: RotationShared) {
             match phase {
                 RotationPhase::Overlapping { .. } => {
                     let elapsed = overlapping_since.map_or(Duration::ZERO, |t| t.elapsed());
-                    if elapsed >= OVERLAP_STALL_WARN && !warned_overlap_stall {
+                    if elapsed >= overlap_stall_warn() && !warned_overlap_stall {
                         warned_overlap_stall = true;
                         // TEST ANCHOR: `tests/rotation_wedge.rs::STALL_WARN_MARKER`
                         // greps stderr for the token `ROTATION STALLED`, and it
