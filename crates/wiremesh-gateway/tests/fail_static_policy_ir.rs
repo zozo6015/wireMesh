@@ -93,6 +93,23 @@ fn schema2_ir_bytes() -> Vec<u8> {
     ir.to_canonical_json().into_bytes()
 }
 
+/// Real WG-shaped key material — base64 of 32 repeated bytes, so
+/// `uapi::pubkey_b64_to_hex` decodes it. The two are distinct, so the
+/// "persisted verbatim" assertions below still discriminate the two peers:
+/// swapping them, or losing either to `None`, still fails.
+///
+/// This suite's original fixtures were the placeholders `"PUB2"`/`"PUB3"`,
+/// which decode to 3 bytes and are therefore filtered to `None` by
+/// `PeerState::active_pubkey_b64`'s `deserialize_with` shim on the way back
+/// off disk (backlog item 23) — so every whole-state round-trip assertion
+/// here compared `Some("PUB2")` against `None` and had been red since that
+/// filter landed. The filter is correct and stays; the placeholders were
+/// fixture rot, exactly as they were in `state.rs`'s own unit tests
+/// (`VALID_KEY_AA`/`_BB`/`_CC`, corrected in the same commit). See
+/// `docs/research/fail-static-policy-ir-stale-fixtures.md`.
+const VALID_KEY_DD: &str = "3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d0=";
+const VALID_KEY_EE: &str = "7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u7u4=";
+
 /// A rich desired state whose peer/device half must survive substitution
 /// untouched.
 fn rich_state(revision: u64, policy_version: u64, policy_ir: Vec<u8>) -> DesiredState {
@@ -102,7 +119,7 @@ fn rich_state(revision: u64, policy_version: u64, policy_ir: Vec<u8>) -> Desired
             PeerState {
                 gateway_id: 2,
                 segment_name: "seg-b".into(),
-                active_pubkey_b64: Some("PUB2".into()),
+                active_pubkey_b64: Some(VALID_KEY_DD.into()),
                 keys: vec![],
                 candidates: vec!["203.0.113.2:51820".into(), "10.0.0.2:51820".into()],
                 allowed_ips: vec!["10.10.2.0/24".into()],
@@ -110,7 +127,7 @@ fn rich_state(revision: u64, policy_version: u64, policy_ir: Vec<u8>) -> Desired
             PeerState {
                 gateway_id: 3,
                 segment_name: "seg-c".into(),
-                active_pubkey_b64: Some("PUB3".into()),
+                active_pubkey_b64: Some(VALID_KEY_EE.into()),
                 keys: vec![],
                 candidates: vec!["198.51.100.3:51820".into()],
                 allowed_ips: vec!["10.10.3.0/24".into()],
