@@ -480,15 +480,25 @@ impl Broker {
     /// like every other broker emit). A no-op if the gateway isn't currently
     /// connected (nothing registered) or the channel is full.
     ///
-    /// **A dropped directive is NOT retried.** Nothing re-emits `KeyRotated`
-    /// for a still-sentinel `pending` row: `sweep_rotations` does not, and
-    /// `projection::emit_key_rotated` fires only on rotation initiate,
-    /// `Admin.RotateKey`, `Sync.SubmitEpochKey`, and the promote / retire /
-    /// abort arms of `drive_rotation_for`. So a `try_send` that finds the
-    /// channel full, or a gateway not connected at that instant, drops the
-    /// whole rotation until the controller's own `Abort` (`ABORT_AFTER`) and
-    /// the next timer tick. (An earlier version of this comment claimed the
-    /// sweep/timer re-emits on subsequent ticks. It does not.)
+    /// **A dropped directive is NOT retried.** `projection::emit_key_rotated`
+    /// has seven call sites: rotation-timer initiate, `Admin.RotateKey`,
+    /// `Sync.SubmitEpochKey`, the promote / retire / abort arms of
+    /// `drive_rotation_for`, and `sweep_rotations`' orphan-retire. Read that
+    /// last one carefully — **the sweep DOES emit `KeyRotated`, but only after
+    /// retiring an orphan `retiring` row, never for a still-sentinel `pending`
+    /// row**, which is precisely what a dropped directive leaves behind. So a
+    /// `try_send` that finds the channel full, or a gateway not connected at
+    /// that instant, drops the whole rotation until the controller's own
+    /// `Abort` (`ABORT_AFTER`) and the next timer tick.
+    ///
+    /// **Do not carry this over from the punch path.** `Broker::periodic_sweep`
+    /// really does re-emit `PunchDirective`s — every 5s, bounded per pair by
+    /// `MAX_PERIODIC_ATTEMPTS` — so "the broker re-emits on its sweep" is TRUE
+    /// of punch and FALSE of rotation. That sentence has already been read off
+    /// one path onto the other. Nothing re-punches a rotation.
+    ///
+    /// (An earlier version of this comment claimed the rotation sweep/timer
+    /// re-emits `KeyRotated` on subsequent ticks. It does not.)
     pub fn send_rotate_if_pending(&self, gateway_id: i64, keys: &[(i64, String, String)]) {
         // Take the NEWEST row of any state, then direct it only if it is itself
         // a sentinel. "The newest row is a sentinel" is the invariant; a
