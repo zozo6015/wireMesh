@@ -44,6 +44,12 @@ on:
     paths: *build_paths
   workflow_dispatch: {}
 
+# Duplicate runs on the same ref were unguarded before B4. `cancel-in-progress`
+# is FALSE here on purpose: these builds push by digest and a cancelled run can leave a half-published manifest.
+concurrency:
+  group: container-images-${{ github.ref }}
+  cancel-in-progress: false
+
 env:
   REGISTRY: ghcr.io
 

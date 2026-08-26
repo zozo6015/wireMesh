@@ -78,7 +78,7 @@ Progress and the current release are tracked in [`docs/progress.html`](docs/prog
 
 ## Project status
 
-Every cycle below is complete and released. The done-bars are integration tests run by hand in the privileged dev container (see [Building & developing](#building--developing)). **No CI job runs any test** — the three workflows build container images, cut releases, and hold a dispatch-only CodeQL job, and none of them invokes `cargo test`. Fixing that is a tracked 1.0 blocker; until it is, every "shipped" below rests on a human having run the suite locally.
+Every cycle below is complete and released. The done-bars are integration tests run by hand in the privileged dev container (see [Building & developing](#building--developing)). **CI runs the suite on every pull request** ([`ci.yml`](.github/workflows/ci.yml)): `cargo fmt --check` and `cargo clippy -D warnings` over both workspaces *and* the feature-gated targets, a privileged fast sweep, and three netns jobs covering the eBPF/nftables conformance suite, the gateway data-plane done-bars, and the key-rotation done-bars on a runner of their own. Every job runs inside the `dev/Dockerfile` image with the checkout at `/work` — the same shape as `./dev.sh` — and every privileged job is gated by [`dev/doctor.sh`](dev/doctor.sh), so an unsupported runner fails on a named probe rather than on a confusing test error. A nightly [`cold-build.yml`](.github/workflows/cold-build.yml) rebuilds both Dockerfiles with `--no-cache`, re-verifies the declared MSRV, and checks that the dev image and the release builder still agree on the compiler.
 
 | Cycle | Scope | Status |
 |---|---|---|
@@ -163,11 +163,15 @@ The workspace run. Network tests are serial, and long runs want a timeout:
 
 **Run that inside the container, not on your host.** It is not a pure-userspace run: `wiremesh-enforcer`'s tests are ungated and genuinely load and attach eBPF on a netns WireGuard device, so they fail loudly anywhere unprivileged.
 
-**Two different flags gate the rest, and one of them fails quietly.** `wiremesh-testkit`'s netns lab and its enforcement-conformance suite are behind that crate's `netns` feature, which the crates needing it already enable. The gateway's own data-plane done-bars — the mesh milestone, the NAT and relay matrices, key rotation, routes and enforcement — are behind a *different* flag, `netns-tests`, on `wiremesh-gateway` alone. That is the one to remember: 14 of the gateway crate's 45 test files sit behind it, and without it they compile to zero tests while `cargo test` prints a green summary that proves nothing.
+**Two different flags gate the rest, and one of them fails quietly.** `wiremesh-testkit`'s netns lab and its enforcement-conformance suite are behind that crate's `netns` feature, which the crates needing it already enable. The gateway's own data-plane done-bars — the mesh milestone, the NAT and relay matrices, key rotation, routes and enforcement — are behind a *different* flag, `netns-tests`, on `wiremesh-gateway` alone. That is the one to remember: 14 of the gateway crate's 48 test files sit behind it, and without it they compile to zero tests while `cargo test` prints a green summary that proves nothing.
 
 ```sh
 ./dev.sh run "cd /work && cargo test -p wiremesh-gateway --features netns-tests -- --test-threads=1 --nocapture"
 ```
+
+The per-crate doctest inventory is pinned by [`dev/doctest-counts.txt`](dev/doctest-counts.txt) and checked in CI: `cargo test --doc` exiting 0 proves the doctests that exist compile, not that the same ones exist, and drift in either direction is a bug — one appearing usually means prose that rustdoc started compiling (a closed Markdown list turns an indented paragraph into a code block), one vanishing is a lost test. Regenerate the table deliberately, from a real run, with [`dev/doctest-counts.sh`](dev/doctest-counts.sh).
+
+Which gated suite runs in which CI job is decided by one script, [`dev/netns-split.sh`](dev/netns-split.sh) — `check` fails if a gated file is named there but has been renamed or un-gated, so a newly added netns test cannot silently run in no job at all. It detects gating by the `#![cfg(feature = "netns-tests")]` inner attribute **at column 0**, never by a substring match: `tests/punch_endpoint_driven.rs` names the attribute only inside a doc comment and is a plain unit test, which is why a naive grep counts 14 instead of 13.
 
 `crates/wiremesh-enforcer-ebpf` ships its own `[workspace]` (the aya template's, which cargo forbids nesting), so it is excluded from the root workspace — build and test it from its own directory.
 
@@ -177,7 +181,7 @@ Requirements: Docker (Desktop or Engine); the image bundles the Rust toolchain, 
 
 Toward **1.0** — the full inventory, with sizings, is in the [release-scope document](docs/research/2026-08-11-v1.0-release-scope.md):
 
-- **Retire the open gates.** Measure G-2 throughput on real hardware; close the rotation wedge and give `RotateKey` a `fabricctl` wrapper so key rotation is both safe and reachable; stand up CI that actually runs the test suite.
+- **Retire the open gates.** Measure G-2 throughput on real hardware; close the rotation wedge and give `RotateKey` a `fabricctl` wrapper so key rotation is both safe and reachable.
 - **Make the release trustworthy.** Signed artifacts and an install script that verifies before it executes; `SECURITY.md`, `CONTRIBUTING.md`, a published threat model, and third-party licence attribution.
 - **Finish the documentation.** A quickstart that goes segment → token → enroll → policy → verified flow on bare metal, a `fabricctl` reference, a policy-DSL reference, and real runbooks (restore, CA rotation, upgrade, component replacement).
 - **Decide the open scope items.** The client peer (build it or move G-4a/X-8 past 1.0), and the OpenBao/Vault reference provider for the trust seams.
