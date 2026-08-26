@@ -126,6 +126,30 @@ grepping a log from `f3f743a` onward wants the new names.)
 the CI runner was loaded and this host was not. The load-bearing evidence is
 the code ordering plus the two corroborations above, not the green runs.
 
+### Deliberate-load attempt (3 runs, also green)
+
+To try to widen the window on purpose: `nproc` = 8, and **24 busy loops**
+(`sha256sum /dev/zero`, 3× oversubscription) were started immediately before
+each run and killed after. The test binary was built **first, unloaded**, so
+the load fell on the test rather than on compilation.
+
+```
+LOAD_RUN_1  ok. 1 passed   28.93s   (unloaded baseline ≈ 15.29s)
+LOAD_RUN_2  ok. 1 passed   28.14s   (unloaded baseline ≈ 14.67s)
+LOAD_RUN_3  ok. 1 passed   26.86s   (unloaded baseline ≈ 14.02s)
+```
+
+The load unambiguously bit — wall-clock roughly **doubled** — and the window
+still never opened. That is not a null result: it is positive evidence that
+**CPU starvation alone is insufficient** to reproduce this, which is what the
+`ctx.endpoint_commit` explanation predicts and a naive "slow machine" account
+does not. The window is opened by *contention on that mutex* from the
+observe/punch commit path, and a busy-loop workload does not contend for it.
+
+Reproducing it deliberately would mean holding `endpoint_commit` across the
+retire — i.e. instrumenting the product — which is out of scope for a test-side
+finding. The ordering argument and the two corroborations stand on their own.
+
 **Premise check on the reproduction.** The tasking said "gateway code unchanged
 since `941ed5f`". Not literally true — #94 merged in between, touching four
 gateway `src/` files. The reproduction is still valid: those four files total
