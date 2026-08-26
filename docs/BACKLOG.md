@@ -523,6 +523,48 @@ fixes: `docs/research/socket-leak-on-rebind.md`.
 
 ---
 
+### 35. Make-before-break is enforced on the data plane, not on the roster
+
+**Nothing orders roster withdrawal before key destruction.** A rotating gateway tears down
+its old epoch's Device &mdash; destroying that private key &mdash; on its OWN grace, while the
+controller independently decides when to stop advertising that epoch. No ordering constraint
+connects the two, so there is a window in which the roster names an epoch whose holder has
+already destroyed it.
+
+**The two clocks are independent by design.** The gateway retires after every peer has been
+corroborated live on the new tun for its `RETIRE_GRACE`; the controller retires
+`RETIRE_GRACE` after its own promote. `crates/wiremesh-gateway/src/main.rs` says the two are
+unrelated in as many words. **The window therefore exists on the healthy path and is merely
+short there** &mdash; this is not a regression, and it is not created by any single change.
+
+Measured at its widest by the orphan-sentinel mis-seed
+(`docs/research/orphan-sentinel-mis-seeds-tracker.md`): both `rotation_wedge` runs show the
+gateway logging `retired epoch 0 &mdash; old Device torn down (key gone)` while the
+controller's rows still hold `(0, real, "active")`, for roughly 390s. **PR1c shrinks the
+window back to its healthy size; nothing pins it there**, and no assertion covers it.
+
+**Exposure.** Established sessions are unaffected &mdash; peers that already cut over are on
+the new epoch. The exposure is any peer that has NOT: a gateway enrolling, reconnecting, or
+re-reading the roster inside the window receives a key that no longer exists and cannot
+establish a session with the rotating gateway.
+
+**Why the obvious fix is blocked.** Gating the gateway's retire on "the roster no longer
+lists this epoch" requires a capability the gateway does not have: the declarative
+`KeyRotated` delta **self-skips the subject gateway**, so a gateway cannot see its own key
+rows &mdash; see the `ChangeEvent::KeyRotated` arm in
+`crates/wiremesh-controller/src/broker.rs`, which states that it "can never learn of its own
+rotation that way". Closing this therefore depends on first giving a gateway sight of its own
+roster entry; it is not a local change on either side.
+
+**Family.** Files beside the promote-side gap already recorded in
+`crates/wiremesh-gateway/src/epochkeys.rs`, whose doc comment notes that the controller's
+ack-less grace-promote "is NOT reconciled down into" the local lifecycle. Same shape:
+**lifecycle divergence between the two sides, each correct on its own clock.** That one is the
+promote end; this is the retire end.
+
+**Phase C.** Ranked below (C-drop)/(E). Not R13, though R13 aggravates it &mdash; a re-armed
+rotation timer opens this window on a schedule rather than only when an operator rotates.
+
 ## Gateway / data plane
 
 ### 12. Fabric routes carry no `src`

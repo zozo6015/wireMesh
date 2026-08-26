@@ -40,7 +40,9 @@ use wiremesh_proto::v1::{
 };
 
 use crate::broker::{Broker, RegistrationGuard, PUNCH_CHANNEL_CAPACITY};
-use crate::db::{is_usable_candidate_endpoint, CasOutcome, DropPendingOutcome, GatewayIdentity};
+use crate::db::{
+    is_usable_candidate_endpoint, CasOutcome, DropPendingOutcome, GatewayIdentity, GatewayKeyRow,
+};
 use crate::db_async::DbHandle;
 use crate::projection::{self, ChangeEvent};
 use crate::rotation::{self, RotationDecision, RotationState};
@@ -303,6 +305,51 @@ pub(crate) struct RotationTracker {
     ///    fresh tracker rebuilt toward the same epoch number while I was
     ///    awaiting".
     installed_at: Instant,
+}
+
+/// The LIVE rotation's pending row: the `pending` row with the **highest** epoch, paired
+/// with the current `active` epoch if there is one.
+///
+/// # Why highest-pending, and not "the first pending row"
+///
+/// `.find(state == "pending")` over a snapshot ordered `epoch ASC` returns the LOWEST pending
+/// epoch. That is only ambiguous when two `pending` rows coexist — which a gateway-side
+/// rotation abort makes routine: the abandoned rotation's sentinel row survives until the
+/// controller's own `ABORT_AFTER`, and a rotation started inside that window adds a second.
+/// The tracker was then seeded on the ORPHAN, the live rotation's `EpochAck` named a
+/// different epoch and was dropped, and `decide` — which only ever looks at
+/// `tracker.pending_epoch` — never examined the live epoch's real key at all. See
+/// `docs/research/orphan-sentinel-mis-seeds-tracker.md`.
+///
+/// # Why NOT the broker's selector, which looks like the same question
+///
+/// `Broker::send_rotate_if_pending` takes the max over ALL rows and directs it only if it is a
+/// sentinel. **That shape is wrong here**, and the discriminating state is
+/// `{1 sentinel pending, 2 active}` — an orphan left behind after the live rotation promoted.
+/// There the newest row is `active`, so a max-over-all selector seeds NOTHING, `decide` is
+/// never asked about the orphan, `ABORT_AFTER` never fires for it, `Db::drop_pending_epoch` is
+/// never called, and the row becomes permanent — at which point
+/// `Db::gateways_with_rotation_state` keeps that gateway out of `initiate_due_rotations`
+/// **forever**. The two selectors answer different questions: the broker asks "is there a NEW
+/// rotation to direct", this asks "which pending row is the LIVE rotation".
+///
+/// # Seeding a tracker on a sentinel is deliberate
+///
+/// It can never promote — `decide` rule 2 returns before rules 3 or 4 can propose one, so
+/// `Db::promote_epoch` is not even called on that path. Its purpose is that it is the orphan's
+/// **only garbage collector**: rule 2 reaches `Abort` at `ABORT_AFTER`, and the `Abort` arm's
+/// `Db::drop_pending_epoch` removes the row. Do not "optimise away" the sentinel case.
+fn select_live_pending(keys: &[GatewayKeyRow]) -> Option<(u32, Option<u32>)> {
+    let pending_epoch = keys
+        .iter()
+        .filter(|(_, _, state)| state == "pending")
+        .map(|(epoch, _, _)| *epoch as u32)
+        .max()?;
+    let prior_active_epoch = keys
+        .iter()
+        .find(|(_, _, state)| state == "active")
+        .map(|(epoch, _, _)| *epoch as u32);
+    Some((pending_epoch, prior_active_epoch))
 }
 
 /// May a held [`RotationTracker`] be evicted, given a `gateway_key` snapshot
@@ -786,19 +833,14 @@ async fn seed_and_record_epoch_acks(
     // row (S3, BACKLOG item 5) — NO `.unwrap_or(0)`.
     let mut seeds: Vec<RotationSeed> = Vec::with_capacity(touched_rotating_gateways.len());
     for &rotating_id in &touched_rotating_gateways {
-        let seed =
-            match db.all_keys_for_gateway(rotating_id).await {
-                Ok(keys) => keys.iter().find(|(_, _, state)| state == "pending").map(
-                    |(pending_epoch, _, _)| {
-                        let prior_active_epoch = keys
-                            .iter()
-                            .find(|(_, _, state)| state == "active")
-                            .map(|(epoch, _, _)| *epoch as u32);
-                        (*pending_epoch as u32, prior_active_epoch)
-                    },
-                ),
-                Err(_) => None,
-            };
+        let seed = match db.all_keys_for_gateway(rotating_id).await {
+            // ONE consumer here, not two: this site feeds the seed only. It has no
+            // `evict_decision` call and must not acquire one — the staleness arbitration
+            // belongs to `drive_rotation_for` and `sweep_rotations`, which hold the
+            // read-instant this path does not have.
+            Ok(keys) => select_live_pending(&keys),
+            Err(_) => None,
+        };
         seeds.push((rotating_id, seed));
     }
 
@@ -829,8 +871,39 @@ async fn seed_and_record_epoch_acks(
         for ack in epoch_acks {
             let rotating_id = ack.peer_gateway_id as i64;
             if let Some(tracker) = rotations.get_mut(&rotating_id) {
-                if ack.epoch == tracker.pending_epoch && ack.live {
-                    tracker.live_acks.insert(reporting_gateway_id as u64);
+                if ack.epoch == tracker.pending_epoch {
+                    if ack.live {
+                        tracker.live_acks.insert(reporting_gateway_id as u64);
+                    }
+                } else {
+                    // TEST ANCHOR — and note what is and is NOT pinned.
+                    // `an_ack_for_an_unknown_epoch_changes_nothing` pins that this branch
+                    // changes no state; it deliberately does NOT assert this string, because
+                    // the controller logs with `eprintln!` and the in-process tests cannot
+                    // capture their own stderr (that test's doc comment says so). So this
+                    // text is an OPERATOR's grep target with no test guarding its wording:
+                    // if you reword it, nothing goes red, and whoever is grepping during an
+                    // incident finds nothing. Change it only deliberately.
+                    //
+                    // An ack naming an epoch the tracker does not know used to be
+                    // dropped in silence — no log, no counter — which is why the orphan
+                    // mis-seed (see `select_live_pending`) presented as "the controller
+                    // simply never promotes" and had to be diagnosed from a database row
+                    // dump. Names BOTH epochs and BOTH gateways because either half alone
+                    // is unactionable: the ack's epoch says what the peer saw, the
+                    // tracker's says what the controller is waiting for, and the gap
+                    // between them is the finding.
+                    //
+                    // Log ONLY. Do not evict or rebuild the tracker here: a promoted
+                    // tracker still owes a `Retire` under `RETIRE_GRACE`, and removing it
+                    // hands a live `retiring` row to `sweep_rotations`' grace-free step-3
+                    // orphan path — the documented 30s-to-~0 collapse.
+                    eprintln!(
+                        "wiremesh-controller: ignoring EpochAck(epoch={}) from gateway \
+                         {reporting_gateway_id} for gateway {rotating_id}: the rotation in \
+                         flight is epoch {}",
+                        ack.epoch, tracker.pending_epoch
+                    );
                 }
             }
         }
@@ -950,10 +1023,13 @@ pub(crate) async fn drive_rotation_for(
     // The DB's current `pending` epoch for this gateway, if any — read off
     // the `keys` snapshot already in hand, so the staleness check below
     // costs no extra query.
-    let db_pending_epoch: Option<u32> = keys
-        .iter()
-        .find(|(_, _, state)| state == "pending")
-        .map(|(epoch, _, _)| *epoch as u32);
+    // ONE selection, TWO consumers below: `evict_decision`'s staleness input and the lazy
+    // seed. They must not be computed separately — if the seed moved to the newest pending
+    // row while the evict input stayed on the first, the tracker and the staleness check
+    // would disagree every tick, evicting and rebuilding the SAME epoch and resetting
+    // `started_at` with it, so no grace could ever elapse. Same red, subtler cause.
+    let live_pending = select_live_pending(&keys);
+    let db_pending_epoch: Option<u32> = live_pending.map(|(epoch, _)| epoch);
 
     // --- Critical section 1: decide. NO `.await` below until the drop. ---
     let plan = {
@@ -971,13 +1047,10 @@ pub(crate) async fn drive_rotation_for(
         }
 
         if !rotations.contains_key(&rotating_gateway_id) {
-            if let Some(pending_epoch) = db_pending_epoch {
-                // (S3, BACKLOG item 5) NO `.unwrap_or(0)`: a snapshot with no
-                // `active` row must seed `None`, not epoch 0.
-                let prior_active_epoch = keys
-                    .iter()
-                    .find(|(_, _, state)| state == "active")
-                    .map(|(epoch, _, _)| *epoch as u32);
+            // Same `live_pending` the evict input above came from — see its comment.
+            // `prior_active_epoch` is `Option<u32>`: a snapshot with no `active` row seeds
+            // `None`, never epoch 0 (S3, BACKLOG item 5).
+            if let Some((pending_epoch, prior_active_epoch)) = live_pending {
                 let now = Instant::now();
                 rotations.insert(
                     rotating_gateway_id,
@@ -1376,8 +1449,9 @@ pub(crate) async fn sweep_rotations(
         // doing it here too is what keeps a gateway holding BOTH a `pending`
         // and a `retiring` row shielded from step 3's immediate, grace-free
         // orphan path if that call's DB read happens to fail.)
-        if let Some((pending_epoch, _, _)) = keys.iter().find(|(_, _, state)| state == "pending") {
-            let pending_epoch = *pending_epoch as u32;
+        // ONE selection, TWO consumers, exactly as in `drive_rotation_for`: `evict_decision`'s
+        // staleness input and the lazy seed below. See `select_live_pending`.
+        if let Some((pending_epoch, prior_active_epoch)) = select_live_pending(&keys) {
             let mut guard = rotations.lock().await;
             // (Second-rotation stranded tracker) Same check-and-evict as
             // `drive_rotation_for`, through the same `evict_decision` — same
@@ -1397,12 +1471,6 @@ pub(crate) async fn sweep_rotations(
                 guard.remove(&gateway_id);
             }
             if !guard.contains_key(&gateway_id) {
-                // (S3, BACKLOG item 5) NO `.unwrap_or(0)`: a snapshot with no
-                // `active` row must seed `None`, not epoch 0.
-                let prior_active_epoch = keys
-                    .iter()
-                    .find(|(_, _, state)| state == "active")
-                    .map(|(epoch, _, _)| *epoch as u32);
                 let now = Instant::now();
                 guard.insert(
                     gateway_id,
