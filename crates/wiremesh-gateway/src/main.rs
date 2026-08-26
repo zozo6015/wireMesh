@@ -4973,6 +4973,16 @@ async fn handle_rotate_inner(
     });
 
     sync::submit_epoch_key(client, n, new_key.pubkey_b64.clone()).await?;
+    // TEST ANCHOR: tests/rotation_wedge.rs greps "Role A minted epoch {n} on"
+    // (presence for the post-unwind rotation, absence for a re-mint of the
+    // aborted epoch); rewording requires updating the test in the same change.
+    //
+    // A PAIRED pin, not an absence-only one like STALL_WARN_MARKER: the
+    // presence assertion fails loudly on a reword, the absence assertion
+    // passes silently. What makes the comment earn its place either way is
+    // that `rotation_wedge.rs` is a `netns-tests` done-bar — it does not run
+    // on the machine of whoever rewords this line, so the coupling has to be
+    // discoverable HERE, at edit time, or it is discovered in CI at best.
     eprintln!(
         "wiremesh-gateway: Role A minted epoch {n} on {new_tun}:{new_port}, submitted pubkey; \
          awaiting rx-corroborated session to flip routes"
