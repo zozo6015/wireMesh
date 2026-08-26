@@ -78,7 +78,7 @@ So the code is right. The *fixture* is wrong: `rich_state()` (:98) builds two pe
 they were legible stand-ins in a test that is about **policy IR bytes**, where the peer
 half exists only to prove substitution does not eat it.
 
-## Why it went unnoticed for 16 days and five releases
+## Why it went unnoticed for 12 published releases (13 tags; v0.10.0 was tagged but never published) across 16 days
 
 Three belts, and this target is in none of them:
 
@@ -94,9 +94,10 @@ Three belts, and this target is in none of them:
    calls it a tracked 1.0 blocker).
 
 `cargo test -p wiremesh-gateway` with no target flag — which builds every `tests/*.rs`
-— was the missing run. Between v0.8.0 and v0.11.0 that is **13 releases**
-(v0.8.0, v0.9.0, v0.9.1, v0.9.2, v0.10.0–v0.10.7, v0.11.0) over 16 days in which a red
-test shipped unobserved. The six *unit* fixtures broken by the same commit were caught
+— was the missing run. Between v0.8.0 and v0.11.0 that is **12 published releases
+(13 tags; v0.10.0 was tagged but never published) across 16 days** in which a red test
+shipped unobserved — v0.8.0, v0.9.0, v0.9.1, v0.9.2, v0.10.1–v0.10.7, v0.11.0 on
+`gh release list`, with the v0.10.0 tag having no release attached. The six *unit* fixtures broken by the same commit were caught
 the same afternoon, because `--lib` was run. Same rot, same day, same author — only the
 belt differed.
 
@@ -132,6 +133,15 @@ asserting that an *undecodable* key survives the round trip — the opposite of 
 and not what any of them says. They are named `*_persisted_verbatim` /
 `*_preserves_peers_relays_serials_and_revision` / `*_preserves_the_device_half`; the
 subject is the device half surviving policy substitution, not key content.
+
+**Forward warning — the same rot is already staged in one more field.** `rich_state()`
+still carries `revoked_serials: vec!["AA:BB".into(), "CC:DD".into()]`: the identical
+placeholder shape, in a field nothing validates *yet*. This codebase adds ingest filters
+field by field (item 1 `candidates`, item 23 `active_pubkey_b64`, item 24 `allowed_ips`
+— three so far, two of them in one commit), so if a serial-format filter ever lands on
+`revoked_serials`, these same four tests go red in exactly this way, and the fix will
+again be a fixture correction rather than a change to the filter. Anyone landing that
+filter should expect them and reach for realistic serials, not for the assertions.
 
 **Coverage gap left open (not filled here):** no test in this file pins the *filter's*
 own behaviour on the fail-static path — i.e. that a hand-written `state.json` carrying
