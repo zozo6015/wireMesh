@@ -18,6 +18,18 @@
 /// | `1.1.x`  | `1.0.0`  | previous minor, in contract |
 /// | `1.2.x`  | `1.1.0`  | previous minor, in contract |
 ///
+/// Two properties the table implies and the clamp test pins explicitly, both
+/// confirmed against X-6:
+///
+/// * **The PATCH component never moves the floor.** `1.2.0`, `1.2.1` and
+///   `1.2.99` all advertise `1.1.0` — the window is measured in minors, so a
+///   patch release must not silently narrow or widen what its predecessor
+///   advertised. This function never parses the patch at all.
+/// * **The window is one minor wide and NON-CUMULATIVE.** `1.2.x` advertises
+///   `1.1.0`, not `1.0.0`: the floor tracks the current release rather than
+///   accumulating every version ever supported, so it rises as the fabric
+///   moves forward instead of stretching indefinitely behind it.
+///
 /// **DERIVED, never written down.** The literal this replaced was `"0.10.0"`,
 /// chosen as "one minor back from v0.11.0" — a version that did not exist
 /// yet. That is the tell: a hand-written floor is correct only for the
