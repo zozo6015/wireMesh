@@ -125,7 +125,13 @@ warned it would.
 
 Two things stopped it being recorded as one. `relay_matrix`'s `case4` — unrelated to the
 change — also failed once and passed twice in the same batch, and the relay suite took 305s
-on the red run versus 228s on a green one. That is a load signature, not a code signature.
+on the red run versus 228s on a green one. That is a load signature, not a code signature. (`case4`'s own fragility was characterised separately on 2026-08-26 and turned out to be
+**bimodal rather than load-driven** — it fired on a provably uncontended host, recovering in
+~66s or not within the test's 125s bound. See
+[`relay-matrix-case4-bimodal-flake.md`](relay-matrix-case4-bimodal-flake.md); a case-4 red
+alongside a rotation red is therefore **two distinct observed failure signatures**, not one
+shared load story — distinct is what the evidence supports; a shared underlying dependency
+has not been ruled out.)
 
 ### The experiment
 
