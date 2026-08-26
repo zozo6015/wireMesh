@@ -789,9 +789,31 @@ async fn a_failed_rotation_does_not_wedge_the_gateway() {
         "gwA SM-reset lines (not asserted): {:?}",
         pa.stderr_grep(SM_RESET_MARKER)
     );
+    // Every claim here is INTERPOLATED from a measured value, none asserted as
+    // a literal. It used to read "phase=idle, aborts=1, links back to baseline,
+    // no pending epoch" as fixed text, and under sabotage 1 — the failure this
+    // whole test exists to catch — it printed `phase=idle` while the phase
+    // reading a few lines above said `overlapping`. The log contradicted itself
+    // at the first place a triager looks.
+    //
+    // The general rule, worth more than this one line: a summary printed AFTER
+    // assertions must not restate those assertions as literals. Three of the
+    // four claims happened to be safe, but only by ADJACENCY — the assertions
+    // above enforce them, so reordering or relaxing any one would make its
+    // literal lie silently. The fourth, the phase, is deliberately NOT
+    // assertion-backed (it is evidence-only so sabotage 1 lands its red on step
+    // (iv) instead of here), which is exactly why it was the one that lied.
+    let extra_links_now: Vec<String> = link_names(&gwa)
+        .difference(&base_links_a)
+        .cloned()
+        .collect();
     eprintln!(
-        "POST-ABORT: phase=idle, aborts=1, links back to baseline, no pending epoch. \
+        "POST-ABORT: phase={:?}, aborts={:?}, extra links vs baseline={:?}, pending epochs={:?}. \
          Store: {:?}",
+        phase_after_abort,
+        scrape_rotation_aborts(&metrics_a),
+        extra_links_now,
+        pending,
         store_after_abort.epochs
     );
 
