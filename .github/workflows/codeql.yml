@@ -75,6 +75,13 @@ jobs:
     steps:
     - name: Checkout repository
       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      with:
+        # No git credential persisted into `.git/config`: nothing in this job
+        # runs an authenticated git operation, and a persisted token is
+        # reachable by any later step or action in the job. Same hardening as
+        # the other workflows (B4 §6.2). `git describe`-style local reads are
+        # unaffected.
+        persist-credentials: false
     # Add any setup steps before running the `github/codeql-action/init` action.
     # This includes steps like installing compilers or runtimes (`actions/setup-node`
     # or others). This is typically only required for manual builds.

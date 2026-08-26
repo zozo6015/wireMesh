@@ -55,6 +55,27 @@ jobs:
         with:
           persist-credentials: false
       - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      # STAMP BEFORE THE BUILD. `release_version_stamping.rs`'s
+      # `every_job_that_compiles_a_shipped_binary_stamps_the_version_first`
+      # states the rule this obeys: stamping is per-JOB, because each job gets
+      # its own runner and its own checkout, so an unstamped compile bakes the
+      # `0.1.0` placeholder into whatever it produces.
+      #
+      # THIS JOB GENUINELY NEEDS IT, and the guard does NOT currently catch it.
+      # The release matrix entry builds `deploy/docker/Dockerfile` target
+      # `export`, whose `builder` stage runs `cargo build --release
+      # --workspace` -- every shipped binary. The guard's classifier compares
+      # `with.file` against the literal path, and this step passes
+      # `${{ matrix.file }}`, so the expression never matches and the job is a
+      # FALSE NEGATIVE: a job that really does compile shipped binaries and
+      # that the invariant cannot see. Do not remove this step on the grounds
+      # that the test is green without it.
+      #
+      # The version is a deliberately non-colliding prerelease: these images
+      # are never published (`push: false`), so stamping a real release number
+      # would be a lie in the other direction.
+      - name: stamp a non-colliding version before compiling
+        run: bash scripts/set-version.sh "0.0.0-cold-$(git rev-parse --short HEAD)"
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
         with:
           context: ${{ matrix.context }}
@@ -86,6 +107,24 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
+      # Stamped to satisfy `release_version_stamping.rs`'s per-job rule, and
+      # recorded plainly: THIS JOB COMPILES NOTHING. It greps two `FROM` lines
+      # and `docker run`s the two prebuilt BASE images to print
+      # `rustc --version`; there is no `cargo build`, no `docker build` and no
+      # build-push-action anywhere in it, so no artifact exists to carry a
+      # version. The guard's classifier matches any `run:` block naming the
+      # release Dockerfile alongside the word "build", and this one does so
+      # incidentally -- via the grep pattern `'^FROM .* AS builder'` and two
+      # comments. That is a FALSE POSITIVE, the mirror of the false negative
+      # noted on the `cold` job above.
+      #
+      # Kept rather than argued away: the step costs milliseconds, it keeps the
+      # invariant's job scan free of exceptions, and an invariant with no
+      # exception list is worth more than one carrying a special case for a job
+      # that would need stamping the moment it ever did compile something. The
+      # precision fix belongs to the guard, not here.
+      - name: stamp a non-colliding version (see note above)
+        run: bash scripts/set-version.sh "0.0.0-parity-$(git rev-parse --short HEAD)"
       - name: dev-image rustc == release-builder rustc
         run: |
           set -euo pipefail

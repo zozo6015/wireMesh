@@ -309,9 +309,17 @@ jobs:
           # observed an empty world and named the wrong cause. Keep both, and
           # keep the local regeneration command in `README.md` on `2>&1` too,
           # so the log this parses has one shape everywhere.
+          #
+          # `--no-fail-fast` for the same reason, and it is NOT redundant here:
+          # `--workspace` is eleven crates, so without it one crate's failing
+          # doctest stops the rest, the tee'd log loses their `Doc-tests` rows,
+          # and the inventory step reds claiming they VANISHED -- the
+          # truncated-log class a third time, in the third of three places it
+          # can occur. The ebpf `--doc` step below is a single crate and does
+          # not need it.
           set -o pipefail
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
-            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 --workspace --doc' 2>&1 | tee doc-root.log
+            "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 --no-fail-fast --workspace --doc' 2>&1 | tee doc-root.log
       # The sub-workspace has its own `Cargo.lock` and is invisible to the
       # root, so its doctests need their own invocation like fmt and clippy do.
       - name: cargo test --doc (crates/wiremesh-enforcer-ebpf)
