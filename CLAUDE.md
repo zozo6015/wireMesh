@@ -189,16 +189,59 @@ gate** — the state is unreachable from any current mutation path and arises on
 for a key-row set with no `active` row, which `Db::rotate_key` deliberately
 tolerates. See `docs/BACKLOG.md` item 5.
 
+**Phase B, through v0.11.0.** Four things landed after S3, and the timer is
+still **OFF**:
+
+* **v0.10.4 — the broker directed the wrong epoch.** `send_rotate_if_pending`
+  took the *first* sentinel `pending` row over an `epoch ASC` snapshot, so an
+  orphan left by an aborted rotation stole the next directive. It now takes the
+  newest row of any state and directs it only if that row is itself a sentinel.
+  A sentinel *below* a real-keyed or active row is stale by construction.
+* **v0.10.5 — the tracker was seeded from that same orphan.** All three seed
+  sites now share `select_live_pending`, the **highest** `pending` row — a
+  different question from the broker's, and the difference is load-bearing:
+  on `{orphan sentinel, active}` the broker's shape would seed nothing, the
+  orphan would never be collected, and `initiate_due_rotations` would skip that
+  gateway permanently. `docs/research/orphan-sentinel-mis-seeds-tracker.md`.
+* **v0.10.6 — B2 route R1 closed.** A rotation failing at any fallible step now
+  unwinds synchronously and the next directive is honoured. Routes R2 and R3
+  remain open (`docs/BACKLOG.md` items 9 and 37).
+* **v0.10.7 — the `ROTATION STALLED` diagnostic** names the directive epoch
+  rather than `old_epoch + 1`.
+
+**B10 (v0.11.0): the v1.0 half is closed.** `client_version`, `max_ir_schema`,
+`controller_version` and `min_supported_version` are on the wire, persisted and
+additive — **stored and never consulted.** Nothing negotiates, nothing is
+gated, and a version-skewed fabric behaves exactly as it did before. Every
+consumer — X-6 skew enforcement, apply-time laggard gating, `fabricctl`
+flagging, skew CI — is Phase C (`docs/BACKLOG.md` item 42).
+
+**The rotation timer remains OFF**, unchanged by any of the above: R2 (the
+controller grace-promotes onto an epoch the gateway never cut over to) and R15
+(a blocked `submit_epoch_key` parks the sync loop) are both Phase C, and
+re-arming is revisited only after both close.
+
 Rotation research notes live in `docs/research/`
 (`second-rotation-stranded-tracker.md`,
 `port-authority-verification-the-shape-was-wrong.md`,
 `flake-direct-rotation-zero-drop.md`). Two cautions carried forward:
+**Two netns done-bars have distinct observed failure signatures, and they need
+different responses** — they are not one load story, and their similar
+percentages are coincidental rather than a shared population.
 `direct_rotation_is_zero_drop` fails **~42% under host load**, so one red run in
 isolation is NOT evidence of a regression — run an interleaved A/B against the
 parent commit before believing your change caused it. And **`RETIRE_GRACE`
 collapsing to ~0 has been reachable by three independent routes**, each of which
 looks like a simplification; `evict_decision`'s `None`-means-keep is pinned by
 unit tests whose failure messages say so.
+
+`relay_matrix`'s `case4_relay_leg_death_unwedges_direct_punch` is the second
+signature and is **not** a load story: on a provably uncontended host it is
+**bimodal** — green at ~66s with 0 defers, or the full 125s budget with 3/3
+defers, nothing in between — so **widening the budget cannot help it**, which
+is the opposite remedy from the one above. Roughly 1 in 3 in controlled
+repeats. `docs/research/relay-matrix-case4-bimodal-flake.md`, `docs/BACKLOG.md`
+item 45.
 
 **Relay ALPN (Phase B, D2 — owner ruling 2026-08-25).** v1.0 speaks
 `wiremesh-relay/0` **only, on both sides**: the shipped client offers `/0`
@@ -213,7 +256,8 @@ relay counts sessions per ALPN in its registration line
 in the shipped 1.0 relay or fleet-wide "zero `/0` sessions" could not start
 being measured until 1.1. Relay connect failures are now classified
 (`RelayConnectFailure`) at every fallible step of `Client::finish_connect` and
-rate-limited per (peer, relay) — `ensure_relay_transport` previously retried an
+rate-limited per (peer, relay) by
+`gateway/src/relay_connect_backoff.rs`, keyed `(gid, relay_id)` — `ensure_relay_transport` previously retried an
 unusable relay every tick forever with one indistinguishable line per attempt.
 See `docs/BACKLOG.md` item 19.
 
