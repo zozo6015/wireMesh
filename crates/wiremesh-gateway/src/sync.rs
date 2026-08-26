@@ -339,6 +339,8 @@ mod tests {
             policy_ir: vec![],
             policy_version: 2,
             revoked_serials: vec![],
+            controller_version: String::new(),
+            min_supported_version: String::new(),
         };
         match classify(Some(Body::Snapshot(snap)), &mut current).unwrap() {
             SyncEvent::State(ds) => {

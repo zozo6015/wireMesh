@@ -384,6 +384,7 @@ async fn enroll_relay_certs(h: &TestController, addr: &str, csr_tag: &str) -> te
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: addr.to_string(),
+            client_version: String::new(),
         })
         .await
         .expect("Enrollment.Enroll (relay path)")

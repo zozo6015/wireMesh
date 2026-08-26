@@ -105,6 +105,10 @@ fn snapshot_with(peers: Vec<Peer>) -> StateSnapshot {
         policy_version: 0,
         revoked_serials: vec![],
         relay_infos: vec![],
+        // (B10) Legacy defaults: this helper builds the snapshot a pre-B10
+        // controller sends, which is what these tests exercise.
+        controller_version: String::new(),
+        min_supported_version: String::new(),
     }
 }
 

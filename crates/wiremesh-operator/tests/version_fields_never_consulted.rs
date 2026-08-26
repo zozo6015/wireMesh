@@ -74,13 +74,19 @@ const ALLOWED: &[(&str, &str)] = &[
     // The schema DDL naming the column.
     ("crates/wiremesh-controller/src/db.rs", "SCHEMA_V4"),
     // The two snapshot builders stamping the controller's own pair.
-    ("crates/wiremesh-controller/src/projection.rs", "build_snapshot"),
+    (
+        "crates/wiremesh-controller/src/projection.rs",
+        "build_snapshot",
+    ),
     (
         "crates/wiremesh-controller/src/projection.rs",
         "build_relay_revocation_snapshot",
     ),
     // Surfacing the stored pair on the admin API (no flagging, no filtering).
-    ("crates/wiremesh-controller/src/services/admin.rs", "list_gateways"),
+    (
+        "crates/wiremesh-controller/src/services/admin.rs",
+        "list_gateways",
+    ),
     // The clients populating their own values.
     ("crates/wiremesh-gateway/src/enroll.rs", "run_enroll"),
     ("crates/wiremesh-gateway/src/sync.rs", "watch"),

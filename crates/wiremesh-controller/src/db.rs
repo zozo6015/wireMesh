@@ -4145,7 +4145,10 @@ mod cas_tests {
         let relay_name: String = conn
             .query_row("SELECT name FROM relay WHERE id = 3", [], |r| r.get(0))
             .expect("the seeded relay row must survive the migration");
-        assert_eq!(relay_name, "relay-a", "relay data must survive the migration");
+        assert_eq!(
+            relay_name, "relay-a",
+            "relay data must survive the migration"
+        );
 
         // The new columns exist and are NULL for a row that predates them —
         // the "never reported" state, which is the whole reason they are
@@ -4283,5 +4286,4 @@ mod cas_tests {
              never reported, which is the distinction this column exists for"
         );
     }
-
 }

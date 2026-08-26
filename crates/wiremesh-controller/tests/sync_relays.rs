@@ -295,6 +295,7 @@ async fn relay_enrollment_rejects_malformed_endpoint() {
         cidrs: vec![],
         wg_pubkey: String::new(),
         endpoint: "not-an-address".to_string(),
+        client_version: String::new(),
     })
     .await
     .expect_err("a malformed (non ip:port) relay endpoint must be rejected by Enrollment.Enroll");

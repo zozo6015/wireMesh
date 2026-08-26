@@ -114,6 +114,7 @@ async fn enroll_with_a_non_base64_wg_pubkey_is_rejected_and_does_not_consume_the
             cidrs: vec!["10.0.0.0/16".to_string()],
             wg_pubkey: BOGUS_NOT_B64.to_string(),
             endpoint: String::new(),
+            client_version: String::new(),
         })
         .await
         .expect_err(
@@ -139,6 +140,7 @@ async fn enroll_with_a_non_base64_wg_pubkey_is_rejected_and_does_not_consume_the
             cidrs: vec!["10.0.0.0/16".to_string()],
             wg_pubkey: VALID_32_BYTE_KEY.to_string(),
             endpoint: String::new(),
+            client_version: String::new(),
         })
         .await
         .expect(
@@ -165,6 +167,7 @@ async fn enroll_with_a_wrong_length_wg_pubkey_is_rejected_and_does_not_consume_t
             cidrs: vec!["10.1.0.0/16".to_string()],
             wg_pubkey: BOGUS_WRONG_LEN.to_string(),
             endpoint: String::new(),
+            client_version: String::new(),
         })
         .await
         .expect_err(
@@ -186,6 +189,7 @@ async fn enroll_with_a_wrong_length_wg_pubkey_is_rejected_and_does_not_consume_t
         cidrs: vec!["10.1.0.0/16".to_string()],
         wg_pubkey: VALID_32_BYTE_KEY.to_string(),
         endpoint: String::new(),
+        client_version: String::new(),
     })
     .await
     .expect("retrying the same token with a valid wg_pubkey must succeed");

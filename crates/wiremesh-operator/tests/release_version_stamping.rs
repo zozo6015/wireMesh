@@ -1080,7 +1080,10 @@ fn every_crate_that_reads_its_own_version_is_stamped() {
         }
     }
 
-    let unstamped: Vec<&String> = readers.iter().filter(|c| !run.stamped.contains(*c)).collect();
+    let unstamped: Vec<&String> = readers
+        .iter()
+        .filter(|c| !run.stamped.contains(*c))
+        .collect();
     assert!(
         unstamped.is_empty(),
         "these crates read their own `CARGO_PKG_VERSION` but are NOT stamped by \
@@ -1093,4 +1096,3 @@ fn every_crate_that_reads_its_own_version_is_stamped() {
         run.stamped
     );
 }
-

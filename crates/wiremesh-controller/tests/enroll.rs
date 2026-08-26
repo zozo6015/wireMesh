@@ -40,6 +40,7 @@ async fn enroll_issues_cert_then_token_is_single_use() {
             cidrs: vec!["10.0.0.0/16".into()],
             wg_pubkey: String::new(),
             endpoint: String::new(),
+            client_version: String::new(),
         })
         .await
         .unwrap()
@@ -64,6 +65,7 @@ async fn enroll_issues_cert_then_token_is_single_use() {
             cidrs: vec!["10.0.0.0/16".into()],
             wg_pubkey: String::new(),
             endpoint: String::new(),
+            client_version: String::new(),
         })
         .await
         .unwrap_err();
@@ -124,6 +126,7 @@ async fn token_bound_to_one_segment_cannot_enroll_into_another() {
             cidrs: vec!["10.1.0.0/16".into()],
             wg_pubkey: String::new(),
             endpoint: String::new(),
+            client_version: String::new(),
         })
         .await
         .unwrap_err();

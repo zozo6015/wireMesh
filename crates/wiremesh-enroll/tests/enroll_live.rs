@@ -1,7 +1,7 @@
 //! Live integration test: enroll against a real (in-process) controller and
 //! assert the returned identity material is a genuine signed leaf.
 
-use wiremesh_proto::v1::{CreateSegmentRequest, MintTokenRequest};
+use wiremesh_proto::v1::{CreateSegmentRequest, ListGatewaysRequest, MintTokenRequest};
 
 #[tokio::test]
 async fn enroll_redeems_token_and_returns_signed_leaf() {
@@ -64,44 +64,50 @@ async fn enroll_redeems_token_and_returns_signed_leaf() {
 }
 
 /// (B10 / X-6) The sentinel round-trip: whatever the CALLER passes as
-/// `client_version` is what reaches the controller's column.
+/// `client_version` is what reaches the controller.
 ///
-/// # Why a sentinel rather than a version comparison
+/// # Why a sentinel and not a version comparison
 ///
-/// The defect this pins is "`wiremesh-enroll` reads `env!("CARGO_PKG_VERSION")`
-/// itself instead of taking the caller's", and **no comparison of version
-/// VALUES can detect it**: every crate in this workspace carries
-/// `version = "0.1.0"` in git, and `scripts/set-version.sh` rewrites them only
-/// transiently inside a release job (see
-/// `wiremesh-operator/tests/release_version_stamping.rs`'s header). So
-/// `wiremesh-enroll`'s version and the gateway's are the SAME STRING in every
-/// local and CI run — "equals the caller's `CARGO_PKG_VERSION`" would pass on
-/// the buggy code, and "is never `0.1.0`" would fail on the correct code.
+/// The defect this pins is "`wiremesh-enroll` reads `env!(...)` itself instead
+/// of taking the caller's", and **no comparison of version VALUES can detect
+/// it**: every crate in this workspace carries `version = "0.1.0"` in git and
+/// `scripts/set-version.sh` rewrites them only transiently inside a release
+/// job, so this crate's version and the gateway's are the SAME STRING in every
+/// local and CI run. "Equals the caller's version" would pass on the buggy
+/// code; "is never 0.1.0" would fail on the correct code. A value no crate
+/// could carry sidesteps both.
 ///
-/// A value no crate could ever carry sidesteps that entirely: if it arrives in
-/// the column, the value was supplied by the caller and cannot have come from
-/// any `env!` expansion. That is the actual ruled property.
+/// Read back through `Admin.ListGateways` rather than the DB: this crate has
+/// no `rusqlite`, and the sentinel is non-empty so the NULL-versus-empty
+/// distinction that forces a raw read elsewhere does not arise here. The raw
+/// column IS asserted, for the legacy case, in
+/// `wiremesh-controller/tests/b10_version_fields.rs`.
 ///
-/// The complementary guard — that the string `CARGO_PKG_VERSION` appears
-/// nowhere under `crates/wiremesh-enroll/src/` — lives in
-/// `wiremesh-operator/tests/release_version_stamping.rs`. Neither substitutes
-/// for the other: this one proves the parameter is threaded, that one proves
-/// the macro has not crept back in beside it.
+/// The complementary guard — that this crate never names `CARGO_PKG_VERSION`
+/// at all — lives in `wiremesh-operator/tests/release_version_stamping.rs`.
+/// Neither substitutes for the other: this proves the parameter is threaded,
+/// that proves the macro has not crept back in beside it.
 #[tokio::test]
-async fn a_caller_supplied_client_version_reaches_the_stored_column() {
-    /// Deliberately not a valid semver a crate could hold, so it cannot be
-    /// confused with any real `CARGO_PKG_VERSION` in any build.
+async fn a_caller_supplied_client_version_reaches_the_controller() {
+    /// Deliberately not a version any crate could hold, so it cannot be
+    /// confused with a real `CARGO_PKG_VERSION` in any build.
     const SENTINEL: &str = "9.9.9-test-sentinel";
 
     let h = wiremesh_testkit::TestController::start().await;
-    let cidrs = vec!["10.9.0.0/16".to_string()];
-    let token = h
-        .admin_client()
+    let mut admin = h.admin_client().await;
+    admin
+        .create_segment(CreateSegmentRequest {
+            name: "aws".into(),
+            cidrs: vec!["10.0.0.0/16".into()],
+        })
         .await
-        .create_enrollment_token(wiremesh_proto::v1::CreateEnrollmentTokenRequest {
-            cidrs: cidrs.clone(),
-            ttl_seconds: 300,
-            kind: "gateway".to_string(),
+        .unwrap();
+
+    let cidrs = vec!["10.0.0.0/16".to_string()];
+    let token = admin
+        .mint_token(MintTokenRequest {
+            kind: "gateway".into(),
+            bound_cidrs: cidrs.clone(),
             rebind_segment_id: 0,
         })
         .await
@@ -122,30 +128,24 @@ async fn a_caller_supplied_client_version_reaches_the_stored_column() {
     .await
     .expect("enrollment should succeed against a live controller");
 
-    let db_path = h.data_dir().join("controller.db");
-    let gateway_id = out.gateway_id as i64;
-    let stored: Option<String> = tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open(&db_path).expect("second connection to the DB");
-        conn.busy_timeout(std::time::Duration::from_secs(5))
-            .expect("busy timeout");
-        conn.query_row(
-            "SELECT version FROM gateway WHERE id = ?1",
-            rusqlite::params![gateway_id],
-            |row| row.get(0),
-        )
-        .expect("the enrolled gateway row must exist")
-    })
-    .await
-    .expect("blocking DB read");
+    let listed = admin
+        .list_gateways(ListGatewaysRequest {})
+        .await
+        .expect("Admin.ListGateways")
+        .into_inner()
+        .gateways;
+    let me = listed
+        .iter()
+        .find(|g| g.id == out.gateway_id)
+        .expect("the gateway just enrolled must appear in the roster");
 
     assert_eq!(
-        stored.as_deref(),
-        Some(SENTINEL),
-        "the caller's `client_version` did not reach the column. Either the parameter is not \
-         threaded through to the `EnrollRequest`, or the controller's enrollment handler is \
-         not storing it. NOTE the sentinel is what makes this test meaningful: a value \
-         comparison could not tell a caller-supplied version from one `wiremesh-enroll` read \
-         out of its own `env!(\"CARGO_PKG_VERSION\")`, because every crate here is `0.1.0` in \
-         git and only a release job rewrites that"
+        me.version, SENTINEL,
+        "the caller's `client_version` did not reach the controller. Either the parameter is \
+         not threaded into the `EnrollRequest`, or the enrollment handler is not storing it. \
+         The SENTINEL is what makes this test meaningful: a version comparison could not \
+         tell a caller-supplied value from one this crate read out of its own \
+         `env!(\"CARGO_PKG_VERSION\")`, because every crate here is `0.1.0` in git and only \
+         a release job rewrites that"
     );
 }

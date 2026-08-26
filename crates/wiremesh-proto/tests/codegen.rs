@@ -24,6 +24,10 @@ fn snapshot_message_roundtrips() {
         policy_ir: vec![],
         policy_version: 0,
         revoked_serials: vec![],
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        controller_version: String::new(),
+        min_supported_version: String::new(),
     };
     let msg = SyncMessage {
         body: Some(Body::Snapshot(snap.clone())),
@@ -137,6 +141,10 @@ fn state_snapshot_relay_infos_roundtrips_multiple_relay_infos() {
         policy_ir: vec![],
         policy_version: 0,
         revoked_serials: vec![],
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        controller_version: String::new(),
+        min_supported_version: String::new(),
     };
 
     let bytes = snap.encode_to_vec();
@@ -255,6 +263,9 @@ fn enroll_request_endpoint_roundtrips() {
         cidrs: vec!["10.1.0.0/24".into()],
         wg_pubkey: "wgpubkey==".into(),
         endpoint: "203.0.113.9:51820".into(),
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        client_version: String::new(),
     };
     let bytes = with_endpoint.encode_to_vec();
     let decoded =
@@ -274,6 +285,9 @@ fn enroll_request_endpoint_roundtrips() {
         cidrs: vec![],
         wg_pubkey: "wgpubkey==".into(),
         endpoint: String::new(),
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        client_version: String::new(),
     };
     let bytes = no_endpoint.encode_to_vec();
     let decoded =
@@ -484,6 +498,10 @@ fn session_generation_roundtrips_on_watch_report_and_submit_epoch_key() {
 
     let watch = WatchRequest {
         session_generation: nonce,
+        // (B10) Pre-existing case: legacy defaults, so what this roundtrips
+        // is unchanged by the additions. The new fields have their own tests.
+        client_version: String::new(),
+        max_ir_schema: 0,
     };
     let decoded = WatchRequest::decode(watch.encode_to_vec().as_slice())
         .expect("decoding the encoded WatchRequest");
@@ -595,9 +613,10 @@ fn watch_request_decodes_with_the_version_fields_cleared() {
     legacy
         .encode(&mut legacy_buf)
         .expect("encoding a legacy WatchRequest");
-    let decoded = WatchRequest::decode(&legacy_buf[..])
-        .expect("a WatchRequest with the version fields absent MUST decode — proto3 defaults \
-                 are the legacy contract, and rejecting them breaks every pre-1.0 gateway");
+    let decoded = WatchRequest::decode(&legacy_buf[..]).expect(
+        "a WatchRequest with the version fields absent MUST decode — proto3 defaults \
+                 are the legacy contract, and rejecting them breaks every pre-1.0 gateway",
+    );
     assert_eq!(
         (decoded.client_version.as_str(), decoded.max_ir_schema),
         ("", 0),
@@ -629,7 +648,9 @@ fn state_snapshot_decodes_with_the_version_fields_cleared() {
         min_supported_version: String::new(),
     };
     let mut buf = Vec::new();
-    legacy.encode(&mut buf).expect("encoding a legacy StateSnapshot");
+    legacy
+        .encode(&mut buf)
+        .expect("encoding a legacy StateSnapshot");
     let decoded = StateSnapshot::decode(&buf[..]).expect(
         "a StateSnapshot with 9/10 absent MUST decode — that is exactly what a new gateway \
          receives from a controller that predates B10",

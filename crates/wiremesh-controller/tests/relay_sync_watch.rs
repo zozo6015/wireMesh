@@ -120,6 +120,7 @@ async fn enroll_relay_with_key(h: &TestController, endpoint: &str) -> RelayIdent
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: endpoint.to_string(),
+            client_version: String::new(),
         })
         .await
         .expect("Enrollment.Enroll (relay path) failed in enroll_relay_with_key")
@@ -171,6 +172,8 @@ async fn open_relay_watch(
         // real `wiremesh_relay::run_sync` sends.
         .watch(WatchRequest {
             session_generation: 0,
+            client_version: String::new(),
+            max_ir_schema: 0,
         })
         .await
         .map(|resp| resp.into_inner())
