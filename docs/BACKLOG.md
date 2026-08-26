@@ -622,7 +622,7 @@ promote end; this is the retire end.
 **Phase C.** Ranked below (C-drop)/(E). Not R13, though R13 aggravates it &mdash; a re-armed
 rotation timer opens this window on a schedule rather than only when an operator rotates.
 
-### 36. A `RotateDirective` fires exactly once, and nothing retries it
+### 36. A dropped `RotateDirective` recovers only on the next `KeyRotated`, with no upper bound
 
 `Broker::send_rotate_if_pending` is driven **only** by `ChangeEvent::KeyRotated`, and
 `projection::emit_key_rotated` has seven call sites: rotation-timer initiate,
