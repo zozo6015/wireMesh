@@ -541,6 +541,25 @@ alongside the `submit_epoch_key` hang route.
 
 **B2 closes the wedge; the timer remains off pending R2/R15 (Phase C).**
 
+### 34. Lost `RotateDirective` inside the unwind's port quarantine
+
+*Placement note: this belongs beside the fire-once `RotateDirective` item (C1), which is
+not filed yet &mdash; it is PR6's. Filed here, adjacent to item 9, because item 9's fix is
+what opens the window. Move it next to C1 when C1 lands.*
+
+**Lost `RotateDirective` inside the unwind's port quarantine.** `unwind_failed_rotation`
+step 2 calls `TunnelSet::tear_down` on `TunnelId::Own { epoch }`, which puts the reserved
+own-tun port (`base + OWN_TUN_PORT_OFFSET`) into `tunnelset::QUARANTINE` for 5s.
+`plan_tunnel`'s `TunnelId::Own` arm refuses while it is held, so a second rotation issued
+inside that window fails at plan time &mdash; and per the fire-once `RotateDirective`
+finding (C1) nothing retries it, leaving the gateway `Idle` with the epoch unadvanced.
+**Symptom:** a second `Admin.RotateKey` within 5s of a failed rotation is silently
+dropped. It is *distinguishable*, not invisible:
+`wiremesh_gateway_rotation_aborts_total{reason="failed"}` increments and the
+`ROTATION ABORTED` log's `{e:#}` chain carries `plan_tunnel`'s "reserved own-epoch listen
+port &hellip; is not available" text. **Do not fix with a retry or a quarantine bypass**
+&mdash; both are Phase C territory alongside C1.
+
 ### 10. `rotation_timer` setup-race flake
 
 Tests race the timer against setup.
