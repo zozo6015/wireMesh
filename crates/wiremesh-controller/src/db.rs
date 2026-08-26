@@ -1690,12 +1690,19 @@ impl Db {
     /// persisted revision must advance in this same transaction, and an
     /// early `InvalidToken` return above must NOT reach here (it rolls back
     /// instead).
-    // The argument list mirrors the `relay` table's columns. Grouping them into
-    // a struct to satisfy the lint would add an indirection whose only purpose
-    // is the lint, in the crate whose history says cleanups introduce bugs.
+    // The parameters are the inputs of ONE enrollment transaction, not one
+    // table's columns -- an earlier version of this reason said the latter and
+    // was wrong. This function redeems the enrollment token (`secret_hash`,
+    // matched on `used_at IS NULL AND expires_at > now`), inserts the `relay`
+    // row (`relay_name`, `endpoint`), records the issued `certificate`
+    // (`cert_serial`, `issuer_handle`, `cert_not_after`), stamps
+    // `enrollment_token.used_at` and the `audit_log` entry (`now`), and bumps
+    // the persisted revision -- five tables, atomically. Grouping them behind
+    // a struct would add an indirection whose only purpose is the lint, in the
+    // crate whose history says cleanups are where regressions enter.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the argument list mirrors the `relay` table's columns"
+        reason = "these are the inputs of one atomic enrollment transaction -- token redemption, relay row, certificate record, audit stamp and revision bump across five tables -- not the columns of a single table"
     )]
     pub fn enroll_relay(
         &self,
