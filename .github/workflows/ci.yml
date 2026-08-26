@@ -273,6 +273,14 @@ jobs:
       - name: cargo test --workspace --doc
         if: always()
         run: |
+          # `set -o pipefail` is LOAD-BEARING: without it this step's exit
+          # status is `tee`'s, so a doctest run that fails or crashes exits 0
+          # here and only the inventory step below reds -- with the WRONG
+          # diagnosis ("a doctest appeared or vanished") for what is actually
+          # "the doc run died". Verified: `check` does red on a truncated log
+          # (8 rows missing) and on an empty one (12), so it is a backstop --
+          # but the right step must fail, with the right message.
+          set -o pipefail
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
             "$DEV_IMAGE" bash -lc 'cd /work && cargo test -j 1 --workspace --doc' | tee doc-root.log
       # The sub-workspace has its own `Cargo.lock` and is invisible to the
@@ -280,6 +288,14 @@ jobs:
       - name: cargo test --doc (crates/wiremesh-enforcer-ebpf)
         if: always()
         run: |
+          # `set -o pipefail` is LOAD-BEARING: without it this step's exit
+          # status is `tee`'s, so a doctest run that fails or crashes exits 0
+          # here and only the inventory step below reds -- with the WRONG
+          # diagnosis ("a doctest appeared or vanished") for what is actually
+          # "the doc run died". Verified: `check` does red on a truncated log
+          # (8 rows missing) and on an empty one (12), so it is a backstop --
+          # but the right step must fail, with the right message.
+          set -o pipefail
           docker run --rm --privileged -v "$PWD":/work -v "$PWD/.ci-cargo-registry":/usr/local/cargo/registry \
             "$DEV_IMAGE" bash -lc 'cd /work/crates/wiremesh-enforcer-ebpf && cargo test -j 1 --doc' | tee doc-ebpf.log
       # WHAT THESE THREE STEPS DO AND DO NOT PROVE -- measured, so nobody reads
