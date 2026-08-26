@@ -3737,4 +3737,376 @@ mod tests {
              rejecting legacy gateways' `Sync.Report` calls with FAILED_PRECONDITION"
         );
     }
+
+    // =======================================================================
+    // PR1c — the tracker seed must select the NEWEST pending row.
+    //
+    // All three seed sites use `.find(state == "pending")` over a snapshot
+    // `Db::all_keys_for_gateway` returns `ORDER BY epoch` ASCENDING, so they
+    // answer "the OLDEST pending row". After a B2 abort leaves an orphan
+    // sentinel behind, that is the orphan — and `report`'s ack loop then drops
+    // the real rotation's one and only ack, because `ack.epoch ==
+    // tracker.pending_epoch` is false.
+    //
+    // # This selector is NOT the broker's, and they must not be unified
+    //
+    // `broker.rs::send_rotate_if_pending` selects "the newest ROW, and only if
+    // it is itself a sentinel" (A′). This one selects "the newest PENDING
+    // row". They differ on exactly `{sentinel@1, active@2}`:
+    //
+    //   * the broker must send NOTHING — directing a stale sentinel beneath a
+    //     newer row rotates the fabric backwards, and `promote_epoch`'s demote
+    //     (`WHERE state = 'active'`, no epoch predicate) would then retire and
+    //     delete the key the fabric is using;
+    //   * the tracker must seed 1 — that tracker is the orphan's ONLY garbage
+    //     collector (`decide` rule 2 -> `Abort` at `ABORT_AFTER` ->
+    //     `drop_pending_epoch`), and seeding nothing there strands the row
+    //     forever.
+    //
+    // Two correct answers to superficially identical questions. "Unify these
+    // two selectors" is the simplification to refuse.
+    //
+    // # An orphan below a live rotation is DELAYED, not stranded
+    //
+    // On `{sentinel@1, real_pending@2}` this seeds 2, leaving the orphan at 1
+    // untracked while 2 is in flight. That is not a leak: once 2 promotes and
+    // retires, 1 is the only pending row left, the next seed picks it, and it
+    // is collected then. Do not "fix" the gap.
+    //
+    // # Fixture order is load-bearing, in the OPPOSITE direction to the broker
+    //
+    // Same guard as `broker.rs`'s `mod tests`, same reason, mirrored: there,
+    // a descending fixture would make the buggy `.find()` pick the newest row
+    // by accident. Here the fixtures are built through `seeded_db`, which
+    // INSERTs them and lets SQLite's `ORDER BY epoch` do the sorting, so the
+    // ascending order is structural rather than assumed — but the rows are
+    // still written ascending so the reading matches what the code sees.
+    // =======================================================================
+
+    /// The sentinel pubkey, from its single definition rather than the literal
+    /// the older fixtures in this module spell out. A second spelling of a
+    /// sentinel is the drift class this crate keeps getting bitten by.
+    const SENT: &str = crate::db::AWAITING_SUBMISSION_SENTINEL;
+
+    /// The reachable post-abort snapshot: the gateway's epoch-0 enrollment key
+    /// is `active`, a B2 abort left an orphan sentinel at 1, and the rotation
+    /// that actually matters is real-keyed and `pending` at 2.
+    ///
+    /// Three rows rather than the brief's two on purpose: epoch 0 `active` is
+    /// where every enrolled gateway starts (`enroll_gateway` always inserts
+    /// it), so a two-row fixture would ALSO be exercising S3's no-`active`-row
+    /// case and confounding two properties in one test.
+    fn orphan_then_live() -> Vec<(i64, &'static str, &'static str)> {
+        vec![
+            (0, "REAL0==", "active"),
+            (1, SENT, "pending"),
+            (2, "REAL2==", "pending"),
+        ]
+    }
+
+    /// The orphan-collection snapshot: the orphan sentinel at 1 is now the
+    /// ONLY pending row, because the rotation above it completed and promoted.
+    fn orphan_below_active() -> Vec<(i64, &'static str, &'static str)> {
+        vec![(1, SENT, "pending"), (2, "REAL2==", "active")]
+    }
+
+    /// `(pending_epoch, started_at, installed_at)` for GW's tracker — the
+    /// identity stamps, which is what tells "kept" apart from "evicted and
+    /// rebuilt".
+    async fn tracker_identity(
+        rotations: &Arc<Mutex<HashMap<i64, RotationTracker>>>,
+    ) -> Option<(u32, Instant, Instant)> {
+        rotations
+            .lock()
+            .await
+            .get(&GW)
+            .map(|t| (t.pending_epoch, t.started_at, t.installed_at))
+    }
+
+    fn broker_for(db: &DbHandle) -> Arc<Broker> {
+        Broker::new(db.clone(), crate::broker::new_registry())
+    }
+
+    /// Site 1 — `drive_rotation_for`'s `db_pending_epoch`.
+    #[tokio::test]
+    async fn drive_rotation_for_seeds_the_newest_pending_row() {
+        let (_dir, db) = seeded_db(&orphan_then_live());
+        let (change_tx, _rx) = broadcast::channel(16);
+        let broker = broker_for(&db);
+        let rotations: Arc<Mutex<HashMap<i64, RotationTracker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+
+        assert_eq!(
+            tracker_identity(&rotations).await.map(|(e, _, _)| e),
+            Some(2),
+            "`drive_rotation_for` seeded the tracker from the OLDEST pending row. The \
+             snapshot arrives `ORDER BY epoch` ASCENDING, so `.find(state == \"pending\")` \
+             answers \"oldest un-submitted\" and picks the orphan sentinel at 1 that a B2 \
+             abort left behind — not epoch 2, the rotation actually in flight. Every ack \
+             for epoch 2 is then dropped by `ack.epoch == tracker.pending_epoch`, and a \
+             gateway acks exactly ONCE per cutover"
+        );
+    }
+
+    /// Site 2 — `sweep_rotations` step 2.
+    #[tokio::test]
+    async fn sweep_rotations_step2_seeds_the_newest_pending_row() {
+        let (_dir, db) = seeded_db(&orphan_then_live());
+        let (change_tx, _rx) = broadcast::channel(16);
+        let broker = broker_for(&db);
+        let rotations: Arc<Mutex<HashMap<i64, RotationTracker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        sweep_rotations(&db, &change_tx, &broker, &rotations).await;
+
+        assert_eq!(
+            tracker_identity(&rotations).await.map(|(e, _, _)| e),
+            Some(2),
+            "`sweep_rotations` step 2 seeded from the oldest pending row (the orphan \
+             sentinel at 1) rather than the newest (2). Step 2 seeds under its own guard \
+             BEFORE step 2b's `drive_rotation_for` runs, so fixing only the other sites \
+             leaves this one reachable on every sweep tick"
+        );
+    }
+
+    /// Site 3 — `seed_and_record_epoch_acks`, and the ack that gets dropped.
+    #[tokio::test]
+    async fn the_ack_seed_loop_seeds_the_newest_pending_row_and_records_its_ack() {
+        let (_dir, db) = seeded_db(&orphan_then_live());
+        let rotations: Arc<Mutex<HashMap<i64, RotationTracker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        const ACKING_PEER: i64 = GW + 1;
+
+        let acks = [EpochAck {
+            peer_gateway_id: GW as u64,
+            epoch: 2,
+            live: true,
+        }];
+        seed_and_record_epoch_acks(&db, &rotations, ACKING_PEER, &acks).await;
+
+        let seeded = tracker_identity(&rotations).await.map(|(e, _, _)| e);
+        assert_eq!(
+            seeded,
+            Some(2),
+            "the ack path seeded from the orphan sentinel at 1 instead of the in-flight \
+             rotation at 2"
+        );
+
+        assert!(
+            rotations
+                .lock()
+                .await
+                .get(&GW)
+                .expect("tracker was just seeded")
+                .live_acks
+                .contains(&(ACKING_PEER as u64)),
+            "the epoch-2 ack was DROPPED. This is the symptom PR1's done-bar hit: the seed \
+             pass installed a tracker on the orphan epoch 1, so the record pass's \
+             `ack.epoch == tracker.pending_epoch` is false and the ack is discarded \
+             SILENTLY. A gateway acks exactly once per Role-B cutover, so nothing retries \
+             it and the rotation falls back to the 90s zero-ack grace promote"
+        );
+    }
+
+    /// The FOURTH consumer: `db_pending_epoch` feeds `evict_decision` as well
+    /// as the seed, and both must move together.
+    ///
+    /// # Why the identity stamps are the observable
+    ///
+    /// Asserting only "a tracker is present on epoch 2" cannot fail under the
+    /// half-refactor: with the seed moved and `evict_decision`'s input left on
+    /// `.find()`, the tracker IS evicted and then IMMEDIATELY rebuilt on 2
+    /// inside the same tick, so presence and epoch both look right. What
+    /// changes is `started_at`/`installed_at`, and with them the rotation's
+    /// clock — which is why the grace can never elapse. This is the same
+    /// "the id alone is not enough" reasoning `TrackerToken` rests on.
+    #[tokio::test]
+    async fn one_tick_does_not_evict_and_rebuild_the_newest_pending_tracker() {
+        let (_dir, db) = seeded_db(&orphan_then_live());
+        let (change_tx, _rx) = broadcast::channel(16);
+        let broker = broker_for(&db);
+        let rotations: Arc<Mutex<HashMap<i64, RotationTracker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // A tracker already on the newest pending row, as a correct seed
+        // leaves it. Installed before the call so it is older than the tick's
+        // `read_at` and therefore genuinely condemnable by `evict_decision`.
+        {
+            let now = saturating_ago(Duration::from_secs(5));
+            rotations.lock().await.insert(
+                GW,
+                RotationTracker {
+                    pending_epoch: 2,
+                    prior_active_epoch: Some(0),
+                    started_at: now,
+                    promoted_at: None,
+                    live_acks: BTreeSet::new(),
+                    installed_at: now,
+                },
+            );
+        }
+        let before = tracker_identity(&rotations).await.expect("just inserted");
+
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+        let after_drive = tracker_identity(&rotations).await;
+        assert_eq!(
+            after_drive,
+            Some(before),
+            "one `drive_rotation_for` tick evicted and rebuilt the tracker. `db_pending_epoch` \
+             feeds BOTH `evict_decision` and the lazy seed, so if only the seed selects the \
+             newest pending row the evict input still says epoch 1, `2 != 1` condemns a \
+             correct tracker, and it is rebuilt with a fresh `started_at`/`installed_at` on \
+             every tick — evict input and seed selection disagree, and the grace can never \
+             elapse. Compare the stamps, not just the epoch: a rebuild lands on epoch 2 too"
+        );
+
+        sweep_rotations(&db, &change_tx, &broker, &rotations).await;
+        assert_eq!(
+            tracker_identity(&rotations).await,
+            Some(before),
+            "one `sweep_rotations` pass evicted and rebuilt the tracker. Step 2 runs the \
+             same evict-and-rebuild against its OWN `evict_decision` argument, so it needs \
+             the same single source as `drive_rotation_for` — same failure, second site"
+        );
+    }
+
+    /// The ruling's load-bearing claim, measured rather than argued: the
+    /// tracker seeded on an orphan sentinel is what eventually collects it.
+    #[tokio::test]
+    async fn the_orphan_sentinel_tracker_collects_the_orphan() {
+        let (_dir, db) = seeded_db(&orphan_below_active());
+        let (change_tx, _rx) = broadcast::channel(16);
+        let broker = broker_for(&db);
+        let rotations: Arc<Mutex<HashMap<i64, RotationTracker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // The site seeds it — this is the state where the two selectors
+        // diverge, and seeding NOTHING here (the broker's A′) is what would
+        // strand the row.
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+        assert_eq!(
+            tracker_identity(&rotations).await.map(|(e, _, _)| e),
+            Some(1),
+            "no tracker was seeded for the orphan sentinel at 1, which is the ONLY pending \
+             row here. Nothing else can ever collect it: `sweep_rotations`' step-3 orphan \
+             path filters `state == \"retiring\"`, and `drive_rotation_for` returns before \
+             deciding when there is no tracker. The row then keeps the gateway inside \
+             `Db::gateways_with_rotation_state`, which `initiate_due_rotations` skips — so \
+             automatic rotation is disabled for that gateway PERMANENTLY (the v0.7.2 class)"
+        );
+
+        // Before `ABORT_AFTER`: nothing happens. `decide` rule 2 returns for a
+        // sentinel-keyed pending row, so rule 4's grace promote is never
+        // reached and `promote_epoch` is never called on this path.
+        let rows_before = key_states(&db).await;
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+        assert_eq!(
+            key_states(&db).await,
+            rows_before,
+            "inside `ABORT_AFTER` the orphan tracker must change nothing at all: its pending \
+             row still holds the sentinel, so `decide` rule 2 answers `Wait` and returns \
+             BEFORE rule 4's grace promote. Any row movement here means rule 2's real-key \
+             gate was bypassed"
+        );
+
+        // Past `ABORT_AFTER`: the collection.
+        {
+            let mut guard = rotations.lock().await;
+            let t = guard.get_mut(&GW).expect("tracker seeded above");
+            t.started_at = saturating_ago(rotation::ABORT_AFTER + ABORT_MARGIN);
+        }
+        drive_rotation_for(&db, &change_tx, &broker, &rotations, GW).await;
+
+        assert_eq!(
+            key_states(&db).await,
+            vec![(2, "active".to_string())],
+            "past `ABORT_AFTER` the orphan tracker's `Abort` must drop row 1 via \
+             `drop_pending_epoch` and leave row 2 `active` untouched — an abort is \
+             non-destructive to the live key by design"
+        );
+        assert!(
+            !rotations.lock().await.contains_key(&GW),
+            "the abort committed, so `TrackerEffect::Finished` must remove the tracker"
+        );
+        assert!(
+            !db.gateways_with_rotation_state()
+                .await
+                .expect("reading rotation state")
+                .contains(&GW),
+            "with the orphan collected the gateway must leave \
+             `Db::gateways_with_rotation_state` — that set is exactly what \
+             `initiate_due_rotations` skips, so this is the assertion that proves automatic \
+             rotation is no longer disabled for it"
+        );
+    }
+
+    /// An ack naming an epoch the tracker does not know must change NOTHING.
+    ///
+    /// TEST ANCHOR — PR1c adds an operator-phrased `ignoring EpochAck(...)`
+    /// line at this drop. It is deliberately NOT asserted here: the controller
+    /// logs with `eprintln!` and these tests run it in-process, so its stderr
+    /// is the test binary's own and is not self-capturable. The line is the
+    /// operator's grep target; THIS test pins that it rides in with no state
+    /// change beside it.
+    ///
+    /// The forbidden shape it guards is the tempting one-liner: evict the
+    /// tracker when an ack does not match. A promoted tracker still owes a
+    /// `Retire` under `RETIRE_GRACE`, and removing it hands any live
+    /// `retiring` row to `sweep_rotations`' grace-free step-3 orphan path —
+    /// the `RETIRE_GRACE`-collapse family, arriving disguised as a diagnosis
+    /// of this bug.
+    #[tokio::test]
+    async fn an_ack_for_an_unknown_epoch_changes_nothing() {
+        let (_dir, db) = seeded_db(&orphan_then_live());
+        let rotations: Arc<Mutex<HashMap<i64, RotationTracker>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        const ACKING_PEER: i64 = GW + 1;
+
+        {
+            let now = saturating_ago(Duration::from_secs(5));
+            rotations.lock().await.insert(
+                GW,
+                RotationTracker {
+                    pending_epoch: 2,
+                    prior_active_epoch: Some(0),
+                    started_at: now,
+                    promoted_at: None,
+                    live_acks: BTreeSet::new(),
+                    installed_at: now,
+                },
+            );
+        }
+        let before = tracker_identity(&rotations).await.expect("just inserted");
+
+        let acks = [EpochAck {
+            peer_gateway_id: GW as u64,
+            epoch: 9,
+            live: true,
+        }];
+        seed_and_record_epoch_acks(&db, &rotations, ACKING_PEER, &acks).await;
+
+        assert_eq!(
+            tracker_identity(&rotations).await,
+            Some(before),
+            "an ack naming epoch 9 — an epoch this tracker knows nothing about — must leave \
+             the tracker EXACTLY as it was. Evicting it here is the forbidden shape: a \
+             promoted tracker still owes a `Retire` under `RETIRE_GRACE`, and removing it \
+             hands any live `retiring` row to `sweep_rotations`' grace-free orphan path, \
+             collapsing the grace to ~0"
+        );
+        assert!(
+            rotations
+                .lock()
+                .await
+                .get(&GW)
+                .expect("tracker must still exist")
+                .live_acks
+                .is_empty(),
+            "a non-matching ack must not be recorded — `live_acks` is the evidence \
+             `decide` rule 3 promotes on, and crediting an unrelated epoch's ack to this \
+             rotation would promote it on a peer that never confirmed this key"
+        );
+    }
 }
