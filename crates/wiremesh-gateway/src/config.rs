@@ -105,6 +105,21 @@ impl GatewayConfig {
 /// `main.rs`, per the v0.10.0 lesson that `main.rs`'s env-to-config assembly
 /// went untested until it was extracted.
 ///
+/// # This module is the ONLY home for test-only knobs
+///
+/// Every environment variable that exists to make a test possible lives here
+/// and nowhere else — currently [`fault::ROTATION_FAIL_ENV`] and
+/// [`fault::OVERLAP_STALL_WARN_ENV`]. The rule matters because the whole
+/// safety argument is per-module: this module is gated on the non-default
+/// `netns-tests` feature, so nothing in it compiles into a release binary, and
+/// each knob is verified by a `strings` check on the shipped binary WITH a
+/// positive control (an empty grep on its own proves only that the grep ran).
+/// A knob parsed inline in `main.rs`, or in any other module, would sit
+/// outside that argument and outside those checks — which is the v0.10.0
+/// lesson, where `main.rs`'s env-to-config assembly went untested until it was
+/// extracted. Add the next one here, with its own pure parse function, its own
+/// unit tests, and its own re-measured `strings` pair.
+///
 /// # Why a fault hook at all
 ///
 /// B2's done-bar has to observe a rotation that fails PART-WAY and then prove

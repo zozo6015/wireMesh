@@ -390,6 +390,34 @@ const RETIRE_GRACE: Duration = Duration::from_secs(2 * ROTATION_KEEPALIVE as u64
 /// assert rather than fail — silently weaker, not red.
 const OVERLAP_STALL_WARN: Duration = Duration::from_secs(90);
 
+/// The epoch a stalled rotation is heading TOWARD, taken from the state
+/// machine's own binding.
+///
+/// Exists so the `ROTATION STALLED` diagnostic cannot name the wrong epoch.
+/// It used to derive the target arithmetically as `a.old_epoch + 1`, which
+/// assumes directive epochs are contiguous with the local active epoch — the
+/// very assumption B2 removed: `handle_rotate_inner` mints at the epoch the
+/// CONTROLLER named, and after an aborted rotation the controller's numbering
+/// skips (its `MAX(epoch) + 1` still counts the orphan row this gateway
+/// scrubbed). So the one situation the warning exists to describe — a rotation
+/// that is not progressing — was also the one where its epoch number was
+/// wrong, sending an operator to look up an epoch that never existed.
+///
+/// Taking `&RotationPhase` rather than a `u32` is the point: the value can
+/// only come from `Overlapping`'s own `new_epoch`, so the wrong epoch is no
+/// longer *representable* at the call site. Reintroducing the bug would mean
+/// deleting this call, which is a visible removal rather than a plausible
+/// arithmetic tweak — and no test can observe the emission (it needs a genuine
+/// R2 park), so the type is doing work an assertion cannot.
+fn stalled_target_epoch(phase: &RotationPhase) -> Option<u32> {
+    match phase {
+        RotationPhase::Overlapping { new_epoch } => Some(*new_epoch),
+        // A stall is only meaningful while Overlapping. `CutOver` has its own
+        // wedge and its own warning (R3); `Idle` is not rotating.
+        RotationPhase::CutOver { .. } | RotationPhase::Idle => None,
+    }
+}
+
 /// The stall threshold this tick actually compares against.
 ///
 /// In a release build this is `OVERLAP_STALL_WARN`, unconditionally — the
@@ -5803,14 +5831,24 @@ async fn run_rotation_ticks(rot: RotationShared) {
                     let elapsed = overlapping_since.map_or(Duration::ZERO, |t| t.elapsed());
                     if elapsed >= overlap_stall_warn() && !warned_overlap_stall {
                         warned_overlap_stall = true;
-                        // TEST ANCHOR: `tests/rotation_wedge.rs::STALL_WARN_MARKER`
-                        // greps stderr for the token `ROTATION STALLED`, and it
-                        // does so as an ABSENCE check — the healthy follow-up
-                        // rotation asserts this count does NOT increase. So a
-                        // reworded line makes that assertion pass SILENTLY and
-                        // look like a healthy gateway rather than a broken test.
-                        // Rewording this string means updating that test in the
-                        // same change.
+                        // TEST ANCHOR, two consumers, two different substrings:
+                        //
+                        //  * `tests/rotation_wedge.rs::STALL_WARN_MARKER` greps
+                        //    the token `ROTATION STALLED` as an ABSENCE check —
+                        //    the healthy follow-up rotation asserts this count
+                        //    does NOT increase, so a reworded token makes that
+                        //    assertion pass SILENTLY and look like a healthy
+                        //    gateway rather than a broken test.
+                        //  * `tests/rotation_stall_epoch.rs` matches the phrase
+                        //    `advertising epoch {}` — that is where the epoch
+                        //    appears, so it is the phrase that pin reads, NOT
+                        //    the token. A reword there makes its poll find no
+                        //    line at all and report "the R2 park failed", which
+                        //    is a wrong hint pointing at the harness instead of
+                        //    at this string.
+                        //
+                        // Rewording either substring means updating the
+                        // matching test in the same change.
                         eprintln!(
                             "wiremesh-gateway: ROTATION STALLED — this gateway's rotation to {} \
                              has been Overlapping for {}s with no peer ever rx-corroborated live \
@@ -5823,7 +5861,12 @@ async fn run_rotation_ticks(rot: RotationShared) {
                              controller's view of this gateway's epochs",
                             a.new_tun,
                             elapsed.as_secs(),
-                            a.old_epoch + 1
+                            // From the SM's binding, never `a.old_epoch + 1`:
+                            // see `stalled_target_epoch`. `Overlapping` is this
+                            // arm's own pattern, so the `unwrap_or` is
+                            // unreachable and exists only to keep the
+                            // diagnostic total.
+                            stalled_target_epoch(&phase).unwrap_or(a.old_epoch)
                         );
                     }
                     if any_live {
