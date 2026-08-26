@@ -1549,9 +1549,12 @@ fn uapi_field(resp: &str, key: &str) -> Option<String> {
 /// restarted gateway is a fabric-wide black hole, and the "retired" private
 /// key was never actually destroyed.
 ///
-/// Choreography: case 1's direct-mesh setup + rotation, then case 4's
-/// bounded wait for the retire/teardown to land (wg0 gone, wg0e1 present) so
-/// the retire step has provably run before the crash. Then SIGKILL gwA's
+/// Choreography: case 1's direct-mesh setup + rotation, then TWO bounded
+/// waits, because `service_retire`'s data-plane half and its key-scrub half
+/// land at different times and only the first is observable as a link —
+/// case 4's teardown wait (wg0 gone, wg0e1 present), then a wait until
+/// epoch 0 is gone from `epoch_keys.json`, so both halves of the retire have
+/// provably run before the crash (see the waits themselves). Then SIGKILL gwA's
 /// process (a real crash — no graceful shutdown path) and restart the same
 /// binary from the same `--state-dir`. Assertions, in fail-first order:
 ///
@@ -1706,13 +1709,29 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     }
     eprintln!("ROTATION COMPLETE: {final_states:?}");
 
-    // ===== Wait for the retire/teardown to land BEFORE crashing =====
-    // Same bounded wait as `old_epoch_device_is_torn_down_after_rotation`:
-    // the retire grace is a handful of keepalives after every peer stays
-    // rx-corroborated live on the new tun. Waiting for gwA's `wg0` to be
-    // GONE (and `wg0e1` present) proves `service_retire` has run — so the
-    // durable-retire assertion (b) below is judged only after the point the
-    // ratified fix says the private key must have been scrubbed from disk.
+    // ===== Wait for the retire to land BEFORE crashing — BOTH halves =====
+    // `service_retire` (`main.rs`) is four ordered steps: (1) tear the old
+    // epoch's Device down, (2) evict its enforcer, (3) renormalize the
+    // surviving key's listen port, (4) `EpochKeys::retire` + `persist` — the
+    // SCRUB, which removes the epoch's row from `epoch_keys.json`. Only step
+    // 1 is observable as a link.
+    //
+    // So the teardown wait below (same bounded wait as
+    // `old_epoch_device_is_torn_down_after_rotation`: the retire grace is a
+    // handful of keepalives after every peer stays rx-corroborated live on
+    // the new tun) proves the DATA-PLANE retire happened and
+    // `service_retire` was entered. It does NOT prove the scrub ran — an
+    // earlier revision of this comment claimed it did, and the ordering
+    // above contradicts it. Step 3 awaits `ctx.endpoint_commit`
+    // (`main.rs`:4199), a mutex shared with the observe/punch commit path,
+    // so the gap between `wg0` disappearing and the key leaving disk is
+    // bounded by lock contention, not by CPU. A `pkill -KILL` inside that
+    // gap crashes a gateway whose epoch-0 row is still present in state
+    // `"retiring"`, and the durable-retire assertion (b) then fails for a
+    // reason that has nothing to do with durability. Observed on a loaded CI
+    // runner: epoch 0 present, and ZERO `CRITICAL: … retire …` lines — which
+    // is what "never ran" looks like, since a scrub that runs and fails logs
+    // one. The scrub therefore gets its own gate, immediately below.
     let teardown_deadline = Instant::now() + Duration::from_secs(30);
     let mut torn_down = false;
     loop {
@@ -1741,7 +1760,51 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
              of a retire that hasn't happened"
         );
     }
-    eprintln!("PRE-CRASH: retire landed (gwA wg0 gone, wg0e1 present, live at offset port)");
+    eprintln!("PRE-CRASH: teardown landed (gwA wg0 gone, wg0e1 present, live at offset port)");
+
+    // ===== Wait for the KEY SCRUB (step 4) to land BEFORE crashing =====
+    // `EpochKeys::retire` REMOVES the row (`epochkeys.rs`: removal, not a
+    // state flip, is the scrub mechanism) and `persist` is an atomic
+    // tmp+rename, so polling the file reads either the pre-scrub or the
+    // post-scrub bytes and never a torn document; anything that is not
+    // `Ok(Some(store))` is simply "not yet".
+    //
+    // 60s rather than the teardown's 30s: what is being waited out is
+    // contention on `endpoint_commit`, which no CPU budget bounds — and the
+    // wait costs nothing when the scrub is prompt, which it normally is
+    // (sub-second after the teardown).
+    //
+    // This gate does NOT judge the scrub; assertion (b) below still does
+    // that, by raw byte-grep AND through the reloaded store, after the crash
+    // and restart. With the scrub pinned here, (b)'s subject is exactly the
+    // claim that is still at risk: the crash + restart must not RE-ADD the
+    // retired key. Boot's legacy migration re-seeds epoch 0 from
+    // `identity.json`/`wg_private.key` — the same path assertion (a) is RED
+    // for — so "gone before the crash" and "gone after the restart" are
+    // genuinely different claims, and only the second one is (b)'s.
+    let mut last_load = String::new();
+    let scrubbed = wait_until(Duration::from_secs(60), || {
+        let loaded = wiremesh_gateway::epochkeys::EpochKeys::load(sda.path());
+        last_load = format!("{loaded:?}");
+        matches!(&loaded, Ok(Some(s)) if s.by_epoch(0).is_none())
+    });
+    if !scrubbed {
+        dump_diag(
+            "epoch-0-key-not-scrubbed-pre-crash",
+            &[("gwA", &gwa), ("gwB", &gwb)],
+            &[("gwA", &pa), ("gwB", &pb)],
+        );
+        pa.kill();
+        pb.kill();
+        panic!(
+            "SETUP FAILED: gwA's epoch-0 key SCRUB (`service_retire` step 4 — \
+             `EpochKeys::retire` + `persist`) never removed the epoch-0 entry from \
+             epoch_keys.json within 60s of the teardown landing. Steps 1-3 ran (wg0 gone, \
+             wg0e1 up), so crashing here would test the restart durability of a scrub that \
+             never happened. Last load: {last_load}"
+        );
+    }
+    eprintln!("PRE-CRASH: key scrub landed (epoch 0 gone from gwA's epoch_keys.json)");
 
     // Capture the NEW epoch's key material from the persisted store while
     // gwA is still up. `handle_rotate` persists the mint, so epoch 1 is in
@@ -1874,6 +1937,10 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     eprintln!("RESTART KEY PASS: wg0 came up with the promoted epoch-1 key");
 
     // ===== (b) durable retire: the old private key is GONE from disk =====
+    // The pre-crash gate already proved the scrub REMOVED epoch 0, so what
+    // this pins is the half that is still at risk: the crash + restart must
+    // not RE-ADD the retired key (boot's legacy migration re-seeds epoch 0
+    // from `identity.json`/`wg_private.key`).
     // Every failure below kills both gateway processes FIRST (the file-wide
     // convention) so a failing assertion can never leave two real gateway
     // binaries running against the lab's netns.
