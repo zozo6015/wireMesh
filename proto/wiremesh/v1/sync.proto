@@ -24,6 +24,27 @@ message WatchRequest {
   // Relays also open `Sync.Watch` but never `Report`, so they are outside the
   // scheme entirely and send 0; `watch_relay` ignores the field.
   uint64 session_generation = 1;
+
+  // (B10 / X-6) The client's own build version, e.g. "0.11.0". Additive and
+  // advisory: proto3 gives an old client "" here, which means "never
+  // reported" and is stored as NULL — never as a second spelling of unknown.
+  //
+  // In Phase B this is STORED AND NEVER CONSULTED. No gate, no filter, no
+  // log line branches on it. Reading it to decide anything is Phase C
+  // (X-6's Watch-open and apply-time gates), deliberately not v1.0.
+  string client_version = 2;
+
+  // (B10 / X-6) The highest policy-IR schema this client can apply. Gateways
+  // send 1 (the only schema `wiremesh_policy::compile` emits and the only one
+  // `PolicyIR::from_json` accepts).
+  //
+  // RELAYS SEND 0, meaning "not applicable" — a relay has no policy IR at
+  // all. That is safe ONLY because the `relay` table has no `max_ir_schema`
+  // column, so B10's legacy read-mapping ("0 -> assume schema 1") can never
+  // be applied to a relay. The two facts are load-bearing on each other: see
+  // the tripwire on SCHEMA_V4 in `wiremesh-controller/src/db.rs` before
+  // adding that column.
+  uint32 max_ir_schema = 3;
 }
 message SyncMessage { oneof body { StateSnapshot snapshot = 1; Delta delta = 2; PunchDirective punch = 3; RotateDirective rotate = 4; } }
 // Broker-issued NAT-traversal instruction: sent to one gateway of a pair,
@@ -108,6 +129,17 @@ message StateSnapshot {
   uint64 policy_version = 6;
   repeated string revoked_serials = 7;
   repeated RelayInfo relay_infos = 8;
+
+  // (B10 / X-6) Facts about the CONTROLLER, carried on the snapshot that
+  // opens every Watch — both the gateway one (`build_snapshot`) and the relay
+  // one (`build_relay_revocation_snapshot`). BOTH must populate them: a relay
+  // that received "" here would permanently mislabel a v1.0 controller as
+  // legacy.
+  //
+  // STORED AND NEVER CONSULTED in Phase B on the receiving side too — a
+  // client must not gate on these. That is Phase C.
+  string controller_version = 9;
+  string min_supported_version = 10;
 }
 message Delta {
   uint64 revision = 1;
@@ -122,6 +154,18 @@ message Delta {
   // true iff this delta updates the relay set (relay_infos is authoritative,
   // possibly empty); false = sparse delta, relays unchanged.
   bool relays_updated = 9;
+
+  // (B10) NOT MIRRORED HERE, deliberately. `StateSnapshot` gained
+  // `controller_version`/`min_supported_version` at 9/10; `Delta` does not
+  // get them, because the version pair is a CONNECTION-LIFETIME fact carried
+  // by the snapshot that opens every Watch, and an incremental delta has no
+  // consumer for it.
+  //
+  // If that ever changes, the mirror MUST start at **10**, not 9: fields 1-8
+  // mirror `StateSnapshot` but THIS message's 9 is `relays_updated`, so the
+  // two have already diverged and "the next free number" is a live footgun.
+  // Note also that `grep -n reserved` across all three protos returns ZERO —
+  // nothing in this wire contract protects a removed field number today.
 }
 // DESIGN FINDING (recorded, NOT fixed here — see the field-by-field
 // justification in `wiremesh-gateway`'s `send_epoch_ack`):

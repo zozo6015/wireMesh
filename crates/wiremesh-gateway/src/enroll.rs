@@ -77,6 +77,7 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
         &wg_pubkey,
         "", // gateways declare no endpoint at enroll (see EnrollArgs note)
         "gateway",
+        "", // client_version: populated in the next commit (B10 population step)
     )
     .await
     .context("enrolling gateway with the controller")?;

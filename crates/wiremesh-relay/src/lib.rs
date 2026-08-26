@@ -1767,6 +1767,9 @@ pub async fn run_sync(
     let mut stream = client
         .watch(WatchRequest {
             session_generation: 0,
+            // B10: populated in the next commit (population step).
+            client_version: String::new(),
+            max_ir_schema: 0,
         })
         .await
         .map_err(|s| anyhow::anyhow!("Sync.Watch failed: {s}"))?

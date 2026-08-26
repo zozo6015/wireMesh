@@ -781,6 +781,8 @@ impl StubGateway {
                 cidrs: cidrs.iter().map(|c| c.to_string()).collect(),
                 wg_pubkey: wg_pubkey.to_string(),
                 endpoint: String::new(),
+                // B10: harness default; real population is the gateway/relay code.
+                client_version: String::new(),
             })
             .await
             .map_err(|status| anyhow::anyhow!("Enrollment.Enroll failed: {status}"))?
@@ -953,7 +955,12 @@ impl StubGateway {
 
         let mut client = SyncClient::new(channel);
         let stream = client
-            .watch(WatchRequest { session_generation })
+            .watch(WatchRequest {
+                session_generation,
+                // B10: harness default; real population is the gateway code.
+                client_version: String::new(),
+                max_ir_schema: 0,
+            })
             .await
             .map_err(|status| anyhow::anyhow!("Sync.Watch failed: {status}"))?
             .into_inner();
@@ -1613,6 +1620,8 @@ pub async fn enroll_relay(h: &TestController, endpoint: &str) -> (String, String
             cidrs: vec![],
             wg_pubkey: String::new(),
             endpoint: endpoint.to_string(),
+            // B10: harness default; real population is the relay code.
+            client_version: String::new(),
         })
         .await
         .expect("Enrollment.Enroll (relay path) failed in enroll_relay")

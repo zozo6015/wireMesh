@@ -316,6 +316,71 @@ CREATE TABLE gateway_candidate (
 );
 "#;
 
+/// Schema migration to `user_version = 4` (Phase B, B10 / X-6): records what
+/// version each client last reported, so a skew window is *observable* before
+/// v1.0 tags.
+///
+/// **Nullable, no DEFAULT — deliberately.** This table's existing
+/// "unknown until reported" columns (`applied_version`, `observe_key`,
+/// `candidate_endpoint`) are nullable for the same reason: `''`/`0` would be
+/// indistinguishable from a genuine legacy client that reports nothing. The
+/// write sites map `""` -> NULL and `0` -> NULL BEFORE the upsert, so NULL is
+/// the ONLY spelling of "never reported" that is ever stored.
+///
+/// **`relay` gains `version` but NOT `max_ir_schema` — and that asymmetry is
+/// a TRIPWIRE, not an oversight.** A relay has no policy IR, so it sends
+/// `max_ir_schema = 0` meaning "not applicable". B10's legacy read-mapping
+/// treats a `0` from a GATEWAY as "assume schema 1". Those two readings of
+/// `0` are only safe to coexist because there is no relay column for the
+/// mapping to ever be applied to. **Adding `max_ir_schema` to `relay` will
+/// look like a harmless symmetry fix and will silently make every relay
+/// report as schema 1.** If you need it, change the wire encoding first so
+/// "not applicable" is distinguishable from "schema 1".
+///
+/// In Phase B these columns are WRITTEN AND NEVER READ for a decision: no
+/// Watch-open gate, no apply-time laggard gate, no `fabricctl` flagging.
+/// That is X-6/Phase C.
+const SCHEMA_V4: &str = r#"
+ALTER TABLE gateway ADD COLUMN version TEXT;
+ALTER TABLE gateway ADD COLUMN max_ir_schema INTEGER;
+ALTER TABLE relay ADD COLUMN version TEXT;
+"#;
+
+/// Normalises a reported client version for STORAGE: `""` becomes `None`.
+///
+/// proto3 cannot distinguish an absent `client_version` from an explicit
+/// `""`, so an old client's request arrives with `""`. Writing that through
+/// would give the column a SECOND spelling of "unknown" (`''` beside `NULL`)
+/// — exactly the ambiguity the nullable choice exists to remove. `NULL` is
+/// the only "never reported" that is ever stored.
+///
+/// # Why this is a function and not an inline `if`
+///
+/// Phase B's scope rule is that these fields are STORED AND NEVER CONSULTED:
+/// no gate, no filter, no flag, no log branches on them. That rule is checked
+/// by grepping the diff's call sites for a branch on the field names — so the
+/// one branch B10 legitimately needs lives HERE, in a pure function, and the
+/// call sites stay branch-free. These two helpers are the complete allowlist:
+/// a branch on any of the four fields anywhere else is out of scope by
+/// construction.
+///
+/// Normalising for storage is not consulting: it decides only what is
+/// WRITTEN, never control flow, what is served, or what is logged.
+pub(crate) fn store_version(reported: &str) -> Option<String> {
+    (!reported.is_empty()).then(|| reported.to_string())
+}
+
+/// Normalises a reported max IR schema for STORAGE: `0` becomes `None`.
+/// See [`store_version`] for why this is a function; the same rule governs it.
+///
+/// `0` is the proto3 default, so it means "never reported" from a gateway —
+/// and "not applicable" from a relay, which has no policy IR. Both map to
+/// `NULL`, and the two readings never collide because the `relay` table has
+/// no `max_ir_schema` column at all (see [`SCHEMA_V4`]'s tripwire).
+pub(crate) fn store_schema(reported: u32) -> Option<u32> {
+    (reported != 0).then_some(reported)
+}
+
 /// Returned (wrapped in [`anyhow::Error`]) when [`Db::insert_segment`]'s CIDR
 /// overlap check finds a conflicting, already-registered CIDR. Names the
 /// existing segment so callers/operators can resolve it (master-spec §4.1,
@@ -774,6 +839,14 @@ impl Db {
             let tx = conn.transaction()?;
             tx.execute_batch(SCHEMA_V3)?;
             tx.execute_batch("PRAGMA user_version = 3")?;
+            tx.commit()?;
+        }
+
+        let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version < 4 {
+            let tx = conn.transaction()?;
+            tx.execute_batch(SCHEMA_V4)?;
+            tx.execute_batch("PRAGMA user_version = 4")?;
             tx.commit()?;
         }
 

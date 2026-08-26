@@ -166,6 +166,9 @@ pub async fn watch(
     Ok(client
         .watch(WatchRequest {
             session_generation: session_generation(),
+            // B10: populated in the next commit (population step).
+            client_version: String::new(),
+            max_ir_schema: 0,
         })
         .await
         .map_err(|s| anyhow!("Sync.Watch failed: {s}"))?

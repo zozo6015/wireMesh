@@ -187,6 +187,24 @@ pub struct EnrollOutcome {
 /// `wg_pubkey` is the enrolling gateway's WireGuard public key (base64); pass
 /// `""` for a relay, which has none. `endpoint` is an optional advertised
 /// `ip:port` (`""` when unknown).
+///
+/// # `client_version` is a PARAMETER, and that is the whole point (B10)
+///
+/// The caller passes its OWN `env!("CARGO_PKG_VERSION")`. This crate must
+/// never read that macro itself, and there is a test asserting the string
+/// `CARGO_PKG_VERSION` appears nowhere under `crates/wiremesh-enroll/src/`.
+///
+/// `env!` expands at its DEFINITION site, not its call site. Both the gateway
+/// and the relay enroll through this one shared function, so an `env!` here
+/// would stamp BOTH with `wiremesh-enroll`'s own version — and
+/// `scripts/set-version.sh` stamps only the five shipped crates, which does
+/// not include this one, so the value would ship as a permanent `"0.1.0"` on
+/// every gateway and every relay. That is worse than reporting nothing: it is
+/// a confident wrong answer in the one field whose entire purpose is
+/// detecting version skew, and being non-empty it would store as a real value
+/// instead of the honest NULL.
+///
+/// Pass `""` to mean "not reported" — it is stored as NULL, never as `''`.
 pub async fn enroll(
     controller_addr: &str,
     ca_pem: &str,
@@ -195,6 +213,7 @@ pub async fn enroll(
     wg_pubkey: &str,
     endpoint: &str,
     common_name: &str,
+    client_version: &str,
 ) -> anyhow::Result<EnrollOutcome> {
     // Keypair + CSR. Mirrors `wiremesh_testkit::gen_csr` (rcgen 0.13): the
     // private key stays local; only the CSR (public half + CN) goes to the CA.
@@ -231,6 +250,7 @@ pub async fn enroll(
             cidrs: cidrs.to_vec(),
             wg_pubkey: wg_pubkey.to_string(),
             endpoint: endpoint.to_string(),
+            client_version: client_version.to_string(),
         })
         .await
         .context("Enrollment.Enroll")?

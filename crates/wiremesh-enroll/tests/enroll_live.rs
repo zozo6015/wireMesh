@@ -37,6 +37,7 @@ async fn enroll_redeems_token_and_returns_signed_leaf() {
         "", // gateway wg_pubkey — empty is accepted (matches controller enroll test)
         "",
         "gateway",
+        "", // client_version (B10) — mechanical signature update, see PR body
     )
     .await
     .expect("enrollment should succeed against a live controller");

@@ -63,7 +63,12 @@ message MintTokenRequest { string kind = 1; repeated string bound_cidrs = 2; uin
 message MintTokenResponse { string token = 1; }   // wiremesh://host/#tok...@sha256:...
 message ListGatewaysRequest {}
 message ListGatewaysResponse { repeated GatewayInfo gateways = 1; }
-message GatewayInfo { uint64 id = 1; string name = 2; string segment = 3; string status = 4; uint64 applied_version = 5; }
+// (B10 / X-6) `version`/`max_ir_schema` are what the gateway last reported on
+// its Watch; NULL in the DB (never reported) surfaces here as "" / 0.
+// Phase B POPULATES them and nothing more: `fabricctl gateway list` gains NO
+// out-of-window flagging, no colouring, no filtering. Reading them to mark a
+// gateway laggard is Phase C (X-6).
+message GatewayInfo { uint64 id = 1; string name = 2; string segment = 3; string status = 4; uint64 applied_version = 5; string version = 6; uint32 max_ir_schema = 7; }
 message RotateKeyRequest { uint64 gateway_id = 1; }
 message RotateKeyResponse { uint32 epoch = 1; string pubkey = 2; string state = 3; } // state is always "pending"
 message DebugKeyStatesRequest { uint64 gateway_id = 1; }

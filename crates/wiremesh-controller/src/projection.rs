@@ -504,6 +504,10 @@ pub async fn build_snapshot(
         policy_ir,
         policy_version,
         revoked_serials,
+        // B10: populated in the next commit (population step). BOTH
+        // builders must carry them — see the field docs in sync.proto.
+        controller_version: String::new(),
+        min_supported_version: String::new(),
     })
 }
 
@@ -547,6 +551,10 @@ pub async fn build_relay_revocation_snapshot(
         policy_ir: Vec::new(),
         policy_version: 0,
         revoked_serials,
+        // B10: populated in the next commit (population step). BOTH
+        // builders must carry them — see the field docs in sync.proto.
+        controller_version: String::new(),
+        min_supported_version: String::new(),
     })
 }
 

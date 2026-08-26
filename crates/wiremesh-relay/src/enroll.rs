@@ -106,6 +106,7 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
         "",
         &args.endpoint,
         "relay",
+        "", // client_version: populated in the next commit (B10 population step)
     )
     .await
     .context("enrolling relay with the controller")?;

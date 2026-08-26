@@ -297,6 +297,11 @@ impl Admin for AdminSvc {
                     segment,
                     status,
                     applied_version: applied_version.unwrap_or(0) as u64,
+                    // B10: populated in the next commit (population step).
+                    // `fabricctl gateway list` gains NO flagging off these —
+                    // that is X-6/Phase C.
+                    version: String::new(),
+                    max_ir_schema: 0,
                 })
                 .collect(),
         }))
