@@ -4109,4 +4109,109 @@ mod tests {
              rotation would promote it on a peer that never confirmed this key"
         );
     }
+
+    // =======================================================================
+    // PR1c — `select_live_pending` itself.
+    //
+    // These call the selector DIRECTLY, so they name the property rather than
+    // its consequences. The three per-site tests above prove each site USES
+    // it; these prove it is right.
+    //
+    // The three cases are chosen so that no two of them agree under any
+    // plausible wrong shape:
+    //
+    //   * `.find()`   (the shipped defect) differs on case 1;
+    //   * the broker's (A′) — max over ALL rows, then require a sentinel —
+    //     differs on case 2, which is the whole reason these two selectors
+    //     must stay separate;
+    //   * "max over all rows" without the pending filter differs on case 2 as
+    //     well, and would also return an `active` epoch as a pending one.
+    // =======================================================================
+
+    /// Case 1 — the live rotation wins over the orphan beneath it.
+    ///
+    /// This is the case `.find()` gets wrong, and the whole of PR1c.
+    #[test]
+    fn select_live_pending_takes_the_newest_pending_row() {
+        assert_eq!(
+            select_live_pending(&[
+                (0, "REAL0==".to_string(), "active".to_string()),
+                (1, SENT.to_string(), "pending".to_string()),
+                (2, "REAL2==".to_string(), "pending".to_string()),
+            ]),
+            Some((2, Some(0))),
+            "with an orphan sentinel at 1 and the in-flight rotation real-keyed at 2, the \
+             seed must be 2. `.find()` over this ascending snapshot answers 1 — \"the oldest \
+             un-submitted epoch\" — and a tracker on 1 then drops epoch 2's one and only ack"
+        );
+    }
+
+    /// Case 2 — THE DISCRIMINATOR against the broker's (A′).
+    ///
+    /// `broker.rs`'s selector must return nothing for this row set; this one
+    /// must return the orphan. Both are correct, for opposite reasons.
+    #[test]
+    fn select_live_pending_takes_an_orphan_sentinel_beneath_an_active_row() {
+        assert_eq!(
+            select_live_pending(&[
+                (1, SENT.to_string(), "pending".to_string()),
+                (2, "REAL2==".to_string(), "active".to_string()),
+            ]),
+            Some((1, Some(2))),
+            "the orphan sentinel at 1 is the only PENDING row and must be seeded, even \
+             though a newer `active` row sits above it. Returning `None` here — which is \
+             what `broker.rs`'s (A′) selector correctly does for its own question — strands \
+             the row FOREVER: the tracker is the orphan's only garbage collector (`decide` \
+             rule 2 -> `Abort` at `ABORT_AFTER` -> `drop_pending_epoch`), \
+             `sweep_rotations`' step-3 orphan path only collects `retiring` rows, and \
+             `drive_rotation_for` returns before deciding when no tracker exists. The \
+             stranded row keeps the gateway inside `Db::gateways_with_rotation_state`, \
+             which `initiate_due_rotations` skips — so AUTOMATIC ROTATION IS DISABLED FOR \
+             THAT GATEWAY PERMANENTLY, the v0.7.2 class of defect. Do not unify this \
+             selector with the broker's"
+        );
+    }
+
+    /// Case 3 — nothing pending, nothing to seed.
+    #[test]
+    fn select_live_pending_returns_none_with_no_pending_row() {
+        assert_eq!(
+            select_live_pending(&[(0, "REAL0==".to_string(), "active".to_string())]),
+            None,
+            "no `pending` row means no rotation is in flight and no tracker may be created. \
+             A selector that fell back to the newest row of ANY state would seed a tracker \
+             on an `active` epoch, which `decide` would then try to promote"
+        );
+    }
+
+    /// The fixture-order guard, mirroring `broker.rs`'s `mod tests` — and it
+    /// bites in the OPPOSITE direction here.
+    ///
+    /// In the broker's suite a descending fixture makes the buggy `.find()`
+    /// pick the newest row by accident. Here the buggy `.find()` picks the
+    /// OLDEST, so a descending fixture would make it accidentally correct on
+    /// case 1 — the one case that catches it. Either way the rule is the same:
+    /// the fixture must be in the order `Db::all_keys_for_gateway`
+    /// (`ORDER BY epoch`) actually returns, or the case stops discriminating.
+    #[test]
+    fn the_selector_cases_are_written_in_the_order_the_db_returns_them() {
+        let rows = [
+            (0, "REAL0==".to_string(), "active".to_string()),
+            (1, SENT.to_string(), "pending".to_string()),
+            (2, "REAL2==".to_string(), "pending".to_string()),
+        ];
+        assert!(
+            rows.windows(2).all(|w| w[0].0 < w[1].0),
+            "case 1's fixture must be ASCENDING, as `ORDER BY epoch` returns it. Reversed, \
+             `.find()` would pick epoch 2 by accident and case 1 — the only case that \
+             catches the shipped defect — would pass against the bug"
+        );
+        assert_eq!(
+            select_live_pending(&rows),
+            Some((2, Some(0))),
+            "and the selector's answer must not depend on that order at all: a `max` is \
+             order-independent by construction, which is precisely what makes it the right \
+             shape here"
+        );
+    }
 }
