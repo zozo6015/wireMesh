@@ -32,7 +32,7 @@ one row set, two bugs — see "Why this was not caught by the previous fix".
 
 Both runs produced the identical end state:
 
-```
+```text
 debug_key_states: [(0, <real>, "active"),
                    (1, "awaiting-submission", "pending"),
                    (2, <real>, "pending")]
@@ -75,7 +75,7 @@ Also measured, in both runs:
    removes row 1 only, the tracker is dropped, the next drive re-seeds on row 2 — which has a
    real key — and rule 4's grace promotes it 90s later.
 
-```
+```text
 t0        rotation 1 initiated; tracker seeded on epoch 1
 t0+…      rotation 2 initiated; epoch 2 built, real key submitted; ack sent and DROPPED
 t0+300s   ABORT_AFTER  -> Abort{1} -> row 1 dropped -> tracker removed
