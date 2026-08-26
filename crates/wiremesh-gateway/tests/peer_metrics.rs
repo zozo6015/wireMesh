@@ -52,6 +52,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremesh_enforcer::Counters;
 use wiremesh_gateway::metrics::{render_peer_stats, serve_metrics, PeerStats};
 use wiremesh_gateway::path::PathState;
+use wiremesh_gateway::rotation::RotationPhase;
 
 /// T5: the pure renderer emits all three per-peer gauges with TYPE
 /// headers, one line per peer, labeled by peer id.
@@ -180,6 +181,13 @@ async fn t5_serve_metrics_scrape_includes_per_peer_gauges() {
         // this file's own header anticipates. One live enforcer is the
         // steady-state (boot tun only) value; the scrape assertion for it
         // lives in the rotation netns suite. No assertion below changes.
+        //
+        // Trailing `RotationPhase::Idle` + `0u64`: the same mechanical growth
+        // once more (B2's rotation phase gauge and abort counter). Idle/0 is
+        // the steady state — no rotation in flight, none ever aborted — so no
+        // assertion in this file changes. Their scrape assertions live in
+        // `metrics.rs`'s own `serve_metrics` test and, end to end against a
+        // real gateway process, in `tests/rotation_wedge.rs` step (iii).
         Ok::<_, anyhow::Error>((
             "ebpf".to_string(),
             9u64,
@@ -189,6 +197,8 @@ async fn t5_serve_metrics_scrape_includes_per_peer_gauges() {
             peer_stats,
             0u64,
             1u64,
+            RotationPhase::Idle,
+            0u64,
         ))
     }));
 

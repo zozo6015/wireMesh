@@ -41,7 +41,10 @@ use wiremesh_gateway::uapi::base64_pub_from_priv;
 /// generator.
 fn fresh_priv() -> String {
     let mut seed = EpochKeys::default();
-    seed.generate_next().unwrap().private_key_b64.clone()
+    // Epoch 0 on an empty store: the store is discarded, only the 32 random
+    // key bytes are used, so the number is arbitrary and 0 is the natural
+    // first. (Ported from `generate_next()`, which produced exactly this.)
+    seed.generate_next_at(0).unwrap().private_key_b64.clone()
 }
 
 /// The heart of the fix: when the persisted store has an active epoch, the
@@ -54,7 +57,11 @@ fn store_active_epoch_wins_over_legacy_identity_key() {
     // The persisted store of a gateway that completed a rotation: epoch 0
     // (the legacy key) retired away, epoch 1 active.
     let mut store = EpochKeys::from_legacy(&legacy).unwrap();
-    store.generate_next().unwrap(); // epoch 1, pending
+    // Epoch 1: what `generate_next()` produced over this `[0 active]` store,
+    // and already load-bearing three lines down (`promote(1)`, `retire(0)`,
+    // `boot.epoch == 1`). Making the mint explicit removes an implicit
+    // dependency on `max+1` that the rest of this test never had.
+    store.generate_next_at(1).unwrap(); // epoch 1, pending
     store.promote(1).unwrap();
     store.retire(0).unwrap();
     let expect = store.active().unwrap().clone();
@@ -81,7 +88,9 @@ fn store_active_epoch_wins_over_legacy_identity_key() {
 fn retiring_entry_does_not_shadow_the_active_epoch() {
     let legacy = fresh_priv();
     let mut store = EpochKeys::from_legacy(&legacy).unwrap();
-    store.generate_next().unwrap();
+    // Epoch 1, as site 2: `promote(1)` and `boot.epoch == 1` below already
+    // pin the number.
+    store.generate_next_at(1).unwrap();
     store.promote(1).unwrap(); // epoch 0 now "retiring", epoch 1 "active"
 
     let boot = EpochKeys::select_boot_key(Some(&store), &legacy).unwrap();
@@ -134,7 +143,7 @@ fn epoch0_only_store_is_equivalent_to_legacy_fallback() {
 }
 
 /// A store that exists but has NO active entry (e.g. only a "pending" mint —
-/// a crash between `generate_next`+persist and the cutover's promote): fall
+/// a crash between `generate_next_at`+persist and the cutover's promote): fall
 /// back to the legacy identity key. Per the ratified decision the fallback
 /// applies "only when no store/active entry exists" — a pending-only store
 /// counts as no active entry, and booting a never-promoted pending key would
@@ -143,8 +152,28 @@ fn epoch0_only_store_is_equivalent_to_legacy_fallback() {
 fn store_without_active_entry_falls_back_to_legacy() {
     let legacy = fresh_priv();
     let mut store = EpochKeys::default();
-    store.generate_next().unwrap(); // a single "pending" entry, nothing active
+    // Epoch 0, DELIBERATELY — see the precondition below. This is not the
+    // mechanical port of `generate_next()`; it is what that call actually
+    // produced on an empty store, and here the number is load-bearing.
+    store.generate_next_at(0).unwrap(); // a single "pending" entry, nothing active
     assert!(store.active().is_none(), "precondition: no active entry");
+    assert_eq!(
+        store.epochs.len(),
+        1,
+        "precondition: exactly one entry to reason about"
+    );
+    assert_eq!(
+        store.epochs[0].epoch,
+        EpochKeys::select_boot_key(None, &legacy).unwrap().epoch,
+        "PRECONDITION: the \"pending\" row must sit at EXACTLY the epoch the legacy fallback \
+         synthesizes. That collision is what makes the assertions below mean anything: they \
+         prove selection is by STATE and never by epoch NUMBER. A `select_boot_key` rewritten \
+         to resolve by number would return the pending key here and go red — which is the \
+         point. Mint this row at any other epoch and this test still PASSES while testing \
+         nothing: with no number left to disambiguate, `boot.epoch == 0` holds trivially. \
+         Derived from `select_boot_key` rather than hardcoded so that if the fallback's \
+         synthesized epoch ever moves, this reds instead of silently decoupling."
+    );
 
     let boot = EpochKeys::select_boot_key(Some(&store), &legacy).unwrap();
     assert_eq!(boot.epoch, 0);

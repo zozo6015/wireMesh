@@ -58,8 +58,9 @@ pub async fn run_enroll(args: EnrollArgs) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    // Fresh WireGuard static key — same method as `epochkeys::generate_next`
-    // (x25519 clamps on use, so raw random bytes are correct).
+    // Fresh WireGuard static key — same method as
+    // `epochkeys::EpochKeys::generate_next_at` (x25519 clamps on use, so raw
+    // random bytes are correct).
     let mut raw = [0u8; 32];
     OsRng.fill_bytes(&mut raw);
     let wg_private_key_b64 = base64_encode(&raw);

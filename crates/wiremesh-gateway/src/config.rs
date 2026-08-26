@@ -92,6 +92,172 @@ impl GatewayConfig {
     }
 }
 
+/// Deterministic fault injection for the rotation setup path — **test-only**.
+///
+/// Gated on the `netns-tests` feature, which is NOT a default feature, so none
+/// of this compiles into a release binary: `cargo build --release` produces a
+/// `wiremesh-gateway` with no such environment read at all. The netns suites
+/// spawn the binary via `env!("CARGO_BIN_EXE_wiremesh-gateway")`, which is
+/// built with the test's own feature set, so the hook is present exactly where
+/// it is needed and nowhere else.
+///
+/// It lives in the library — with its own unit tests — rather than inline in
+/// `main.rs`, per the v0.10.0 lesson that `main.rs`'s env-to-config assembly
+/// went untested until it was extracted.
+///
+/// # Why a fault hook at all
+///
+/// B2's done-bar has to observe a rotation that fails PART-WAY and then prove
+/// the next one succeeds. The alternative — occupying the reserved own-tun port
+/// so `plan_tunnel` errors — does not work from outside the process:
+/// `plan_tunnel` arbitrates against `TunnelSet::plans()` (in-process state),
+/// not against the OS.
+#[cfg(feature = "netns-tests")]
+pub mod fault {
+    use anyhow::{anyhow, Context};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::OnceLock;
+
+    /// The environment variable that arms the hook.
+    /// Format: `<point>` or `<point>:<count>`, e.g.
+    /// `after-enforcer-insert` or `after-mint:2`.
+    pub const ROTATION_FAIL_ENV: &str = "WIREMESH_TEST_FAIL_ROTATION";
+
+    /// Where in `handle_rotate_inner` an injected failure fires. The names
+    /// match the residue each point leaves behind (design §2.2's step table).
+    ///
+    /// There is deliberately **no `after-submit` point.** A rotation whose key
+    /// has been submitted is not abortable gateway-side — the controller
+    /// grace-promotes onto it at 90s with zero acks and retires the prior epoch
+    /// at ~120s, so unwinding then turns a degraded-but-reachable gateway into
+    /// a hard, non-self-healing blackhole (design §3.2 Piece 1b). A hook that
+    /// could reach that point would be a standing invitation to wire the unwind
+    /// to it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RotationFailPoint {
+        /// After the key is minted and persisted, before the tun is planned.
+        /// Residue: an orphan `"pending"` key on disk, nothing else.
+        AfterMint,
+        /// After the new tun is up, before its enforcer is attached.
+        /// Residue: orphan key + a live tun.
+        AfterBringUp,
+        /// After the enforcer is inserted into the shared map, before the peer
+        /// apply. Residue: orphan key + live tun + a live enforcer entry — the
+        /// maximal case, and the one the done-bar drives.
+        AfterEnforcerInsert,
+    }
+
+    impl RotationFailPoint {
+        fn parse(s: &str) -> anyhow::Result<Self> {
+            match s {
+                "after-mint" => Ok(Self::AfterMint),
+                "after-bring-up" => Ok(Self::AfterBringUp),
+                "after-enforcer-insert" => Ok(Self::AfterEnforcerInsert),
+                other => Err(anyhow!(
+                    "unknown rotation fail point {other:?}; expected one of \
+                     after-mint, after-bring-up, after-enforcer-insert"
+                )),
+            }
+        }
+    }
+
+    /// An armed (or disarmed) rotation fault, with a one-shot latch.
+    #[derive(Debug)]
+    pub struct RotationFaults {
+        point: Option<RotationFailPoint>,
+        remaining: AtomicU32,
+    }
+
+    impl RotationFaults {
+        /// Parse a spec. **Pure** — takes the value rather than reading the
+        /// environment, so its unit tests need no env mutation (and are
+        /// therefore safe under a parallel test harness).
+        ///
+        /// * `None`, empty, or whitespace-only → armed: nothing.
+        /// * `<point>` → that point, count 1.
+        /// * `<point>:<count>` → that point, that count (`:0` arms nothing).
+        /// * anything else → `Err`.
+        ///
+        /// A malformed spec is a HARD ERROR, never a silent no-op: a typo'd
+        /// fault point that quietly armed nothing would produce a green netns
+        /// run that proved nothing at all. Note the interaction between the
+        /// two rules — whitespace collapses to "absent" for the WHOLE spec
+        /// only, never for a half, or the hard-error posture would have a
+        /// whitespace-shaped bypass (`"after-mint: "` is an error, not a
+        /// default).
+        pub fn parse(spec: Option<&str>) -> anyhow::Result<Self> {
+            let Some(raw) = spec.map(str::trim).filter(|s| !s.is_empty()) else {
+                return Ok(Self {
+                    point: None,
+                    remaining: AtomicU32::new(0),
+                });
+            };
+            let (point_str, count) = match raw.split_once(':') {
+                None => (raw, 1u32),
+                Some((p, c)) => {
+                    let p = p.trim();
+                    let c = c.trim();
+                    if p.is_empty() {
+                        return Err(anyhow!(
+                            "{ROTATION_FAIL_ENV}={raw:?}: a count with no fail point"
+                        ));
+                    }
+                    if c.is_empty() {
+                        return Err(anyhow!(
+                            "{ROTATION_FAIL_ENV}={raw:?}: a trailing ':' with no count"
+                        ));
+                    }
+                    let n: u32 = c.parse().with_context(|| {
+                        format!("{ROTATION_FAIL_ENV}={raw:?}: count {c:?} is not a number")
+                    })?;
+                    (p, n)
+                }
+            };
+            Ok(Self {
+                point: Some(RotationFailPoint::parse(point_str)?),
+                remaining: AtomicU32::new(count),
+            })
+        }
+
+        /// Read [`ROTATION_FAIL_ENV`].
+        pub fn from_env() -> anyhow::Result<Self> {
+            Self::parse(std::env::var(ROTATION_FAIL_ENV).ok().as_deref())
+        }
+
+        /// Should the rotation currently at `at` fail? Consumes one unit of
+        /// the latch if so.
+        ///
+        /// The latch only ever decrements and never resets, which is what lets
+        /// the done-bar fail the FIRST directive and watch the SECOND complete
+        /// inside one process — no restart, which would reset the state machine
+        /// for free and confound the sabotage runs.
+        pub fn take(&self, at: RotationFailPoint) -> bool {
+            if self.point != Some(at) {
+                return false;
+            }
+            // Compare-exchange rather than load-then-store so two callers can
+            // never both consume the same unit.
+            self.remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                    n.checked_sub(1).filter(|_| n > 0)
+                })
+                .is_ok()
+        }
+    }
+
+    /// The process-wide armed fault set, read from the environment once.
+    ///
+    /// A malformed spec panics here rather than being ignored — see
+    /// [`RotationFaults::parse`]. This is test-only code; failing loudly at the
+    /// first rotation is the correct posture.
+    pub fn rotation_faults() -> &'static RotationFaults {
+        static FAULTS: OnceLock<RotationFaults> = OnceLock::new();
+        FAULTS.get_or_init(|| {
+            RotationFaults::from_env().expect("parsing the rotation fault-injection spec")
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,5 +495,176 @@ mod tests {
             "port out of u16 range"
         );
         assert!(validate_host_port("host:-1").is_err(), "negative port");
+    }
+
+    //
+    //
+
+    #[cfg(feature = "netns-tests")]
+    mod rotation_fault_hook {
+        use crate::config::fault::{RotationFailPoint, RotationFaults, ROTATION_FAIL_ENV};
+
+        #[test]
+        fn parse_accepts_each_fail_point_with_a_default_count_of_one() {
+            for (text, expect) in [
+                ("after-mint", RotationFailPoint::AfterMint),
+                ("after-bring-up", RotationFailPoint::AfterBringUp),
+                (
+                    "after-enforcer-insert",
+                    RotationFailPoint::AfterEnforcerInsert,
+                ),
+            ] {
+                let f = RotationFaults::parse(Some(text))
+                    .unwrap_or_else(|e| panic!("{text:?} must parse: {e:#}"));
+                assert!(f.take(expect), "{text:?}: the FIRST directive must fail");
+                assert!(
+                    !f.take(expect),
+                    "{text:?}: the count defaults to 1, so the SECOND directive must pass. This \
+                     is what makes the hook a one-shot — `rotation_wedge.rs` step (iv) issues \
+                     its directive to the SAME live process, and a hook that kept firing would \
+                     red step (iv) for a harness reason rather than the wedge."
+                );
+            }
+        }
+
+        #[test]
+        fn parse_reads_an_explicit_count_and_never_resets_it() {
+            let f = RotationFaults::parse(Some("after-mint:2")).expect("`:N` must parse");
+            assert!(f.take(RotationFailPoint::AfterMint));
+            assert!(f.take(RotationFailPoint::AfterMint));
+            assert!(!f.take(RotationFailPoint::AfterMint));
+            assert!(
+                !f.take(RotationFailPoint::AfterMint),
+                "the counter only ever decrements — it must NOT reset (on a Sync reconnect or \
+                 anything else). A resetting counter would re-arm between the two directives \
+                 `rotation_wedge.rs` issues and fail the retry too, which is exactly the \
+                 symptom the wedge produces — the harness would be forging its own red."
+            );
+        }
+
+        #[test]
+        fn take_only_fires_at_the_configured_point() {
+            let f = RotationFaults::parse(Some("after-enforcer-insert")).unwrap();
+            assert!(
+                !f.take(RotationFailPoint::AfterMint),
+                "a non-configured point must not consume the budget, or the rotation would fail \
+                 EARLIER than the test asked and leave a smaller residue — step (iii) asserts on \
+                 the tun, the enforcer gauge AND the store, and only the deepest point \
+                 (`uapi::apply`, design §2.2 step 8) produces all three"
+            );
+            assert!(
+                !f.take(RotationFailPoint::AfterBringUp),
+                "likewise for the middle point"
+            );
+            assert!(f.take(RotationFailPoint::AfterEnforcerInsert));
+        }
+
+        #[test]
+        fn an_absent_variable_arms_nothing() {
+            let f = RotationFaults::parse(None).expect("an absent variable is not an error");
+            for at in [
+                RotationFailPoint::AfterMint,
+                RotationFailPoint::AfterBringUp,
+                RotationFailPoint::AfterEnforcerInsert,
+            ] {
+                assert!(
+                    !f.take(at),
+                    "an unset {ROTATION_FAIL_ENV} must leave EVERY fail point disarmed. Every netns suite in this \
+                     crate spawns gateways without it (`key_rotation.rs`, `mesh_milestone.rs`, \
+                     `nat_matrix.rs`, `relay_matrix.rs`), and all of them are built with this \
+                     feature ON — so a default that armed anything would break the whole \
+                     privileged suite at once."
+                );
+            }
+        }
+
+        #[test]
+        fn an_empty_or_whitespace_only_value_is_treated_as_absent() {
+            for empty in ["", "   ", "\t", "\n"] {
+                let f = RotationFaults::parse(Some(empty)).unwrap_or_else(|e| {
+                    panic!(
+                        "{empty:?} must parse as ARMS-NOTHING, not as an error: an exported-but- \
+                         empty variable is what a shell leaves behind \
+                         (`{ROTATION_FAIL_ENV}=` with no value, or a cleared CI variable), and \
+                         failing the boot on it would turn an innocuous environment into a \
+                         gateway that will not start. Got: {e:#}"
+                    )
+                });
+                for at in [
+                    RotationFailPoint::AfterMint,
+                    RotationFailPoint::AfterBringUp,
+                    RotationFailPoint::AfterEnforcerInsert,
+                ] {
+                    assert!(!f.take(at), "{empty:?} must arm nothing");
+                }
+            }
+        }
+
+        #[test]
+        fn a_zero_count_is_valid_and_arms_nothing() {
+            let f = RotationFaults::parse(Some("after-mint:0")).expect("`:0` is a valid count");
+            assert!(
+                !f.take(RotationFailPoint::AfterMint),
+                "`:0` names a point but budgets no failures. It is VALID — not an error — so a \
+                 run can be disarmed by editing the count alone, without deleting the variable \
+                 and losing which point was being exercised. `take` is true only when the armed \
+                 point matches AND the remaining budget is > 0, and 0 fails the second half."
+            );
+        }
+
+        #[test]
+        fn surrounding_whitespace_is_trimmed_from_the_spec_and_from_each_half() {
+            // The counterpart to the two rules either side of it, and the
+            // reason they are not in conflict: whitespace IS trimmed at both
+            // levels, but a half that trims away to NOTHING is an error, while
+            // a whole spec that trims away to nothing means "absent". Pinning
+            // the positive case is what keeps the distinction legible — read
+            // alone, the Err list above looks like "whitespace is rejected",
+            // which is not the rule.
+            let f =
+                RotationFaults::parse(Some("  after-mint  ")).expect("the whole spec is trimmed");
+            assert!(f.take(RotationFailPoint::AfterMint));
+
+            let f = RotationFaults::parse(Some("after-mint : 3")).expect("each half is trimmed");
+            assert!(f.take(RotationFailPoint::AfterMint));
+            assert!(f.take(RotationFailPoint::AfterMint));
+            assert!(f.take(RotationFailPoint::AfterMint));
+            assert!(
+                !f.take(RotationFailPoint::AfterMint),
+                "the count was 3, not more"
+            );
+        }
+
+        #[test]
+        fn an_unparseable_value_is_a_hard_error_not_a_silent_disarm() {
+            for bad in [
+                "after-lunch",
+                "after-mint:",
+                // THE BYPASS (gateway-dev's final table). Whitespace collapses
+                // to "absent" for the WHOLE spec only — never for a HALF. So a
+                // space after the colon is the trailing-colon case, not the
+                // absent case. Without this pin, `WIREMESH_TEST_FAIL_ROTATION=\
+                // "after-mint: "` would slip through the empty-means-absent
+                // rule and silently disarm the hook, which is precisely the
+                // silent-disarm this whole test exists to forbid.
+                "after-mint: ",
+                "after-mint:\t",
+                "after-mint:xyz",
+                ":2",
+                " :2",
+                "after-mint:1:2",
+            ] {
+                assert!(
+                    RotationFaults::parse(Some(bad)).is_err(),
+                    "{bad:?} must be a hard error — a malformed value is a typo, and an EMPTY \
+                     one is not (see the sibling test: empty means absent, deliberately). A typo \
+                     that silently disarmed the hook would \
+                     make `rotation_wedge.rs` observe a gateway that rotated NORMALLY and report \
+                     it as 'the unwind never ran' — a harness bug wearing a product bug's \
+                     failure message. Failing loudly at first use names the real cause in one \
+                     line."
+                );
+            }
+        }
     }
 }

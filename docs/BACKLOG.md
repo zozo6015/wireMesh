@@ -497,11 +497,68 @@ left of this item it is scoped to those, not to the function.
 
 A delay, not a failure &mdash; but it happens every time.
 
-### 9. Rotation wedge &mdash; three routes in
+### 9. Rotation wedge &mdash; three routes in &mdash; **CLOSED (route R1) in PR1/B2**
 
 `on_directive` is honoured only from `Idle`, so anything parking the phase off-`Idle`
 means the gateway silently ignores every later directive **and** never scrubs the old
 key. Most reachable via `handle_rotate` advancing the phase then doing fallible work.
+
+**Shipped shape.** `handle_rotate` now unwinds its own failure synchronously. The body
+moved to `handle_rotate_inner`, which writes a `RotationResidue` (`for_directive`, no
+`Default` &mdash; a defaulted `tun_epoch` of 0 names the live boot tun) as it makes
+progress; on `Err` the wrapper logs `ROTATION ABORTED` and runs
+`unwind_failed_rotation`, which in order drops `role_a`, tears down
+`TunnelId::Own { epoch }`, evicts its enforcer entry, scrubs the orphan mint via the new
+`EpochKeys::discard_pending` + `persist`, and LAST drives the new
+`Rotation::on_failed` (`Overlapping -> Idle`, emitting `RotationAction::Abort`). So the
+next directive is honoured and the freshly-minted private key does not survive on disk.
+
+`Rotation::on_failed` returns `None` from `CutOver` **and that is load-bearing**: an
+abort edge there would tear the old epoch down after routes have flipped, which is a
+fifth member of the `RETIRE_GRACE`-collapse family in "Recurring traps" below. It is
+pinned by a unit test whose failure message says so.
+
+Two adjacent findings closed with it. `EpochKeys::generate_next` is **gone**, replaced by
+`generate_next_at(epoch)`: the gateway numbered its own epochs `local max + 1`, a second
+counter that agreed with `Db::rotate_key`'s `MAX(epoch) + 1` only while nothing removed a
+local entry &mdash; which the orphan scrub does. Diverged, the gateway would submit under
+the directive epoch and store under another, the cutover's `promote` would miss, and
+`service_retire`'s `retire` would miss too, leaving the OLD private key on disk forever.
+A `"pending"` occupant is replaced (a crash between persist and unwind can strand one at
+an epoch the controller's `drop_pending_epoch` has freed for reissue, and refusing would
+wedge every later mint); an `"active"`/`"retiring"` occupant is an error.
+Observability: `wiremesh_gateway_rotation_phase` and
+`wiremesh_gateway_rotation_aborts_total{reason="failed"}`, both on the scrape's `fetch`
+tuple.
+
+**Routes R2 and R3 remain open, by design.** R2 (`Overlapping` forever because no peer
+ever goes rx-corroborated live) gets the gateway-local `OVERLAP_STALL_WARN` warning and
+the phase gauge, nothing more: once `submit_epoch_key` lands, the controller
+grace-promotes with zero acks and retires the prior epoch, so a gateway-side abort would
+convert a degraded-but-reachable gateway into a hard blackhole. R3 (`CutOver` whose watch
+set drained) keeps its existing `ROTATION WEDGED` warning. Both are filed for Phase C
+alongside the `submit_epoch_key` hang route.
+
+**B2 closes the wedge; the timer remains off pending R2/R15 (Phase C).**
+
+### 34. Lost `RotateDirective` inside the unwind's port quarantine
+
+*Placement note: this belongs beside the fire-once `RotateDirective` item (C1), which is
+not filed yet &mdash; it is PR6's. Filed here, adjacent to item 9, because item 9's fix is
+what opens the window. Move it next to C1 when C1 lands.*
+
+**Lost `RotateDirective` inside the unwind's port quarantine.** `unwind_failed_rotation`
+step 2 calls `TunnelSet::tear_down` on `TunnelId::Own { epoch }`, which puts the reserved
+own-tun port (`base + OWN_TUN_PORT_OFFSET`) into `tunnelset::QUARANTINE` for 5s.
+`plan_tunnel`'s `TunnelId::Own` arm refuses while it is held, so a second rotation issued
+inside that window fails at plan time &mdash; and per the fire-once `RotateDirective`
+finding (C1) nothing retries it, leaving the gateway `Idle` with the epoch unadvanced.
+**Symptom:** a second `Admin.RotateKey` within 5s of a failed rotation is silently
+dropped. It is *distinguishable*, not invisible:
+`wiremesh_gateway_rotation_aborts_total{reason="failed"}` increments and the
+`ROTATION ABORTED` log's `{e:#}` chain carries `plan_tunnel`'s "reserved own-epoch listen
+port &hellip; is not available" text. **Do not fix with a retry or a quarantine bypass**
+&mdash; both are Phase C territory alongside C1.
 
 ### 10. `rotation_timer` setup-race flake
 

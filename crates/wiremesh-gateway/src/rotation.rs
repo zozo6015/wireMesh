@@ -30,6 +30,23 @@ pub enum RotationPhase {
     CutOver { new_epoch: u32 },
 }
 
+impl RotationPhase {
+    /// Stable lowercase label for the `wiremesh_gateway_rotation_phase`
+    /// info-gauge (B2, design §3.2 Piece 4). Mirrors
+    /// [`crate::path::PathState::as_str`] — the label is part of the metric's
+    /// contract, so it is derived here rather than at the render site, and it
+    /// deliberately does NOT carry the epoch number (a label whose value is
+    /// unbounded is a Prometheus cardinality bug; the epoch is visible in the
+    /// logs and in the key store).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            RotationPhase::Idle => "idle",
+            RotationPhase::Overlapping { .. } => "overlapping",
+            RotationPhase::CutOver { .. } => "cutover",
+        }
+    }
+}
+
 /// Side effect the caller must perform in response to a state transition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RotationAction {
@@ -40,6 +57,11 @@ pub enum RotationAction {
     FlipRoutes { epoch: u32 },
     /// Tear down the given (now-retired) epoch's device.
     TearDown { epoch: u32 },
+    /// Unwind everything the given epoch's rotation built: its device, its
+    /// enforcer entry, and its freshly-minted `"pending"` key. Emitted only by
+    /// [`Rotation::on_failed`], i.e. only for a rotation that never reached
+    /// cutover, so nothing this tears down is carrying traffic (B2).
+    Abort { epoch: u32 },
 }
 
 /// Pure rotation state machine for a single gateway. See module docs.
@@ -95,6 +117,44 @@ impl Rotation {
             RotationPhase::CutOver { .. } => {
                 self.phase = RotationPhase::Idle;
                 Some(RotationAction::TearDown { epoch })
+            }
+            _ => None,
+        }
+    }
+
+    /// The setup half of a rotation FAILED before the data plane ever moved:
+    /// return to `Idle` so the NEXT directive is honored, and tell the caller
+    /// which epoch's half-built resources to unwind (BACKLOG item 9, B2).
+    ///
+    /// This is the only edge out of `Overlapping` other than a cutover, and it
+    /// exists because [`Rotation::on_directive`] is honored only from `Idle`:
+    /// a `handle_rotate` that advanced the phase and then failed used to park
+    /// the machine off-`Idle` PERMANENTLY, so the gateway silently ignored
+    /// every later directive until the process restarted, and never scrubbed
+    /// the old key.
+    ///
+    /// # `CutOver` and `Idle` return `None`, and that is load-bearing
+    ///
+    /// **From `CutOver` this MUST stay a no-op.** By `CutOver` the routes have
+    /// already flipped onto the new epoch and the old epoch is retiring under
+    /// `RETIRE_GRACE`; an abort edge here would tear the old epoch's device and
+    /// key down *after* the flip, on the one path whose grace clock is the only
+    /// thing keeping a peer that has not caught up from losing its session.
+    /// That is make-before-break collapsing into break-before-make — the fifth
+    /// member of a family of four ALREADY-DOCUMENTED routes to `RETIRE_GRACE`
+    /// ~= 0 (`docs/BACKLOG.md`, "Recurring traps"), every one of which looked
+    /// like a simplification when it was written. The safe unlock for a wedged
+    /// `CutOver` is not an abort; it needs either an admin-rotate guard on the
+    /// controller or a gateway-visible "your old epoch is gone" signal, and it
+    /// is filed rather than fixed here.
+    ///
+    /// From `Idle` there is simply nothing in flight to unwind. Both cases are
+    /// non-destructive by construction: the phase is left exactly as it was.
+    pub fn on_failed(&mut self) -> Option<RotationAction> {
+        match self.phase {
+            RotationPhase::Overlapping { new_epoch } => {
+                self.phase = RotationPhase::Idle;
+                Some(RotationAction::Abort { epoch: new_epoch })
             }
             _ => None,
         }
@@ -647,5 +707,110 @@ mod tests {
         let action = r.on_new_epoch_session(true);
         assert_eq!(action, None);
         assert_eq!(r.phase, RotationPhase::CutOver { new_epoch: 1 });
+    }
+
+    // `#[cfg(test)] mod tests`, after `session_corroboration_is_idempotent_after_cutover`.
+
+    // --- B2: the abort edge (design §3.2 Piece 1, §9) ------------------------
+
+    #[test]
+    fn on_failed_from_overlapping_aborts_to_idle() {
+        let mut r = Rotation::new();
+        r.on_directive(7);
+        assert_eq!(r.phase, RotationPhase::Overlapping { new_epoch: 7 });
+
+        let action = r.on_failed();
+        assert_eq!(
+            action,
+            Some(RotationAction::Abort { epoch: 7 }),
+            "an aborted setup must name the epoch it was building (7) so the caller's unwind \
+             tears down THAT epoch's tun/enforcer/mint and not a live one"
+        );
+        assert_eq!(
+            r.phase,
+            RotationPhase::Idle,
+            "Overlapping is the setup-re-entrancy phase; a rotation that failed during setup has \
+             nothing in flight, so the machine must be back at Idle"
+        );
+    }
+
+    #[test]
+    fn on_failed_from_cutover_is_a_no_op() {
+        let mut r = Rotation::new();
+        r.on_directive(1);
+        r.on_new_epoch_session(true);
+        assert_eq!(r.phase, RotationPhase::CutOver { new_epoch: 1 });
+
+        let action = r.on_failed();
+        assert_eq!(
+            action, None,
+            "MAKE-BEFORE-BREAK: `CutOver` means routes have ALREADY flipped onto the new epoch \
+             and the old epoch is only being kept alive for peers that have not caught up. An \
+             abort edge out of `CutOver` would tear the old epoch down after the flip and \
+             collapse make-before-break — that is RETIRE_GRACE-collapse route #5, and four \
+             independent routes to the same collapse are already recorded in docs/BACKLOG.md \
+             (\"Recurring traps\"), each of which looked like a simplification. `on_failed` is \
+             an abort of SETUP only. See design §3.5 and the `evict_decision` precedent, whose \
+             None-means-keep is pinned by unit tests for exactly this reason."
+        );
+        assert_eq!(
+            r.phase,
+            RotationPhase::CutOver { new_epoch: 1 },
+            "a refused abort must not move the phase either — a `CutOver` that silently became \
+             `Idle` would drop the retire debt and leak the old epoch's Device and private key"
+        );
+    }
+
+    #[test]
+    fn on_failed_from_idle_is_a_no_op() {
+        let mut r = Rotation::new();
+        assert_eq!(r.phase, RotationPhase::Idle);
+
+        let action = r.on_failed();
+        assert_eq!(
+            action, None,
+            "there is no rotation to abort from Idle; emitting an Abort here would hand the \
+             caller an epoch number to tear down that nothing had built"
+        );
+        assert_eq!(r.phase, RotationPhase::Idle);
+    }
+
+    #[test]
+    fn directive_is_honoured_immediately_after_on_failed() {
+        let mut r = Rotation::new();
+        r.on_directive(1);
+        r.on_failed();
+
+        let action = r.on_directive(2);
+        assert_eq!(
+            action,
+            Some(RotationAction::MintBringUpSubmit { epoch: 2 }),
+            "THE WEDGE (docs/BACKLOG.md item 9): before B2 a rotation that failed part-way left \
+             the phase parked off Idle, and `on_directive` is honoured ONLY from Idle — so that \
+             gateway silently ignored every later directive until the process restarted. \
+             Nothing retries a RotateDirective (design C1: `broker.rs::send_rotate_if_pending` \
+             fires once), so the next directive is the only chance there is. It must be taken \
+             here, in the same breath as the failure — with no tick, no reconnect and no \
+             restart in between."
+        );
+        assert_eq!(r.phase, RotationPhase::Overlapping { new_epoch: 2 });
+    }
+
+    #[test]
+    fn late_session_observation_after_abort_does_not_flip_routes() {
+        let mut r = Rotation::new();
+        r.on_directive(1);
+        r.on_failed();
+        assert_eq!(r.phase, RotationPhase::Idle);
+
+        let action = r.on_new_epoch_session(true);
+        assert_eq!(
+            action, None,
+            "the unwind has already torn down epoch 1's Device; a liveness observation that \
+             raced it must not flip routes onto a tun that no longer exists (the tick reads \
+             liveness by UAPI off the run task, so a stale reading IS reachable). Routes \
+             pointing at a torn-down device is a data-plane outage, not a degraded rotation."
+        );
+        assert_eq!(r.phase, RotationPhase::Idle);
     }
 }

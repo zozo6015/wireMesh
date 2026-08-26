@@ -11,6 +11,7 @@
 //! boot — is proven end-to-end by Task 12's mesh milestone, which spawns the
 //! real binary and scrapes this port for real.
 use crate::path::PathState;
+use crate::rotation::RotationPhase;
 use std::future::Future;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -180,6 +181,43 @@ pub fn render_live_enforcers(count: u64) -> String {
     s
 }
 
+/// Render the gateway's own key-rotation state (B2, design §3.2 Piece 4):
+/// the current phase as an info-gauge plus the count of rotations that failed
+/// setup and were unwound.
+///
+/// `wiremesh_gateway_rotation_phase{phase="idle|overlapping|cutover"} 1`
+/// follows the `wiremesh_gateway_backend_info` / `wiremesh_gateway_path_state`
+/// info-gauge pattern — ONE line, for the current phase only, rather than
+/// explicit 0s for the other two. The phase label is
+/// [`RotationPhase::as_str`] and deliberately carries no epoch number, which
+/// would be unbounded-cardinality.
+///
+/// `wiremesh_gateway_rotation_aborts_total{reason="failed"}` counts unwinds.
+/// One label value only: `reason="failed"` is the sole way a rotation is
+/// abandoned gateway-side. A rotation whose key was already SUBMITTED is
+/// explicitly not abortable (design §3.2 Piece 1b — aborting there converts a
+/// degraded-but-reachable gateway into a hard blackhole), so there is no
+/// `reason="deadline"` and adding one would be a behaviour change, not a
+/// label.
+///
+/// Both are always emitted, including at 0 — an absent series is
+/// indistinguishable from a dead exporter, and "this gateway is aborting
+/// rotations" is exactly the alert an operator needs to be able to write
+/// (same rule as [`render_policy_apply_failures`]).
+pub fn render_rotation(phase: &RotationPhase, aborts: u64) -> String {
+    let mut s = String::new();
+    s.push_str("# TYPE wiremesh_gateway_rotation_phase gauge\n");
+    s.push_str(&format!(
+        "wiremesh_gateway_rotation_phase{{phase=\"{}\"}} 1\n",
+        phase.as_str()
+    ));
+    s.push_str("# TYPE wiremesh_gateway_rotation_aborts_total counter\n");
+    s.push_str(&format!(
+        "wiremesh_gateway_rotation_aborts_total{{reason=\"failed\"}} {aborts}\n"
+    ));
+    s
+}
+
 /// Wrap a Prometheus text body in a minimal HTTP/1.1 response.
 fn http_response(body: &str) -> String {
     format!(
@@ -195,8 +233,8 @@ fn http_response(body: &str) -> String {
 /// transition_counts, peer_stats, policy_apply_failures, live_enforcers)`,
 /// which is rendered via [`render`] + [`render_path_state`] +
 /// [`render_path_transitions`] + [`render_peer_stats`] +
-/// [`render_policy_apply_failures`] + [`render_live_enforcers`] and written
-/// back verbatim (any HTTP request line the client sent is drained and
+/// [`render_policy_apply_failures`] + [`render_live_enforcers`] +
+/// [`render_rotation`] and written back verbatim (any HTTP request line the client sent is drained and
 /// ignored — this is a scrape-only stub server, not a general HTTP server).
 ///
 /// `peer_stats` (sixth, mesh-convergence fix T5),
@@ -217,6 +255,8 @@ where
                 Vec<((PathState, PathState), u64)>,
                 Vec<(String, PeerStats)>,
                 u64,
+                u64,
+                RotationPhase,
                 u64,
             )>,
         > + Send
@@ -240,6 +280,8 @@ where
                     peer_stats,
                     policy_apply_failures,
                     live_enforcers,
+                    rotation_phase,
+                    rotation_aborts,
                 )) => {
                     let mut body = render(&kind, version, &counters);
                     body.push_str(&render_path_state(&peer_states));
@@ -247,6 +289,7 @@ where
                     body.push_str(&render_peer_stats(&peer_stats));
                     body.push_str(&render_policy_apply_failures(policy_apply_failures));
                     body.push_str(&render_live_enforcers(live_enforcers));
+                    body.push_str(&render_rotation(&rotation_phase, rotation_aborts));
                     body
                 }
                 Err(e) => format!("# error collecting counters: {e:#}\n"),
@@ -332,6 +375,10 @@ mod tests {
             // And likewise the trailing `1u64` (key-rotation T3): the
             // steady-state live-enforcer count is the lone boot tun's, and
             // the scrape assertion for it lives in the rotation netns suite.
+            // B2: the tuple grows by two (phase, aborts). `tests/peer_metrics.rs`'s
+            // header records the rule this obeys — adding a metric means the
+            // `serve_metrics` fetch tuple grows by one element — because a
+            // renderer alone is INVISIBLE to a scrape.
             Ok::<_, anyhow::Error>((
                 "ebpf".to_string(),
                 9u64,
@@ -341,6 +388,8 @@ mod tests {
                 peer_stats,
                 0u64,
                 1u64,
+                RotationPhase::Overlapping { new_epoch: 3 },
+                2u64,
             ))
         }));
 
@@ -379,6 +428,68 @@ mod tests {
                 "wiremesh_gateway_path_transitions_total{from=\"connecting\",to=\"direct\"} 3"
             ),
             "path transitions must reach the scrape body: {text}"
+        );
+        // Without these two the netns done-bar's step (iii) cannot pass: it
+        // scrapes both series off a REAL gateway process, so a renderer that
+        // never reached the fetch tuple would make that assertion vacuous.
+        assert!(
+            text.contains("wiremesh_gateway_rotation_phase{phase=\"overlapping\"} 1"),
+            "the rotation phase gauge must reach the scrape body, not merely exist as a \
+             separately-tested pure renderer: {text}"
+        );
+        assert!(
+            text.contains("wiremesh_gateway_rotation_aborts_total{reason=\"failed\"} 2"),
+            "likewise the abort counter — it is `rotation_wedge.rs` step (iii)'s primary \
+             machine-readable evidence that the unwind ran at all: {text}"
+        );
+    }
+
+    #[test]
+    fn render_rotation_emits_phase_gauge_and_abort_counter() {
+        let out = render_rotation(&RotationPhase::Overlapping { new_epoch: 3 }, 2);
+        assert!(out.contains("# TYPE wiremesh_gateway_rotation_phase gauge"));
+        assert!(
+            out.contains("wiremesh_gateway_rotation_phase{phase=\"overlapping\"} 1"),
+            "body: {out}"
+        );
+        assert!(out.contains("# TYPE wiremesh_gateway_rotation_aborts_total counter"));
+        assert!(
+            out.contains("wiremesh_gateway_rotation_aborts_total{reason=\"failed\"} 2"),
+            "the abort counter is the only ALERTABLE signal that a gateway is failing rotations. \
+             R2 and R3 are both left OPEN by Phase B (design §3.2 Piece 1b, §3.5) and their \
+             entire operator story is this counter plus the phase gauge. body: {out}"
+        );
+    }
+
+    #[test]
+    fn render_rotation_names_only_the_current_phase() {
+        let idle = render_rotation(&RotationPhase::Idle, 0);
+        assert!(
+            idle.contains("wiremesh_gateway_rotation_phase{phase=\"idle\"} 1"),
+            "body: {idle}"
+        );
+        assert_eq!(
+            idle.lines()
+                .filter(|l| l.starts_with("wiremesh_gateway_rotation_phase{"))
+                .count(),
+            1,
+            "info-gauge pattern, as `render_backend_info` and `render_path_state` already use: \
+             emit ONLY the current phase, never 0-valued lines for the others. A scrape that \
+             also carried `phase=\"overlapping\" 0` would make \
+             `max_over_time(...phase{{phase=\"overlapping\"}})` — the alert an operator writes \
+             for a stuck rotation — silently useless. body: {idle}"
+        );
+
+        let cutover = render_rotation(&RotationPhase::CutOver { new_epoch: 4 }, 0);
+        assert!(
+            cutover.contains("wiremesh_gateway_rotation_phase{phase=\"cutover\"} 1"),
+            "body: {cutover}"
+        );
+        assert!(
+            !cutover.contains("phase=\"overlapping\""),
+            "a gateway in CutOver must not also report Overlapping: the two mean different things \
+             to an operator (setup in flight vs. retire debt outstanding — design §2), and \
+             CutOver is the one phase Phase B deliberately leaves unabortable. body: {cutover}"
         );
     }
 }
