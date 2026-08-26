@@ -169,7 +169,15 @@ The workspace run. Network tests are serial, and long runs want a timeout:
 ./dev.sh run "cd /work && cargo test -p wiremesh-gateway --features netns-tests -- --test-threads=1 --nocapture"
 ```
 
-The per-crate doctest inventory is pinned by [`dev/doctest-counts.txt`](dev/doctest-counts.txt) and checked in CI: `cargo test --doc` exiting 0 proves the doctests that exist compile, not that the same ones exist, and drift in either direction is a bug — one appearing usually means prose that rustdoc started compiling (a closed Markdown list turns an indented paragraph into a code block), one vanishing is a lost test. Regenerate the table deliberately, from a real run, with [`dev/doctest-counts.sh`](dev/doctest-counts.sh).
+The per-crate doctest inventory is pinned by [`dev/doctest-counts.txt`](dev/doctest-counts.txt) and checked in CI: `cargo test --doc` exiting 0 proves the doctests that exist compile, not that the same ones exist, and drift in either direction is a bug — one appearing usually means prose that rustdoc started compiling (a closed Markdown list turns an indented paragraph into a code block), one vanishing is a lost test. Regenerate the table deliberately, from a real run. The script takes the two log paths and runs no cargo itself — `generate` with no arguments exits 2 — so produce the logs first:
+
+```sh
+./dev.sh run "cd /work && cargo test -j 1 --workspace --doc" > /tmp/doc-root.log
+./dev.sh run "cd /work/crates/wiremesh-enforcer-ebpf && cargo test -j 1 --doc" > /tmp/doc-ebpf.log
+dev/doctest-counts.sh generate /tmp/doc-root.log /tmp/doc-ebpf.log > dev/doctest-counts.txt
+```
+
+The two arguments are the **root-workspace** log and the **ebpf sub-workspace** log, in that order — not one per crate.
 
 Which gated suite runs in which CI job is decided by one script, [`dev/netns-split.sh`](dev/netns-split.sh) — `check` fails if a gated file is named there but has been renamed or un-gated, so a newly added netns test cannot silently run in no job at all. It detects gating by the `#![cfg(feature = "netns-tests")]` inner attribute **at column 0**, never by a substring match: `tests/punch_endpoint_driven.rs` names the attribute only inside a doc comment and is a plain unit test, which is why a naive grep counts 14 instead of 13.
 
