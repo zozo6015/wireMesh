@@ -374,8 +374,10 @@ run: |
 "#;
 
 /// `release.yml`'s `linux-binaries` build step, same treatment. This one IS a
-/// build, and it is the reason the verb list cannot be just `docker build`:
-/// `docker build` is not a substring of `docker buildx build`.
+/// build. `"docker build"` alone would classify it correctly — `docker build`
+/// IS a substring of `docker buildx build` — so what the buildx entry buys is
+/// the MESSAGE: the reason names the command actually present instead of a
+/// vaguer one, in a failure a release engineer reads under time pressure.
 const LINUX_BINARIES_BUILD_STEP: &str = r#"
 name: Build release binaries (Dockerfile export stage)
 run: |
@@ -869,8 +871,11 @@ fn workflow_files() -> Vec<String> {
 
 /// The build VERBS a `run:` block can invoke on the Dockerfile, most specific
 /// first so the reported reason names the command that is actually there.
-/// `docker buildx build` is not optional to carry: it is what `release.yml`'s
-/// `linux-binaries` job uses, and `docker build` is not a substring of it.
+/// Order matters only for the reported reason, not for coverage:
+/// `docker build` IS a substring of `docker buildx build`, so either entry
+/// alone would match `release.yml`'s `linux-binaries` step. Listing the
+/// longer form first makes `.iter().find` report `runs \`docker buildx build\``
+/// rather than the vaguer `runs \`docker build\``.
 const DOCKER_BUILD_VERBS: [&str; 2] = ["docker buildx build", "docker build"];
 
 /// Does this step compile workspace source into a shipped binary? Returns the

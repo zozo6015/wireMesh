@@ -13,7 +13,8 @@
 job compiling a shipped binary runs `scripts/set-version.sh` at an earlier step index.
 On PR3 it flagged `cold-build.yml`'s `toolchain-parity` job as such a build.
 
-`toolchain-parity` compiles nothing. Its single step:
+`toolchain-parity` compiles nothing. Its parity step (PR3 later added a second,
+stamping step — see "The predicted repair already happened" below):
 
 - `grep`s the first `FROM` line out of `dev/Dockerfile`;
 - `grep`s the first `FROM … AS builder` line out of `deploy/docker/Dockerfile`;
@@ -83,12 +84,20 @@ if run.contains(DOCKERFILE) {
 }
 ```
 
-`docker buildx build` is not optional to carry, and it is listed first so the reported
-reason names the command actually present: `release.yml`'s `linux-binaries` job — the
-job that produces **every packaged Linux binary** — runs `docker buildx build -f
-deploy/docker/Dockerfile --target export`, and `docker build` is not a substring of
-`docker buildx build`. A verb list of just `docker build` would have swapped a false
-positive for a false negative on the single most important job the guard covers.
+**Correction (reviewer, 2026-08-26).** An earlier revision of this note claimed
+`docker build` "is not a substring of `docker buildx build`" and that a list without the
+buildx entry would have created a false negative on `release.yml`'s `linux-binaries`
+job. **That is wrong.** `docker buildx build`[0..12] *is* `docker build`, so
+`"docker build"` alone matches both spellings and coverage was never at risk. The claim
+was asserted from reading rather than from running a two-line check — the same failure
+mode this whole note is about, made while writing it.
+
+What the buildx entry actually buys is the **message**. `.iter().find` returns the first
+matching verb, so listing the longer form first makes the reported reason read
+``runs `docker buildx build` of deploy/docker/Dockerfile`` rather than the vaguer
+``runs `docker build` of …``. That is worth having — the reason string is what a release
+engineer reads in a failure, under time pressure, and it should name the command that is
+actually there — but it is a legibility win, not a coverage one.
 
 The `uses:` arm is untouched: it already required
 `docker/build-push-action` **and** `with.file == deploy/docker/Dockerfile`, which is a
@@ -110,7 +119,7 @@ satisfied with margin.
 ## The tests
 
 **`a_run_block_that_only_mentions_the_dockerfile_in_a_grep_is_not_a_build`** — the
-negative case, built from PR3's actual `toolchain-parity` step (text unchanged; only
+negative case, built from PR3's actual `toolchain-parity` parity step (text unchanged; only
 the YAML indentation is re-rooted so the fixture is a standalone step mapping,
 including all three `build` occurrences). Asserts `build_reason(&step) == None`.
 
@@ -130,15 +139,64 @@ tightening ever goes one notch too far.
 Together they bracket the predicate from both sides, which a single test cannot do:
 one fails if it is too loose, the other if it is too tight.
 
-## Residual blind spot, stated rather than papered over
+## Residual blind spot — and it already has a live near-miss
 
 The verb check is still a substring test, just a far narrower one. A `run:` block whose
-COMMENT contains the literal string `docker build` alongside a mention of the Dockerfile
-would still be misclassified. That is a much less likely accident than the word `build`
-— it requires the exact command spelling in prose — and closing it properly means
-parsing the shell rather than the YAML, which is a different order of complexity than
-this guard warrants. Recorded here so the next person who hits it knows the shape of the
-remaining hole rather than rediscovering it.
+own text contains the literal `docker build` or `cargo build` in a shell comment or an
+`echo` would still be misclassified.
+
+**This is not hypothetical.** PR3's `cold-build.yml` contains, at the `toolchain-parity`
+job, a comment reading *"there is no `cargo build`, no `docker build` and no
+build-push-action anywhere in it"* — both literals, in a passage whose entire purpose is
+to say the job does not build. It is safe today by a mechanism nobody chose: those are
+**YAML** comments, and `serde_yaml` strips them before `step["run"]` is ever read. Move
+the same sentence three lines down into a `run: |` block, as a `#` shell comment or an
+`echo`, and it fires.
+
+The `cargo build` arm is the sharper edge of this. Unlike the Dockerfile arm it has **no
+second condition at all** — no path guard, nothing — so the bare literal `cargo build`
+anywhere in any `run:` block classifies that step as a build. A step that echoes
+`"run cargo build locally to reproduce"` in a failure hint is enough.
+
+Closing this properly means parsing the shell rather than the YAML, which is a different
+order of complexity than this guard warrants. Recorded so the next person who hits it
+recognises the shape instead of rediscovering it.
+
+## The predicted repair already happened
+
+This note argues above that the real damage of a satisfiable false demand is that
+someone satisfies it. PR3 did: `toolchain-parity` carries a step
+
+```yaml
+- name: stamp a non-colliding version (see note above)
+  run: bash scripts/set-version.sh "0.0.0-parity-$(git rev-parse --short HEAD)"
+```
+
+added purely to placate this guard, under sixteen lines of comment that state plainly
+*"THIS JOB COMPILES NOTHING"* and *"The precision fix belongs to the guard, not here."*
+That was the right call at the time — the guard was wrong and the workaround was honest
+and documented, which is far better than an exception list. But it is exactly the
+outcome predicted: a version stamped into a job with no artifact to stamp it into.
+
+With the classifier tightened, that step and its apologia are **no longer required**.
+Removing them is `cold-build.yml`'s call, not this branch's; noted so the option is not
+lost.
+
+## Filed follow-up: the `cold` job is excluded by accident, not by intent
+
+`cold-build.yml`'s `cold` job DOES build `deploy/docker/Dockerfile` via
+`docker/build-push-action`, and the `uses:` arm does not classify it — its
+`with.file` is `${{ matrix.file }}`, an unresolved expression, and the arm tests exact
+equality against the literal path.
+
+The fix is **not** "resolve the expression". That job is `push: false`, `load: false`
+and ships nothing — it exists to prove the Dockerfiles still build from scratch — so
+teaching the classifier to see through the matrix would re-create precisely the
+over-firing this branch removes, this time demanding a stamp from a cold *build*. The
+follow-up is to make the exclusion **intentional**: exempt steps that publish nothing
+(`push: false`), or classify on whether the step produces a shipped artifact rather than
+on whether it compiles. Until then it is excluded for the wrong reason, and a matrix
+that grew a pushing entry would still be missed.
 
 ## Verification
 
