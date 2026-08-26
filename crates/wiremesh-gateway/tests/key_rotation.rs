@@ -1775,14 +1775,16 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     // wait costs nothing when the scrub is prompt, which it normally is
     // (sub-second after the teardown).
     //
-    // This gate does NOT judge the scrub; assertion (b) below still does
-    // that, by raw byte-grep AND through the reloaded store, after the crash
-    // and restart. With the scrub pinned here, (b)'s subject is exactly the
-    // claim that is still at risk: the crash + restart must not RE-ADD the
-    // retired key. Boot's legacy migration re-seeds epoch 0 from
-    // `identity.json`/`wg_private.key` — the same path assertion (a) is RED
-    // for — so "gone before the crash" and "gone after the restart" are
-    // genuinely different claims, and only the second one is (b)'s.
+    // The split between this gate and assertion (b), exactly: THIS GATE
+    // requires epoch 0 to be scrubbed BEFORE the crash — it fails (as a setup
+    // failure, naming step 4) if the scrub has not landed. ASSERTION (b)
+    // verifies only that the scrubbed key is not RESURRECTED after the
+    // restart, by raw byte-grep and through the reloaded store. Boot's legacy
+    // migration re-seeds epoch 0 from `identity.json`/`wg_private.key` — the
+    // same path assertion (a) is RED for — so "gone before the crash" and
+    // "still gone after the restart" are genuinely different claims. The gate
+    // establishes the first; (b) is left with only the second, which is the
+    // half that was ever at risk across a crash.
     let mut last_load = String::new();
     let scrubbed = wait_until(Duration::from_secs(60), || {
         let loaded = wiremesh_gateway::epochkeys::EpochKeys::load(sda.path());
@@ -1938,10 +1940,10 @@ async fn rotation_survives_gateway_restart_on_new_epoch() {
     eprintln!("RESTART KEY PASS: wg0 came up with the promoted epoch-1 key");
 
     // ===== (b) durable retire: the old private key is GONE from disk =====
-    // The pre-crash gate already proved the scrub REMOVED epoch 0, so what
-    // this pins is the half that is still at risk: the crash + restart must
-    // not RE-ADD the retired key (boot's legacy migration re-seeds epoch 0
-    // from `identity.json`/`wg_private.key`).
+    // The pre-crash gate REQUIRED epoch 0 to be scrubbed before the crash, so
+    // this verifies only the other half: that the scrubbed key is not
+    // RESURRECTED by the restart (boot's legacy migration re-seeds epoch 0
+    // from `identity.json`/`wg_private.key` when no `active` entry exists).
     // Every failure below kills both gateway processes FIRST (the file-wide
     // convention) so a failing assertion can never leave two real gateway
     // binaries running against the lab's netns.

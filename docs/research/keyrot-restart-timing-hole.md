@@ -6,7 +6,7 @@
 `key_rotation` 5/7. One of the two failures was
 `rotation_survives_gateway_restart_on_new_epoch` at `key_rotation.rs:1891`:
 
-```
+```text
 SECURITY: the retired epoch-0 PRIVATE key is still in gwA's epoch_keys.json
 after retire + restart — retirement never durably destroyed it
 ```
@@ -23,7 +23,7 @@ that happens *before* the scrub it asserts, and a loaded runner can land its
 (the range was `:4305-4340` at `1f70ef6` and `:4306-4346` at `b30969e` — the
 symbol is the citation, the numbers only orient):
 
-```
+```text
   1  tunnels.tear_down(id)                    ← wg0 DISAPPEARS HERE
   2  enforcers.lock().await.remove(&id)
   3  renormalize_active_listen_port(..).await ← awaits ctx.endpoint_commit
@@ -97,7 +97,7 @@ precisely the pre-scrub state.
 
 Both failure paths log loudly and unmissably:
 
-```
+```text
 CRITICAL: persisting retire of epoch {n} failed: … — the retired PRIVATE key is still on disk
 CRITICAL: retiring epoch {n} in the key store failed: … — its private key remains in epoch_keys.json
 ```
@@ -114,7 +114,7 @@ legitimately still on disk at that instant.
 
 Root `main` @ `1f70ef6`, uncontended, exclusive volume:
 
-```
+```text
 RUN_1  ok. 1 passed; 0 failed   15.29s   PRE-CRASH: retire landed
 RUN_2  ok. 1 passed; 0 failed   14.67s   PRE-CRASH: retire landed
 RUN_3  ok. 1 passed; 0 failed   14.02s   PRE-CRASH: retire landed
@@ -136,7 +136,7 @@ To try to widen the window on purpose: `nproc` = 8, and **24 busy loops**
 each run and killed after. The test binary was built **first, unloaded**, so
 the load fell on the test rather than on compilation.
 
-```
+```text
 LOAD_RUN_1  ok. 1 passed   28.93s   (unloaded baseline ≈ 15.29s)
 LOAD_RUN_2  ok. 1 passed   28.14s   (unloaded baseline ≈ 14.67s)
 LOAD_RUN_3  ok. 1 passed   26.86s   (unloaded baseline ≈ 14.02s)
@@ -210,13 +210,17 @@ by symbol — plus four things this section did not spell out:
   from `identity.json`/`wg_private.key` when no `active` entry exists, which is
   the same path assertion (a) is RED for. Assertion text itself is unchanged.
 
-One property this fix stops covering: whether step 4 completes within *any*
-bound. A gate that waits it out cannot also fail on it. That is a product
-property rather than a restart-durability one, and it is independently pinned by
+What changes about timing coverage, stated precisely. The scrub is still bounded
+here: the new gate **fails** if epoch 0 is not removed within its 60s window
+before the crash, and it fails naming step 4. What no longer exists is the
+restart test *independently asserting durability timing* — a scrub that lands
+slowly but inside 60s is now tolerated, where before it would have produced a
+`SECURITY` failure about key durability, which was the wrong verdict for a
+timing observation in the first place. The scrub as a product property is
+independently pinned by
 `crates/wiremesh-gateway/tests/epoch_persistence.rs`'s
-`retire_then_reload_scrubs_retired_private_key_from_disk`, so nothing is left
-uncovered by the change — but the *timing* of it is now nobody's assertion, and
-that is deliberate.
+`retire_then_reload_scrubs_retired_private_key_from_disk`. Nothing is left
+uncovered; one test stopped answering a question that was never its own.
 
 ---
 
