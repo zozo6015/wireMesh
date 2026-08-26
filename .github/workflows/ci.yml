@@ -355,15 +355,18 @@ jobs:
           path: .ci-cargo-registry
           key: cargo-registry-${{ hashFiles('Cargo.lock', 'crates/wiremesh-enforcer-ebpf/Cargo.lock') }}
           restore-keys: cargo-registry-
-      # Fails if a gated test file is named in dev/netns-split.sh but no longer
-      # exists or is no longer gated. Cheap, and it runs before the 20-minute
-      # build so a bookkeeping slip is reported in seconds.
-      - name: dev/netns-split.sh check
-        run: bash dev/netns-split.sh check
       - name: dev/doctor.sh
         run: |
           docker run --rm --privileged -v "$PWD":/work "$DEV_IMAGE" \
             bash -lc 'cd /work && bash dev/doctor.sh'
+      # Fails if a gated test file is named in dev/netns-split.sh but no longer
+      # exists or is no longer gated, or if a rotation done-bar is unassigned.
+      # Cheap -- but it runs AFTER `doctor.sh`, because the bar is literal:
+      # `doctor.sh` is the first `run:` step of every privileged job, so an
+      # unsupported runner always fails on a named probe rather than on
+      # whatever this job happens to check first.
+      - name: dev/netns-split.sh check
+        run: bash dev/netns-split.sh check
       # `throughput_bench` and the rotation suites are excluded here — see
       # dev/netns-split.sh for why each one is where it is.
       - name: cargo test -p wiremesh-gateway --features netns-tests

@@ -38,7 +38,7 @@ cd "$(dirname "$0")/.."
 TESTS_DIR="crates/wiremesh-gateway/tests"
 
 # Rotation done-bars: their own runner (see above).
-ROTATION=(key_rotation rotation_slot_quarantine_netns rotation_wedge)
+ROTATION=(key_rotation rotation_slot_quarantine_netns rotation_wedge rotation_stall_epoch)
 # Excluded from CI entirely: measures, asserts nothing.
 EXCLUDED=(throughput_bench)
 
