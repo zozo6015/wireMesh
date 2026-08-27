@@ -90,16 +90,3 @@ ipnet = "2"
 serde_yaml = "0.9"
 sha2 = "0.10"
 rand = "0.8"
-
-# boringtun 0.6.0 ships a one-word bug that disables the per-peer connected-UDP
-# fast path entirely: device/peer.rs:120 creates the socket with Type::STREAM +
-# IPPROTO_UDP (EPROTONOSUPPORT on every received packet), capping the receive
-# path at ~286 pps (~3 Mbit/s). Upstream fixed it on master in b8c668f
-# ("fix: fix udp socket creation argument error #430") but never cut a release.
-# This pins 0.6.0 + that exact cherry-picked upstream commit. Measured effect on
-# the G-2 harness: 3.04 Mbit/s -> 966 Mbit/s pinned-4vCPU / 1.15 Gbit/s
-# unpinned, UDP loss 97% -> 0%. See
-# docs/research/g2-root-cause-one-word-boringtun-fix.md. Drop this patch when a
-# boringtun release >0.6.0 containing b8c668f exists on crates.io.
-[patch.crates-io]
-boringtun = { git = "https://github.com/zozo6015/boringtun.git", rev = "b8c6ddc2404e5555ba686151a0a4f740d98c6ec0" }
